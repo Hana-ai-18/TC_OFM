@@ -87,11 +87,11 @@ class VelocityField(nn.Module):
         self.spatial_enc = FNO3DEncoder(
             in_channel   = unet_in_ch,
             out_channel  = 1,
-            d_model      = 64,
+            d_model      = 32,      # FIX: 64 → 32
             n_layers     = 4,
             modes_t      = 4,
-            modes_h      = 16,
-            modes_w      = 16,
+            modes_h      = 4,       # FIX: 16 → 4
+            modes_w      = 4,       # FIX: 16 → 4
             spatial_down = 32,
             dropout      = 0.05,
         )
