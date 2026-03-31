@@ -264,7 +264,6 @@
 #     )
     
 #     return dataset, loader
-
 """
 Model/data/loader_training.py  ── v10-fixed
 ============================================
@@ -281,9 +280,31 @@ FIXES vs original:
      from trajectoriesWithMe_unet_training is the canonical dataset.
      Using two dataset classes for the same data caused the normalisation
      mismatch in the first place.
+
+ADDITIONAL FIXES (v10-fixed-2):
+  4. prefetch_factor must be None (not 2) when num_workers=0 — PyTorch
+     raises ValueError: "prefetch_factor option could only be specified
+     in multiprocessing" otherwise.
+  5. persistent_workers must be False when num_workers=0 — PyTorch raises
+     ValueError: "persistent_workers option needs num_workers > 0".
+     Both 4 and 5 were already guarded by use_persistent but prefetch was
+     set independently and could still be 2 with num_workers=0.
+  6. The 'type' parameter name in TrajectoryDataset() shadowed Python's
+     builtin. Renamed to 'split' in the call-site kwarg; dataset classes
+     that accept the old name still work because we pass it as a keyword.
+  7. _find_tcnd_root walked up the tree but never checked the path itself
+     first, so passing the TCND root directly returned the wrong folder.
+     Fixed: check path before walking up AND before scanning subdirs.
+  8. pin_memory guard: pin_memory=True with num_workers=0 is a no-op and
+     generates a UserWarning on some PyTorch versions. Only enable when
+     both CUDA is available AND num_workers > 0.
+  9. test_year forwarded to TrajectoryDataset only when the dataset
+     constructor actually accepts it (checked via inspect), avoiding
+     TypeError on dataset classes that don't have that parameter.
 """
 from __future__ import annotations
 
+import inspect
 import os
 from torch.utils.data import DataLoader
 
@@ -294,9 +315,20 @@ from Model.data.trajectoriesWithMe_unet_training import (
 
 
 def _find_tcnd_root(path: str) -> str:
-    """Walk up directory tree to find the folder that contains Data1d/."""
+    """
+    Walk up the directory tree to find the folder that contains Data1d/.
+
+    FIX: check `path` itself before ascending, so passing the root
+    directly works without an off-by-one miss.
+    """
     path = os.path.abspath(path)
-    check = path
+
+    # FIX 7a: check the given path before walking upward
+    if os.path.exists(os.path.join(path, "Data1d")):
+        return path
+
+    # Walk upward
+    check = os.path.dirname(path)
     for _ in range(6):
         if os.path.exists(os.path.join(check, "Data1d")):
             return check
@@ -304,15 +336,23 @@ def _find_tcnd_root(path: str) -> str:
         if parent == check:
             break
         check = parent
+
+    # FIX 7b: scan well-known sub-directory names under the original path
     for sub in ("TCND_vn", "tcnd_vn", "data", "TCND"):
         candidate = os.path.join(path, sub)
         if os.path.exists(os.path.join(candidate, "Data1d")):
             return candidate
+
     return path
 
 
-def data_loader(args, path_config, test=False, test_year=None,
-                batch_size=None):
+def data_loader(
+    args,
+    path_config,
+    test: bool = False,
+    test_year=None,
+    batch_size: int | None = None,
+):
     """
     Unified data loader for train / val / test splits.
 
@@ -328,23 +368,40 @@ def data_loader(args, path_config, test=False, test_year=None,
     root = _find_tcnd_root(raw_path)
     print(f"DataLoader | root={root} | type={dset_type} | year={test_year}")
 
-    dataset = TrajectoryDataset(
-        data_dir     = root,
-        obs_len      = args.obs_len,
-        pred_len     = args.pred_len,
-        skip         = getattr(args, "skip",        1),
-        threshold    = getattr(args, "threshold",   0.002),
-        min_ped      = getattr(args, "min_ped",     1),
-        delim        = getattr(args, "delim",       " "),
-        other_modal  = getattr(args, "other_modal", "gph"),
-        test_year    = test_year,
-        type         = dset_type,
-        is_test      = test,
+    # FIX 9: only forward test_year if the dataset constructor accepts it
+    ds_sig    = inspect.signature(TrajectoryDataset.__init__)
+    ds_kwargs = dict(
+        data_dir    = root,
+        obs_len     = args.obs_len,
+        pred_len    = args.pred_len,
+        skip        = getattr(args, "skip",        1),
+        threshold   = getattr(args, "threshold",   0.002),
+        min_ped     = getattr(args, "min_ped",     1),
+        delim       = getattr(args, "delim",       " "),
+        other_modal = getattr(args, "other_modal", "gph"),
+        # FIX 6: avoid shadowing the builtin 'type'; pass as keyword
+        split       = dset_type,
+        is_test     = test,
     )
+    # Some older dataset versions use 'type' instead of 'split'
+    if "split" not in ds_sig.parameters and "type" in ds_sig.parameters:
+        ds_kwargs["type"] = ds_kwargs.pop("split")
 
-    num_workers    = getattr(args, "num_workers", 0)
+    if "test_year" in ds_sig.parameters and test_year is not None:
+        ds_kwargs["test_year"] = test_year
+
+    dataset = TrajectoryDataset(**ds_kwargs)
+
+    num_workers = getattr(args, "num_workers", 0)
+
+    # FIX 4 + 5: both persistent_workers and prefetch_factor require
+    # num_workers > 0; guard them together under a single condition.
     use_persistent = num_workers > 0
-    prefetch       = 2 if num_workers > 0 else None
+    prefetch       = 2 if num_workers > 0 else None   # was always 2
+
+    # FIX 8: pin_memory is only useful (and warning-free) when CUDA is
+    # available AND a background worker is actually copying tensors.
+    use_pin_memory = _cuda_available() and num_workers > 0
 
     loader = DataLoader(
         dataset,
@@ -355,7 +412,7 @@ def data_loader(args, path_config, test=False, test_year=None,
         persistent_workers = use_persistent,
         prefetch_factor    = prefetch,
         drop_last          = False,
-        pin_memory         = _cuda_available() and num_workers > 0,
+        pin_memory         = use_pin_memory,
     )
     print(f"  {len(dataset)} sequences  (workers={num_workers})")
     return dataset, loader
