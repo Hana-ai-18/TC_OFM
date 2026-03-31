@@ -1,5 +1,5 @@
 """
-TCNM/env_net_transformer_gphsplit.py  ── v10 (no changes from v9)
+Model/env_net_transformer_gphsplit.py  ── v10 (no changes from v9)
 ===================================================================
 Env-T-Net: Environmental-Time Network.
 

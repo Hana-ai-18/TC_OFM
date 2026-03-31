@@ -1,5 +1,5 @@
 """
-TCNM/data/trajectoriesWithMe_unet_training.py  ── v10
+Model/data/trajectoriesWithMe_unet_training.py  ── v10
 ======================================================
 TC trajectory dataset — TRAINING VERSION.
 Không thay đổi so với v9-fixed (data pipeline không phải bottleneck).

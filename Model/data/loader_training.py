@@ -1,5 +1,5 @@
 """
-TCNM/data/loader_training.py - Data loader for training
+Model/data/loader_training.py - Data loader for training
 Handles Vietnam TC data structure
 """
 import os

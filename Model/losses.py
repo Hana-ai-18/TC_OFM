@@ -1,5 +1,5 @@
 """
-TCNM/losses.py  ── v10 (algorithm unchanged from v9)
+Model/losses.py  ── v10 (algorithm unchanged from v9)
 ======================================================
 Loss functions: OT-CFM + PINN-BVE.
 

@@ -1,5 +1,5 @@
 """
-TCNM/data/trajectoriesWithMe_unet.py  ── v10 (TEST / INFERENCE)
+Model/data/trajectoriesWithMe_unet.py  ── v10 (TEST / INFERENCE)
 """
 from __future__ import annotations
 

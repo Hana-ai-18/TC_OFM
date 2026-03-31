@@ -1,5 +1,5 @@
 """
-TCNM/mamba_encoder.py  ── v10-turbo
+Model/mamba_encoder.py  ── v10-turbo
 ======================================
 Mamba (Selective SSM) — pure PyTorch implementation.
 Replaces LSTM in DataEncoder1D with 3-5x faster sequence modeling.
