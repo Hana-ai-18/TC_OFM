@@ -1161,12 +1161,14 @@ class VelocityField(nn.Module):
         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
         t_emb = self.time_fc2(t_emb)
 
-        x_emb  = self.traj_embed(x_t) + self.pos_enc + t_emb.unsqueeze(1)
+        x_emb = self.traj_embed(x_t) + self.pos_enc[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
+        #                                           ^^^^^^^^^^^^^^^^^^^^^^^^
+        #  FIX: slice pos_enc to active seq length so curriculum (e.g. len=4)
+        #  doesn't mismatch the full pos_enc shape [1, pred_len=12, 128]
         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
 
         out = self.transformer(x_emb, memory)
         return self.out_fc2(F.gelu(self.out_fc1(out)))
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TCFlowMatching  ── v14

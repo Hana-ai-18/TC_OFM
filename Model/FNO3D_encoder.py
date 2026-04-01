@@ -67,7 +67,12 @@ class SpectralConv3d(nn.Module):
         self.w_im = nn.Parameter(scale * torch.randn(*shape))
 
     def _complex_mul(self, x, w_re, w_im):
-        # FIX 1: unambiguous subscripts — b=batch i=in j=out p/q/r=modes
+        # x is already float32 (cast before FFT in forward()).
+        # w_re/w_im are float32 parameters, but under AMP the model runs in
+        # float16 so they may arrive as half — cast explicitly to avoid
+        # ComplexHalf when torch.complex() combines the einsum outputs.
+        w_re = w_re.float()
+        w_im = w_im.float()
         x_re = x.real
         x_im = x.imag
         out_re = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_re)
