@@ -241,7 +241,7 @@ PINN_SCALE   = 100.0
 # FIX-L5: smooth 0.2→0.05 (was over-smoothing track curves)
 # FIX-L1: pinn 0.5→0.1 (kept from v10)
 WEIGHTS: Dict[str, float] = dict(
-    fm=1.0, dir=2.0, step=0.5, disp=1.0, heading=2.0, smooth=0.05, pinn=0.1,
+    fm=1.0, dir=2.0, step=0.5, disp=1.0, heading=2.0, smooth=0.05, pinn=0.05,
 )
 
 
@@ -360,7 +360,7 @@ def _pinn_simplified(pred_abs):
     lat_rad = pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180)
     beta_n  = (2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH) * torch.cos(lat_rad)
     raw = ((dzeta + beta_n * vy[1:T-2]) ** 2).mean() * PINN_SCALE
-    return raw.clamp(max=50.0)
+    return raw.clamp(max=5.0)
 
 
 def pinn_bve_loss(pred_abs, batch_list):

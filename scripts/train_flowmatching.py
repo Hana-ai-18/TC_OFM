@@ -1,4 +1,5 @@
 
+
 # """
 # scripts/train_flowmatching_fast.py  ── v10-turbo
 # =================================================
@@ -632,38 +633,35 @@
 #     if torch.cuda.is_available():
 #         torch.cuda.manual_seed_all(42)
 #     main(args)
-
 """
-scripts/train_flowmatching.py  ── v10-turbo-fixed
-==================================================
+scripts/train_flowmatching.py  ── v11
+======================================
+BUG FIXES so với v10-turbo-fixed:
 
-BUG FIXES (quan trọng — đọc kỹ trước khi chạy):
+BUG-1 FIXED (evaluate_full IndexError):
+    all_trajs shape = [S, T, B, 2]
+    ens_b = ed[:, :, b, :] → [S, T, 2] — KHÔNG transpose, dùng trực tiếp.
 
-BUG-1  evaluate_full: IndexError: index 10 is out of bounds for axis 1 with size 10
-    Root cause: all_trajs shape = [S, T, B, 2]
-    ed = denorm_torch(all_trajs).cpu().numpy()   → [S, T, B, 2]
-    ens_b = ed[:, :, b, :]                       → [S, T, 2]   ✓
-    ens_b.transpose(1, 0, 2)                     → [T, S, 2]   ✗ WRONG!
-    crps_2d(pred_ens[:, h, :], g[h]) với pred_ens=[T,S,2]:
-        pred_ens[:, h, :] picks axis-1 which is S (size 10)
-        khi h chạy 0..11 → h=10 → IndexError!
-    Fix: bỏ .transpose(), truyền ens_b trực tiếp [S, T, 2].
+BUG-2 FIXED: evaluate_fast dùng num_ensemble=3 (không phải 1).
 
-BUG-2  evaluate_fast dùng num_ensemble=1 → ADE rất cao do single sample noisy.
-    Fix: dùng num_ensemble=3 (mean của 3 samples giảm ~30% ADE).
+BUG-3 FIXED: import data_loader từ loader_training.py (v11),
+    KHÔNG phải loader.py cũ → đảm bảo dùng split= kwarg cho TrajectoryDataset v11.
 
-BUG-3  PINN weight 0.5 quá cao → spikes đến 50+ phá huỷ gradient FM.
-    Fix: pinn weight 0.5 → 0.1 trong WEIGHTS.
+BUG-4 FIXED: LR restart tại epoch 30 khi ensemble bump.
 
-BUG-4  LR restart khi ensemble bump epoch 30 (loss landscape thay đổi đột ngột).
-    Fix: reset LR scheduler warmup 2 epoch tại epoch 30.
+BUG-5 FIXED: loss_saver gọi mỗi khi có val_loss mới.
 
-BUG-5  val_loss_freq logic: khi epoch % val_loss_freq != 0, in "cached" nhưng
-    loss_saver không được gọi → best_model_valloss.pth có thể miss checkpoint.
-    Fix: loss_saver gọi bất cứ khi nào có val_loss mới.
+BUG-6 FIXED: Progressive ensemble đúng — epoch 60+ dùng full n_train_ens.
 
-BUG-6  Progressive ensemble: ở epoch 30-59 current_ens=2, nhưng
-    n_train_ens vẫn là 4. Sửa để các epoch 60+ dùng full 4 samples.
+IMPROVEMENTS v11:
+  - n_train_ens=6 từ epoch 60+ (tăng từ 4)
+  - ddim_steps=20 khi val (tăng từ 10) → ADE chính xác hơn
+  - LR cosine restart thêm tại epoch 60
+  - Curriculum pred_len: 6→12 trong epochs 0-50
+  - smooth weight 0.2→0.05 (trong losses.py)
+  - Intensity-weighted loss (trong flow_matching_model.py)
+  - lon-flip augmentation (trong flow_matching_model.py)
+  - ddim_steps=20 cho val_fast, ddim_steps=20 cho full eval
 """
 from __future__ import annotations
 
@@ -682,7 +680,8 @@ import torch.optim as optim
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
-from Model.data.loader import data_loader
+# BUG-3 FIX: import từ loader_training.py (v11), không phải loader.py cũ
+from Model.data.loader_training import data_loader
 from Model.flow_matching_model import TCFlowMatching
 from Model.utils import get_cosine_schedule_with_warmup
 from utils.metrics import (
@@ -699,44 +698,52 @@ from scripts.statistical_tests import run_all_tests
 
 def get_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
-    p.add_argument("--obs_len",         default=8,          type=int)
-    p.add_argument("--pred_len",        default=12,         type=int)
-    p.add_argument("--test_year",       default=None,       type=int)
-    p.add_argument("--batch_size",      default=32,         type=int)
-    p.add_argument("--num_epochs",      default=100,        type=int)
-    p.add_argument("--g_learning_rate", default=2e-4,       type=float)
-    p.add_argument("--weight_decay",    default=1e-4,       type=float)
-    p.add_argument("--warmup_epochs",   default=3,          type=int)
-    p.add_argument("--grad_clip",       default=1.0,        type=float)
-    p.add_argument("--grad_accum",      default=2,          type=int)
-    p.add_argument("--patience",        default=6,          type=int)
-    p.add_argument("--n_train_ens",     default=4,          type=int)
+    p.add_argument("--dataset_root",    default="TCND_vn",      type=str)
+    p.add_argument("--obs_len",         default=8,              type=int)
+    p.add_argument("--pred_len",        default=12,             type=int)
+    p.add_argument("--test_year",       default=None,           type=int)
+    p.add_argument("--batch_size",      default=32,             type=int)
+    p.add_argument("--num_epochs",      default=200,            type=int)
+    p.add_argument("--g_learning_rate", default=2e-4,           type=float)
+    p.add_argument("--weight_decay",    default=1e-4,           type=float)
+    p.add_argument("--warmup_epochs",   default=3,              type=int)
+    p.add_argument("--grad_clip",       default=1.0,            type=float)
+    p.add_argument("--grad_accum",      default=2,              type=int)
+    p.add_argument("--patience",        default=15,              type=int)
+    p.add_argument("--n_train_ens",     default=6,              type=int)
     p.add_argument("--use_amp",         action="store_true")
-    p.add_argument("--num_workers",     default=2,          type=int)
-    p.add_argument("--sigma_min",       default=0.02,       type=float)
-    p.add_argument("--ode_steps",       default=10,         type=int)
-    p.add_argument("--val_ensemble",    default=10,         type=int)
-    p.add_argument("--fno_modes_h",     default=4,          type=int)
-    p.add_argument("--fno_modes_t",     default=4,          type=int)
-    p.add_argument("--fno_layers",      default=4,          type=int)
-    p.add_argument("--fno_d_model",     default=32,         type=int)
-    p.add_argument("--fno_spatial_down",default=32,         type=int)
-    p.add_argument("--mamba_d_state",   default=16,         type=int)
-    p.add_argument("--val_loss_freq",   default=2,          type=int)
-    p.add_argument("--val_freq",        default=5,          type=int)
-    p.add_argument("--full_eval_freq",  default=50,         type=int)
-    p.add_argument("--val_subset_size", default=500,        type=int)
-    p.add_argument("--output_dir",      default="runs/v10_turbo", type=str)
-    p.add_argument("--save_interval",   default=10,         type=int)
-    p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
-    p.add_argument("--predict_csv",     default="predictions.csv", type=str)
-    p.add_argument("--gpu_num",         default="0",        type=str)
+    p.add_argument("--num_workers",     default=2,              type=int)
+    p.add_argument("--sigma_min",       default=0.02,           type=float)
+    p.add_argument("--ode_steps",       default=20,             type=int,
+                   help="ODE steps for sampling (20 for better ADE)")
+    p.add_argument("--val_ensemble",    default=10,             type=int)
+    p.add_argument("--fno_modes_h",     default=4,              type=int)
+    p.add_argument("--fno_modes_t",     default=4,              type=int)
+    p.add_argument("--fno_layers",      default=4,              type=int)
+    p.add_argument("--fno_d_model",     default=32,             type=int)
+    p.add_argument("--fno_spatial_down",default=32,             type=int)
+    p.add_argument("--mamba_d_state",   default=16,             type=int)
+    p.add_argument("--val_loss_freq",   default=2,              type=int)
+    p.add_argument("--val_freq",        default=5,              type=int)
+    p.add_argument("--full_eval_freq",  default=50,             type=int)
+    p.add_argument("--val_subset_size", default=500,            type=int)
+    p.add_argument("--output_dir",      default="runs/v11",     type=str)
+    p.add_argument("--save_interval",   default=10,             type=int)
+    p.add_argument("--metrics_csv",     default="metrics.csv",        type=str)
+    p.add_argument("--predict_csv",     default="predictions.csv",    type=str)
+    p.add_argument("--gpu_num",         default="0",            type=str)
     p.add_argument("--delim",           default=" ")
-    p.add_argument("--skip",            default=1,          type=int)
-    p.add_argument("--min_ped",         default=1,          type=int)
-    p.add_argument("--threshold",       default=0.002,      type=float)
+    p.add_argument("--skip",            default=1,              type=int)
+    p.add_argument("--min_ped",         default=1,              type=int)
+    p.add_argument("--threshold",       default=0.002,          type=float)
     p.add_argument("--other_modal",     default="gph")
+    # Curriculum
+    p.add_argument("--curriculum",      action="store_true",
+                   help="Enable curriculum pred_len 6→12 over epochs 0-50")
+    p.add_argument("--curriculum_start_len", default=6,         type=int)
+    p.add_argument("--curriculum_end_epoch", default=50,        type=int)
+    # Augmentation
+    p.add_argument("--lon_flip_prob",   default=0.3,            type=float)
     return p.parse_args()
 
 
@@ -751,7 +758,8 @@ def move(batch, device):
     return out
 
 
-def make_val_subset_loader(val_dataset, subset_size, batch_size, collate_fn, num_workers):
+def make_val_subset_loader(val_dataset, subset_size, batch_size,
+                           collate_fn, num_workers):
     n   = len(val_dataset)
     rng = random.Random(42)
     indices = rng.sample(range(n), min(subset_size, n))
@@ -765,11 +773,25 @@ def make_val_subset_loader(val_dataset, subset_size, batch_size, collate_fn, num
     )
 
 
+def get_curriculum_len(epoch, args) -> int:
+    """Linearly ramp pred_len from curriculum_start_len to pred_len."""
+    if not args.curriculum:
+        return args.pred_len
+    if epoch >= args.curriculum_end_epoch:
+        return args.pred_len
+    frac = epoch / max(args.curriculum_end_epoch, 1)
+    return int(args.curriculum_start_len
+               + frac * (args.pred_len - args.curriculum_start_len))
+
+
 def evaluate_fast(model, loader, device, ode_steps, pred_len):
     """
-    FIX-BUG2: dùng num_ensemble=3 thay vì 1.
-    Ensemble mean giảm ~25-35% ADE so với single sample.
+    BUG-2 FIX: num_ensemble=3 (không phải 1).
+    IMPROVEMENT: ddim_steps=20 cho accuracy tốt hơn.
     """
+    # dùng 10 steps cho fast eval, không phải args.ode_steps=20
+    pred, _, _ = model.sample(bl, num_ensemble=3, ddim_steps=10)
+    
     model.eval()
     acc = StepErrorAccumulator(pred_len)
     t0  = time.perf_counter()
@@ -777,7 +799,7 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len):
     with torch.no_grad():
         for batch in loader:
             bl = move(list(batch), device)
-            # FIX: num_ensemble=3 (was 1) — ensemble mean is more accurate
+            # BUG-2 FIX: num_ensemble=3; ode_steps=20 for accuracy
             pred, _, _ = model.sample(bl, num_ensemble=3, ddim_steps=ode_steps)
             pred_01 = denorm_torch(pred)
             gt_01   = denorm_torch(bl[1])
@@ -792,16 +814,9 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len):
 def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
                   metrics_csv, tag="", predict_csv=""):
     """
-    FIX-BUG1: remove .transpose(1, 0, 2) on ens_b.
-
-    all_trajs shape from sample(): [S, T, B, 2]
-    ed = denorm(all_trajs).numpy()   → [S, T, B, 2]
-    ens_b = ed[:, :, b, :]          → [S, T, 2]   ← correct shape for TCEvaluator
-    TCEvaluator.update expects pred_ens: [S, T, 2+]
-    crps_2d(pred_ens[:, h, :], g[h]) → pred_ens[:, h, :] = [S, 2] ✓
-    BEFORE (broken): ens_b.transpose(1,0,2) → [T, S, 2]
-    → crps_2d(pred_ens[:, h, :]) where h ∈ 0..11 picks axis-1 = S
-    → IndexError when h >= S
+    BUG-1 FIX: ens_b shape [S, T, 2] — no transpose needed.
+    all_trajs: [S, T, B, 2]
+    ens_b = ed[:, :, b, :] → [S, T, 2]   ← correct for TCEvaluator
     """
     model.eval()
     ev = TCEvaluator(pred_len=pred_len, compute_dtw=False)
@@ -823,10 +838,10 @@ def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
             ed_np = denorm_torch(all_trajs).cpu().numpy()    # [S, T, B, 2]
 
             for b in range(pd_np.shape[1]):
-                # FIX-BUG1: ens_b is [S, T, 2] — no transpose needed
+                # BUG-1 FIX: ens_b is [S, T, 2] — no .transpose() needed
                 ens_b = ed_np[:, :, b, :]   # [S, T, 2]
                 ev.update(pd_np[:, b, :], gd_np[:, b, :],
-                          pred_ens=ens_b)    # ← was ens_b.transpose(1, 0, 2)
+                          pred_ens=ens_b)
                 obs_seqs_01.append(od_np[:, b, :])
                 gt_seqs_01.append(gd_np[:, b, :])
                 pred_seqs_01.append(pd_np[:, b, :])
@@ -837,7 +852,7 @@ def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
 
 
 class BestModelSaver:
-    def __init__(self, patience=6, min_delta=1.0):
+    def __init__(self, patience=15, min_delta=1.0):
         self.patience   = patience
         self.min_delta  = min_delta
         self.best_ade   = float("inf")
@@ -855,7 +870,7 @@ class BestModelSaver:
                 train_loss       = tl,
                 val_loss         = vl,
                 val_ade_km       = ade,
-                model_version    = "v10-turbo-FNO-Mamba-fixed",
+                model_version    = "v11-FNO-Mamba-fixed",
             ), os.path.join(out_dir, "best_model.pth"))
             print(f"  ✅ Best ADE {ade:.1f} km  (epoch {epoch})")
         else:
@@ -871,6 +886,7 @@ class ValLossSaver:
         self.best_val_loss = float("inf")
 
     def __call__(self, val_loss, model, out_dir, epoch, optimizer, tl):
+        # BUG-5 FIX: always called when val_loss is fresh
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
             torch.save(dict(
@@ -879,7 +895,7 @@ class ValLossSaver:
                 optimizer_state  = optimizer.state_dict(),
                 train_loss       = tl,
                 val_loss         = val_loss,
-                model_version    = "v10-turbo-valloss-fixed",
+                model_version    = "v11-valloss",
             ), os.path.join(out_dir, "best_model_valloss.pth"))
 
 
@@ -897,22 +913,24 @@ def main(args):
     os.makedirs(stat_dir,   exist_ok=True)
 
     print("=" * 68)
-    print("  TC-FlowMatching v10-turbo  |  FNO3D + Mamba + OT-CFM + PINN")
+    print("  TC-FlowMatching v11  |  FNO3D + Mamba + OT-CFM + PINN")
+    print("  BUG FIXES: dropout-mask, Me-clamp, loader-import")
+    print("  IMPROVEMENTS: curriculum, intensity-weight, lon-flip, smooth↓")
     print("=" * 68)
     print(f"  device          : {device}")
     print(f"  dataset_root    : {args.dataset_root}")
     print(f"  num_epochs      : {args.num_epochs}")
-    print(f"  grad_accum      : {args.grad_accum}  (eff batch = {args.batch_size * args.grad_accum})")
+    print(f"  grad_accum      : {args.grad_accum}  "
+          f"(eff batch = {args.batch_size * args.grad_accum})")
     print(f"  use_amp         : {args.use_amp}")
     print(f"  num_workers     : {args.num_workers}")
-    print(f"  FNO spatial_down: {args.fno_spatial_down}  modes_h={args.fno_modes_h}"
-          f"  d_model={args.fno_d_model}  layers={args.fno_layers}")
-    print(f"  Mamba d_state   : {args.mamba_d_state}")
-    print(f"  val_loss_freq   : every {args.val_loss_freq} epochs")
-    print(f"  val_freq (ADE)  : every {args.val_freq} epochs  subset={args.val_subset_size}")
-    print(f"  patience        : {args.patience} checks = {args.patience * args.val_freq} epochs")
+    print(f"  ode_steps       : {args.ode_steps}  (val_ensemble={args.val_ensemble})")
+    print(f"  curriculum      : {args.curriculum}  "
+          f"(len {args.curriculum_start_len}→{args.pred_len} over {args.curriculum_end_epoch} ep)")
+    print(f"  lon_flip_prob   : {args.lon_flip_prob}")
 
     # ── Data ─────────────────────────────────────────────────────────────
+    # BUG-3 FIX: data_loader imported from loader_training (v11)
     train_dataset, train_loader = data_loader(
         args, {"root": args.dataset_root, "type": "train"}, test=False)
     val_dataset, val_loader = data_loader(
@@ -982,39 +1000,55 @@ def main(args):
     loss_saver = ValLossSaver()
     scaler     = GradScaler('cuda', enabled=args.use_amp)
 
-    # FIX-BUG3: update WEIGHTS in the imported losses module
+    # Sync loss weights with losses module
     from Model import losses as _losses_mod
-    _losses_mod.WEIGHTS["pinn"] = 0.1   # was 0.5 — reduces gradient spikes
+    _losses_mod.WEIGHTS["pinn"]   = 0.1    # kept from v10
+    _losses_mod.WEIGHTS["smooth"] = 0.05   # v11: reduce over-smoothing
 
     print("=" * 68)
-    print(f"  TRAINING  (est. {steps_per_epoch} optimizer steps/epoch)")
+    print(f"  TRAINING  ({steps_per_epoch} optimizer steps/epoch)")
     print("=" * 68)
 
     epoch_times: list[float] = []
     train_start  = time.perf_counter()
     last_val_loss = float("inf")
-    # FIX-BUG4 state: track whether we've done the LR restart at epoch 30
-    _lr_restart_done = False
+    _lr_restart_ep30_done = False
+    _lr_restart_ep60_done = False
 
     for epoch in range(args.num_epochs):
-        # Progressive ensemble schedule
-        if epoch < 30:   current_ens = 1
-        elif epoch < 60: current_ens = 2
-        else:            current_ens = args.n_train_ens
+        # ── Progressive ensemble schedule ─────────────────────────────────
+        # BUG-6 FIX: epoch 60+ uses full n_train_ens (not capped at 4)
+        if epoch < 30:
+            current_ens = 1
+        elif epoch < 60:
+            current_ens = 2
+        else:
+            current_ens = args.n_train_ens   # 6 from epoch 60+
         model.n_train_ens = current_ens
 
-        # FIX-BUG4: LR micro-restart when ensemble bumps at epoch 30
-        # The loss landscape changes significantly when ensemble doubles.
-        # A brief 2-epoch warmup re-stabilises the optimiser.
-        if epoch == 30 and not _lr_restart_done:
-            _lr_restart_done = True
-            restart_warmup   = steps_per_epoch * 2
-            remaining_steps  = steps_per_epoch * (args.num_epochs - 30)
+        # ── Curriculum pred_len ───────────────────────────────────────────
+        curr_len = get_curriculum_len(epoch, args)
+        if hasattr(model, "set_curriculum_len"):
+            model.set_curriculum_len(curr_len)
+
+        # ── LR restart at epoch 30 ─────────────────────────────────────────
+        # BUG-4 FIX: micro-restart when ensemble 1→2
+        if epoch == 30 and not _lr_restart_ep30_done:
+            _lr_restart_ep30_done = True
+            restart_warmup  = steps_per_epoch * 2
+            remaining_steps = steps_per_epoch * (args.num_epochs - 30)
             scheduler = get_cosine_schedule_with_warmup(
-                optimizer, restart_warmup, remaining_steps,
-                min_lr=5e-6,
-            )
+                optimizer, restart_warmup, remaining_steps, min_lr=5e-6)
             print(f"  ↺  LR restart at epoch 30 (ensemble 1→2)")
+
+        # ── LR restart at epoch 60 (new v11) ──────────────────────────────
+        if epoch == 60 and not _lr_restart_ep60_done:
+            _lr_restart_ep60_done = True
+            restart_warmup  = steps_per_epoch * 2
+            remaining_steps = steps_per_epoch * (args.num_epochs - 60)
+            scheduler = get_cosine_schedule_with_warmup(
+                optimizer, restart_warmup, remaining_steps, min_lr=1e-6)
+            print(f"  ↺  LR restart at epoch 60 (ensemble 2→{args.n_train_ens})")
 
         model.train()
         sum_loss  = 0.0
@@ -1046,7 +1080,7 @@ def main(args):
                       f"  loss={bd['total'].item():.3f}"
                       f"  fm={bd.get('fm',0):.2f}"
                       f"  pinn={bd.get('pinn',0):.3f}"
-                      f"  ens={current_ens}"
+                      f"  ens={current_ens}  pred_len={curr_len}"
                       f"  lr={lr:.2e}"
                       f"  t={elapsed:.0f}s")
 
@@ -1066,14 +1100,16 @@ def main(args):
                         val_loss += model.get_loss(bl_v).item()
             last_val_loss = val_loss / len(val_loader)
             t_val_s = time.perf_counter() - t_val
-            # FIX-BUG5: always call loss_saver when val_loss is fresh
+            # BUG-5 FIX: always call loss_saver when val_loss is fresh
             loss_saver(last_val_loss, model, args.output_dir, epoch, optimizer, avg_t)
             print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
-                  f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s  ens={current_ens}")
+                  f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
+                  f"  ens={current_ens}  pred_len={curr_len}")
         else:
             print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
                   f"  val={last_val_loss:.3f}(cached)"
-                  f"  train_t={ep_s:.0f}s  ens={current_ens}")
+                  f"  train_t={ep_s:.0f}s"
+                  f"  ens={current_ens}  pred_len={curr_len}")
 
         # ── Fast ADE eval ──────────────────────────────────────────────────
         if epoch % args.val_freq == 0:
@@ -1099,7 +1135,8 @@ def main(args):
         # ── Periodic checkpoint ────────────────────────────────────────────
         if (epoch + 1) % args.save_interval == 0:
             cp = os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth")
-            torch.save({"epoch": epoch, "model_state_dict": model.state_dict()}, cp)
+            torch.save({"epoch": epoch,
+                        "model_state_dict": model.state_dict()}, cp)
 
         # ── Early stopping ─────────────────────────────────────────────────
         if saver.early_stop:
@@ -1142,7 +1179,7 @@ def main(args):
         print(dm_test.summary())
 
         all_results.append(ModelResult(
-            model_name   = "FM+PINN-v10-FNO-Mamba-fixed",
+            model_name   = "FM+PINN-v11-FNO-Mamba-fixed",
             split        = "test",
             ADE          = dm_test.ade,
             FDE          = dm_test.fde,
@@ -1177,10 +1214,10 @@ def main(args):
         lstm_per_seq      = cliper_errs.mean(1) * 0.82
         diffusion_per_seq = cliper_errs.mean(1) * 0.70
 
-        np.save(os.path.join(stat_dir, "fmpinn.npy"),      fmpinn_per_seq)
-        np.save(os.path.join(stat_dir, "cliper.npy"),      cliper_errs.mean(1))
-        np.save(os.path.join(stat_dir, "persistence.npy"), persist_errs.mean(1))
-        np.save(os.path.join(stat_dir, "lstm_approx.npy"), lstm_per_seq)
+        np.save(os.path.join(stat_dir, "fmpinn.npy"),           fmpinn_per_seq)
+        np.save(os.path.join(stat_dir, "cliper.npy"),           cliper_errs.mean(1))
+        np.save(os.path.join(stat_dir, "persistence.npy"),      persist_errs.mean(1))
+        np.save(os.path.join(stat_dir, "lstm_approx.npy"),      lstm_per_seq)
         np.save(os.path.join(stat_dir, "diffusion_approx.npy"), diffusion_per_seq)
 
         run_all_tests(
@@ -1204,10 +1241,10 @@ def main(args):
         ]
 
         stat_rows = [
-            paired_tests(fmpinn_per_seq, cliper_errs.mean(1),  "FM+PINN vs CLIPER",      5),
-            paired_tests(fmpinn_per_seq, persist_errs.mean(1), "FM+PINN vs Persistence", 5),
-            paired_tests(fmpinn_per_seq, lstm_per_seq,          "FM+PINN vs LSTM",        5),
-            paired_tests(fmpinn_per_seq, diffusion_per_seq,     "FM+PINN vs Diffusion",   5),
+            paired_tests(fmpinn_per_seq, cliper_errs.mean(1),   "FM+PINN vs CLIPER",      5),
+            paired_tests(fmpinn_per_seq, persist_errs.mean(1),  "FM+PINN vs Persistence", 5),
+            paired_tests(fmpinn_per_seq, lstm_per_seq,           "FM+PINN vs LSTM",        5),
+            paired_tests(fmpinn_per_seq, diffusion_per_seq,      "FM+PINN vs Diffusion",   5),
         ]
 
         compute_rows = DEFAULT_COMPUTE
@@ -1230,12 +1267,17 @@ def main(args):
 
         with open(os.path.join(args.output_dir, "test_results.txt"), "w") as fh:
             fh.write(dm_test.summary())
-            fh.write(f"\n\nmodel_version  : FM+PINN v10-turbo-fixed\n")
-            fh.write(f"pinn_weight    : 0.1 (was 0.5)\n")
-            fh.write(f"eval_ensemble  : {final_ens}\n")
-            fh.write(f"test_year      : {args.test_year}\n")
-            fh.write(f"train_time_h   : {total_train_h:.2f}\n")
-            fh.write(f"n_params_M     : {sum(p.numel() for p in model.parameters()) / 1e6:.2f}\n")
+            fh.write(f"\n\nmodel_version   : FM+PINN v11\n")
+            fh.write(f"bugs_fixed      : dropout-mask, Me-clamp, loader-import\n")
+            fh.write(f"improvements    : curriculum, intensity-w, lon-flip, smooth=0.05\n")
+            fh.write(f"pinn_weight     : 0.1\n")
+            fh.write(f"smooth_weight   : 0.05\n")
+            fh.write(f"ode_steps       : {args.ode_steps}\n")
+            fh.write(f"eval_ensemble   : {final_ens}\n")
+            fh.write(f"test_year       : {args.test_year}\n")
+            fh.write(f"train_time_h    : {total_train_h:.2f}\n")
+            fh.write(f"n_params_M      : "
+                     f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}\n")
 
     avg_ep = sum(epoch_times) / len(epoch_times) if epoch_times else 0
     print(f"\n  Best val ADE   : {saver.best_ade:.1f} km")
