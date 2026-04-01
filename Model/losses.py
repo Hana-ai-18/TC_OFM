@@ -1597,7 +1597,7 @@ def smooth_loss(pred):
 
 def _pinn_simplified(pred_abs: torch.Tensor) -> torch.Tensor:
     T = pred_abs.shape[0]
-    if T < 4:
+    if T < 5:
         return pred_abs.new_zeros(())
 
     # v   = pred_abs[1:] - pred_abs[:-1]
@@ -1914,7 +1914,8 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
     # 3. TỔNG HỢP
     total = (
         weights['fm']       * l_fm +
-        weights['velocity'] * l_vel   * 100.0 +
+        # weights['velocity'] * l_vel   * 100.0 +
+        weights['velocity'] * l_vel   * 30.0 +
         weights['disp']     * l_disp  * 100.0 +
         weights['step']     * l_step  *  10.0 +
         weights['heading']  * l_heading * 10.0 +

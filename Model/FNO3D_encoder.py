@@ -73,7 +73,8 @@ class SpectralConv3d(nn.Module):
     def _complex_mul(self, x, w_re, w_im):
             w_re = w_re.float()
             w_im = w_im.float()
-            x_re, x_im = x.real, x.imag
+            x_re = x.real.float()
+            x_im = x.imag.float()
             out_re = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_re)
                     - torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_im))
             out_im = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_im)
