@@ -1067,22 +1067,22 @@ class VelocityField(nn.Module):
 
         # ── Time embedding ────────────────────────────────────────────────
         self.time_fc1 = nn.Linear(128, 256)
-        self.time_fc2 = nn.Linear(256, 128)
+        self.time_fc2 = nn.Linear(256, 256)
 
         # ── Trajectory Transformer decoder ──────────────────────────────
-        self.traj_embed = nn.Linear(4, 128)
-        self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 128) * 0.02)
+        self.traj_embed = nn.Linear(4, 256)
+        self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=128, nhead=8, dim_feedforward=512,
+                d_model=256, nhead=8, dim_feedforward=512,
                 dropout=0.15, activation="gelu", batch_first=True,
             ),
             num_layers=4,
         )
-        self.out_fc1 = nn.Linear(128, 256)
+        self.out_fc1 = nn.Linear(256, 256)
         self.out_fc2 = nn.Linear(256, 4)
 
-    def _time_emb(self, t: torch.Tensor, dim: int = 128) -> torch.Tensor:
+    def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
         half = dim // 2
         freq = torch.exp(
             torch.arange(half, dtype=torch.float32, device=t.device)
