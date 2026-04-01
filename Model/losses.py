@@ -1580,7 +1580,8 @@ def heading_loss(pred, gt):
             cross = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
             n1    = v[1:].norm(dim=-1).clamp(min=1e-6)
             n2    = v[:-1].norm(dim=-1).clamp(min=1e-6)
-            return cross / (n1 * n2)
+            return (cross / (n1 * n2)).clamp(-10.0, 10.0)
+
         curv_mse = F.mse_loss(_curv(pv), _curv(gv))
     else:
         curv_mse = pred.new_zeros(())
@@ -1926,7 +1927,9 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
         weights['pinn']     * l_pinn
     )
 
-    if torch.isnan(total):
+    # if torch.isnan(total):
+    #     total = pred_abs.new_zeros(())
+    if torch.isnan(total) or torch.isinf(total):
         total = pred_abs.new_zeros(())
 
     # FIX: key là 'velocity' (khớp với train script bd.get('velocity'))
