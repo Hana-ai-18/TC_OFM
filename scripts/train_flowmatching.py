@@ -2864,11 +2864,11 @@ def get_args():
     p.add_argument("--fno_d_model",     default=32,             type=int)
     p.add_argument("--fno_spatial_down",default=32,             type=int)
     p.add_argument("--mamba_d_state",   default=16,             type=int)
-    p.add_argument("--val_loss_freq",   default=5,              type=int,
+    p.add_argument("--val_loss_freq",   default=2,              type=int,
                    help="FIX-T4: aligned with val_freq=5 so ADE and val_loss "
                         "are computed together")
-    p.add_argument("--val_freq",        default=5,              type=int)
-    p.add_argument("--full_eval_freq",  default=50,             type=int)
+    p.add_argument("--val_freq",        default=2,              type=int)
+    p.add_argument("--full_eval_freq",  default=10,             type=int)
     p.add_argument("--val_subset_size", default=200,            type=int)
     p.add_argument("--output_dir",      default="runs/v14",     type=str)
     p.add_argument("--save_interval",   default=10,             type=int)
