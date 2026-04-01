@@ -71,8 +71,15 @@ def selective_scan_parallel(
     dA = torch.exp(
         torch.einsum("bti,is->btis", delta_clamped, A)
     )                                                  # [B, T, d_inner, d_state]
-    dB_u = torch.einsum("bti,bts->btis", delta_clamped * u, B)
+    # dB_u = torch.einsum("bti,bts->btis", delta_clamped * u, B)
+    # # HIỆN TẠI
+    # dB_u = torch.einsum("bti,bts->btis", delta_clamped * u, B_ssm)
+    # # delta_clamped * u nhân u vào delta trước → sai ZOH formula
 
+    # ZOH đúng: B̄ = Δ·B (không có u), rồi h = Ā·h + B̄·u
+    # Tức: dB_u[t] = Δ[t] ⊗ B[t] * u[t] (u nhân vào sau)
+    dB_u = torch.einsum("bti,bts->btis", delta_clamped, B) * u.unsqueeze(-1)
+    # shape: [B,T,d_inner,d_state] * [B,T,d_inner,1] → [B,T,d_inner,d_state] ✓
     h  = torch.zeros(B_size, d_inner, d_state, device=device)
     ys = []
     for t in range(T):

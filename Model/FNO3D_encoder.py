@@ -26,6 +26,8 @@ FIXES vs original:
 from __future__ import annotations
 
 import math
+from matplotlib import scale
+from numpy import shape
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -92,6 +94,12 @@ class SpectralConv3d(nn.Module):
         mt = min(self.modes_t, T // 2)
         mh = min(self.modes_h, H // 2)
         mw = min(self.modes_w, W // 2 + 1)
+        # FIX — mỗi góc cần weight riêng (chuẩn FNO multi-corner):
+        # Thêm 4 cặp weight trong __init__:
+        for i in range(1, 5):
+            setattr(self, f'w_re_{i}', nn.Parameter(scale * torch.randn(*shape)))
+            setattr(self, f'w_im_{i}', nn.Parameter(scale * torch.randn(*shape)))
+
 
         # FIX LOGIC: Lấy đủ 4 góc phổ để giữ các tần số thấp quan trọng
         # (Chỉ chiều W là không cần vì rfftn đã cắt một nửa)

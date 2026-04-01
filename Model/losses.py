@@ -1421,9 +1421,13 @@ def recurvature_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     dir_loss = (1.0 - cos_sim)                      # [T-3, B], 0=perfect
 
     # Chỉ tính loss tại turning points, weight ×3 cho turning points
-    mask = sign_change.float()                       # [T-3, B]
-    weighted = dir_loss * (1.0 + 2.0 * mask)        # non-turning=1×, turning=3×
-
+    # mask = sign_change.float()                       # [T-3, B]
+    # weighted = dir_loss * (1.0 + 2.0 * mask)        # non-turning=1×, turning=3×
+    mask = sign_change.float()  # [T-3, B]
+    if mask.sum() < 1:
+        return pred.new_zeros(())
+    weighted = (dir_loss * mask).sum() / mask.sum().clamp(min=1)  # mean chỉ tại turning points
+    return weighted
     return weighted.mean()
 
 
@@ -1596,19 +1600,45 @@ def _pinn_simplified(pred_abs: torch.Tensor) -> torch.Tensor:
     if T < 4:
         return pred_abs.new_zeros(())
 
-    v   = pred_abs[1:] - pred_abs[:-1]
-    vx, vy = v[..., 0], v[..., 1]
+    # v   = pred_abs[1:] - pred_abs[:-1]
+    # vx, vy = v[..., 0], v[..., 1]
 
-    zeta  = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
-    if zeta.shape[0] < 2:
-        return pred_abs.new_zeros(())
+    # zeta  = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]
+    # if zeta.shape[0] < 2:
+    #     return pred_abs.new_zeros(())
 
-    dzeta   = zeta[1:] - zeta[:-1]
-    lat_rad = pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180)
-    beta_n  = (2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH) * torch.cos(lat_rad)
-    vy_mid  = vy[1:T-2]
+    # dzeta   = zeta[1:] - zeta[:-1]
+    # lat_rad = pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180)
+    # beta_n  = (2.0 * OMEGA * NORM_TO_M * DT_6H / R_EARTH) * torch.cos(lat_rad)
+    # vy_mid  = vy[1:T-2]
 
-    raw = ((dzeta + beta_n * vy_mid) ** 2).mean() * PINN_SCALE
+    # raw = ((dzeta + beta_n * vy_mid) ** 2).mean() * PINN_SCALE
+    # # HIỆN TẠI
+    # dzeta   = zeta[1:] - zeta[:-1]          # shape [T-4, B]
+    # lat_rad = pred_abs[2:T-1, :, 1] ...     # shape [T-3, B] ← lệch 1
+    # vy_mid  = vy[1:T-2]                      # shape [T-3, B] ← cũng lệch
+
+    # FIX — align tất cả về [T-4, B]:
+    v   = pred_abs[1:] - pred_abs[:-1]       # [T-1, B, 2]
+    vx, vy = v[...,0], v[...,1]              # [T-1, B]
+    zeta    = vx[1:] * vy[:-1] - vy[1:] * vx[:-1]  # [T-2, B]
+    dzeta   = zeta[1:] - zeta[:-1]          # [T-3, B]
+
+    # lat tại midpoint của dzeta[k] = pred_abs[k+2]
+    lat_rad = pred_abs[2:T-1, :, 1] * NORM_TO_DEG * (math.pi / 180)  # [T-3, B]
+    # nhưng dzeta shape [T-3, B] và lat_rad shape [T-3, B] → T-3 == T-3 ✓
+    # vấn đề là vy_mid:
+    vy_mid  = vy[1:T-2]   # vy shape [T-1,B], slice [1:T-2] = [T-3,B] ✓ khi T≥5
+
+    # Kiểm tra lại: T=12 → dzeta[T-3=9,B], lat_rad[T-3=9,B], vy_mid[T-3=9,B] ✓
+    # T=4 (curriculum) → dzeta[1,B], lat_rad[1,B], vy_mid[1,B] ✓
+    # THỰC RA không lệch với T≥5 — bug ở chỗ khác:
+    # pred_abs[2:T-1] khi T=pred_abs.shape[0]=12 → [2:11] = 9 phần tử ✓
+    # vy[1:T-2] = vy[1:10] = 9 phần tử ✓
+    # Vậy không lệch — đây là false alarm. Tuy nhiên beta_n cần kiểm tra:
+    beta_n = (2*OMEGA*NORM_TO_M*DT_6H/R_EARTH) * torch.cos(lat_rad)  # [T-3,B]
+    # nhân với vy_mid [T-3,B] → OK
+    raw = ((dzeta + beta_n * vy_mid)**2).mean() * PINN_SCALE  # scalar ✓
     return raw.clamp(max=50.0)
 
 
@@ -1856,7 +1886,17 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
 
     # 2. CÁC THÀNH PHẦN LOSS
+    # HIỆN TẠI — gọi với unit_01deg=False nhưng input là normalized coords
     l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
+    # bên trong: _haversine(..., unit_01deg=False) → coi lon/lat là degrees trực tiếp
+    # nhưng normalized coords ~[-2,3], không phải degrees [0,180]
+
+    # FIX — truyền unit_01deg=False VÀ convert trước, hoặc dùng unit_01deg=True
+    # Nhìn vào _haversine với unit_01deg=True:
+    #   lon_deg = (norm * 50 + 1800) / 10  ← đây là denorm đúng
+    # Vậy cần unit_01deg=True:
+    l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w, unit_01deg=True)  # ← FIX-C3
+
 
     # FIX: dùng hàm per-sample rồi mới nhân weight → .mean()
     l_vel  = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()

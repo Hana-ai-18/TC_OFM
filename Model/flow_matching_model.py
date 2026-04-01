@@ -1301,7 +1301,20 @@ class TCFlowMatching(nn.Module):
             samples.append(pa_s)
         pred_samples = torch.stack(samples)  # [S, T, B, 2]
 
-        x1_pred  = x_t + denom * pred_vel
+        # HIỆN TẠI — sai
+        # x1_pred  = x_t + denom * pred_vel
+
+        # # ĐÚNG — OT-CFM integration step
+        # # Tại thời điểm t, x1_pred = x_t + (1-t) * vel
+        # # denom đã được tính = (1 - (1-σ)*t), không phải (1-t)
+        # # Cần dùng trực tiếp (1-te) để reconstruct x1
+        # x1_pred = x_t + (1.0 - te * (1.0 - self.sigma_min)) * pred_vel
+        # # Hoặc đơn giản hơn — dùng lại công thức ngược từ x_t definition:
+        # # x_t = t*x1 + (1-(1-σ)t)*x0  →  x1 = (x_t - (1-(1-σ)t)*x0) / t
+        # # Nhưng x0 không có sẵn. Cách đúng nhất với CFM:
+        # x1_pred = (x_t - (1.0 - te) * torch.randn_like(x_t) * self.sigma_min) / te.clamp(min=1e-5)
+        # # Thực tế implementation chuẩn dùng Euler step từ t→1:
+        x1_pred = x_t + (1.0 - te) * pv_s  # ← cách phổ biến nhất
         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
 
         breakdown = compute_total_loss(
