@@ -67,10 +67,10 @@ class SpectralConv3d(nn.Module):
         self.w_im = nn.Parameter(scale * torch.randn(*shape))
 
     def _complex_mul(self, x, w_re, w_im):
-        # x is already float32 (cast before FFT in forward()).
-        # w_re/w_im are float32 parameters, but under AMP the model runs in
-        # float16 so they may arrive as half — cast explicitly to avoid
-        # ComplexHalf when torch.complex() combines the einsum outputs.
+    # cast weights to float32: under AMP the module runs in float16 but
+    # x is already float32 (cast in forward before rfftn). Without this
+    # cast the einsum outputs are float16 and torch.complex raises the
+    # ComplexHalf experimental warning then errors downstream.
         w_re = w_re.float()
         w_im = w_im.float()
         x_re = x.real
