@@ -96,19 +96,19 @@ class SpectralConv3d(nn.Module):
             
             # Góc 1: Dương Time, Dương Height
             out_ft[:, :, :mt, :mh, :mw] = self._complex_mul(
-                x_ft[:, :, :mt, :mh, :mw], self.w_re, self.w_im)
+                x_ft[:, :, :mt, :mh, :mw], self.w_re_1, self.w_im_1)
             
             # Góc 2: Âm Time, Dương Height (Thêm phần này để model "nhạy" hơn)
             out_ft[:, :, -mt:, :mh, :mw] = self._complex_mul(
-                x_ft[:, :, -mt:, :mh, :mw], self.w_re, self.w_im)
+                x_ft[:, :, -mt:, :mh, :mw], self.w_re_2, self.w_im_2)
                 
             # Góc 3: Dương Time, Âm Height
             out_ft[:, :, :mt, -mh:, :mw] = self._complex_mul(
-                x_ft[:, :, :mt, -mh:, :mw], self.w_re, self.w_im)
+                x_ft[:, :, :mt, -mh:, :mw], self.w_re_3, self.w_im_3)
                 
             # Góc 4: Âm Time, Âm Height
             out_ft[:, :, -mt:, -mh:, :mw] = self._complex_mul(
-                x_ft[:, :, -mt:, -mh:, :mw], self.w_re, self.w_im)
+                x_ft[:, :, -mt:, -mh:, :mw], self.w_re_4, self.w_im_4)
 
             return torch.fft.irfftn(out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho").to(x.dtype)
 
@@ -161,8 +161,8 @@ class FNO3DEncoder(nn.Module):
         d_model:      int   = 32,    # FIX: was 64
         n_layers:     int   = 4,
         modes_t:      int   = 4,
-        modes_h:      int   = 8,     # FIX: was 16
-        modes_w:      int   = 8,     # FIX: was 16
+        modes_h:      int   = 4,     # FIX: was 16
+        modes_w:      int   = 4,     # FIX: was 16
         spatial_down: int   = 32,
         dropout:      float = 0.05,
     ):

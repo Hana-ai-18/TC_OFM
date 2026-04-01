@@ -1035,8 +1035,8 @@ class VelocityField(nn.Module):
             d_model      = 64,
             n_layers     = 4,
             modes_t      = 4,
-            modes_h      = 8,
-            modes_w      = 8,
+            modes_h      = 4,
+            modes_w      = 4,
             spatial_down = 32,
             dropout      = 0.05,
         )
