@@ -1916,7 +1916,7 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
         weights['fm']       * l_fm +
         # weights['velocity'] * l_vel   * 100.0 +
         weights['velocity'] * l_vel   * 30.0 +
-        weights['disp']     * l_disp  * 100.0 +
+        weights['disp']     * l_disp  * 30.0 +
         weights['step']     * l_step  *  10.0 +
         weights['heading']  * l_heading * 10.0 +
         weights['recurv']   * l_recurv  * 10.0 +
