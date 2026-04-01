@@ -26,8 +26,7 @@ FIXES vs original:
 from __future__ import annotations
 
 import math
-from matplotlib import scale
-from numpy import shape
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
