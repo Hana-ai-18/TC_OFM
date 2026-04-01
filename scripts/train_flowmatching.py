@@ -633,6 +633,7 @@ def main(args):
                       f"  loss={bd['total'].item():.3f}"
                       f"  fm={bd.get('fm',0):.2f}"
                       f"  vel={bd.get('velocity',0):.6f}"
+                      f"  pinn={bd.get('pinn', 0):.4f}"  
                       f"  recurv={bd.get('recurv',0):.3f}"
                       f"  rr={rr:.2f}"      # recurvature ratio in batch
                       f"  pinn_w={epoch_weights['pinn']:.3f}"

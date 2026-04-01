@@ -48,79 +48,71 @@ class SpectralConv3d(nn.Module):
       2 × 64 × 64 × 4 × 16 × 16 = 8,388,608 per layer  ✗
     """
 
-    def __init__(
-        self,
-        in_channels:  int,
-        out_channels: int,
-        modes_t:      int = 4,
-        modes_h:      int = 4,    # FIX: was 16
-        modes_w:      int = 4,    # FIX: was 16
-    ):
-        super().__init__()
-        self.in_ch   = in_channels
-        self.out_ch  = out_channels
-        self.modes_t = modes_t
-        self.modes_h = modes_h
-        self.modes_w = modes_w
+    class SpectralConv3d(nn.Module):
+        def __init__(
+            self,
+            in_channels:  int,
+            out_channels: int,
+            modes_t:      int = 4,
+            modes_h:      int = 4,
+            modes_w:      int = 4,
+        ):
+            super().__init__()
+            self.in_ch   = in_channels
+            self.out_ch  = out_channels
+            self.modes_t = modes_t
+            self.modes_h = modes_h
+            self.modes_w = modes_w
 
-        scale = 1.0 / math.sqrt(in_channels * out_channels)
-        shape = (in_channels, out_channels, modes_t, modes_h, modes_w)
-        self.w_re = nn.Parameter(scale * torch.randn(*shape))
-        self.w_im = nn.Parameter(scale * torch.randn(*shape))
+            _scale = 1.0 / math.sqrt(in_channels * out_channels)
+            _shape = (in_channels, out_channels, modes_t, modes_h, modes_w)
 
-    def _complex_mul(self, x, w_re, w_im):
-    # cast weights to float32: under AMP the module runs in float16 but
-    # x is already float32 (cast in forward before rfftn). Without this
-    # cast the einsum outputs are float16 and torch.complex raises the
-    # ComplexHalf experimental warning then errors downstream.
-        w_re = w_re.float()
-        w_im = w_im.float()
-        x_re = x.real
-        x_im = x.imag
-        out_re = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_re)
-                - torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_im))
-        out_im = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_im)
-                + torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_re))
-        return torch.complex(out_re, out_im)
+            # All 4 corners initialised here, once, as proper parameters
+            for i in range(1, 5):
+                setattr(self, f'w_re_{i}', nn.Parameter(_scale * torch.randn(*_shape)))
+                setattr(self, f'w_im_{i}', nn.Parameter(_scale * torch.randn(*_shape)))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
-        # Cast to float32 for FFT stability under AMP
-        x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
+        def _complex_mul(self, x, w_re, w_im):
+            w_re = w_re.float()
+            w_im = w_im.float()
+            x_re, x_im = x.real, x.imag
+            out_re = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_re)
+                    - torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_im))
+            out_im = (torch.einsum("bipqr,ijpqr->bjpqr", x_re, w_im)
+                    + torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_re))
+            return torch.complex(out_re, out_im)
 
-        out_ft = torch.zeros(B, self.out_ch, T, H, W // 2 + 1, 
-                             dtype=torch.cfloat, device=x.device)
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            B, C, T, H, W = x.shape
+            x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
 
-        mt = min(self.modes_t, T // 2)
-        mh = min(self.modes_h, H // 2)
-        mw = min(self.modes_w, W // 2 + 1)
-        # FIX — mỗi góc cần weight riêng (chuẩn FNO multi-corner):
-        # Thêm 4 cặp weight trong __init__:
-        for i in range(1, 5):
-            setattr(self, f'w_re_{i}', nn.Parameter(scale * torch.randn(*shape)))
-            setattr(self, f'w_im_{i}', nn.Parameter(scale * torch.randn(*shape)))
+            out_ft = torch.zeros(B, self.out_ch, T, H, W // 2 + 1,
+                                dtype=torch.cfloat, device=x.device)
 
+            mt = min(self.modes_t, T // 2)
+            mh = min(self.modes_h, H // 2)
+            mw = min(self.modes_w, W // 2 + 1)
 
-        # FIX LOGIC: Lấy đủ 4 góc phổ để giữ các tần số thấp quan trọng
-        # (Chỉ chiều W là không cần vì rfftn đã cắt một nửa)
-        
-        # Góc 1: Dương Time, Dương Height
-        out_ft[:, :, :mt, :mh, :mw] = self._complex_mul(
-            x_ft[:, :, :mt, :mh, :mw], self.w_re, self.w_im)
-        
-        # Góc 2: Âm Time, Dương Height (Thêm phần này để model "nhạy" hơn)
-        out_ft[:, :, -mt:, :mh, :mw] = self._complex_mul(
-            x_ft[:, :, -mt:, :mh, :mw], self.w_re, self.w_im)
+            # FIX LOGIC: Lấy đủ 4 góc phổ để giữ các tần số thấp quan trọng
+            # (Chỉ chiều W là không cần vì rfftn đã cắt một nửa)
             
-        # Góc 3: Dương Time, Âm Height
-        out_ft[:, :, :mt, -mh:, :mw] = self._complex_mul(
-            x_ft[:, :, :mt, -mh:, :mw], self.w_re, self.w_im)
+            # Góc 1: Dương Time, Dương Height
+            out_ft[:, :, :mt, :mh, :mw] = self._complex_mul(
+                x_ft[:, :, :mt, :mh, :mw], self.w_re, self.w_im)
             
-        # Góc 4: Âm Time, Âm Height
-        out_ft[:, :, -mt:, -mh:, :mw] = self._complex_mul(
-            x_ft[:, :, -mt:, -mh:, :mw], self.w_re, self.w_im)
+            # Góc 2: Âm Time, Dương Height (Thêm phần này để model "nhạy" hơn)
+            out_ft[:, :, -mt:, :mh, :mw] = self._complex_mul(
+                x_ft[:, :, -mt:, :mh, :mw], self.w_re, self.w_im)
+                
+            # Góc 3: Dương Time, Âm Height
+            out_ft[:, :, :mt, -mh:, :mw] = self._complex_mul(
+                x_ft[:, :, :mt, -mh:, :mw], self.w_re, self.w_im)
+                
+            # Góc 4: Âm Time, Âm Height
+            out_ft[:, :, -mt:, -mh:, :mw] = self._complex_mul(
+                x_ft[:, :, -mt:, -mh:, :mw], self.w_re, self.w_im)
 
-        return torch.fft.irfftn(out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho").to(x.dtype)
+            return torch.fft.irfftn(out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho").to(x.dtype)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FNO Layer = SpectralConv + local Conv residual
