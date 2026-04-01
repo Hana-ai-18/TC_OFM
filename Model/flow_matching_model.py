@@ -1066,21 +1066,21 @@ class VelocityField(nn.Module):
         self.ctx_fc2  = nn.Linear(512, ctx_dim)
 
         # ── Time embedding ────────────────────────────────────────────────
-        self.time_fc1 = nn.Linear(128, 256)
-        self.time_fc2 = nn.Linear(256, 256)
+        self.time_fc1 = nn.Linear(256, 512)
+        self.time_fc2 = nn.Linear(512, 256)
 
         # ── Trajectory Transformer decoder ──────────────────────────────
         self.traj_embed = nn.Linear(4, 256)
         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=256, nhead=8, dim_feedforward=512,
+                d_model=256, nhead=8, dim_feedforward=1024,
                 dropout=0.15, activation="gelu", batch_first=True,
             ),
             num_layers=4,
         )
-        self.out_fc1 = nn.Linear(256, 256)
-        self.out_fc2 = nn.Linear(256, 4)
+        self.out_fc1 = nn.Linear(256, 512)
+        self.out_fc2 = nn.Linear(512, 4)
 
     def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
         half = dim // 2
@@ -1158,13 +1158,13 @@ class VelocityField(nn.Module):
         return self._decode(x_t, t, ctx)
 
     def _decode(self, x_t, t, ctx):
-        t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
+        t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
         t_emb = self.time_fc2(t_emb)
 
         # x_emb = self.traj_embed(x_t) + self.pos_enc[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
         x_emb  = self.traj_embed(x_t) + self.pos_enc[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
         #  FIX: slice pos_enc to active seq length so curriculum (e.g. len=4)
-        #  doesn't mismatch the full pos_enc shape [1, pred_len=12, 128]
+        #  doesn't mismatch the full pos_enc shape [1, pred_len=12, 256]
         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
 
         out = self.transformer(x_emb, memory)
