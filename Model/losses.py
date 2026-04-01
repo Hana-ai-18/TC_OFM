@@ -1477,53 +1477,53 @@ def fm_afcrps_loss(
     return loss_per_b.mean()
 
 
-# ── Velocity loss (FIX-L17) ───────────────────────────────────────────────────
+# # ── Velocity loss (FIX-L17) ───────────────────────────────────────────────────
 
+# # def velocity_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+# #     """
+# #     Penalize per-step speed error và along-track signed error.
+# #     pred, gt: [T, B, 2]
+# #     """
+# #     if pred.shape[0] < 2:
+# #         return pred.new_zeros(())
+
+# #     pred_v = pred[1:] - pred[:-1]
+# #     gt_v   = gt[1:] - gt[:-1]
+
+# #     pred_speed = pred_v.norm(dim=-1)
+# #     gt_speed   = gt_v.norm(dim=-1)
+# #     speed_mse  = F.mse_loss(pred_speed, gt_speed)
+
+# #     gt_v_norm  = gt_v / gt_v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+# #     ate_signed = ((pred_v - gt_v) * gt_v_norm).sum(-1)
+# #     ate_mse    = (ate_signed ** 2).mean()
+
+# #     return speed_mse + 0.3 * ate_mse
 # def velocity_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-#     """
-#     Penalize per-step speed error và along-track signed error.
-#     pred, gt: [T, B, 2]
-#     """
 #     if pred.shape[0] < 2:
 #         return pred.new_zeros(())
 
-#     pred_v = pred[1:] - pred[:-1]
-#     gt_v   = gt[1:] - gt[:-1]
+#     # Tính vector vận tốc (bước nhảy)
+#     v_pred = pred[1:] - pred[:-1]
+#     v_gt   = gt[1:] - gt[:-1]
 
-#     pred_speed = pred_v.norm(dim=-1)
-#     gt_speed   = gt_v.norm(dim=-1)
-#     speed_mse  = F.mse_loss(pred_speed, gt_speed)
+#     # 1. Speed Loss: Khớp độ lớn vận tốc (tốc độ km/h)
+#     s_pred = torch.norm(v_pred, dim=-1)
+#     s_gt   = torch.norm(v_gt, dim=-1)
+#     l_speed    = F.mse_loss(s_pred, s_gt)
 
-#     gt_v_norm  = gt_v / gt_v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-#     ate_signed = ((pred_v - gt_v) * gt_v_norm).sum(-1)
-#     ate_mse    = (ate_signed ** 2).mean()
-
-#     return speed_mse + 0.3 * ate_mse
-def velocity_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    if pred.shape[0] < 2:
-        return pred.new_zeros(())
-
-    # Tính vector vận tốc (bước nhảy)
-    v_pred = pred[1:] - pred[:-1]
-    v_gt   = gt[1:] - gt[:-1]
-
-    # 1. Speed Loss: Khớp độ lớn vận tốc (tốc độ km/h)
-    s_pred = torch.norm(v_pred, dim=-1)
-    s_gt   = torch.norm(v_gt, dim=-1)
-    l_speed    = F.mse_loss(s_pred, s_gt)
-
-    # 2. ATE Loss (Along-track): Khớp vị trí trên quỹ đạo
-    # Tránh chia cho 0 nếu bão đứng yên
-    gt_v_unit = v_gt / torch.norm(v_gt, dim=-1, keepdim=True).clamp(min=1e-6)
+#     # 2. ATE Loss (Along-track): Khớp vị trí trên quỹ đạo
+#     # Tránh chia cho 0 nếu bão đứng yên
+#     gt_v_unit = v_gt / torch.norm(v_gt, dim=-1, keepdim=True).clamp(min=1e-6)
     
-    # Chiếu sai số vận tốc lên hướng đi thực tế
-    # Nếu giá trị này dương: model dự báo bão đi nhanh hơn thực tế
-    # Nếu âm: model dự báo bão đi chậm hơn thực tế
-    ate_errors = torch.sum((v_pred - v_gt) * gt_v_unit, dim=-1)
-    l_ate      = torch.mean(ate_errors**2, dim=0)
+#     # Chiếu sai số vận tốc lên hướng đi thực tế
+#     # Nếu giá trị này dương: model dự báo bão đi nhanh hơn thực tế
+#     # Nếu âm: model dự báo bão đi chậm hơn thực tế
+#     ate_errors = torch.sum((v_pred - v_gt) * gt_v_unit, dim=-1)
+#     l_ate      = torch.mean(ate_errors**2, dim=0)
 
-    # Kết hợp: Ưu tiên speed để ổn định, ate để chính xác thời gian
-    return l_speed + 0.5 * l_ate
+#     # Kết hợp: Ưu tiên speed để ổn định, ate để chính xác thời gian
+#     return l_speed + 0.5 * l_ate
 
 # ── Acceleration loss (FIX-L18) ───────────────────────────────────────────────
 
@@ -1545,22 +1545,22 @@ def overall_dir_loss(pred, gt, ref):
     return (1.0 - ((p_d / pn) * (g_d / gn)).sum(-1)).mean()
 
 
-def step_dir_loss(pred, gt):
-    if pred.shape[0] < 2:
-        return pred.new_zeros(())
-    pv = pred[1:] - pred[:-1]
-    gv = gt[1:]   - gt[:-1]
-    pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-    return (1.0 - ((pv / pn) * (gv / gn)).sum(-1)).mean()
+# def step_dir_loss(pred, gt):
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(())
+#     pv = pred[1:] - pred[:-1]
+#     gv = gt[1:]   - gt[:-1]
+#     pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     return (1.0 - ((pv / pn) * (gv / gn)).sum(-1)).mean()
 
 
-def disp_loss(pred, gt):
-    if pred.shape[0] < 2:
-        return pred.new_zeros(())
-    pd = (pred[1:] - pred[:-1]).norm(dim=-1).mean(0)
-    gd = (gt[1:]   - gt[:-1]).norm(dim=-1).mean(0)
-    return ((pd - gd) ** 2).mean()
+# def disp_loss(pred, gt):
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(())
+#     pd = (pred[1:] - pred[:-1]).norm(dim=-1).mean(0)
+#     gd = (gt[1:]   - gt[:-1]).norm(dim=-1).mean(0)
+#     return ((pd - gd) ** 2).mean()
 
 
 def heading_loss(pred, gt):
@@ -1616,124 +1616,59 @@ def pinn_bve_loss(pred_abs, batch_list):
     return _pinn_simplified(pred_abs)
 
 
-# ── Main loss function ────────────────────────────────────────────────────────
+# # ── Main loss function ────────────────────────────────────────────────────────
 
-# def compute_total_loss(
-#     pred_abs,
-#     gt,
-#     ref,
-#     batch_list,
-#     pred_samples=None,
-#     weights=WEIGHTS,
-#     intensity_w: Optional[torch.Tensor] = None,
-# ) -> Dict:
-#     """
-#     FIX-L21: Recurvature weighting — nhân loss theo per-sample weight.
-#              Recurvature sequences (tổng góc quay >= 45°) được weight ×2.5.
-#              Điều này trực tiếp fix PR=1.37 (straight-track bias).
+# # def compute_total_loss(
+# #     pred_abs,
+# #     gt,
+# #     ref,
+# #     batch_list,
+# #     pred_samples=None,
+# #     weights=WEIGHTS,
+# #     intensity_w: Optional[torch.Tensor] = None,
+# # ) -> Dict:
+# #     """
+# #     FIX-L21: Recurvature weighting — nhân loss theo per-sample weight.
+# #              Recurvature sequences (tổng góc quay >= 45°) được weight ×2.5.
+# #              Điều này trực tiếp fix PR=1.37 (straight-track bias).
 
-#     FIX-L22: Kết hợp recurv_w và intensity_w thành unified sample_weight.
+# #     FIX-L22: Kết hợp recurv_w và intensity_w thành unified sample_weight.
 
-#     FIX-L23: recurvature_loss — penalize turning point heading error.
-#     """
-#     # FIX-L21: Tính recurvature weight từ gt trajectory
-#     recurv_w = _recurvature_weights(gt, w_recurv=2.5)   # [B]
+# #     FIX-L23: recurvature_loss — penalize turning point heading error.
+# #     """
+# #     # FIX-L21: Tính recurvature weight từ gt trajectory
+# #     recurv_w = _recurvature_weights(gt, w_recurv=2.5)   # [B]
 
-#     # FIX-L22: Kết hợp với intensity_w nếu có
-#     if intensity_w is not None:
-#         sample_w = (recurv_w * intensity_w.to(recurv_w.device))
-#         sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
-#     else:
-#         sample_w = recurv_w / recurv_w.mean().clamp(min=1e-6)
+# #     # FIX-L22: Kết hợp với intensity_w nếu có
+# #     if intensity_w is not None:
+# #         sample_w = (recurv_w * intensity_w.to(recurv_w.device))
+# #         sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
+# #     else:
+# #         sample_w = recurv_w / recurv_w.mean().clamp(min=1e-6)
 
-#     # FM loss với unified sample weight
-#     l_fm = (
-#         fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
-#         if pred_samples is not None
-#         else _haversine(pred_abs, gt, unit_01deg=False).mean()
-#     )
+# #     # FM loss với unified sample weight
+# #     l_fm = (
+# #         fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
+# #         if pred_samples is not None
+# #         else _haversine(pred_abs, gt, unit_01deg=False).mean()
+# #     )
 
-#     l_dir     = overall_dir_loss(pred_abs, gt, ref)
-#     l_step    = step_dir_loss(pred_abs, gt)
-#     l_disp    = disp_loss(pred_abs, gt)
-#     l_heading = heading_loss(pred_abs, gt)
-#     l_smooth  = smooth_loss(pred_abs)
-#     l_pinn    = pinn_bve_loss(pred_abs, batch_list)
-#     l_vel     = velocity_loss(pred_abs, gt)
-#     l_accel   = acceleration_loss(pred_abs)
-#     l_recurv  = recurvature_loss(pred_abs, gt)   # FIX-L23
+# #     l_dir     = overall_dir_loss(pred_abs, gt, ref)
+# #     l_step    = step_dir_loss(pred_abs, gt)
+# #     l_disp    = disp_loss(pred_abs, gt)
+# #     l_heading = heading_loss(pred_abs, gt)
+# #     l_smooth  = smooth_loss(pred_abs)
+# #     l_pinn    = pinn_bve_loss(pred_abs, batch_list)
+# #     l_vel     = velocity_loss(pred_abs, gt)
+# #     l_accel   = acceleration_loss(pred_abs)
+# #     l_recurv  = recurvature_loss(pred_abs, gt)   # FIX-L23
 
-#     # FIX-L21: Apply recurv_w đến các directional losses (không phải smooth/pinn)
-#     # Cách: scale total của direction-related losses theo mean(recurv_w - 1)
-#     # Straight tracks: factor=1.0, Recurvature: factor=up to 2.5
-#     direction_factor = sample_w.mean()
+# #     # FIX-L21: Apply recurv_w đến các directional losses (không phải smooth/pinn)
+# #     # Cách: scale total của direction-related losses theo mean(recurv_w - 1)
+# #     # Straight tracks: factor=1.0, Recurvature: factor=up to 2.5
+# #     direction_factor = sample_w.mean()
 
-#     total = (weights.get("fm",       2.0)  * l_fm
-#            + weights.get("dir",      2.0)  * l_dir      * direction_factor
-#            + weights.get("step",     0.5)  * l_step     * direction_factor
-#            + weights.get("disp",     0.5)  * l_disp
-#            + weights.get("heading",  1.5)  * l_heading  * direction_factor
-#            + weights.get("smooth",   0.05) * l_smooth
-#            + weights.get("pinn",     0.02) * l_pinn
-#            + weights.get("velocity", 2.0)  * l_vel      *10 * direction_factor
-#            + weights.get("accel",    0.3)  * l_accel
-#            + weights.get("recurv",   1.0)  * l_recurv   * direction_factor)
-
-#     total = total.clamp(max=500.0)
-
-#     if torch.isnan(total) or torch.isinf(total):
-#         print("  ⚠  NaN/Inf in total loss — returning zero")
-#         total = pred_abs.new_zeros(())
-
-#     # Log recurvature ratio để monitor
-#     n_recurv = (recurv_w > 1.5).float().sum().item()
-#     B        = recurv_w.shape[0]
-
-#     return dict(
-#         total=total,
-#         fm=l_fm.item(), dir=l_dir.item(), step=l_step.item(),
-#         disp=l_disp.item(), heading=l_heading.item(),
-#         smooth=l_smooth.item(), pinn=l_pinn.item(),
-#         velocity=l_vel.item(), accel=l_accel.item(),
-#         recurv=l_recurv.item(),
-#         recurv_ratio=n_recurv / max(B, 1),   # % batch là recurvature
-#     )
-# def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None, weights=WEIGHTS, intensity_w=None):
-#     # 1. Tính trọng số [B] cho từng ca bão (Recurvature = 2.5, Straight = 1.0)
-#     # Hàm này trả về tensor shape [B]
-#     recurv_w = _recurvature_weights(gt, w_recurv=2.5) 
-    
-#     if intensity_w is not None:
-#         sample_w = recurv_w * intensity_w.to(recurv_w.device)
-#     else:
-#         sample_w = recurv_w
-        
-#     # Chuẩn hóa để tránh nổ gradient nhưng GIỮ NGUYÊN tỉ lệ 2.5 : 1 giữa các mẫu
-#     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
-
-#     # 2. Flow Matching Loss (Vị trí) - Đã tích hợp sample_w bên trong hàm này
-#     l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
-
-#     # 3. Velocity Loss (Tốc độ) - QUAN TRỌNG: Tính per-sample rồi mới nhân weight
-#     # Giả sử hàm velocity_loss_per_sample trả về tensor [B]
-#     l_vel_vec = velocity_loss(pred_abs, gt) 
-#     l_vel = (l_vel_vec * sample_w).mean()
-
-#     # 4. Hướng và các thành phần khác (Tính scalar)
-#     l_recurv = recurvature_loss(pred_abs, gt) # Turning point penalty
-#     l_heading = heading_loss(pred_abs, gt)   # Góc lệch hướng
-#     l_pinn = pinn_bve_loss(pred_abs, batch_list)
-
-#     # 5. TỔNG HỢP VỚI HỆ SỐ CÂN BẰNG SCALE
-#     # l_vel nhân 100 để "có tiếng nói" tương đương với l_fm (km)
-#     # l_heading nhân 5 để ép model chú ý đến hướng
-#     total = (weights.get("fm", 2.0) * l_fm +
-#              weights.get("velocity", 2.0) * l_vel * 100.0 + 
-#              weights.get("heading", 1.5) * l_heading * 5.0 + 
-#              weights.get("recurv", 1.5) * l_recurv * 5.0 + 
-#              weights.get("pinn", 0.02) * l_pinn)
-
-# # total = (weights.get("fm",       2.0)  * l_fm
+# #     total = (weights.get("fm",       2.0)  * l_fm
 # #            + weights.get("dir",      2.0)  * l_dir      * direction_factor
 # #            + weights.get("step",     0.5)  * l_step     * direction_factor
 # #            + weights.get("disp",     0.5)  * l_disp
@@ -1743,67 +1678,227 @@ def pinn_bve_loss(pred_abs, batch_list):
 # #            + weights.get("velocity", 2.0)  * l_vel      *10 * direction_factor
 # #            + weights.get("accel",    0.3)  * l_accel
 # #            + weights.get("recurv",   1.0)  * l_recurv   * direction_factor)
-#     # NaN guard
+
+# #     total = total.clamp(max=500.0)
+
+# #     if torch.isnan(total) or torch.isinf(total):
+# #         print("  ⚠  NaN/Inf in total loss — returning zero")
+# #         total = pred_abs.new_zeros(())
+
+# #     # Log recurvature ratio để monitor
+# #     n_recurv = (recurv_w > 1.5).float().sum().item()
+# #     B        = recurv_w.shape[0]
+
+# #     return dict(
+# #         total=total,
+# #         fm=l_fm.item(), dir=l_dir.item(), step=l_step.item(),
+# #         disp=l_disp.item(), heading=l_heading.item(),
+# #         smooth=l_smooth.item(), pinn=l_pinn.item(),
+# #         velocity=l_vel.item(), accel=l_accel.item(),
+# #         recurv=l_recurv.item(),
+# #         recurv_ratio=n_recurv / max(B, 1),   # % batch là recurvature
+# #     )
+# # def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None, weights=WEIGHTS, intensity_w=None):
+# #     # 1. Tính trọng số [B] cho từng ca bão (Recurvature = 2.5, Straight = 1.0)
+# #     # Hàm này trả về tensor shape [B]
+# #     recurv_w = _recurvature_weights(gt, w_recurv=2.5) 
+    
+# #     if intensity_w is not None:
+# #         sample_w = recurv_w * intensity_w.to(recurv_w.device)
+# #     else:
+# #         sample_w = recurv_w
+        
+# #     # Chuẩn hóa để tránh nổ gradient nhưng GIỮ NGUYÊN tỉ lệ 2.5 : 1 giữa các mẫu
+# #     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
+
+# #     # 2. Flow Matching Loss (Vị trí) - Đã tích hợp sample_w bên trong hàm này
+# #     l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
+
+# #     # 3. Velocity Loss (Tốc độ) - QUAN TRỌNG: Tính per-sample rồi mới nhân weight
+# #     # Giả sử hàm velocity_loss_per_sample trả về tensor [B]
+# #     l_vel_vec = velocity_loss(pred_abs, gt) 
+# #     l_vel = (l_vel_vec * sample_w).mean()
+
+# #     # 4. Hướng và các thành phần khác (Tính scalar)
+# #     l_recurv = recurvature_loss(pred_abs, gt) # Turning point penalty
+# #     l_heading = heading_loss(pred_abs, gt)   # Góc lệch hướng
+# #     l_pinn = pinn_bve_loss(pred_abs, batch_list)
+
+# #     # 5. TỔNG HỢP VỚI HỆ SỐ CÂN BẰNG SCALE
+# #     # l_vel nhân 100 để "có tiếng nói" tương đương với l_fm (km)
+# #     # l_heading nhân 5 để ép model chú ý đến hướng
+# #     total = (weights.get("fm", 2.0) * l_fm +
+# #              weights.get("velocity", 2.0) * l_vel * 100.0 + 
+# #              weights.get("heading", 1.5) * l_heading * 5.0 + 
+# #              weights.get("recurv", 1.5) * l_recurv * 5.0 + 
+# #              weights.get("pinn", 0.02) * l_pinn)
+
+# # # total = (weights.get("fm",       2.0)  * l_fm
+# # #            + weights.get("dir",      2.0)  * l_dir      * direction_factor
+# # #            + weights.get("step",     0.5)  * l_step     * direction_factor
+# # #            + weights.get("disp",     0.5)  * l_disp
+# # #            + weights.get("heading",  1.5)  * l_heading  * direction_factor
+# # #            + weights.get("smooth",   0.05) * l_smooth
+# # #            + weights.get("pinn",     0.02) * l_pinn
+# # #            + weights.get("velocity", 2.0)  * l_vel      *10 * direction_factor
+# # #            + weights.get("accel",    0.3)  * l_accel
+# # #            + weights.get("recurv",   1.0)  * l_recurv   * direction_factor)
+# #     # NaN guard
+# #     if torch.isnan(total): total = pred_abs.new_zeros(())
+
+# #     return dict(
+# #         total=total,
+# #         fm=l_fm.item(),
+# #         vel=l_vel.item(),
+# #         recurv=l_recurv.item(),
+# #         # Tỷ lệ bão quay đầu trong batch để theo dõi
+# #         recurv_ratio=(recurv_w > 1.0).float().mean().item() 
+# #     )
+# # --- PHẦN 2: HÀM TỔNG HỢP CHÍNH ---
+
+# def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None, weights=WEIGHTS, intensity_w=None):
+#     # 1. TRỌNG SỐ MẪU (Recurvature Priority)
+#     recurv_w = _recurvature_weights(gt, w_recurv=2.5) # [B]
+#     sample_w = recurv_w * (intensity_w.to(gt.device) if intensity_w is not None else 1.0)
+#     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
+
+#     # 2. TÍNH TOÁN CÁC THÀNH PHẦN (Tất cả đưa về mean batch có trọng số)
+#     # Vị trí (km)
+#     l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
+    
+#     # Tốc độ & Độ dài bước (Scale x100)
+#     l_vel = (velocity_loss(pred_abs, gt) * sample_w).mean()
+#     l_disp = (disp_loss(pred_abs, gt) * sample_w).mean()
+
+#     # Hướng & Khúc cua (Scale x10)
+#     l_step = (step_dir_loss(pred_abs, gt) * sample_w).mean()
+#     l_heading = heading_loss(pred_abs, gt) # Scalar mean
+#     l_recurv = recurvature_loss(pred_abs, gt) # Scalar mean
+#     l_dir_final = overall_dir_loss(pred_abs, gt, ref)
+
+#     # Regularization & Physics
+#     l_smooth = smooth_loss(pred_abs)
+#     l_accel = acceleration_loss(pred_abs)
+#     l_pinn = pinn_bve_loss(pred_abs, batch_list)
+
+#     # 3. TỔNG HỢP (Scale Balancing)
+#     total = (
+#         weights['fm']       * l_fm +
+#         weights['velocity'] * l_vel * 100.0 + 
+#         weights['disp']     * l_disp * 100.0 +   # Thêm disp
+#         weights['step']     * l_step * 10.0 +    # Thêm step
+#         weights['heading']  * l_heading * 10.0 + 
+#         weights['recurv']   * l_recurv * 10.0 + 
+#         weights['dir']      * l_dir_final * 5.0 +
+#         weights['smooth']   * l_smooth * 10.0 + 
+#         weights['accel']    * l_accel * 10.0 +
+#         weights['pinn']     * l_pinn
+#     )
+
 #     if torch.isnan(total): total = pred_abs.new_zeros(())
 
 #     return dict(
-#         total=total,
-#         fm=l_fm.item(),
-#         vel=l_vel.item(),
-#         recurv=l_recurv.item(),
-#         # Tỷ lệ bão quay đầu trong batch để theo dõi
-#         recurv_ratio=(recurv_w > 1.0).float().mean().item() 
+#         total=total, fm=l_fm.item(), vel=l_vel.item(), 
+#         step=l_step.item(), disp=l_disp.item(),
+#         recurv=l_recurv.item(), smooth=l_smooth.item(),
+#         recurv_ratio=(recurv_w > 1.0).float().mean().item()
 #     )
-# --- PHẦN 2: HÀM TỔNG HỢP CHÍNH ---
+# losses.py
 
-def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None, weights=WEIGHTS, intensity_w=None):
-    # 1. TRỌNG SỐ MẪU (Recurvature Priority)
-    recurv_w = _recurvature_weights(gt, w_recurv=2.5) # [B]
+def velocity_loss_per_sample(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """
+    Returns per-sample velocity loss, shape [B].
+    Fix: does NOT call .mean() internally so caller can apply sample_w.
+    """
+    if pred.shape[0] < 2:
+        return pred.new_zeros(pred.shape[1])  # [B]
+
+    v_pred = pred[1:] - pred[:-1]   # [T-1, B, 2]
+    v_gt   = gt[1:]   - gt[:-1]
+
+    s_pred = torch.norm(v_pred, dim=-1)   # [T-1, B]
+    s_gt   = torch.norm(v_gt,   dim=-1)
+    l_speed = (s_pred - s_gt).pow(2).mean(0)  # [B]
+
+    gt_v_unit = v_gt / torch.norm(v_gt, dim=-1, keepdim=True).clamp(min=1e-6)
+    ate_errors = ((v_pred - v_gt) * gt_v_unit).sum(-1)  # [T-1, B]
+    l_ate = ate_errors.pow(2).mean(0)  # [B]
+
+    return l_speed + 0.5 * l_ate  # [B]
+
+
+def disp_loss_per_sample(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Returns per-sample displacement loss, shape [B]."""
+    if pred.shape[0] < 2:
+        return pred.new_zeros(pred.shape[1])
+    pd = (pred[1:] - pred[:-1]).norm(dim=-1).mean(0)  # [B]
+    gd = (gt[1:]   - gt[:-1]).norm(dim=-1).mean(0)
+    return (pd - gd).pow(2)  # [B]
+
+
+def step_dir_loss_per_sample(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    """Returns per-sample step direction loss, shape [B]."""
+    if pred.shape[0] < 2:
+        return pred.new_zeros(pred.shape[1])
+    pv = pred[1:] - pred[:-1]
+    gv = gt[1:]   - gt[:-1]
+    pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    cos_sim = ((pv / pn) * (gv / gn)).sum(-1)  # [T-1, B]
+    return (1.0 - cos_sim).mean(0)  # [B]
+
+
+def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
+                       weights=WEIGHTS, intensity_w=None):
+    # 1. TRỌNG SỐ MẪU
+    recurv_w = _recurvature_weights(gt, w_recurv=2.5)  # [B]
     sample_w = recurv_w * (intensity_w.to(gt.device) if intensity_w is not None else 1.0)
     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
 
-    # 2. TÍNH TOÁN CÁC THÀNH PHẦN (Tất cả đưa về mean batch có trọng số)
-    # Vị trí (km)
+    # 2. CÁC THÀNH PHẦN LOSS
     l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
-    
-    # Tốc độ & Độ dài bước (Scale x100)
-    l_vel = (velocity_loss(pred_abs, gt) * sample_w).mean()
-    l_disp = (disp_loss(pred_abs, gt) * sample_w).mean()
 
-    # Hướng & Khúc cua (Scale x10)
-    l_step = (step_dir_loss(pred_abs, gt) * sample_w).mean()
-    l_heading = heading_loss(pred_abs, gt) # Scalar mean
-    l_recurv = recurvature_loss(pred_abs, gt) # Scalar mean
+    # FIX: dùng hàm per-sample rồi mới nhân weight → .mean()
+    l_vel  = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
+    l_disp = (disp_loss_per_sample(pred_abs, gt) * sample_w).mean()
+    l_step = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
+
+    # Scalar losses (không có per-sample version hợp lý)
+    l_heading   = heading_loss(pred_abs, gt)
+    l_recurv    = recurvature_loss(pred_abs, gt)
     l_dir_final = overall_dir_loss(pred_abs, gt, ref)
+    l_smooth    = smooth_loss(pred_abs)
+    l_accel     = acceleration_loss(pred_abs)
+    l_pinn      = pinn_bve_loss(pred_abs, batch_list)
 
-    # Regularization & Physics
-    l_smooth = smooth_loss(pred_abs)
-    l_accel = acceleration_loss(pred_abs)
-    l_pinn = pinn_bve_loss(pred_abs, batch_list)
-
-    # 3. TỔNG HỢP (Scale Balancing)
+    # 3. TỔNG HỢP
     total = (
         weights['fm']       * l_fm +
-        weights['velocity'] * l_vel * 100.0 + 
-        weights['disp']     * l_disp * 100.0 +   # Thêm disp
-        weights['step']     * l_step * 10.0 +    # Thêm step
-        weights['heading']  * l_heading * 10.0 + 
-        weights['recurv']   * l_recurv * 10.0 + 
+        weights['velocity'] * l_vel   * 100.0 +
+        weights['disp']     * l_disp  * 100.0 +
+        weights['step']     * l_step  *  10.0 +
+        weights['heading']  * l_heading * 10.0 +
+        weights['recurv']   * l_recurv  * 10.0 +
         weights['dir']      * l_dir_final * 5.0 +
-        weights['smooth']   * l_smooth * 10.0 + 
-        weights['accel']    * l_accel * 10.0 +
+        weights['smooth']   * l_smooth * 10.0 +
+        weights['accel']    * l_accel  * 10.0 +
         weights['pinn']     * l_pinn
     )
 
-    if torch.isnan(total): total = pred_abs.new_zeros(())
+    if torch.isnan(total):
+        total = pred_abs.new_zeros(())
 
+    # FIX: key là 'velocity' (khớp với train script bd.get('velocity'))
     return dict(
-        total=total, fm=l_fm.item(), vel=l_vel.item(), 
-        step=l_step.item(), disp=l_disp.item(),
-        recurv=l_recurv.item(), smooth=l_smooth.item(),
+        total=total,
+        fm=l_fm.item(),
+        velocity=l_vel.item(),   # ← đổi từ 'vel' → 'velocity'
+        step=l_step.item(),
+        disp=l_disp.item(),
+        recurv=l_recurv.item(),
+        smooth=l_smooth.item(),
         recurv_ratio=(recurv_w > 1.0).float().mean().item()
     )
-
 # ── Legacy helpers ────────────────────────────────────────────────────────────
 
 class TripletLoss(torch.nn.Module):
