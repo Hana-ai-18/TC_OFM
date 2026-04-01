@@ -47,8 +47,7 @@ class SpectralConv3d(nn.Module):
       2 × 64 × 64 × 4 × 16 × 16 = 8,388,608 per layer  ✗
     """
 
-    class SpectralConv3d(nn.Module):
-        def __init__(
+    def __init__(
             self,
             in_channels:  int,
             out_channels: int,
@@ -71,7 +70,7 @@ class SpectralConv3d(nn.Module):
                 setattr(self, f'w_re_{i}', nn.Parameter(_scale * torch.randn(*_shape)))
                 setattr(self, f'w_im_{i}', nn.Parameter(_scale * torch.randn(*_shape)))
 
-        def _complex_mul(self, x, w_re, w_im):
+    def _complex_mul(self, x, w_re, w_im):
             w_re = w_re.float()
             w_im = w_im.float()
             x_re, x_im = x.real, x.imag
@@ -81,7 +80,7 @@ class SpectralConv3d(nn.Module):
                     + torch.einsum("bipqr,ijpqr->bjpqr", x_im, w_re))
             return torch.complex(out_re, out_im)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
             B, C, T, H, W = x.shape
             x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
 
