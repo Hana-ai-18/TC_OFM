@@ -1019,7 +1019,7 @@ class VelocityField(nn.Module):
         self,
         pred_len:   int   = 12,
         obs_len:    int   = 8,
-        ctx_dim:    int   = 128,
+        ctx_dim:    int   = 256, #tăng từ 128 lên 256 để tăng khả năng biểu diễn của context
         sigma_min:  float = 0.02,
         unet_in_ch: int   = 13,
     ):
@@ -1032,11 +1032,11 @@ class VelocityField(nn.Module):
         self.spatial_enc = FNO3DEncoder(
             in_channel   = unet_in_ch,
             out_channel  = 1,
-            d_model      = 32,
+            d_model      = 64,
             n_layers     = 4,
             modes_t      = 4,
-            modes_h      = 4,
-            modes_w      = 4,
+            modes_h      = 8,
+            modes_w      = 8,
             spatial_down = 32,
             dropout      = 0.05,
         )
@@ -1337,15 +1337,37 @@ class TCFlowMatching(nn.Module):
         # noise x_t = randn * sigma_min (different each call).
         raw_ctx = self.net._context(batch_list)
 
+        # for _ in range(num_ensemble):
+        #     x_t = torch.randn(B, self.pred_len, 4, device=device) * self.sigma_min
+        #     for step in range(ddim_steps):
+        #         t_b = torch.full((B,), step * dt, device=device)
+        #         vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx)
+        #         x_t = x_t + dt * vel
+        #         # BUG-2 FIX: clamp lon/lat AND pressure/wind dims
+        #         x_t[:, :, :2].clamp_(-5.0, 5.0)
+        #         x_t[:, :, 2:].clamp_(-3.0, 3.0)
+        #     tr, me = self._to_abs(x_t, lp, lm)
+        #     traj_s.append(tr)
+        #     me_s.append(me)
+
         for _ in range(num_ensemble):
             x_t = torch.randn(B, self.pred_len, 4, device=device) * self.sigma_min
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx)
+                
+                # 1. Cập nhật tích phân
                 x_t = x_t + dt * vel
-                # BUG-2 FIX: clamp lon/lat AND pressure/wind dims
-                x_t[:, :, :2].clamp_(-5.0, 5.0)
-                x_t[:, :, 2:].clamp_(-3.0, 3.0)
+                
+                # 2. Kẹp lỏng để ổn định số học (tránh NaN), không kẹp để định hình dữ liệu
+                # Ngưỡng 10.0 là đủ xa để không ảnh hưởng đến vật lý bão
+                x_t.clamp_(-10.0, 10.0) 
+
+            # 3. KẸP CHẶT SAU KHI KẾT THÚC ODE (Ra khỏi vòng lặp step)
+            # Bây giờ mới đưa bão về vùng thực tế của bản đồ normalized
+            x_t[:, :, :2].clamp_(-5.0, 5.0)
+            x_t[:, :, 2:].clamp_(-3.0, 3.0)
+            
             tr, me = self._to_abs(x_t, lp, lm)
             traj_s.append(tr)
             me_s.append(me)
@@ -1418,3 +1440,4 @@ class TCFlowMatching(nn.Module):
 
 # Backward-compat alias
 TCDiffusion = TCFlowMatching
+

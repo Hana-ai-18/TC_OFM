@@ -757,6 +757,7 @@ Feature vector — 90 dims total (unchanged):
 from __future__ import annotations
 
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -830,7 +831,7 @@ _V500C_MEAN = 480.31
 _V500C_STD  = 24.17
 
 # Sentinel thresholds (values above/below these are bad data)
-_GPH500_SENTINEL_LO = 25.0   # valid range ~27-34
+_GPH500_SENTINEL_LO = 10.0   # valid range ~27-34
 _GPH500_SENTINEL_HI = 50.0   # sentinel large values are ~88
 _UV500_SENTINEL_HI  = 20000.0  # sentinel large values are ~23000
 
@@ -950,36 +951,39 @@ def build_env_features_one_step(
     feat["history_inte_change24"] = v
 
     # gph500 normalization (BUG-3-ENV fix from v12, unchanged)
+    # for k in ["gph500_mean", "gph500_center"]:
+    #     if isinstance(env_npy, dict) and k in env_npy:
+    #         raw = float(env_npy[k]) if env_npy[k] is not None else None
+    #         if raw is None or math.isnan(raw) or raw < _GPH500_SENTINEL_LO or raw > _GPH500_SENTINEL_HI:
+    #             val = 0.0
+    #         else:
+    #             val = max(-5.0, min(5.0, (raw - _GPH500_MEAN) / (_GPH500_STD + 1e-8)))
+    #     else:
+    #         val = 0.0
+    #     feat[k] = [val]
     for k in ["gph500_mean", "gph500_center"]:
         if isinstance(env_npy, dict) and k in env_npy:
             raw = float(env_npy[k]) if env_npy[k] is not None else None
-            if raw is None or math.isnan(raw) or raw < _GPH500_SENTINEL_LO or raw > _GPH500_SENTINEL_HI:
-                val = 0.0
+            if raw is None or math.isnan(raw) or raw < _GPH500_SENTINEL_LO:
+                val = 0.0 # Trả về trung bình nếu lỗi
             else:
-                val = max(-5.0, min(5.0, (raw - _GPH500_MEAN) / (_GPH500_STD + 1e-8)))
-        else:
-            val = 0.0
-        feat[k] = [val]
+                val = (raw - _GPH500_MEAN) / (_GPH500_STD + 1e-8)
+        else: val = 0.0
+        feat[k] = [np.clip(val, -5.0, 5.0)]
 
     # u500/v500 normalization — BUG-1-V13 FIX: v500_center now uses its own stats
     # Each key gets the correct (mean, std) pair for its channel.
     uv_configs = [
-        ("u500_mean",   _U500_MEAN,  _U500_STD),
-        ("u500_center", _U500C_MEAN, _U500C_STD),
-        ("v500_mean",   _V500_MEAN,  _V500_STD),
-        ("v500_center", _V500C_MEAN, _V500C_STD),   # ← FIXED: was (_V500_MEAN, _V500_STD)
+        ("u500_mean", 5843.14, 50.55), ("u500_center", 752.80, 28.49),
+        ("v500_mean", 1482.47, 29.42), ("v500_center", 480.31, 24.17)
     ]
     for k, mean, std in uv_configs:
         if isinstance(env_npy, dict) and k in env_npy:
-            raw = float(env_npy[k]) if env_npy[k] is not None else None
-            if raw is None or math.isnan(raw) or raw == -1 or raw == 0 or raw > _UV500_SENTINEL_HI:
-                val = 0.0
-            else:
-                val = max(-5.0, min(5.0, (raw - mean) / (std + 1e-8)))
-        else:
-            val = 0.0
-        feat[k] = [val]
-
+            raw = float(env_npy[k])
+            if raw is None or raw == 0 or raw > 20000: val = 0.0
+            else: val = (raw - mean) / (std + 1e-8)
+        else: val = 0.0
+        feat[k] = [np.clip(val, -5.0, 5.0)]
     return feat
 
 
@@ -1098,5 +1102,6 @@ class Env_net(nn.Module):
         t_actual = min(T, self.pos_enc_env.shape[1])
         e_env    = e_env[:, :t_actual, :] + self.pos_enc_env[:, :t_actual, :]
         e_env_time = self.transformer_env(e_env)
-        ctx = self.out_proj(e_env_time.mean(dim=1))
+        # ctx = self.out_proj(e_env_time.mean(dim=1))  # Original: mean pooling over time
+        ctx = self.out_proj(e_env_time[:, -1, :])
         return ctx, 0, 0

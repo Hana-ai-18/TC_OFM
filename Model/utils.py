@@ -171,16 +171,16 @@ def dic2cuda(env_data, device=None):
     return env_data
 
 
-class StandardScaler:
-    def __init__(self):
-        self.mean = torch.tensor([1316.42, 218.44, 979.47, 28.18])
-        self.std  = torch.tensor([145.29,   88.04,  23.42, 13.26])
+# class StandardScaler:
+#     def __init__(self):
+#         self.mean = torch.tensor([1316.42, 218.44, 979.47, 28.18])
+#         self.std  = torch.tensor([145.29,   88.04,  23.42, 13.26])
 
-    def transform(self, data):
-        return (data - self.mean.to(data.device)) / self.std.to(data.device)
+#     def transform(self, data):
+#         return (data - self.mean.to(data.device)) / self.std.to(data.device)
 
-    def inverse_transform(self, data):
-        return (data * self.std.to(data.device)) + self.mean.to(data.device)
+#     def inverse_transform(self, data):
+#         return (data * self.std.to(data.device)) + self.mean.to(data.device)
 
 
 class EarlyStopping:

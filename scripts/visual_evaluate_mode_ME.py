@@ -1046,10 +1046,15 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
         std_lon  = pts[:, 0].std()
         std_lat  = pts[:, 1].std()
         mean_lat = pts[:, 1].mean()
-        std_km   = np.sqrt(
-            (std_lon * 111 * np.cos(np.deg2rad(mean_lat)))**2
-            + (std_lat * 111)**2
-        )
+        # std_km   = np.sqrt(
+        #     (std_lon * 111 * np.cos(np.deg2rad(mean_lat)))**2
+        #     + (std_lat * 111)**2
+        # )
+        # spreads_km.append(std_km)
+        # FIX: Bù trừ cos(lat) cho kinh độ để ra km chuẩn
+        std_lon_km = pts[:, 0].std() * 111.32 * np.cos(np.deg2rad(mean_lat))
+        std_lat_km = pts[:, 1].std() * 110.57
+        std_km = np.sqrt(std_lon_km**2 + std_lat_km**2)
         spreads_km.append(std_km)
     spreads_km = np.array(spreads_km)
 
@@ -1226,17 +1231,26 @@ def _plot_on_ax(ax, lon_range, lat_range,
                       path_effects=outline)
 
     # ── 7. Lead-time labels ───────────────────────────────────────────────
-    for i, (lx, ly) in enumerate(zip(pred_lon, pred_lat)):
-        h   = i * 6
-        lbl = "NOW" if i == 0 else (f"+{h}h" if h % 24 == 0 else None)
-        if lbl:
-            _text(lx, ly + 0.4, lbl,
-                  fontsize=7.5, color="#AAFFAA",
-                  ha="center", fontweight="bold",
-                  path_effects=[pe.withStroke(linewidth=2,
-                                              foreground="black")],
-                  zorder=15)
-
+    # for i, (lx, ly) in enumerate(zip(pred_lon, pred_lat)):
+    #     h   = i * 6
+    #     lbl = "NOW" if i == 0 else (f"+{h}h" if h % 24 == 0 else None)
+    #     if lbl:
+    #         _text(lx, ly + 0.4, lbl,
+    #               fontsize=7.5, color="#AAFFAA",
+    #               ha="center", fontweight="bold",
+    #               path_effects=[pe.withStroke(linewidth=2,
+    #                                           foreground="black")],
+    #               zorder=15)
+    # ── 7. Lead-time labels (Cả cho GT và Pred để so sánh tốc độ) ──
+    for i in range(len(pred_lon)):
+        h = i * 6
+        if h % 24 == 0:
+            lbl = "NOW" if i == 0 else f"+{h}h"
+            # Nhãn cho Dự báo (Màu xanh)
+            _text(pred_lon[i], pred_lat[i] + 0.5, lbl, color="#AAFFAA", fontweight="bold", path_effects=outline)
+            # Nhãn cho Thực tế (Màu đỏ) - Giúp nhìn ra bão nhanh hay chậm hơn
+            if i < len(gt_lon):
+                _text(gt_lon[i], gt_lat[i] - 0.7, lbl, color="#FFAAAA", fontsize=6, alpha=0.8, path_effects=outline)
     # ── 8. NOW star ───────────────────────────────────────────────────────
     _scatter([cur_pos[0]], [cur_pos[1]],
              s=350, marker="*", color="#FFD700",
@@ -1308,18 +1322,28 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     pred_Me_n = pred_Me[:, 0, :].cpu().numpy()
     ens_n     = all_trajs[:, :, 0, :].cpu().numpy()   # [S, T, 2]
 
-    obs_deg  = to_deg(denorm_traj(obs_n))
-    gt_deg   = to_deg(denorm_traj(gt_n))
+    # obs_deg  = to_deg(denorm_traj(obs_n))
+    # gt_deg   = to_deg(denorm_traj(gt_n))
     pred_deg = to_deg(denorm_traj(pred_n))
     ens_deg  = to_deg(denorm_traj(ens_n))
 
     errors_km = haversine_km(pred_deg, gt_deg)
 
-    obs_r = denorm_traj(obs_n)
-    gt_r  = denorm_traj(gt_n)
-    v_c   = obs_r[-1] - obs_r[-2] if len(obs_r) >= 2 else np.zeros(2)
-    cliper_preds = np.array([obs_r[-1] + (k+1)*v_c for k in range(len(gt_r))])
-    cliper_err   = haversine_km(to_deg(cliper_preds), to_deg(gt_r))
+    # obs_r = denorm_traj(obs_n)
+    # gt_r  = denorm_traj(gt_n)
+    # v_c   = obs_r[-1] - obs_r[-2] if len(obs_r) >= 2 else np.zeros(2)
+    # cliper_preds = np.array([obs_r[-1] + (k+1)*v_c for k in range(len(gt_r))])
+    # cliper_err   = haversine_km(to_deg(cliper_preds), to_deg(gt_r))
+    obs_deg = to_deg(denorm_traj(obs_n))
+    gt_deg  = to_deg(denorm_traj(gt_n))
+    
+    if len(obs_deg) >= 2:
+        v_deg = obs_deg[-1] - obs_deg[-2] # Vận tốc tính bằng độ/6h
+        cliper_preds_deg = np.array([obs_deg[-1] + (k+1)*v_deg for k in range(len(gt_deg))])
+    else:
+        cliper_preds_deg = np.tile(obs_deg[-1], (len(gt_deg), 1))
+        
+    cliper_err = haversine_km(cliper_preds_deg, gt_deg)
 
     return obs_deg, gt_deg, pred_deg, pred_Me_n, ens_deg, errors_km, cliper_err
 

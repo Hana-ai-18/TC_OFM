@@ -1199,17 +1199,40 @@ def denorm_deg_np(arr_norm: np.ndarray) -> np.ndarray:
 
 # ── FIX-MET-1: cliper_forecast exported ──────────────────────────────────────
 
+# def cliper_forecast(obs_01: np.ndarray, h: int) -> np.ndarray:
+#     """
+#     Simple CLIPER-WNP: linear extrapolation from last two observed steps.
+#     Returns predicted position (0.1° units) at lead step h (1-indexed).
+
+#     FIX-MET-1: exported at module level for use in train script.
+#     """
+#     if obs_01.shape[0] < 2:
+#         return obs_01[-1].copy()
+#     v = obs_01[-1] - obs_01[-2]
+#     return obs_01[-1] + h * v
 def cliper_forecast(obs_01: np.ndarray, h: int) -> np.ndarray:
     """
-    Simple CLIPER-WNP: linear extrapolation from last two observed steps.
-    Returns predicted position (0.1° units) at lead step h (1-indexed).
-
-    FIX-MET-1: exported at module level for use in train script.
+    Dự báo CLIPER chuẩn xác bằng cách đưa về không gian Degrees.
+    obs_01: Tọa độ đã chuẩn hóa (normalized) từ DataLoader.
+    h: Bước dự báo (1, 2, ..., 12).
     """
-    if obs_01.shape[0] < 2:
-        return obs_01[-1].copy()
-    v = obs_01[-1] - obs_01[-2]
-    return obs_01[-1] + h * v
+    # 1. Giải chuẩn hóa về độ thực tế (ví dụ: 112.5, 16.1)
+    # Hàm denorm_deg_np phải được định nghĩa đúng theo công thức của Dataset
+    obs_deg = denorm_deg_np(obs_01) 
+
+    if obs_deg.shape[0] < 2:
+        return obs_01[-1].copy() * 10.0 # Fallback
+    
+    # 2. Tính vận tốc dựa trên sự thay đổi độ (Degrees per step)
+    # v = (v_lon, v_lat)
+    v = obs_deg[-1] - obs_deg[-2]
+    
+    # 3. Dự báo tuyến tính cho bước thứ h
+    pred_deg = obs_deg[-1] + (h * v)
+    
+    # 4. Trả về đơn vị 0.1 degree (ví dụ: 1125, 161) 
+    # để TCEvaluator tính Haversine ra km chính xác.
+    return pred_deg * 10.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1263,27 +1286,73 @@ def classify(gt_01: np.ndarray, thr: float = RECURV_THR_DEG) -> str:
     return "recurvature" if total_rotation_angle(gt_01) >= thr else "straight"
 
 
+# def ate_cte(pred_01: np.ndarray, gt_01: np.ndarray,
+#             lon_idx: int = 0, lat_idx: int = 1
+#             ) -> Tuple[np.ndarray, np.ndarray]:
+#     T = pred_01.shape[0]
+#     ate_arr = np.zeros(T)
+#     cte_arr = np.zeros(T)
+#     for k in range(T):
+#         if k == 0:
+#             dk = gt_01[1] - gt_01[0] if T > 1 else np.array([1.0, 0.0])
+#         else:
+#             dk = gt_01[k] - gt_01[k - 1]
+#         norm_dk = np.linalg.norm(dk)
+#         if norm_dk < 1e-8:
+#             continue
+#         t_hat = dk / norm_dk
+#         n_hat = np.array([-t_hat[1], t_hat[0]])
+#         delta = pred_01[k] - gt_01[k]
+        
+#         # Lấy vĩ độ thực tế để tính hệ số km
+#         lat_deg = gt_01[k, 1] / 10.0
+#         km_per_01deg = 11.11 # 111.1 / 10
+        
+#         # Chuyển đổi delta sang km (đơn giản hóa cục bộ)
+#         delta_km = delta * km_per_01deg
+#         delta_km[0] *= np.cos(np.deg2rad(lat_deg)) # Bù trừ kinh độ theo vĩ độ
+        
+#         ate_arr[k] = float(np.dot(delta_km, t_hat))
+#         cte_arr[k] = float(np.dot(delta_km, n_hat))
+#     return ate_arr, cte_arr
 def ate_cte(pred_01: np.ndarray, gt_01: np.ndarray,
             lon_idx: int = 0, lat_idx: int = 1
             ) -> Tuple[np.ndarray, np.ndarray]:
     T = pred_01.shape[0]
     ate_arr = np.zeros(T)
     cte_arr = np.zeros(T)
+    
+    km_per_01deg = 11.112 # Quy đổi 0.1 độ sang km
+
     for k in range(T):
+        # 1. Tính vector dịch chuyển của Ground Truth để làm hệ trục tọa độ
         if k == 0:
             dk = gt_01[1] - gt_01[0] if T > 1 else np.array([1.0, 0.0])
         else:
             dk = gt_01[k] - gt_01[k - 1]
-        norm_dk = np.linalg.norm(dk)
+        
+        # Bù trừ vĩ độ cho vector hướng
+        lat_rad = np.deg2rad(gt_01[k, lat_idx] / 10.0)
+        dk_km = dk * km_per_01deg
+        dk_km[0] *= np.cos(lat_rad)
+        
+        norm_dk = np.linalg.norm(dk_km)
         if norm_dk < 1e-8:
             continue
-        t_hat = dk / norm_dk
-        n_hat = np.array([-t_hat[1], t_hat[0]])
-        delta = pred_01[k] - gt_01[k]
-        ate_arr[k] = float(np.dot(delta, t_hat))
-        cte_arr[k] = float(np.dot(delta, n_hat))
-    return ate_arr, cte_arr
+            
+        t_hat = dk_km / norm_dk # Vector hướng đi (Along-track)
+        n_hat = np.array([-t_hat[1], t_hat[0]]) # Vector chệch hướng (Cross-track)
 
+        # 2. Tính sai số vị trí thực tế bằng km
+        delta_pos = pred_01[k] - gt_01[k]
+        delta_km = delta_pos * km_per_01deg
+        delta_km[0] *= np.cos(lat_rad) # Bù trừ kinh độ
+
+        # 3. Chiếu sai số lên hệ trục ATE/CTE
+        ate_arr[k] = float(np.dot(delta_km, t_hat))
+        cte_arr[k] = float(np.dot(delta_km, n_hat))
+
+    return ate_arr, cte_arr
 
 def circular_std(angles_deg: np.ndarray) -> float:
     if len(angles_deg) == 0:
@@ -1457,6 +1526,7 @@ class SequenceResult:
     ate:       np.ndarray
     cte:       np.ndarray
     category:  str
+    category_pred: str
     theta:     float
     csd_gt:    float
     oyr_val:   float
@@ -1652,6 +1722,11 @@ class TCEvaluator:
         _ate, _cte = ate_cte(p, g)
         theta      = total_rotation_angle(g)
         cat        = "recurvature" if theta >= self.recurv_thr else "straight"
+           # --- THÊM LOGIC NÀY: Nhãn của Model dự báo ---
+        theta_pred = total_rotation_angle(p)
+        cat_pred   = "recurvature" if theta_pred >= self.recurv_thr else "straight"
+        # --------------------------------------------
+
         csd_g      = compute_csd(g)
         _oyr       = oyr(p, g)
         _hle       = hle(p, g)
@@ -1668,16 +1743,28 @@ class TCEvaluator:
                          g[h]) for h in range(T)
             ])
 
+        # dtw_val = dtw_haversine(p, g) if self.compute_dtw else float("nan")
+
+        # r = SequenceResult(
+        #     ade=_ade, fde=_fde, per_step=ps,
+        #     ate=_ate, cte=_cte,
+        #     category=cat, theta=theta, csd_gt=csd_g,
+        #     oyr_val=_oyr, hle_val=_hle,
+        #     crps=crps_arr, ssr=ssr_arr, dtw=dtw_val,
+        # )
+
         dtw_val = dtw_haversine(p, g) if self.compute_dtw else float("nan")
 
+        # CẬP NHẬT ĐOẠN KHỞI TẠO r
         r = SequenceResult(
             ade=_ade, fde=_fde, per_step=ps,
             ate=_ate, cte=_cte,
-            category=cat, theta=theta, csd_gt=csd_g,
+            category=cat,           # Nhãn thật
+            category_pred=cat_pred, # Nhãn dự báo (MỚI THÊM)
+            theta=theta, csd_gt=csd_g,
             oyr_val=_oyr, hle_val=_hle,
             crps=crps_arr, ssr=ssr_arr, dtw=dtw_val,
         )
-
         if loss_dict:
             r.loss_fm      = loss_dict.get("fm",      float("nan"))
             r.loss_dir     = loss_dict.get("dir",     float("nan"))
@@ -1763,9 +1850,19 @@ class TCEvaluator:
 
         csd_vals = [r.csd_gt for r in rs]
         tau = float(np.median(csd_vals)) if csd_vals else 0.0
-        rdr_num = sum(1 for r in rec_r if r.csd_gt >= tau)
-        rdr_val = rdr_num / len(rec_r) if rec_r else float("nan")
+        # rdr_num = sum(1 for r in rec_r if r.csd_gt >= tau)
+        # rdr_val = rdr_num / len(rec_r) if rec_r else float("nan")
 
+        # ── RDR (Recurvature Detection Rate - Tỷ lệ phát hiện quay đầu) ──
+        # rec_r là danh sách các ca thực tế là quay đầu (Ground Truth = recurvature)
+        if rec_r:
+            # Đếm xem trong những ca quay đầu thật, model đoán đúng bao nhiêu ca
+            rdr_num = sum(1 for r in rec_r if r.category_pred == "recurvature")
+            rdr_val = rdr_num / len(rec_r)
+        else:
+            rdr_val = float("nan")
+            
+        # Sau đó gán rdr_val vào DatasetMetrics ở bên dưới
         m = DatasetMetrics(
             ade           = float(np.mean([r.ade for r in rs])),
             fde           = float(np.mean([r.fde for r in rs])),

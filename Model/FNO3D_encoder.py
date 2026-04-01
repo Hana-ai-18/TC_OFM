@@ -83,27 +83,36 @@ class SpectralConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T, H, W = x.shape
-
-        # FIX 2: float32 before FFT to avoid ComplexHalf under AMP
+        # Cast to float32 for FFT stability under AMP
         x_ft = torch.fft.rfftn(x.float(), dim=(-3, -2, -1), norm="ortho")
 
-        mt = min(self.modes_t, T      // 2)
-        mh = min(self.modes_h, H      // 2)
+        out_ft = torch.zeros(B, self.out_ch, T, H, W // 2 + 1, 
+                             dtype=torch.cfloat, device=x.device)
+
+        mt = min(self.modes_t, T // 2)
+        mh = min(self.modes_h, H // 2)
         mw = min(self.modes_w, W // 2 + 1)
 
-        # FIX 3: always cfloat
-        out_ft = torch.zeros(
-            B, self.out_ch, T, H, W // 2 + 1,
-            dtype=torch.cfloat, device=x.device,
-        )
+        # FIX LOGIC: Lấy đủ 4 góc phổ để giữ các tần số thấp quan trọng
+        # (Chỉ chiều W là không cần vì rfftn đã cắt một nửa)
+        
+        # Góc 1: Dương Time, Dương Height
         out_ft[:, :, :mt, :mh, :mw] = self._complex_mul(
-            x_ft[:, :, :mt, :mh, :mw], self.w_re, self.w_im,
-        )
+            x_ft[:, :, :mt, :mh, :mw], self.w_re, self.w_im)
+        
+        # Góc 2: Âm Time, Dương Height (Thêm phần này để model "nhạy" hơn)
+        out_ft[:, :, -mt:, :mh, :mw] = self._complex_mul(
+            x_ft[:, :, -mt:, :mh, :mw], self.w_re, self.w_im)
+            
+        # Góc 3: Dương Time, Âm Height
+        out_ft[:, :, :mt, -mh:, :mw] = self._complex_mul(
+            x_ft[:, :, :mt, -mh:, :mw], self.w_re, self.w_im)
+            
+        # Góc 4: Âm Time, Âm Height
+        out_ft[:, :, -mt:, -mh:, :mw] = self._complex_mul(
+            x_ft[:, :, -mt:, -mh:, :mw], self.w_re, self.w_im)
 
-        return torch.fft.irfftn(
-            out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho"
-        ).to(x.dtype)
-
+        return torch.fft.irfftn(out_ft, s=(T, H, W), dim=(-3, -2, -1), norm="ortho").to(x.dtype)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FNO Layer = SpectralConv + local Conv residual
@@ -154,8 +163,8 @@ class FNO3DEncoder(nn.Module):
         d_model:      int   = 32,    # FIX: was 64
         n_layers:     int   = 4,
         modes_t:      int   = 4,
-        modes_h:      int   = 4,     # FIX: was 16
-        modes_w:      int   = 4,     # FIX: was 16
+        modes_h:      int   = 8,     # FIX: was 16
+        modes_w:      int   = 8,     # FIX: was 16
         spatial_down: int   = 32,
         dropout:      float = 0.05,
     ):
