@@ -1428,7 +1428,7 @@ def recurvature_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         return pred.new_zeros(())
     weighted = (dir_loss * mask).sum() / mask.sum().clamp(min=1)  # mean chỉ tại turning points
     return weighted
-    return weighted.mean()
+    # return weighted.mean()
 
 
 # ── AFCRPS loss ───────────────────────────────────────────────────────────────
@@ -1887,7 +1887,7 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
 
     # 2. CÁC THÀNH PHẦN LOSS
     # HIỆN TẠI — gọi với unit_01deg=False nhưng input là normalized coords
-    l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
+    # l_fm = fm_afcrps_loss(pred_samples, gt, intensity_w=sample_w)
     # bên trong: _haversine(..., unit_01deg=False) → coi lon/lat là degrees trực tiếp
     # nhưng normalized coords ~[-2,3], không phải degrees [0,180]
 
@@ -1932,11 +1932,14 @@ def compute_total_loss(pred_abs, gt, ref, batch_list, pred_samples=None,
     return dict(
         total=total,
         fm=l_fm.item(),
-        velocity=l_vel.item(),   # ← đổi từ 'vel' → 'velocity'
+        velocity=l_vel.item(),
         step=l_step.item(),
         disp=l_disp.item(),
+        heading=l_heading.item(),    # ← thêm
         recurv=l_recurv.item(),
         smooth=l_smooth.item(),
+        accel=l_accel.item(),        # ← thêm
+        pinn=l_pinn.item(),          # ← thêm — đây là nguyên nhân pinn=0.0000
         recurv_ratio=(recurv_w > 1.0).float().mean().item()
     )
 # ── Legacy helpers ────────────────────────────────────────────────────────────
