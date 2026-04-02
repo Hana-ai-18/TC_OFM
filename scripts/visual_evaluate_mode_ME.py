@@ -2244,6 +2244,49 @@ def _plot_on_ax(
 
 # ── Run inference ──────────────────────────────────────────────────────────────
 
+def _extract_seq(tensor, batch_idx=0):
+    """
+    Safely extract the trajectory for one sample from a batch tensor.
+
+    seq_collate produces obs/gt with shape  [T, B, F]  (time-first).
+    model.sample()  produces pred with shape [B, T, F]  (batch-first).
+    all_trajs has shape [S, B, T, F]  (ensemble-first, batch-second).
+
+    This function normalises both conventions → returns [T, F].
+
+    Heuristic: if dim-0 >> dim-1, assume time-first [T, B, F];
+               otherwise assume batch-first [B, T, F].
+    We also print shapes once so bugs are immediately visible.
+    """
+    t = tensor.cpu()
+    if t.dim() == 3:
+        d0, d1, _ = t.shape
+        # If d0 looks like a time axis (≥ d1 * 2 or d1 == 1), treat as [T, B, F]
+        if d1 == 1 or d0 >= d1 * 2:
+            return t[:, batch_idx, :].numpy()      # [T, B, F] → [T, F]
+        else:
+            return t[batch_idx, :, :].numpy()      # [B, T, F] → [T, F]
+    raise ValueError(f"_extract_seq: unexpected tensor dim {t.dim()}, shape {t.shape}")
+
+
+def _extract_ens(all_trajs, batch_idx=0):
+    """
+    Extract ensemble trajectories for one sample.
+    Expected shape: [S, B, T, F]  →  returns [S, T, F]
+    Also handles [S, T, B, F] just in case.
+    """
+    t = all_trajs.cpu()
+    if t.dim() == 4:
+        S, d1, d2, F = t.shape
+        if d1 == 1 or d2 > d1:
+            # [S, B, T, F]
+            return t[:, batch_idx, :, :].numpy()   # → [S, T, F]
+        else:
+            # [S, T, B, F]
+            return t[:, :, batch_idx, :].numpy()   # → [S, T, F]
+    raise ValueError(f"_extract_ens: unexpected tensor dim {t.dim()}, shape {t.shape}")
+
+
 def run_inference(model, target, device, ode_steps, num_ensemble):
     batch = move_batch(seq_collate([target]), device)
     with torch.no_grad():
@@ -2251,11 +2294,18 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
             batch, num_ensemble=num_ensemble, ddim_steps=ode_steps
         )
 
-    obs_n     = batch[0][:, 0, :].cpu().numpy()
-    gt_n      = batch[1][:, 0, :].cpu().numpy()
-    pred_n    = pred_mean[:, 0, :].cpu().numpy()
-    pred_Me_n = pred_Me[:, 0, :].cpu().numpy()
-    ens_n     = all_trajs[:, :, 0, :].cpu().numpy()   # [S, T, 2]
+    # ── Debug: print shapes once so axis confusion is immediately visible ──
+    print(f"  [shape] batch[0]   (obs)      : {tuple(batch[0].shape)}")
+    print(f"  [shape] batch[1]   (gt)       : {tuple(batch[1].shape)}")
+    print(f"  [shape] pred_mean             : {tuple(pred_mean.shape)}")
+    print(f"  [shape] pred_Me               : {tuple(pred_Me.shape)}")
+    print(f"  [shape] all_trajs             : {tuple(all_trajs.shape)}")
+
+    obs_n     = _extract_seq(batch[0])       # [T_obs,  2]
+    gt_n      = _extract_seq(batch[1])       # [T_pred, 2]
+    pred_n    = _extract_seq(pred_mean)      # [T_pred, 2]
+    pred_Me_n = _extract_seq(pred_Me)        # [T_pred, F_me]
+    ens_n     = _extract_ens(all_trajs)      # [S, T_pred, 2]
 
     obs_deg  = to_deg(denorm_traj(obs_n))
     gt_deg   = to_deg(denorm_traj(gt_n))
