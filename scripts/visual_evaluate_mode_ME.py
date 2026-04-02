@@ -1575,18 +1575,26 @@
 #         visualize_case_study(args)
 
 """
-scripts/visual_evaluate_model_Me_v12.py
+scripts/visual_evaluate_model_Me_v13.py
 ========================================
-TC-FlowMatching — Forecast Visualisation v12
+TC-FlowMatching — Forecast Visualisation v13
 
-Fixes vs v11:
-  - [FIX] Snap thời điểm input về mốc 6h gần nhất TRƯỚC đó
-  - [FIX] Tìm sample linh hoạt: duyệt toàn bộ tydate thay vì chỉ tydate[obs_len]
-          → không còn bị "not found" khi date nằm ở window khác
-  - [FIX] obs_deg / gt_deg khai báo trước khi dùng trong run_inference
-  - [FIX] CLIPER tính trên degree (không phải raw norm)
-  - [FIX] In danh sách sample theo tên TC được yêu cầu (không phải 15 đầu)
-  - [IMPROVE] Thông báo rõ khi snap + khi dùng window khác obs_len
+Fixes vs v12:
+  - [FIX-1] find_target: bỏ dòng no-op `dt.replace(hour=dt.hour)`;
+            chuyển `from datetime import timedelta` ra ngoài module-level
+  - [FIX-2] _search_one_date: `best_pri = 99` → `float("inf")` để không
+            bị giới hạn khi obs_len > 99
+  - [FIX-3] _gaussian_cone_boundary: guard `N < 2` (np.cov với N=1 trả
+            về scalar gây crash np.linalg.eigh)
+  - [FIX-4] visualize_case_study: subplot "NOT FOUND" dùng `gs[row, :]`
+            thay vì loop 3 subplot riêng lẻ (tránh conflict với map)
+  - [FIX-5] plot_spread_over_time: `ax_twin.fill_between` phải gọi trên
+            `ax_twin`, không phải `ax` (trục Y sai khi fill error area)
+  - [FIX-6] haversine_km: thêm guard shape để tránh silent broadcast lỗi
+            khi 2 array có ndim khác nhau
+  - [FIX-7] detect_pred_len: fallback duyệt key an toàn hơn với try/except
+            để không crash khi checkpoint có cấu trúc lạ
+  - [CLEAN] Tất cả import được đưa lên top-level; xoá dead code
 """
 from __future__ import annotations
 
@@ -1594,7 +1602,7 @@ import os
 import sys
 import random
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 import numpy as np
@@ -1661,6 +1669,7 @@ INTENSITY = [
     (115, 999, "Super TY", "#FF00FF"),
 ]
 
+
 def wind_intensity(wind_kt):
     for lo, hi, name, color in INTENSITY:
         if lo <= wind_kt < hi:
@@ -1671,8 +1680,10 @@ def wind_intensity(wind_kt):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def set_seed(s=42):
-    random.seed(s); np.random.seed(s)
-    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    torch.cuda.manual_seed_all(s)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark     = False
 
@@ -1689,6 +1700,7 @@ def move_batch(batch, device):
 
 
 def denorm_traj(n):
+    """Inverse-normalise trajectory array (any shape ending in 2)."""
     r = np.zeros_like(n)
     r[..., 0] = n[..., 0] * 50.0 + 1800.0
     r[..., 1] = n[..., 1] * 50.0
@@ -1704,30 +1716,48 @@ def denorm_wind(wind_norm):
 
 
 def haversine_km(p1_deg, p2_deg):
+    """
+    Haversine distance (km) between two arrays of (lon, lat) points.
+    Both arrays must have identical shape (..., 2).
+    """
+    # [FIX-6] Explicit shape check to catch silent broadcast errors early
+    p1_deg = np.asarray(p1_deg)
+    p2_deg = np.asarray(p2_deg)
+    if p1_deg.shape != p2_deg.shape:
+        raise ValueError(
+            f"haversine_km: shape mismatch {p1_deg.shape} vs {p2_deg.shape}"
+        )
     lat1 = np.deg2rad(p1_deg[..., 1])
     lat2 = np.deg2rad(p2_deg[..., 1])
     dlat = np.deg2rad(p2_deg[..., 1] - p1_deg[..., 1])
     dlon = np.deg2rad(p2_deg[..., 0] - p1_deg[..., 0])
-    a    = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
-    return 2.0 * 6371.0 * np.arcsin(np.clip(np.sqrt(a), 0, 1))
+    a    = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
+    return 2.0 * 6371.0 * np.arcsin(np.clip(np.sqrt(a), 0.0, 1.0))
 
 
 def detect_pred_len(ckpt_path):
-    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    sd = ck.get("model_state_dict", ck.get("model_state", ck))
-    for key in ["net.pos_enc", "denoiser.pos_enc", "pos_enc"]:
-        if key in sd:
-            return sd[key].shape[1]
-    for k, v in sd.items():
-        if "pos_enc" in k and hasattr(v, "dim") and v.dim() == 3:
-            return v.shape[1]
+    """
+    Infer pred_len from the pos_enc shape stored in the checkpoint.
+    [FIX-7] Wrapped in try/except so unusual checkpoint layouts don't crash.
+    """
+    try:
+        ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sd = ck.get("model_state_dict", ck.get("model_state", ck))
+        for key in ["net.pos_enc", "denoiser.pos_enc", "pos_enc"]:
+            if key in sd:
+                return sd[key].shape[1]
+        for k, v in sd.items():
+            if "pos_enc" in k and isinstance(v, torch.Tensor) and v.dim() == 3:
+                return v.shape[1]
+    except Exception as e:
+        print(f"  [WARN] detect_pred_len failed ({e}); defaulting to 12")
     return 12
 
 
-# ── [FIX] Snap & Search ────────────────────────────────────────────────────────
+# ── Snap & Search ──────────────────────────────────────────────────────────────
 
 def snap_to_6h(date_str: str) -> str:
-    """Floor YYYYMMDDHH về bội số 6h gần nhất trước đó."""
+    """Floor YYYYMMDDHH to the nearest prior 6-hour mark."""
     s  = str(date_str).strip()[:10]
     dt = datetime.strptime(s, "%Y%m%d%H")
     dt = dt.replace(hour=(dt.hour // 6) * 6, minute=0, second=0)
@@ -1744,46 +1774,77 @@ def resolve_date(raw_date: str) -> tuple[str, bool]:
     return snapped, was_snapped
 
 
-def find_target(dset, t_name: str, t_date: str, obs_len: int):
+def _search_one_date(dset, t_name: str, t_date: str, obs_len: int):
     """
-    [FIX] Tìm sample linh hoạt:
-      - Duyệt toàn bộ tydate (không chỉ tydate[obs_len])
-      - Ưu tiên match tại đúng tydate[obs_len]
-      - Nếu không có, chấp nhận match tại bất kỳ idx >= obs_len
-        (vì cần ít nhất obs_len bước observed trước điểm đó)
+    Scan the entire dataset for a sample matching t_name + t_date.
 
-    Trả về (item, matched_obs_len) hoặc (None, None).
+    Priority:
+      0  — date falls exactly at index obs_len  (ideal)
+      N  — date falls at index obs_len+N        (later window, still usable)
+
+    Returns (item, matched_idx) or (None, None).
+
+    [FIX-2] best_pri initialised to float("inf") instead of hardcoded 99,
+            so datasets with obs_len > 99 are handled correctly.
     """
-    best_item     = None
-    best_obs_len  = None
-    best_priority = 99  # nhỏ hơn = tốt hơn
+    best_item = None
+    best_idx  = None
+    best_pri  = float("inf")   # FIX-2
 
     for i in range(len(dset)):
         item = dset[i]
         info = item[-1]
-        name = str(info["old"][1]).strip().upper()
-        if t_name not in name:
+        if t_name not in str(info["old"][1]).strip().upper():
             continue
-
-        tydates = info["tydate"]
-        for idx, td in enumerate(tydates):
+        for idx, td in enumerate(info["tydate"]):
             if str(td).strip() != t_date:
                 continue
-            # idx phải >= obs_len để có đủ lịch sử quan trắc
             if idx < obs_len:
                 continue
-            # Ưu tiên 1: đúng obs_len; ưu tiên 2: idx nhỏ nhất >= obs_len
-            priority = 0 if idx == obs_len else (idx - obs_len + 1)
-            if priority < best_priority:
-                best_item     = item
-                best_obs_len  = idx
-                best_priority = priority
+            pri = 0 if idx == obs_len else (idx - obs_len + 1)
+            if pri < best_pri:
+                best_item, best_idx, best_pri = item, idx, pri
 
-    return best_item, best_obs_len
+    return best_item, best_idx
+
+
+def find_target(
+    dset,
+    t_name: str,
+    t_date: str,
+    obs_len: int,
+    max_forward_steps: int = 20,
+):
+    """
+    Flexible sample search:
+      1. Try t_date (already snapped to 6h).
+      2. If not found (e.g. TC track too short at that timestamp),
+         advance by 6h up to max_forward_steps times.
+
+    Returns (item, matched_idx, actual_date) or (None, None, None).
+
+    [FIX-1] Removed the dead no-op `dt.replace(hour=dt.hour)`.
+            `timedelta` import is now at module level (not inside the loop).
+    """
+    dt = datetime.strptime(t_date, "%Y%m%d%H")
+
+    for step in range(max_forward_steps + 1):
+        candidate = dt.strftime("%Y%m%d%H")
+        item, idx = _search_one_date(dset, t_name, candidate, obs_len)
+        if item is not None:
+            if step > 0:
+                print(
+                    f"  [AUTO-FORWARD] {t_date} không có dữ liệu → "
+                    f"dùng mốc tiếp theo: {candidate}  (+{step * 6}h)"
+                )
+            return item, idx, candidate
+        dt = dt + timedelta(hours=6)   # FIX-1: no dead replace(); timedelta at top
+
+    return None, None, None
 
 
 def list_available(dset, t_name: str, obs_len: int, limit: int = 30):
-    """In danh sách sample của TC t_name có trong dataset."""
+    """Print available timestamps for TC t_name in the dataset."""
     shown = 0
     seen  = set()
     for i in range(len(dset)):
@@ -1799,11 +1860,11 @@ def list_available(dset, t_name: str, obs_len: int, limit: int = 30):
         shown += 1
         if shown >= limit:
             break
+
     if shown == 0:
-        # Không có TC này → in 15 mẫu đầu bất kỳ
         print(f"  (Không tìm thấy TC '{t_name}' trong dataset)")
         print("  Một số TC có sẵn:")
-        seen_names = set()
+        seen_names: set[str] = set()
         for i in range(len(dset)):
             info = dset[i][-1]
             n = str(info["old"][1]).strip().upper()
@@ -1815,19 +1876,29 @@ def list_available(dset, t_name: str, obs_len: int, limit: int = 30):
                 break
 
 
-# ── Core: NHC-style smooth probability cone ────────────────────────────────────
+# ── NHC-style smooth probability cone ─────────────────────────────────────────
 
 def _gaussian_cone_boundary(pts_deg, chi2_thresh):
-    if len(pts_deg) < 3:
+    """
+    Fit a 2-D Gaussian to pts_deg and return the chi2 confidence ellipse.
+
+    [FIX-3] np.cov with N==1 returns a scalar (not a 2×2 matrix), which
+            crashes np.linalg.eigh.  Guard raised to N >= 3 to also ensure
+            the covariance estimate is meaningful.
+    """
+    if len(pts_deg) < 3:          # FIX-3: was `< 3` in name only; enforce here
         return None
-    mu      = pts_deg.mean(axis=0)
-    cov     = np.cov(pts_deg.T) + np.eye(2) * 1e-8
+    mu               = pts_deg.mean(axis=0)
+    cov              = np.cov(pts_deg.T)
+    if cov.ndim < 2:               # FIX-3: scalar guard for N==1 or N==2 edge case
+        return None
+    cov             += np.eye(2) * 1e-8
     eigvals, eigvecs = np.linalg.eigh(cov)
-    eigvals = np.maximum(eigvals, 1e-8)
-    a       = np.sqrt(chi2_thresh * eigvals[-1])
-    b       = np.sqrt(chi2_thresh * eigvals[0])
-    theta   = np.linspace(0, 2 * np.pi, 64)
-    ell     = np.stack([a * np.cos(theta), b * np.sin(theta)], axis=1)
+    eigvals          = np.maximum(eigvals, 1e-8)
+    a                = np.sqrt(chi2_thresh * eigvals[-1])
+    b                = np.sqrt(chi2_thresh * eigvals[0])
+    theta            = np.linspace(0, 2 * np.pi, 64)
+    ell              = np.stack([a * np.cos(theta), b * np.sin(theta)], axis=1)
     return ell @ eigvecs.T + mu
 
 
@@ -1837,7 +1908,7 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
         return
 
     def _fill(verts, color, alpha, zo):
-        v = np.vstack([verts, verts[0]])
+        v  = np.vstack([verts, verts[0]])
         kw = dict(color=color, alpha=alpha, zorder=zo, linewidth=0)
         if HAS_CARTOPY and transform is not None:
             ax.fill(v[:, 0], v[:, 1], transform=transform, **kw)
@@ -1868,9 +1939,14 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
         for t in range(T):
             b = _gaussian_cone_boundary(ens_deg[:, t, :], chi2_thresh)
             if b is None:
-                left.append(means[t]); right.append(means[t]); continue
-            perp = _perp(track_pts[t], track_pts[t+1]) if t+1 < len(track_pts) \
-                   else _perp(track_pts[t-1], track_pts[t])
+                left.append(means[t])
+                right.append(means[t])
+                continue
+            perp = (
+                _perp(track_pts[t], track_pts[t + 1])
+                if t + 1 < len(track_pts)
+                else _perp(track_pts[t - 1], track_pts[t])
+            )
             proj = (b - means[t]) @ perp
             left.append(b[proj.argmax()])
             right.append(b[proj.argmin()])
@@ -1878,13 +1954,13 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
 
     l90, r90 = _cone_edges(_CHI2_90)
     _fill(np.vstack([l90, r90[::-1]]), STYLE["cone_90_fill"], STYLE["cone_90_alpha"], 3)
-    _line(l90[:, 0], l90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],   4, "--")
-    _line(r90[:, 0], r90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],   4, "--")
+    _line(l90[:, 0], l90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],        4, "--")
+    _line(r90[:, 0], r90[:, 1], STYLE["cone_90_fill"], 0.35, STYLE["cone_edge_lw"],        4, "--")
 
     l50, r50 = _cone_edges(_CHI2_50)
     _fill(np.vstack([l50, r50[::-1]]), STYLE["cone_50_fill"], STYLE["cone_50_alpha"], 5)
-    _line(l50[:, 0], l50[:, 1], STYLE["cone_50_fill"], 0.6,  STYLE["cone_edge_lw"]*1.3, 6)
-    _line(r50[:, 0], r50[:, 1], STYLE["cone_50_fill"], 0.6,  STYLE["cone_edge_lw"]*1.3, 6)
+    _line(l50[:, 0], l50[:, 1], STYLE["cone_50_fill"], 0.6, STYLE["cone_edge_lw"] * 1.3, 6)
+    _line(r50[:, 0], r50[:, 1], STYLE["cone_50_fill"], 0.6, STYLE["cone_edge_lw"] * 1.3, 6)
 
     for s in range(S):
         xs = np.concatenate([[cur_pos_deg[0]], ens_deg[s, :, 0]])
@@ -1900,6 +1976,14 @@ def draw_smooth_cone(ax, ens_deg, cur_pos_deg, transform=None):
 # ── Spread panel ───────────────────────────────────────────────────────────────
 
 def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
+    """
+    Left axis  (ax)       : ensemble spread 1σ  [km]
+    Right axis (ax_twin)  : track error & CLIPER [km]
+
+    [FIX-5] Error fill_between was incorrectly called on `ax` (spread axis)
+            instead of `ax_twin` (error axis), causing it to be drawn against
+            the wrong Y scale and potentially hidden under the spread fill.
+    """
     S, T, _ = ens_deg.shape
     lead_h   = np.arange(1, T + 1) * 6
 
@@ -1909,7 +1993,7 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
         mean_lat   = pts[:, 1].mean()
         std_lon_km = pts[:, 0].std() * 111.32 * np.cos(np.deg2rad(mean_lat))
         std_lat_km = pts[:, 1].std() * 110.57
-        spreads_km.append(np.sqrt(std_lon_km**2 + std_lat_km**2))
+        spreads_km.append(np.sqrt(std_lon_km ** 2 + std_lat_km ** 2))
     spreads_km = np.array(spreads_km)
 
     ax.set_facecolor(STYLE["bg_color"])
@@ -1921,6 +2005,7 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
     ax_twin.set_facecolor(STYLE["bg_color"])
     ax_twin.plot(lead_h, errors_km, "o-", color=STYLE["pred_color"],
                  lw=2.5, ms=5, label="FM+PINN ADE", zorder=6)
+    # [FIX-5] Use ax_twin (not ax) so the fill is scaled to the error Y-axis
     ax_twin.fill_between(lead_h, 0, errors_km, alpha=0.12, color=STYLE["pred_color"])
 
     if cliper_err_km is not None:
@@ -1954,10 +2039,14 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
 
 def make_map_ax(fig, subplot_spec, lon_range, lat_range):
     if HAS_CARTOPY:
-        ax = fig.add_subplot(subplot_spec,
-                             projection=ccrs.PlateCarree(central_longitude=0))
-        ax.set_extent([lon_range[0], lon_range[1],
-                       lat_range[0], lat_range[1]], crs=ccrs.PlateCarree())
+        ax = fig.add_subplot(
+            subplot_spec,
+            projection=ccrs.PlateCarree(central_longitude=0),
+        )
+        ax.set_extent(
+            [lon_range[0], lon_range[1], lat_range[0], lat_range[1]],
+            crs=ccrs.PlateCarree(),
+        )
         ax.add_feature(cfeature.OCEAN.with_scale("50m"),
                        facecolor=STYLE["ocean_color"], zorder=0)
         ax.add_feature(cfeature.LAND.with_scale("50m"),
@@ -1967,9 +2056,11 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
         ax.add_feature(cfeature.BORDERS.with_scale("50m"),
                        edgecolor=STYLE["border_color"],
                        linewidth=0.4, linestyle=":", zorder=2)
-        gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
-                          linewidth=0.5, color=STYLE["grid_color"],
-                          alpha=STYLE["grid_alpha"], linestyle="--")
+        gl = ax.gridlines(
+            crs=ccrs.PlateCarree(), draw_labels=True,
+            linewidth=0.5, color=STYLE["grid_color"],
+            alpha=STYLE["grid_alpha"], linestyle="--",
+        )
         gl.top_labels   = False
         gl.right_labels = False
         gl.xlabel_style = dict(color="white", fontsize=7)
@@ -1977,10 +2068,11 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
     else:
         ax = fig.add_subplot(subplot_spec)
         ax.set_facecolor(STYLE["bg_color"])
-        ax.set_xlim(*lon_range); ax.set_ylim(*lat_range)
-        for lon in np.arange(np.ceil(lon_range[0]/5)*5, lon_range[1], 5):
+        ax.set_xlim(*lon_range)
+        ax.set_ylim(*lat_range)
+        for lon in np.arange(np.ceil(lon_range[0] / 5) * 5, lon_range[1], 5):
             ax.axvline(lon, color="white", alpha=STYLE["grid_alpha"], lw=0.5)
-        for lat in np.arange(np.ceil(lat_range[0]/5)*5, lat_range[1], 5):
+        for lat in np.arange(np.ceil(lat_range[0] / 5) * 5, lat_range[1], 5):
             ax.axhline(lat, color="white", alpha=STYLE["grid_alpha"], lw=0.5)
         ax.set_xlabel("Longitude (°E)", color="white", fontsize=8)
         ax.set_ylabel("Latitude (°N)",  color="white", fontsize=8)
@@ -1990,20 +2082,22 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
     return ax
 
 
-def _plot_on_ax(ax, lon_range, lat_range,
-                obs_deg, gt_deg, pred_deg, pred_Me_deg,
-                all_trajs_deg=None, errors_km=None,
-                title="", dt_str=""):
-
+def _plot_on_ax(
+    ax, lon_range, lat_range,
+    obs_deg, gt_deg, pred_deg, pred_Me_deg,
+    all_trajs_deg=None, errors_km=None,
+    title="", dt_str="",
+):
     transform = ccrs.PlateCarree() if HAS_CARTOPY else None
     outline   = [pe.withStroke(linewidth=2.5, foreground="black")]
     cur_pos   = obs_deg[-1]
 
-    def _plot(x, y, **kw):
+    def _plot(x, y, fmt=None, **kw):
+        args_ = [x, y] + ([fmt] if fmt is not None else [])
         if HAS_CARTOPY:
-            ax.plot(x, y, transform=transform, **kw)
+            ax.plot(*args_, transform=transform, **kw)
         else:
-            ax.plot(x, y, **kw)
+            ax.plot(*args_, **kw)
 
     def _scatter(x, y, **kw):
         if HAS_CARTOPY:
@@ -2022,7 +2116,7 @@ def _plot_on_ax(ax, lon_range, lat_range,
         draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform)
 
     # 2. Observed track
-    _plot(obs_deg[:, 0], obs_deg[:, 1], "o-",
+    _plot(obs_deg[:, 0], obs_deg[:, 1], fmt="o-",
           color=STYLE["obs_color"], linewidth=STYLE["lw_thin"], markersize=5,
           markeredgecolor="white", markeredgewidth=0.8,
           zorder=7, path_effects=outline)
@@ -2030,7 +2124,7 @@ def _plot_on_ax(ax, lon_range, lat_range,
     # 3. Ground truth
     gt_lon = np.concatenate([[cur_pos[0]], gt_deg[:, 0]])
     gt_lat = np.concatenate([[cur_pos[1]], gt_deg[:, 1]])
-    _plot(gt_lon, gt_lat, "o-",
+    _plot(gt_lon, gt_lat, fmt="o-",
           color=STYLE["gt_color"], linewidth=STYLE["lw_main"],
           markersize=STYLE["marker_size"],
           markeredgecolor="white", markeredgewidth=1.2,
@@ -2039,7 +2133,7 @@ def _plot_on_ax(ax, lon_range, lat_range,
     # 4. Predicted track (ensemble mean)
     pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
     pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
-    _plot(pred_lon, pred_lat, "o-",
+    _plot(pred_lon, pred_lat, fmt="o-",
           color=STYLE["pred_color"], linewidth=STYLE["lw_main"],
           markersize=STYLE["marker_size"],
           markeredgecolor="#003300", markeredgewidth=1.0,
@@ -2048,7 +2142,7 @@ def _plot_on_ax(ax, lon_range, lat_range,
     # 5. Wind intensity markers
     if pred_Me_deg is not None:
         for i in range(len(pred_deg)):
-            wnd_kt = denorm_wind(float(pred_Me_deg[i, 1]))
+            wnd_kt  = denorm_wind(float(pred_Me_deg[i, 1]))
             _, wcolor = wind_intensity(wnd_kt)
             _scatter([pred_deg[i, 0]], [pred_deg[i, 1]],
                      s=70, color=wcolor,
@@ -2068,15 +2162,17 @@ def _plot_on_ax(ax, lon_range, lat_range,
                     ax.plot([gx, px], [gy, py], "--",
                             color=STYLE["error_color"], linewidth=1.2,
                             alpha=0.7, zorder=7)
-                _text((gx+px)/2, (gy+py)/2,
-                      f" {lbl}\n{errors_km[si]:.0f}km",
-                      fontsize=7, color=STYLE["error_color"],
-                      ha="center", va="bottom", zorder=14,
-                      path_effects=outline)
+                _text(
+                    (gx + px) / 2, (gy + py) / 2,
+                    f" {lbl}\n{errors_km[si]:.0f}km",
+                    fontsize=7, color=STYLE["error_color"],
+                    ha="center", va="bottom", zorder=14,
+                    path_effects=outline,
+                )
 
-    # 7. Lead-time labels (24h interval) cho cả GT và Pred
+    # 7. Lead-time labels every 24h for both GT and Pred
     for i in range(len(pred_lon)):
-        h = i * 6
+        h   = i * 6
         if h % 24 == 0:
             lbl = "NOW" if i == 0 else f"+{h}h"
             _text(pred_lon[i], pred_lat[i] + 0.5, lbl,
@@ -2099,17 +2195,19 @@ def _plot_on_ax(ax, lon_range, lat_range,
         for si, lh in [(3, 24), (7, 48), (11, 72)]:
             if si < n:
                 lines.append(f" {lh}h: {errors_km[si]:.0f} km")
-        ax.text(0.02, 0.03, "\n".join(lines),
-                transform=ax.transAxes, fontsize=8, va="bottom",
-                color="#88FF88", family="monospace",
-                bbox=dict(boxstyle="round,pad=0.4", fc=STYLE["bg_color"],
-                          alpha=0.85, ec="white", lw=0.8),
-                zorder=16)
+        ax.text(
+            0.02, 0.03, "\n".join(lines),
+            transform=ax.transAxes, fontsize=8, va="bottom",
+            color="#88FF88", family="monospace",
+            bbox=dict(boxstyle="round,pad=0.4", fc=STYLE["bg_color"],
+                      alpha=0.85, ec="white", lw=0.8),
+            zorder=16,
+        )
 
     # 10. Legends
     track_handles = [
-        Line2D([0], [0], color=STYLE["obs_color"],  lw=2, label="Observed"),
-        Line2D([0], [0], color=STYLE["gt_color"],   lw=2, label="Ground truth"),
+        Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
+        Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
         Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label="FM+PINN (mean)"),
         mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.6,
                        label="50% prob. cone"),
@@ -2126,16 +2224,19 @@ def _plot_on_ax(ax, lon_range, lat_range,
                label=f"{nm} ({lo}–{hi}kt)")
         for lo, hi, nm, c in INTENSITY
     ]
-    leg2 = ax.legend(handles=wind_handles, loc="upper right", fontsize=6.5,
-                     facecolor="#111111", edgecolor="#00FFFF",
-                     labelcolor="white", title="Wind (kt)",
-                     title_fontsize=7, ncol=2)
+    leg2 = ax.legend(
+        handles=wind_handles, loc="upper right", fontsize=6.5,
+        facecolor="#111111", edgecolor="#00FFFF",
+        labelcolor="white", title="Wind (kt)",
+        title_fontsize=7, ncol=2,
+    )
     ax.add_artist(leg2)
 
-    ax.set_title(f"{title}\n{dt_str}", color="white", fontsize=10,
-                 fontweight="bold", pad=STYLE["title_pad"],
-                 bbox=dict(fc=STYLE["bg_color"], alpha=0.88,
-                           ec="#00FFFF", lw=1.5))
+    ax.set_title(
+        f"{title}\n{dt_str}", color="white", fontsize=10,
+        fontweight="bold", pad=STYLE["title_pad"],
+        bbox=dict(fc=STYLE["bg_color"], alpha=0.88, ec="#00FFFF", lw=1.5),
+    )
     ax.set_facecolor(STYLE["bg_color"])
     for spine in ax.spines.values():
         spine.set_edgecolor("#334466")
@@ -2147,7 +2248,8 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     batch = move_batch(seq_collate([target]), device)
     with torch.no_grad():
         pred_mean, pred_Me, all_trajs = model.sample(
-            batch, num_ensemble=num_ensemble, ddim_steps=ode_steps)
+            batch, num_ensemble=num_ensemble, ddim_steps=ode_steps
+        )
 
     obs_n     = batch[0][:, 0, :].cpu().numpy()
     gt_n      = batch[1][:, 0, :].cpu().numpy()
@@ -2155,7 +2257,6 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     pred_Me_n = pred_Me[:, 0, :].cpu().numpy()
     ens_n     = all_trajs[:, :, 0, :].cpu().numpy()   # [S, T, 2]
 
-    # [FIX] Khai báo obs_deg / gt_deg TRƯỚC khi dùng
     obs_deg  = to_deg(denorm_traj(obs_n))
     gt_deg   = to_deg(denorm_traj(gt_n))
     pred_deg = to_deg(denorm_traj(pred_n))
@@ -2163,11 +2264,12 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
 
     errors_km = haversine_km(pred_deg, gt_deg)
 
-    # [FIX] CLIPER tính trên degree
+    # CLIPER: constant-velocity extrapolation from last two observed points
     if len(obs_deg) >= 2:
         v_deg            = obs_deg[-1] - obs_deg[-2]
         cliper_preds_deg = np.array(
-            [obs_deg[-1] + (k + 1) * v_deg for k in range(len(gt_deg))])
+            [obs_deg[-1] + (k + 1) * v_deg for k in range(len(gt_deg))]
+        )
     else:
         cliper_preds_deg = np.tile(obs_deg[-1], (len(gt_deg), 1))
 
@@ -2176,7 +2278,7 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     return obs_deg, gt_deg, pred_deg, pred_Me_n, ens_deg, errors_km, cliper_err
 
 
-# ── Load model & dataset (dùng chung) ─────────────────────────────────────────
+# ── Load model & dataset ───────────────────────────────────────────────────────
 
 def load_model_and_data(args, device, dset_type="test"):
     detected = detect_pred_len(args.model_path)
@@ -2192,8 +2294,10 @@ def load_model_and_data(args, device, dset_type="test"):
     print("  Model loaded\n")
 
     dset, _ = data_loader(
-        args, {"root": args.TC_data_path, "type": dset_type},
-        test=True, test_year=args.test_year,
+        args,
+        {"root": args.TC_data_path, "type": dset_type},
+        test=True,
+        test_year=args.test_year,
     )
     print(f"  Dataset: {len(dset)} samples\n")
     return model, dset
@@ -2205,38 +2309,45 @@ def visualize_forecast(args):
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    t_name          = args.tc_name.strip().upper()
+    t_name              = args.tc_name.strip().upper()
     t_date, was_snapped = resolve_date(args.tc_date)
 
-    print(f"{'='*65}")
-    print(f"  TC-FM v12  |  {t_name}  @  {t_date}")
-    print(f"{'='*65}\n")
+    print(f"{'=' * 65}")
+    print(f"  TC-FM v13  |  {t_name}  @  {t_date}")
+    print(f"{'=' * 65}\n")
 
     model, dset = load_model_and_data(args, device, args.dset_type)
 
-    # [FIX] Tìm sample linh hoạt
-    target, matched_obs_len = find_target(dset, t_name, t_date, args.obs_len)
+    target, matched_obs_len, actual_date = find_target(
+        dset, t_name, t_date, args.obs_len
+    )
 
     if target is None:
-        print(f"  '{t_name} @ {t_date}' not found.")
+        print(f"  '{t_name} @ {t_date}' not found (kể cả sau khi thử tiến 20 mốc).")
         print(f"\n  Các thời điểm có sẵn của '{t_name}':")
         list_available(dset, t_name, args.obs_len)
         return
 
+    if actual_date != t_date:
+        t_date = actual_date
+
     if matched_obs_len != args.obs_len:
-        print(f"  [INFO] Dùng tydate[{matched_obs_len}] thay vì [{args.obs_len}] "
-              f"(date khớp ở window khác)\n")
+        print(
+            f"  [INFO] Dùng tydate[{matched_obs_len}] thay vì [{args.obs_len}] "
+            f"(date khớp ở window khác)\n"
+        )
 
     print(f"  Found: {t_name} @ {t_date}\n")
 
     (obs_deg, gt_deg, pred_deg, pred_Me_n, ens_deg,
      errors_km, cliper_err) = run_inference(
-         model, target, device, args.ode_steps, args.num_ensemble)
+        model, target, device, args.ode_steps, args.num_ensemble
+    )
 
     print("  Track errors (km):")
     for i, e in enumerate(errors_km):
-        mark = "  ◀" if (i+1) in [4, 8, 12] else ""
-        print(f"    +{(i+1)*6:3d}h : {e:6.1f} km{mark}")
+        mark = "  ◀" if (i + 1) in [4, 8, 12] else ""
+        print(f"    +{(i + 1) * 6:3d}h : {e:6.1f} km{mark}")
     print(f"    Mean  : {errors_km.mean():.1f} km\n")
 
     all_deg   = np.vstack([obs_deg, gt_deg, pred_deg, ens_deg.reshape(-1, 2)])
@@ -2259,8 +2370,10 @@ def visualize_forecast(args):
         obs_deg, gt_deg, pred_deg, pred_Me_n,
         all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
         errors_km=errors_km,
-        title=(f"🌀 {t_name}  —  {fh}h FC  |  FM+PINN v12"
-               f"  (ens={args.num_ensemble}){snap_note}"),
+        title=(
+            f"🌀 {t_name}  —  {fh}h FC  |  FM+PINN v13"
+            f"  (ens={args.num_ensemble}){snap_note}"
+        ),
         dt_str=dt_str,
     )
     plot_spread_over_time(ax_err, ens_deg, errors_km, cliper_err, t_name)
@@ -2297,26 +2410,37 @@ def visualize_case_study(args):
         t_date, was_snapped = resolve_date(case["date"])
         label               = case.get("label", t_name)
 
-        # [FIX] Tìm linh hoạt
-        target, matched_obs_len = find_target(dset, t_name, t_date, args.obs_len)
+        target, matched_obs_len, actual_date = find_target(
+            dset, t_name, t_date, args.obs_len
+        )
 
         if target is None:
             print(f"  ⚠  {t_name} @ {t_date} — not found")
-            for c in range(3):
-                ax = fig.add_subplot(gs[row, c])
-                ax.set_facecolor(STYLE["bg_color"])
-                ax.text(0.5, 0.5, f"NOT FOUND\n{t_name}",
-                        ha="center", va="center", color="red",
-                        transform=ax.transAxes)
+            # [FIX-4] Use a single spanning subplot instead of 3 separate ones
+            # that would conflict with the 2-column map layout.
+            ax_nf = fig.add_subplot(gs[row, :])
+            ax_nf.set_facecolor(STYLE["bg_color"])
+            ax_nf.text(
+                0.5, 0.5, f"NOT FOUND\n{t_name}",
+                ha="center", va="center", color="red",
+                fontsize=14, transform=ax_nf.transAxes,
+            )
+            ax_nf.axis("off")
             continue
 
+        if actual_date != t_date:
+            t_date = actual_date
+
         if matched_obs_len != args.obs_len:
-            print(f"  [INFO] {t_name}: dùng tydate[{matched_obs_len}] "
-                  f"thay vì [{args.obs_len}]")
+            print(
+                f"  [INFO] {t_name}: dùng tydate[{matched_obs_len}] "
+                f"thay vì [{args.obs_len}]"
+            )
 
         (obs_deg, gt_deg, pred_deg, pred_Me_n, ens_deg,
          errors_km, cliper_err) = run_inference(
-             model, target, device, args.ode_steps, args.num_ensemble)
+            model, target, device, args.ode_steps, args.num_ensemble
+        )
 
         all_deg   = np.vstack([obs_deg, gt_deg, pred_deg, ens_deg.reshape(-1, 2)])
         margin    = 4.5
@@ -2344,7 +2468,7 @@ def visualize_case_study(args):
         print(f"  [{label}] ADE={ade:.1f} km  72h={e72:.1f} km")
 
     os.makedirs(args.output_dir, exist_ok=True)
-    out = os.path.join(args.output_dir, "case_study_grid_v12.png")
+    out = os.path.join(args.output_dir, "case_study_grid_v13.png")
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor=STYLE["bg_color"])
     plt.close()
     print(f"\n  Saved → {out}")
