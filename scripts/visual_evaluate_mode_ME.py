@@ -2246,27 +2246,32 @@ def _plot_on_ax(
 
 def _extract_seq(tensor, batch_idx=0):
     """
-    Safely extract the trajectory for one sample from a batch tensor.
+    Extract trajectory for one sample → [T, F].
 
-    seq_collate produces obs/gt with shape  [T, B, F]  (time-first).
-    model.sample()  produces pred with shape [B, T, F]  (batch-first).
-    all_trajs has shape [S, B, T, F]  (ensemble-first, batch-second).
+    seq_collate (traj_TBC) produces [T, B, F].
+    model.sample typically produces [B, T, F].
 
-    This function normalises both conventions → returns [T, F].
-
-    Heuristic: if dim-0 >> dim-1, assume time-first [T, B, F];
-               otherwise assume batch-first [B, T, F].
-    We also print shapes once so bugs are immediately visible.
+    Decision rule (unambiguous given our domain):
+      - If d1 == 1  → time-first [T, 1, F],  take [:, 0, :]
+      - If d0 == 1  → batch-first [1, T, F], take [0, :, :]
+      - If d0 > d1  → time-first  [T, B, F], take [:, batch_idx, :]
+      - If d1 > d0  → batch-first [B, T, F], take [batch_idx, :, :]
+      - If d0 == d1 → ambiguous; default to time-first (seq_collate convention)
     """
     t = tensor.cpu()
-    if t.dim() == 3:
-        d0, d1, _ = t.shape
-        # If d0 looks like a time axis (≥ d1 * 2 or d1 == 1), treat as [T, B, F]
-        if d1 == 1 or d0 >= d1 * 2:
-            return t[:, batch_idx, :].numpy()      # [T, B, F] → [T, F]
-        else:
-            return t[batch_idx, :, :].numpy()      # [B, T, F] → [T, F]
-    raise ValueError(f"_extract_seq: unexpected tensor dim {t.dim()}, shape {t.shape}")
+    if t.dim() != 3:
+        raise ValueError(f"_extract_seq: expected 3-D tensor, got shape {t.shape}")
+    d0, d1, _ = t.shape
+    if d1 == 1:
+        return t[:, batch_idx, :].numpy()    # [T, 1, F] → [T, F]
+    if d0 == 1:
+        return t[batch_idx, :, :].numpy()    # [1, T, F] → [T, F]
+    if d0 > d1:
+        return t[:, batch_idx, :].numpy()    # [T, B, F]
+    if d1 > d0:
+        return t[batch_idx, :, :].numpy()    # [B, T, F]
+    # d0 == d1: default to seq_collate convention (time-first)
+    return t[:, batch_idx, :].numpy()
 
 
 def _extract_ens(all_trajs, batch_idx=0):
@@ -2294,36 +2299,58 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
             batch, num_ensemble=num_ensemble, ddim_steps=ode_steps
         )
 
-    # ── Debug: print shapes once so axis confusion is immediately visible ──
-    print(f"  [shape] batch[0]   (obs)      : {tuple(batch[0].shape)}")
-    print(f"  [shape] batch[1]   (gt)       : {tuple(batch[1].shape)}")
-    print(f"  [shape] pred_mean             : {tuple(pred_mean.shape)}")
-    print(f"  [shape] pred_Me               : {tuple(pred_Me.shape)}")
-    print(f"  [shape] all_trajs             : {tuple(all_trajs.shape)}")
+    # ── Shapes ────────────────────────────────────────────────────────────
+    print(f"  [shape] batch[0] (obs_traj) : {tuple(batch[0].shape)}")
+    print(f"  [shape] batch[1] (pred_traj): {tuple(batch[1].shape)}")
+    print(f"  [shape] pred_mean           : {tuple(pred_mean.shape)}")
+    print(f"  [shape] pred_Me             : {tuple(pred_Me.shape)}")
+    print(f"  [shape] all_trajs           : {tuple(all_trajs.shape)}")
 
-    obs_n     = _extract_seq(batch[0])       # [T_obs,  2]
-    gt_n      = _extract_seq(batch[1])       # [T_pred, 2]
-    pred_n    = _extract_seq(pred_mean)      # [T_pred, 2]
-    pred_Me_n = _extract_seq(pred_Me)        # [T_pred, F_me]
-    ens_n     = _extract_ens(all_trajs)      # [S, T_pred, 2]
+    # ── Extract: seq_collate → [T, B, F]; model.sample → depends on impl ──
+    # batch tensors are [T, B, F] (time-first, from traj_TBC in seq_collate)
+    # model output convention must be checked via shape
+    obs_n     = _extract_seq(batch[0])    # [T_obs,  2]  absolute, normalised
+    gt_n      = _extract_seq(batch[1])    # [T_pred, 2]  absolute, normalised
+    pred_n    = _extract_seq(pred_mean)   # [T_pred, 2]  — unknown space
+    pred_Me_n = _extract_seq(pred_Me)     # [T_pred, F_me]
+    ens_n     = _extract_ens(all_trajs)   # [S, T_pred, 2]
 
-    # ── Deep value debug ──────────────────────────────────────────────────
-    print(f"\n  [raw]  obs_n  (first 2 rows):\n{obs_n[:2]}")
-    print(f"  [raw]  gt_n   (first 2 rows):\n{gt_n[:2]}")
-    print(f"  [raw]  pred_n (first 2 rows):\n{pred_n[:2]}")
+    # ── Auto-detect: does model output absolute coords or relative deltas? ──
+    # obs_n values are normalised absolute coords, typically in range [-1, 1]
+    # or similar (e.g. lon_norm ~ -0.3..0.3, lat_norm ~ -0.5..0.5).
+    # If pred_n has much smaller magnitude than obs_n → it's delta (relative).
+    obs_abs_mean  = np.abs(obs_n).mean()
+    pred_abs_mean = np.abs(pred_n).mean()
+
+    print(f"\n  [raw] obs_n  (all rows):\n{obs_n}")
+    print(f"\n  [raw] gt_n   (all rows):\n{gt_n}")
+    print(f"\n  [raw] pred_n (all rows):\n{pred_n}")
+    print(f"\n  obs |mean|={obs_abs_mean:.4f}  pred |mean|={pred_abs_mean:.4f}")
+
+    IS_DELTA = pred_abs_mean < obs_abs_mean * 0.15   # heuristic: delta << absolute
+
+    if IS_DELTA:
+        print("  [AUTO] pred looks like DELTA (relative) → cumsum + obs[-1]")
+        # cumulative sum of deltas, starting from last observed position
+        pred_n_abs  = obs_n[-1:] + np.cumsum(pred_n, axis=0)
+        ens_abs     = obs_n[-1:] + np.cumsum(ens_n, axis=1)
+    else:
+        print("  [AUTO] pred looks like ABSOLUTE → use directly")
+        pred_n_abs = pred_n
+        ens_abs    = ens_n
+
+    print(f"\n  [raw] pred_n_abs (first/last):\n{pred_n_abs[0]}  …  {pred_n_abs[-1]}")
+    print(f"  [raw] gt_n       (first/last):\n{gt_n[0]}  …  {gt_n[-1]}\n")
 
     obs_deg  = to_deg(denorm_traj(obs_n))
     gt_deg   = to_deg(denorm_traj(gt_n))
-    pred_deg = to_deg(denorm_traj(pred_n))
-    ens_deg  = to_deg(denorm_traj(ens_n))
+    pred_deg = to_deg(denorm_traj(pred_n_abs))
+    ens_deg  = to_deg(denorm_traj(ens_abs))
 
-    print(f"\n  [deg]  obs_deg  (first→last): {obs_deg[0]}  …  {obs_deg[-1]}")
-    print(f"  [deg]  gt_deg   (first→last): {gt_deg[0]}  …  {gt_deg[-1]}")
-    print(f"  [deg]  pred_deg (first→last): {pred_deg[0]}  …  {pred_deg[-1]}")
-    print(f"  [deg]  ens_deg  mean t=0   : {ens_deg[:, 0, :].mean(axis=0)}")
-    print(f"  [deg]  ens_deg  mean t=-1  : {ens_deg[:, -1, :].mean(axis=0)}")
-    print(f"  NOTE: expected lon ~120-160°E, lat ~10-50°N")
-    print(f"        if lon<50 or lat>100 → feature order is [lat,lon] → need swap!\n")
+    print(f"  [deg] obs_deg  (last)  : {obs_deg[-1]}")
+    print(f"  [deg] gt_deg   (first) : {gt_deg[0]}")
+    print(f"  [deg] pred_deg (first) : {pred_deg[0]}")
+    print(f"  expected: lon 100-180°E, lat 0-60°N\n")
 
     errors_km = haversine_km(pred_deg, gt_deg)
 
