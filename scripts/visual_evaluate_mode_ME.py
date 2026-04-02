@@ -2307,10 +2307,23 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     pred_Me_n = _extract_seq(pred_Me)        # [T_pred, F_me]
     ens_n     = _extract_ens(all_trajs)      # [S, T_pred, 2]
 
+    # ── Deep value debug ──────────────────────────────────────────────────
+    print(f"\n  [raw]  obs_n  (first 2 rows):\n{obs_n[:2]}")
+    print(f"  [raw]  gt_n   (first 2 rows):\n{gt_n[:2]}")
+    print(f"  [raw]  pred_n (first 2 rows):\n{pred_n[:2]}")
+
     obs_deg  = to_deg(denorm_traj(obs_n))
     gt_deg   = to_deg(denorm_traj(gt_n))
     pred_deg = to_deg(denorm_traj(pred_n))
     ens_deg  = to_deg(denorm_traj(ens_n))
+
+    print(f"\n  [deg]  obs_deg  (first→last): {obs_deg[0]}  …  {obs_deg[-1]}")
+    print(f"  [deg]  gt_deg   (first→last): {gt_deg[0]}  …  {gt_deg[-1]}")
+    print(f"  [deg]  pred_deg (first→last): {pred_deg[0]}  …  {pred_deg[-1]}")
+    print(f"  [deg]  ens_deg  mean t=0   : {ens_deg[:, 0, :].mean(axis=0)}")
+    print(f"  [deg]  ens_deg  mean t=-1  : {ens_deg[:, -1, :].mean(axis=0)}")
+    print(f"  NOTE: expected lon ~120-160°E, lat ~10-50°N")
+    print(f"        if lon<50 or lat>100 → feature order is [lat,lon] → need swap!\n")
 
     errors_km = haversine_km(pred_deg, gt_deg)
 
