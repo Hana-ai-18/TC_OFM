@@ -1599,7 +1599,7 @@ def main(args):
     total_steps     = steps_per_epoch * args.num_epochs
     warmup          = steps_per_epoch * args.warmup_epochs
     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
-    saver     = BestModelSaver(patience=args.patience, ade_tol=5.0)
+    saver     = BestModelSaver(patience=args.patience, ade_tol=1.0)
     scaler    = GradScaler('cuda', enabled=args.use_amp)
 
     print("=" * 68)
