@@ -1068,7 +1068,10 @@ def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
             + (res_v / scale).pow(2).mean())
 
     # FIX-L42: clamp max=50.0 so gradient can still flow at high loss values
-    return loss.clamp(max=50.0)
+    # return loss.clamp(max=50.0)
+    if loss > 50.0:
+        return 50.0 + torch.log(loss - 49.0) # Vẫn tăng nhưng tăng chậm, gradient không bao giờ bằng 0
+    return loss
 
 
 def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
@@ -1171,8 +1174,15 @@ def pinn_bve_loss(pred_abs_deg: torch.Tensor,
     l_steer = pinn_rankine_steering(pred_abs_deg, env_data)
     l_speed = pinn_speed_constraint(pred_abs_deg)
 
+    # Trước:
     total = l_sw + 0.5 * l_steer + 0.1 * l_speed
     return total.clamp(max=50.0)
+
+    # Sau khi sửa:
+    total = l_sw + 0.5 * l_steer + 0.1 * l_speed
+    if total > 50.0:
+        return 50.0 + torch.log(total - 49.0)
+    return total
 
 
 # ── Physics consistency loss ──────────────────────────────────────────────────
