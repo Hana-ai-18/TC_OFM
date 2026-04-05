@@ -48,7 +48,7 @@ import torch.nn.functional as F
 from Model.FNO3D_encoder import FNO3DEncoder
 from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 from Model.env_net_transformer_gphsplit import Env_net
-from Model.losses import compute_total_loss, WEIGHTS
+from Model.losses import compute_total_loss, WEIGHTS, fm_physics_consistency_loss
 
 
 def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
