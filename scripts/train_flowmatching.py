@@ -3578,14 +3578,10 @@ from __future__ import annotations
 
 import csv
 import math
-import sys
 import os
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
-# Lấy đường dẫn của thư mục cha (thư mục gốc TC_FM)
-root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if root_path not in sys.path:
-    sys.path.append(root_path)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
