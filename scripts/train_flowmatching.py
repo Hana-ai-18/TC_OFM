@@ -1742,7 +1742,7 @@ from Model.utils import get_cosine_schedule_with_warmup
 from Model.losses import WEIGHTS as _BASE_WEIGHTS
 from utils.metrics import (
     TCEvaluator, StepErrorAccumulator,
-    save_metrics_csv, haversine_km_torch, haversine_km_np,
+    save_metrics_csv, haversine_km_torch, haversine_km,
     denorm_torch, denorm_np, denorm_deg_np, HORIZON_STEPS,
     cliper_forecast, LANDFALL_TARGETS, LANDFALL_RADIUS_KM,
     brier_skill_score,
