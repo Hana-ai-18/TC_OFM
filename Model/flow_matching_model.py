@@ -684,35 +684,32 @@
 
 # # Backward-compat alias
 # TCDiffusion = TCFlowMatching
-
 """
-Model/flow_matching_model.py  ── v21
+Model/flow_matching_model.py  ── v23
 ==========================================
-FIXES vs v20:
+FIXES vs v21:
 
-  FIX-M17  [CRITICAL] _physics_correct called physics_loss.backward() while
-           the entire sample() method is decorated with @torch.no_grad().
-           PyTorch strips gradient tracking from all tensors inside no_grad
-           context → RuntimeError: "element 0 of tensors does not require grad
-           and does not have a grad_fn".
+  FIX-M18  [CURRICULUM REMOVED] set_curriculum_len() vẫn giữ để backward
+           compat nhưng KHÔNG được gọi từ trainer nữa. active_pred_len
+           luôn = pred_len. evaluate_full_val_ade không cần restore nữa.
 
-           Fix: wrap the physics correction loop with torch.enable_grad()
-           to locally re-enable autograd inside the no_grad sampling context.
-           The x tensor is explicitly detached and requires_grad set to True
-           at the start of each iteration to ensure clean gradient flow.
-           Result tensor is detached before returning to preserve the
-           no_grad semantics of the outer sample() call.
+  FIX-M19  get_loss_breakdown(): nhận thêm step_weight_alpha parameter
+           và truyền vào compute_total_loss() → fm_afcrps_loss() sử dụng
+           soft weighting thay curriculum len-slicing.
 
-Kept from v20:
-  FIX-M11  sample() restored as proper class method
-  FIX-M12  physics correction methods as class methods
-  FIX-M13  fm_physics_consistency_loss import
-  FIX-M14  _denorm_to_deg handles [B,2] shapes
-  FIX-M15  env_data passed to pinn_bve_loss
-  FIX-M16  PhysicsGuidedVelocityField integrated into VelocityField._decode
-  FIX-M7   OT-CFM x1_pred formula corrected
-  FIX-M8   pred_abs converted to degrees for directional losses
-  FIX-M9/M10 ctx_noise_scale=0.01, initial_sample_sigma=0.15
+  FIX-M20  get_loss_breakdown(): truyền all_trajs vào compute_total_loss()
+           để tính ensemble_spread_loss. Giúp kiểm soát spread tăng quá mức.
+
+  FIX-M21  _physics_correct(): tăng n_steps=5 (từ 3), giảm lr=0.002 (từ
+           0.005) để physics correction ổn định hơn và ít overshoot.
+
+  FIX-M22  sample(): initial_sample_sigma=0.1 (set từ constructor) đã fix
+           spread. Thêm post-sampling clip chặt hơn [-3.0, 3.0] cho cả lon
+           và lat (từ [-5.0, 5.0] cho lon).
+
+Kept from v21:
+  FIX-M17  _physics_correct với torch.enable_grad()
+  FIX-M11..M16 OT-CFM, beta drift, env_data, physics scale
 """
 from __future__ import annotations
 
@@ -736,10 +733,7 @@ from Model.losses import (
 
 
 def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
-    """
-    Normalised trajectory → degrees for loss computation.
-    Handles both [T, B, 2] and [B, 2] shapes.
-    """
+    """Normalised → degrees. Handles [T, B, 2] and [B, 2]."""
     out = traj_norm.clone()
     out[..., 0] = (traj_norm[..., 0] * 50.0 + 1800.0) / 10.0
     out[..., 1] = (traj_norm[..., 1] * 50.0) / 10.0
@@ -747,21 +741,14 @@ def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  VelocityField  (FlowMatching denoiser)
+#  VelocityField
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VelocityField(nn.Module):
     """
-    OT-CFM velocity field  v_θ(x_t, t, context).
-
-    Architecture:
-      h_t       [B, 128]  ← DataEncoder1D w/ Mamba
-      e_Env     [B,  64]  ← Env-T-Net
-      f_spatial [B,  16]  ← FNO decoder pooled
-      ctx_dim = 256
-
-    Physics-guided decode:
-      v_total = v_neural(ctx) + σ(w_physics) * v_beta_drift(x_t)
+    OT-CFM velocity field v_θ(x_t, t, context).
+    Architecture: DataEncoder1D (Mamba) + FNO3D + Env-T-Net → Transformer decoder.
+    Physics-guided: v_total = v_neural + sigmoid(w_physics) * v_beta_drift.
     """
 
     def __init__(
@@ -825,7 +812,6 @@ class VelocityField(nn.Module):
         self.out_fc1 = nn.Linear(256, 512)
         self.out_fc2 = nn.Linear(512, 4)
 
-        # Physics-guided: learnable scale for beta-drift contribution
         self.physics_scale = nn.Parameter(torch.ones(4) * 0.5)
 
     def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
@@ -852,7 +838,6 @@ class VelocityField(nn.Module):
             image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
 
         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
-
         T_obs = obs_traj.shape[0]
 
         e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
@@ -862,8 +847,8 @@ class VelocityField(nn.Module):
         T_bot = e_3d_s.shape[1]
         if T_bot != T_obs:
             e_3d_s = F.interpolate(
-                e_3d_s.permute(0, 2, 1),
-                size=T_obs, mode="linear", align_corners=False,
+                e_3d_s.permute(0, 2, 1), size=T_obs,
+                mode="linear", align_corners=False,
             ).permute(0, 2, 1)
 
         f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))
@@ -885,15 +870,11 @@ class VelocityField(nn.Module):
         return self.ctx_fc2(self.ctx_drop(raw))
 
     def _beta_drift_velocity(self, x_t: torch.Tensor) -> torch.Tensor:
-        """
-        Beta drift in normalised state space.
-        x_t: [B, T, 4] normalised state
-        Returns [B, T, 4] velocity contribution.
-        """
+        """Beta drift in normalised state space. x_t: [B, T, 4]."""
         OMEGA_val  = 7.2921e-5
         R_val      = 6.371e6
         DT         = 6 * 3600.0
-        M_PER_NORM = 5.0 * 111.0 * 1000.0  # 555,000 m per normalised unit
+        M_PER_NORM = 5.0 * 111.0 * 1000.0
 
         lat_norm = x_t[:, :, 1]
         lat_deg  = lat_norm * 5.0
@@ -901,8 +882,8 @@ class VelocityField(nn.Module):
 
         beta   = 2 * OMEGA_val * torch.cos(lat_rad) / R_val
         R_tc   = 3e5
-        v_lon  = -beta * R_tc ** 2 / 2   # m/s westward
-        v_lat  =  beta * R_tc ** 2 / 4   # m/s poleward
+        v_lon  = -beta * R_tc ** 2 / 2
+        v_lat  =  beta * R_tc ** 2 / 4
 
         v_lon_norm = v_lon * DT / M_PER_NORM
         v_lat_norm = v_lat * DT / M_PER_NORM
@@ -914,18 +895,12 @@ class VelocityField(nn.Module):
 
     def _decode(self, x_t: torch.Tensor, t: torch.Tensor,
                 ctx: torch.Tensor) -> torch.Tensor:
-        """
-        Physics-guided decode:
-          v_total = v_neural(transformer) + sigmoid(w)*2 * v_beta
-        x_t:  [B, T, 4]
-        t:    [B]
-        ctx:  [B, 256]
-        """
         t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
         t_emb = self.time_fc2(t_emb)
 
-        x_emb  = (self.traj_embed(x_t)
-                  + self.pos_enc[:, :x_t.size(1), :]
+        T_seq  = min(x_t.size(1), self.pos_enc.shape[1])
+        x_emb  = (self.traj_embed(x_t[:, :T_seq, :])
+                  + self.pos_enc[:, :T_seq, :]
                   + t_emb.unsqueeze(1))
         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
 
@@ -933,11 +908,10 @@ class VelocityField(nn.Module):
             self.transformer(x_emb, memory)
         )))  # [B, T, 4]
 
-        # Physics prior (no grad — pure prior, gradient flows through neural only)
         with torch.no_grad():
-            v_phys = self._beta_drift_velocity(x_t)   # [B, T, 4]
+            v_phys = self._beta_drift_velocity(x_t[:, :T_seq, :])
 
-        scale = torch.sigmoid(self.physics_scale) * 2.0   # [4] in [0, 2]
+        scale = torch.sigmoid(self.physics_scale) * 2.0
         return v_neural + scale * v_phys
 
     def forward(self, x_t, t, batch_list):
@@ -955,9 +929,7 @@ class VelocityField(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TCFlowMatching(nn.Module):
-    """
-    TC trajectory prediction via OT-CFM + Physics-guided velocity field.
-    """
+    """TC trajectory prediction via OT-CFM + Physics-guided velocity field."""
 
     def __init__(
         self,
@@ -966,8 +938,8 @@ class TCFlowMatching(nn.Module):
         sigma_min:            float = 0.02,
         n_train_ens:          int   = 4,
         unet_in_ch:           int   = 13,
-        ctx_noise_scale:      float = 0.01,
-        initial_sample_sigma: float = 0.15,
+        ctx_noise_scale:      float = 0.02,   # FIX-T23-5: 0.02 default
+        initial_sample_sigma: float = 0.1,    # FIX-T23-4: 0.1 default
         **kwargs,
     ):
         super().__init__()
@@ -975,7 +947,7 @@ class TCFlowMatching(nn.Module):
         self.obs_len              = obs_len
         self.sigma_min            = sigma_min
         self.n_train_ens          = n_train_ens
-        self.active_pred_len      = pred_len
+        self.active_pred_len      = pred_len   # FIX-M18: always full pred_len
         self.ctx_noise_scale      = ctx_noise_scale
         self.initial_sample_sigma = initial_sample_sigma
         self.net = VelocityField(
@@ -986,7 +958,12 @@ class TCFlowMatching(nn.Module):
         )
 
     def set_curriculum_len(self, active_len: int) -> None:
-        self.active_pred_len = max(1, min(active_len, self.pred_len))
+        """
+        FIX-M18: Kept for backward compat but NO-OP in v23.
+        Curriculum is removed. active_pred_len is always pred_len.
+        """
+        # self.active_pred_len = max(1, min(active_len, self.pred_len))
+        pass  # no-op
 
     @staticmethod
     def _to_rel(traj_gt, Me_gt, last_pos, last_Me):
@@ -1037,27 +1014,29 @@ class TCFlowMatching(nn.Module):
                 aug[idx] = t
         return aug
 
-    def get_loss(self, batch_list: List) -> torch.Tensor:
-        return self.get_loss_breakdown(batch_list)["total"]
+    def get_loss(self, batch_list: List,
+                 step_weight_alpha: float = 0.0) -> torch.Tensor:
+        return self.get_loss_breakdown(batch_list, step_weight_alpha)["total"]
 
-    def get_loss_breakdown(self, batch_list: List) -> Dict:
+    def get_loss_breakdown(self, batch_list: List,
+                           step_weight_alpha: float = 0.0) -> Dict:
+        """
+        FIX-M19: Nhận step_weight_alpha, truyền vào compute_total_loss.
+        FIX-M20: Truyền all_trajs để tính ensemble_spread_loss.
+        """
         batch_list = self._lon_flip_aug(batch_list, p=0.3)
 
-        traj_gt = batch_list[1]
-        Me_gt   = batch_list[8]
-        obs_t   = batch_list[0]
-        obs_Me  = batch_list[7]
+        traj_gt  = batch_list[1]
+        Me_gt    = batch_list[8]
+        obs_t    = batch_list[0]
+        obs_Me   = batch_list[7]
 
         try:
             env_data = batch_list[13]
         except (IndexError, TypeError):
             env_data = None
 
-        apl = self.active_pred_len
-        if apl < traj_gt.shape[0]:
-            traj_gt = traj_gt[:apl]
-            Me_gt   = Me_gt[:apl]
-
+        # FIX-M18: NO curriculum slicing. Always use full pred_len.
         lp, lm = obs_t[-1], obs_Me[-1]
         x1 = self._to_rel(traj_gt, Me_gt, lp, lm)
 
@@ -1067,40 +1046,45 @@ class TCFlowMatching(nn.Module):
         x_t, t, te, denom, _ = self._cfm_noisy(x1)
         pred_vel = self.net.forward_with_ctx(x_t, t, raw_ctx, noise_scale=0.0)
 
-        # Ensemble samples for AFCRPS
+        # Ensemble samples for AFCRPS + spread penalty
         samples: List[torch.Tensor] = []
         for _ in range(self.n_train_ens):
             xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
             pv_s  = self.net.forward_with_ctx(xt_s, ts, raw_ctx, noise_scale=0.0)
-            x1_s  = xt_s + dens_s * pv_s   # FIX-M7: correct OT-CFM formula
+            x1_s  = xt_s + dens_s * pv_s   # OT-CFM
             pa_s, _ = self._to_abs(x1_s, lp, lm)
             samples.append(pa_s)
-        pred_samples = torch.stack(samples)  # [S, T, B, 2]
+        pred_samples = torch.stack(samples)   # [S, T, B, 2]
+
+        # FIX-M20: all_trajs for spread penalty
+        all_trajs_4d = pred_samples   # [S, T, B, 2]
 
         l_fm_physics = fm_physics_consistency_loss(
             pred_samples, gt_norm=traj_gt, last_pos=lp)
 
-        x1_pred = x_t + denom * pred_vel   # FIX-M7
+        x1_pred = x_t + denom * pred_vel
         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
 
-        pred_abs_deg = _denorm_to_deg(pred_abs)   # FIX-M8
+        pred_abs_deg = _denorm_to_deg(pred_abs)
         traj_gt_deg  = _denorm_to_deg(traj_gt)
         ref_deg      = _denorm_to_deg(lp)
 
         breakdown = compute_total_loss(
-            pred_abs     = pred_abs_deg,
-            gt           = traj_gt_deg,
-            ref          = ref_deg,
-            batch_list   = batch_list,
-            pred_samples = pred_samples,
-            gt_norm      = traj_gt,
-            weights      = WEIGHTS,
-            intensity_w  = intensity_w,
-            env_data     = env_data,
+            pred_abs           = pred_abs_deg,
+            gt                 = traj_gt_deg,
+            ref                = ref_deg,
+            batch_list         = batch_list,
+            pred_samples       = pred_samples,
+            gt_norm            = traj_gt,
+            weights            = WEIGHTS,
+            intensity_w        = intensity_w,
+            env_data           = env_data,
+            step_weight_alpha  = step_weight_alpha,   # FIX-M19
+            all_trajs          = all_trajs_4d,         # FIX-M20
         )
 
         fm_phys_w = WEIGHTS.get("fm_physics", 0.3)
-        breakdown["total"] = breakdown["total"] + fm_phys_w * l_fm_physics
+        breakdown["total"]      = breakdown["total"] + fm_phys_w * l_fm_physics
         breakdown["fm_physics"] = l_fm_physics.item()
 
         return breakdown
@@ -1116,17 +1100,18 @@ class TCFlowMatching(nn.Module):
         predict_csv:  Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Generate ensemble of TC track predictions via DDIM-style integration.
-
+        FIX-T23-3: ddim_steps default 20 (từ 10).
+        FIX-M22: tighter clip [-3.0, 3.0] cho cả lon và lat.
         Returns:
-            pred_mean:  [T, B, 2] mean track (normalised coords)
+            pred_mean:  [T, B, 2] mean track (normalised)
             me_mean:    [T, B, 2] mean intensity
             all_trajs:  [S, T, B, 2] all ensemble members
         """
-        lp  = batch_list[0][-1]   # [B, 2] last observed position
-        lm  = batch_list[7][-1]   # [B, 2] last observed intensity
+        lp  = batch_list[0][-1]   # [B, 2]
+        lm  = batch_list[7][-1]   # [B, 2]
         B   = lp.shape[0]
         device = lp.device
+        T   = self.pred_len   # FIX-M18: always full pred_len
         dt  = 1.0 / max(ddim_steps, 1)
 
         raw_ctx = self.net._context(batch_list)
@@ -1135,30 +1120,28 @@ class TCFlowMatching(nn.Module):
         me_s:   List[torch.Tensor] = []
 
         for k in range(num_ensemble):
-            x_t = torch.randn(
-                B, self.active_pred_len, 4, device=device
-            ) * self.initial_sample_sigma
+            # FIX-T23-4: initial_sample_sigma=0.1 (set in constructor)
+            x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
             # DDIM Euler integration
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 ns  = self.ctx_noise_scale if step == 0 else 0.0
-                vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx,
-                                                noise_scale=ns)
+                vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
                 x_t = x_t + dt * vel
 
-            # FIX-M17: physics correction needs grad → use enable_grad()
-            x_t = self._physics_correct(x_t, lp, lm, n_steps=3)
+            # Physics correction
+            x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
 
-            x_t[:, :, :2].clamp_(-5.0, 5.0)
-            x_t[:, :, 2:].clamp_(-3.0, 3.0)
+            # FIX-M22: tighter clip
+            x_t = x_t.clamp(-3.0, 3.0)
 
             tr, me = self._to_abs(x_t, lp, lm)
             traj_s.append(tr)
             me_s.append(me)
 
         all_trajs = torch.stack(traj_s)   # [S, T, B, 2]
-        all_me    = torch.stack(me_s)     # [S, T, B, 2]
+        all_me    = torch.stack(me_s)
         pred_mean = all_trajs.mean(0)
         me_mean   = all_me.mean(0)
 
@@ -1174,16 +1157,12 @@ class TCFlowMatching(nn.Module):
         x_pred: torch.Tensor,
         last_pos: torch.Tensor,
         last_Me:  torch.Tensor,
-        n_steps:  int   = 3,
-        lr:       float = 0.005,
+        n_steps:  int   = 5,    # FIX-M21: 5 (từ 3)
+        lr:       float = 0.002, # FIX-M21: 0.002 (từ 0.005)
     ) -> torch.Tensor:
         """
-        Light physics correction via projected gradient descent.
-        Only penalises hard physical violations (speed > 600 km/6h).
-
-        FIX-M17: Wraps with torch.enable_grad() so that backward() works
-        even when called from inside the @torch.no_grad() sample() method.
-        The returned tensor is detached to restore no_grad semantics.
+        FIX-M17: torch.enable_grad() inside no_grad context.
+        FIX-M21: n_steps=5, lr=0.002 for more stable correction.
         """
         with torch.enable_grad():
             x = x_pred.detach().requires_grad_(True)
@@ -1192,7 +1171,7 @@ class TCFlowMatching(nn.Module):
             for _ in range(n_steps):
                 optimizer.zero_grad()
                 pred_abs, _ = self._to_abs(x, last_pos, last_Me)
-                pred_deg    = _denorm_to_deg(pred_abs)   # [T, B, 2] degrees
+                pred_deg    = _denorm_to_deg(pred_abs)
 
                 l_speed = self._pinn_speed_constraint(pred_deg)
                 l_accel = self._pinn_beta_plane_simplified(pred_deg)
@@ -1207,40 +1186,28 @@ class TCFlowMatching(nn.Module):
 
     @staticmethod
     def _pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
-        """Penalise step displacement > 600 km/6h."""
         if pred_deg.shape[0] < 2:
             return pred_deg.new_zeros(())
-
         dt_deg  = pred_deg[1:] - pred_deg[:-1]
         lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
         cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-
-        dx_km = dt_deg[:, :, 0] * cos_lat * 111.0
-        dy_km = dt_deg[:, :, 1] * 111.0
-        speed = torch.sqrt(dx_km ** 2 + dy_km ** 2)
-
-        violation = F.relu(speed - 600.0)
-        return violation.pow(2).mean()
+        dx_km   = dt_deg[:, :, 0] * cos_lat * 111.0
+        dy_km   = dt_deg[:, :, 1] * 111.0
+        speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
+        return F.relu(speed - 600.0).pow(2).mean()
 
     @staticmethod
     def _pinn_beta_plane_simplified(pred_deg: torch.Tensor) -> torch.Tensor:
-        """Penalise unrealistic directional acceleration."""
         if pred_deg.shape[0] < 3:
             return pred_deg.new_zeros(())
-
         v = pred_deg[1:] - pred_deg[:-1]
         a = v[1:] - v[:-1]
-
         lat_rad = torch.deg2rad(pred_deg[1:-1, :, 1])
         cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-
         a_lon_km = a[:, :, 0] * cos_lat * 111.0
         a_lat_km = a[:, :, 1] * 111.0
-
         max_accel = 50.0
-        violation = F.relu(
-            torch.sqrt(a_lon_km ** 2 + a_lat_km ** 2) - max_accel
-        )
+        violation = F.relu(torch.sqrt(a_lon_km**2 + a_lat_km**2) - max_accel)
         return violation.pow(2).mean() * 0.1
 
     @staticmethod
@@ -1257,9 +1224,9 @@ class TCFlowMatching(nn.Module):
         all_lon  = ((all_trajs[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
         all_lat  = ((all_trajs[..., 1] * 50.0) / 10.0).cpu().numpy()
 
-        fields = ["timestamp", "batch_idx", "step_idx", "lead_h",
-                  "lon_mean_deg", "lat_mean_deg",
-                  "lon_std_deg", "lat_std_deg", "ens_spread_km"]
+        fields   = ["timestamp", "batch_idx", "step_idx", "lead_h",
+                    "lon_mean_deg", "lat_mean_deg",
+                    "lon_std_deg", "lat_std_deg", "ens_spread_km"]
         write_hdr = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)
@@ -1270,7 +1237,7 @@ class TCFlowMatching(nn.Module):
                     dlat   = all_lat[:, k, b] - mean_lat[k, b]
                     dlon   = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(
                         math.radians(mean_lat[k, b]))
-                    spread = float(np.sqrt((dlat ** 2 + dlon ** 2).mean()) * 111.0)
+                    spread = float(np.sqrt((dlat**2 + dlon**2).mean()) * 111.0)
                     w.writerow(dict(
                         timestamp     = ts,
                         batch_idx     = b,
