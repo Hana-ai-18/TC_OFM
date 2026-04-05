@@ -1174,9 +1174,9 @@ def pinn_bve_loss(pred_abs_deg: torch.Tensor,
     l_steer = pinn_rankine_steering(pred_abs_deg, env_data)
     l_speed = pinn_speed_constraint(pred_abs_deg)
 
-    # Trước:
-    total = l_sw + 0.5 * l_steer + 0.1 * l_speed
-    return total.clamp(max=50.0)
+    # # Trước:
+    # total = l_sw + 0.5 * l_steer + 0.1 * l_speed
+    # return total.clamp(max=50.0)
 
     # Sau khi sửa:
     total = l_sw + 0.5 * l_steer + 0.1 * l_speed
