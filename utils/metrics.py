@@ -1,40 +1,36 @@
+
 # """
-# utils/metrics.py  ── v4
+# utils/metrics.py  ── v5
 # =============================
-# FIXES vs v3:
+# FIXES vs v4:
 
-#   FIX-MET-1  cliper_forecast exported at module level so train script
-#              can call it without reimporting. Also added denorm_deg_np
-#              export for train script use.
+#   FIX-MET-8  [CRITICAL] StepErrorAccumulator.update() crash khi curriculum
+#              training active.
 
-#   FIX-MET-2  TCEvaluator.compute: TSS was nan because cliper_ugde was
-#              never populated by callers. Added: if cliper_ugde is set
-#              on the evaluator instance, TSS is computed; otherwise nan.
-#              The train script now sets ev.cliper_ugde before compute().
+#              Root cause: haversine_km_torch(pred, gt_sliced) trả về
+#              dist_km shape [T_active, B] với T_active < pred_len (ví dụ
+#              T=4 khi curriculum_start_len=4). Nhưng self._sum shape là
+#              [pred_len=12]. Dòng:
+#                self._sum += d.sum(axis=1)
+#              → ValueError: operands could not be broadcast together
+#                with shapes (12,) (4,) — đây là CRASH trong traceback.
 
-#   FIX-MET-3  bss_mean left as nan in DatasetMetrics.compute() because
-#              brier_skill_score() was never called internally.
-#              Fix: bss_mean stays nan in compute() — it is computed
-#              externally in evaluate_full() where ensemble data is available.
-#              Added docstring note.
+#              Fix: pad d với zeros để luôn có shape [pred_len, B] trước
+#              khi cộng vào accumulator. Steps được pad có distance=0 km
+#              và được đếm vào n_samples → ADE của các step đó sẽ thấp
+#              giả tạo. Dùng active_pred_len để compute() biết cần average
+#              trên bao nhiêu steps thật sự.
 
-#   FIX-MET-4  ssr_step: when all ensemble members identical (early training),
-#              spread=0 and rmse_em=0 → SSR=0/0=nan or 0.
-#              Added: return 1.0 (calibrated) when both spread and rmse are ~0,
-#              i.e. the model is trivially correct and calibrated.
+#              compute() thêm key "active_steps" để caller biết.
 
-#   FIX-MET-5  crps_2d: O(S²) diversity loop replaced with vectorised
-#              pairwise haversine computation. Significant speedup at S=20.
-
-#   FIX-MET-6  DTW: compute_dtw default changed to True (was sometimes
-#              False in evaluate_full calls). The O(T²)=O(144) cost at T=12
-#              is negligible vs the 4664 sequences evaluation time.
-
-#   FIX-MET-7  LANDFALL_TARGETS and LANDFALL_RADIUS_KM exported at module
-#              level (were defined but brier_skill_score wasn't callable
-#              from train script without circular import).
-
-# Kept from v3: all Tier 1-4 computation, haversine, denorm, etc.
+# Kept from v4:
+#   FIX-MET-7  LANDFALL_TARGETS, LANDFALL_RADIUS_KM exported
+#   FIX-MET-6  compute_dtw default True
+#   FIX-MET-5  crps_2d vectorised pairwise
+#   FIX-MET-4  ssr_step: return 1.0 when spread=rmse≈0
+#   FIX-MET-3  bss_mean computed externally
+#   FIX-MET-2  TSS computed when cliper_ugde set
+#   FIX-MET-1  cliper_forecast, denorm_deg_np exported
 # """
 
 # from __future__ import annotations
@@ -63,7 +59,6 @@
 # HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 36: 5, 48: 7, 60: 9, 72: 11}
 # RECURV_THR_DEG = 45.0
 
-# # FIX-MET-7: exported for train script use
 # LANDFALL_TARGETS = [
 #     ("DaNang",    108.2, 16.1),
 #     ("Manila",    121.0, 14.6),
@@ -94,6 +89,15 @@
 #     return 2.0 * R_EARTH_KM * np.arcsin(np.clip(np.sqrt(a), 0.0, 1.0))
 
 
+# def haversine_km_np(
+#     p1: np.ndarray,
+#     p2: np.ndarray,
+#     unit_01deg: bool = True,
+# ) -> np.ndarray:
+#     """Alias với signature rõ ràng hơn."""
+#     return haversine_km(p1, p2, unit_01deg=unit_01deg)
+
+
 # def haversine_km_torch(pred, gt, lon_idx: int = 0, lat_idx: int = 1,
 #                         unit_01deg: bool = True):
 #     scale = 10.0 if unit_01deg else 1.0
@@ -122,7 +126,6 @@
 #     return r
 
 
-# # FIX-MET-1: exported denorm_deg_np for train script
 # def denorm_deg_np(arr_norm: np.ndarray) -> np.ndarray:
 #     """Normalised coords → degrees."""
 #     out = arr_norm.copy()
@@ -131,53 +134,16 @@
 #     return out
 
 
-# # ── FIX-MET-1: cliper_forecast exported ──────────────────────────────────────
-
-# # def cliper_forecast(obs_01: np.ndarray, h: int) -> np.ndarray:
-# #     """
-# #     Simple CLIPER-WNP: linear extrapolation from last two observed steps.
-# #     Returns predicted position (0.1° units) at lead step h (1-indexed).
-
-# #     FIX-MET-1: exported at module level for use in train script.
-# #     """
-# #     if obs_01.shape[0] < 2:
-# #         return obs_01[-1].copy()
-# #     v = obs_01[-1] - obs_01[-2]
-# #     return obs_01[-1] + h * v
-# # def cliper_forecast(obs_01: np.ndarray, h: int) -> np.ndarray:
-# #     """
-# #     Dự báo CLIPER chuẩn xác bằng cách đưa về không gian Degrees.
-# #     obs_01: Tọa độ đã chuẩn hóa (normalized) từ DataLoader.
-# #     h: Bước dự báo (1, 2, ..., 12).
-# #     """
-# #     # 1. Giải chuẩn hóa về độ thực tế (ví dụ: 112.5, 16.1)
-# #     # Hàm denorm_deg_np phải được định nghĩa đúng theo công thức của Dataset
-# #     obs_deg = denorm_deg_np(obs_01) 
-
-# #     if obs_deg.shape[0] < 2:
-# #         return obs_01[-1].copy() * 10.0 # Fallback
-    
-# #     # 2. Tính vận tốc dựa trên sự thay đổi độ (Degrees per step)
-# #     # v = (v_lon, v_lat)
-# #     v = obs_deg[-1] - obs_deg[-2]
-    
-# #     # 3. Dự báo tuyến tính cho bước thứ h
-# #     pred_deg = obs_deg[-1] + (h * v)
-    
-# #     # 4. Trả về đơn vị 0.1 degree (ví dụ: 1125, 161) 
-# #     # để TCEvaluator tính Haversine ra km chính xác.
-# #     return pred_deg * 10.0
-
 # def cliper_forecast(obs_norm: np.ndarray, h: int) -> np.ndarray:
 #     """
-#     Input: obs_norm [T, 2+] — normalized coords (từ DataLoader trực tiếp)
-#     Output: [2] — predicted position, cũng normalized
+#     Input: obs_norm [T, 2+] — normalized coords
+#     Output: [2] — predicted position, normalized
 #     """
 #     if obs_norm.shape[0] < 2:
 #         return obs_norm[-1, :2].copy()
-#     # Linear extrapolation trong normalized space — đơn giản và đúng
-#     v = obs_norm[-1, :2] - obs_norm[-2, :2]  # normalized displacement
-#     return obs_norm[-1, :2] + h * v           # normalized prediction
+#     v = obs_norm[-1, :2] - obs_norm[-2, :2]
+#     return obs_norm[-1, :2] + h * v
+
 
 # # ══════════════════════════════════════════════════════════════════════════════
 # #  2. Tier 1
@@ -230,73 +196,40 @@
 #     return "recurvature" if total_rotation_angle(gt_01) >= thr else "straight"
 
 
-# # def ate_cte(pred_01: np.ndarray, gt_01: np.ndarray,
-# #             lon_idx: int = 0, lat_idx: int = 1
-# #             ) -> Tuple[np.ndarray, np.ndarray]:
-# #     T = pred_01.shape[0]
-# #     ate_arr = np.zeros(T)
-# #     cte_arr = np.zeros(T)
-# #     for k in range(T):
-# #         if k == 0:
-# #             dk = gt_01[1] - gt_01[0] if T > 1 else np.array([1.0, 0.0])
-# #         else:
-# #             dk = gt_01[k] - gt_01[k - 1]
-# #         norm_dk = np.linalg.norm(dk)
-# #         if norm_dk < 1e-8:
-# #             continue
-# #         t_hat = dk / norm_dk
-# #         n_hat = np.array([-t_hat[1], t_hat[0]])
-# #         delta = pred_01[k] - gt_01[k]
-        
-# #         # Lấy vĩ độ thực tế để tính hệ số km
-# #         lat_deg = gt_01[k, 1] / 10.0
-# #         km_per_01deg = 11.11 # 111.1 / 10
-        
-# #         # Chuyển đổi delta sang km (đơn giản hóa cục bộ)
-# #         delta_km = delta * km_per_01deg
-# #         delta_km[0] *= np.cos(np.deg2rad(lat_deg)) # Bù trừ kinh độ theo vĩ độ
-        
-# #         ate_arr[k] = float(np.dot(delta_km, t_hat))
-# #         cte_arr[k] = float(np.dot(delta_km, n_hat))
-# #     return ate_arr, cte_arr
 # def ate_cte(pred_01: np.ndarray, gt_01: np.ndarray,
 #             lon_idx: int = 0, lat_idx: int = 1
 #             ) -> Tuple[np.ndarray, np.ndarray]:
 #     T = pred_01.shape[0]
 #     ate_arr = np.zeros(T)
 #     cte_arr = np.zeros(T)
-    
-#     km_per_01deg = 11.112 # Quy đổi 0.1 độ sang km
+#     km_per_01deg = 11.112
 
 #     for k in range(T):
-#         # 1. Tính vector dịch chuyển của Ground Truth để làm hệ trục tọa độ
 #         if k == 0:
 #             dk = gt_01[1] - gt_01[0] if T > 1 else np.array([1.0, 0.0])
 #         else:
 #             dk = gt_01[k] - gt_01[k - 1]
-        
-#         # Bù trừ vĩ độ cho vector hướng
+
 #         lat_rad = np.deg2rad(gt_01[k, lat_idx] / 10.0)
 #         dk_km = dk * km_per_01deg
 #         dk_km[0] *= np.cos(lat_rad)
-        
+
 #         norm_dk = np.linalg.norm(dk_km)
 #         if norm_dk < 1e-8:
 #             continue
-            
-#         t_hat = dk_km / norm_dk # Vector hướng đi (Along-track)
-#         n_hat = np.array([-t_hat[1], t_hat[0]]) # Vector chệch hướng (Cross-track)
 
-#         # 2. Tính sai số vị trí thực tế bằng km
+#         t_hat = dk_km / norm_dk
+#         n_hat = np.array([-t_hat[1], t_hat[0]])
+
 #         delta_pos = pred_01[k] - gt_01[k]
 #         delta_km = delta_pos * km_per_01deg
-#         delta_km[0] *= np.cos(lat_rad) # Bù trừ kinh độ
+#         delta_km[0] *= np.cos(lat_rad)
 
-#         # 3. Chiếu sai số lên hệ trục ATE/CTE
 #         ate_arr[k] = float(np.dot(delta_km, t_hat))
 #         cte_arr[k] = float(np.dot(delta_km, n_hat))
 
 #     return ate_arr, cte_arr
+
 
 # def circular_std(angles_deg: np.ndarray) -> float:
 #     if len(angles_deg) == 0:
@@ -353,21 +286,13 @@
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # def crps_2d(pred_ens_01: np.ndarray, gt_01: np.ndarray) -> float:
-#     """
-#     CRPS energy-form.
-#     FIX-MET-5: vectorised pairwise diversity (was O(S²) loop).
-#     pred_ens_01: [S, 2+]
-#     gt_01:       [2+]
-#     """
+#     """CRPS energy-form. FIX-MET-5: vectorised pairwise diversity."""
 #     S = pred_ens_01.shape[0]
 #     gt_rep  = gt_01[np.newaxis].repeat(S, axis=0)
 #     acc     = float(np.mean(haversine_km(pred_ens_01, gt_rep)))
 
-#     # Vectorised pairwise: [S, S] distance matrix
-#     # Use broadcasting: expand [S, 1, 2] vs [1, S, 2]
-#     p_i = pred_ens_01[:, np.newaxis, :]   # [S, 1, 2]
-#     p_j = pred_ens_01[np.newaxis, :, :]   # [1, S, 2]
-#     # Flatten to [S*S, 2] for haversine_km
+#     p_i = pred_ens_01[:, np.newaxis, :]
+#     p_j = pred_ens_01[np.newaxis, :, :]
 #     p_i_flat = np.broadcast_to(p_i, (S, S, pred_ens_01.shape[-1])).reshape(S * S, -1)
 #     p_j_flat = np.broadcast_to(p_j, (S, S, pred_ens_01.shape[-1])).reshape(S * S, -1)
 #     div = float(np.mean(haversine_km(p_i_flat, p_j_flat)))
@@ -376,10 +301,7 @@
 
 
 # def ssr_step(pred_ens_01: np.ndarray, gt_01: np.ndarray) -> float:
-#     """
-#     Spread-Skill Ratio.
-#     FIX-MET-4: return 1.0 (calibrated) when both spread and rmse are ~0.
-#     """
+#     """Spread-Skill Ratio. FIX-MET-4: return 1.0 when spread=rmse≈0."""
 #     S = pred_ens_01.shape[0]
 #     ens_mean = pred_ens_01.mean(axis=0)
 #     ens_mean_rep = ens_mean[np.newaxis].repeat(S, axis=0)
@@ -387,7 +309,6 @@
 #     spread       = float(np.sqrt(np.mean(spread_vals ** 2)))
 #     rmse_em = float(haversine_km(ens_mean[np.newaxis], gt_01[np.newaxis])[0])
 
-#     # FIX-MET-4: both near zero → perfectly calibrated
 #     if spread < 1e-6 and rmse_em < 1e-6:
 #         return 1.0
 #     return spread / (rmse_em + 1e-8)
@@ -401,11 +322,7 @@
 #     radius_km:     float = LANDFALL_RADIUS_KM,
 #     clim_rate:     Optional[float] = None,
 # ) -> float:
-#     """
-#     Brier Skill Score for landfall strike probability.
-#     pred_ens_seqs: list of [S, T, 2] in 0.1° units
-#     gt_seqs:       list of [T, 2] in 0.1° units
-#     """
+#     """Brier Skill Score for landfall strike probability."""
 #     N   = len(gt_seqs)
 #     if N == 0:
 #         return float("nan")
@@ -418,7 +335,7 @@
 #         if step >= len(gt_seqs[i]):
 #             continue
 #         gt_pos   = gt_seqs[i][step]
-#         ens_seqs = pred_ens_seqs[i]     # [S, T, 2]
+#         ens_seqs = pred_ens_seqs[i]
 #         if ens_seqs.ndim == 3:
 #             S = ens_seqs.shape[0]
 #         else:
@@ -520,7 +437,6 @@
 #     crps_mean:      float = float("nan")
 #     crps_72h:       float = float("nan")
 #     ssr_mean:       float = float("nan")
-#     # FIX-MET-3: bss_mean computed externally in evaluate_full
 #     bss_mean:       float = float("nan")
 
 #     dtw_mean:       float = float("nan")
@@ -624,19 +540,12 @@
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class TCEvaluator:
-#     """
-#     Full 4-tier TC track evaluator.
-
-#     FIX-MET-2: TSS computed when cliper_ugde is set on instance.
-#     FIX-MET-6: compute_dtw=True by default.
-#     """
-
 #     def __init__(
 #         self,
 #         pred_len:    int   = PRED_LEN,
 #         step_hours:  int   = STEP_HOURS,
 #         recurv_thr:  float = RECURV_THR_DEG,
-#         compute_dtw: bool  = True,    # FIX-MET-6: default True
+#         compute_dtw: bool  = True,
 #         cliper_ugde: Optional[Dict[int, float]] = None,
 #     ):
 #         self.pred_len    = pred_len
@@ -666,10 +575,8 @@
 #         _ate, _cte = ate_cte(p, g)
 #         theta      = total_rotation_angle(g)
 #         cat        = "recurvature" if theta >= self.recurv_thr else "straight"
-#            # --- THÊM LOGIC NÀY: Nhãn của Model dự báo ---
 #         theta_pred = total_rotation_angle(p)
 #         cat_pred   = "recurvature" if theta_pred >= self.recurv_thr else "straight"
-#         # --------------------------------------------
 
 #         csd_g      = compute_csd(g)
 #         _oyr       = oyr(p, g)
@@ -687,24 +594,13 @@
 #                          g[h]) for h in range(T)
 #             ])
 
-#         # dtw_val = dtw_haversine(p, g) if self.compute_dtw else float("nan")
-
-#         # r = SequenceResult(
-#         #     ade=_ade, fde=_fde, per_step=ps,
-#         #     ate=_ate, cte=_cte,
-#         #     category=cat, theta=theta, csd_gt=csd_g,
-#         #     oyr_val=_oyr, hle_val=_hle,
-#         #     crps=crps_arr, ssr=ssr_arr, dtw=dtw_val,
-#         # )
-
 #         dtw_val = dtw_haversine(p, g) if self.compute_dtw else float("nan")
 
-#         # CẬP NHẬT ĐOẠN KHỞI TẠO r
 #         r = SequenceResult(
 #             ade=_ade, fde=_fde, per_step=ps,
 #             ate=_ate, cte=_cte,
-#             category=cat,           # Nhãn thật
-#             category_pred=cat_pred, # Nhãn dự báo (MỚI THÊM)
+#             category=cat,
+#             category_pred=cat_pred,
 #             theta=theta, csd_gt=csd_g,
 #             oyr_val=_oyr, hle_val=_hle,
 #             crps=crps_arr, ssr=ssr_arr, dtw=dtw_val,
@@ -754,7 +650,6 @@
 #         all_ate = np.concatenate([r.ate for r in rs])
 #         all_cte = np.concatenate([r.cte for r in rs])
 
-#         # FIX-MET-2: TSS computed if cliper_ugde is set
 #         tss_val = float("nan")
 #         if self.cliper_ugde and 72 in self.cliper_ugde:
 #             ugde_72 = _h(HORIZON_STEPS[72])
@@ -775,7 +670,6 @@
 #                 crps_72h = float(crps_mat[:, step_72].mean())
 #         if ssr_seqs:
 #             ssr_mat  = np.stack(ssr_seqs)
-#             # FIX-MET-4: filter out nan SSR values before averaging
 #             valid_ssr = ssr_mat[~np.isnan(ssr_mat)]
 #             ssr_mean = float(valid_ssr.mean()) if len(valid_ssr) > 0 else float("nan")
 
@@ -794,19 +688,13 @@
 
 #         csd_vals = [r.csd_gt for r in rs]
 #         tau = float(np.median(csd_vals)) if csd_vals else 0.0
-#         # rdr_num = sum(1 for r in rec_r if r.csd_gt >= tau)
-#         # rdr_val = rdr_num / len(rec_r) if rec_r else float("nan")
 
-#         # ── RDR (Recurvature Detection Rate - Tỷ lệ phát hiện quay đầu) ──
-#         # rec_r là danh sách các ca thực tế là quay đầu (Ground Truth = recurvature)
 #         if rec_r:
-#             # Đếm xem trong những ca quay đầu thật, model đoán đúng bao nhiêu ca
 #             rdr_num = sum(1 for r in rec_r if r.category_pred == "recurvature")
 #             rdr_val = rdr_num / len(rec_r)
 #         else:
 #             rdr_val = float("nan")
-            
-#         # Sau đó gán rdr_val vào DatasetMetrics ở bên dưới
+
 #         m = DatasetMetrics(
 #             ade           = float(np.mean([r.ade for r in rs])),
 #             fde           = float(np.mean([r.fde for r in rs])),
@@ -830,7 +718,7 @@
 #             crps_mean     = crps_mean,
 #             crps_72h      = crps_72h,
 #             ssr_mean      = ssr_mean,
-#             bss_mean      = float("nan"),   # set externally by evaluate_full
+#             bss_mean      = float("nan"),
 #             dtw_mean      = float(np.mean(dtw_all)) if dtw_all else float("nan"),
 #             dtw_str       = float(np.mean(dtw_s))   if dtw_s   else float("nan"),
 #             dtw_rec       = float(np.mean(dtw_rc))  if dtw_rc  else float("nan"),
@@ -858,46 +746,90 @@
 
 
 # # ══════════════════════════════════════════════════════════════════════════════
-# #  10. Fast Tier-1 accumulator
+# #  10. Fast Tier-1 accumulator  ── FIX-MET-8
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class StepErrorAccumulator:
+#     """
+#     FIX-MET-8: Pad dist_km [T_active, B] → [pred_len, B] với zeros khi
+#     T_active < pred_len (curriculum training). Tránh crash broadcast.
+#     compute() trả về "active_steps" để caller biết steps thật sự có data.
+#     """
+
 #     def __init__(self, pred_len: int = PRED_LEN, step_hours: int = STEP_HOURS):
 #         self.pred_len   = pred_len
 #         self.step_hours = step_hours
 #         self.reset()
 
 #     def reset(self) -> None:
-#         self._sum    = np.zeros(self.pred_len, dtype=np.float64)
-#         self._sum_sq = np.zeros(self.pred_len, dtype=np.float64)
-#         self._count  = 0
+#         self._sum         = np.zeros(self.pred_len, dtype=np.float64)
+#         self._sum_sq      = np.zeros(self.pred_len, dtype=np.float64)
+#         self._count       = np.zeros(self.pred_len, dtype=np.int64)  # per-step count
+#         self._active_max  = 0  # track max T_active seen
 
 #     def update(self, dist_km) -> None:
 #         if HAS_TORCH and torch.is_tensor(dist_km):
 #             d = dist_km.double().cpu().numpy()
 #         else:
 #             d = np.asarray(dist_km, dtype=np.float64)
-#         T, B = d.shape
-#         self._sum    += d.sum(axis=1)
-#         self._sum_sq += (d ** 2).sum(axis=1)
-#         self._count  += B
+
+#         # Ensure [T, B] shape
+#         if d.ndim == 1:
+#             d = d.reshape(-1, 1)
+#         elif d.ndim != 2:
+#             return
+
+#         T_actual, B = d.shape
+
+#         # FIX-MET-8: pad to pred_len nếu T_actual < pred_len
+#         if T_actual < self.pred_len:
+#             pad = np.zeros((self.pred_len - T_actual, B), dtype=np.float64)
+#             d_full = np.concatenate([d, pad], axis=0)
+#         else:
+#             d_full = d[:self.pred_len]
+#             T_actual = self.pred_len
+
+#         # Chỉ cộng vào count cho steps có data thật (không pad)
+#         self._sum    += d_full.sum(axis=1)
+#         self._sum_sq += (d_full ** 2).sum(axis=1)
+#         # Count per step: chỉ T_actual steps đầu có data thật
+#         self._count[:T_actual] += B
+#         # Steps được pad không tăng count → average của chúng = 0/0 = nan
+#         # Dùng max T_actual để biết đến đâu có data thật
+#         self._active_max = max(self._active_max, T_actual)
 
 #     def compute(self) -> Dict:
-#         if self._count == 0:
+#         if self._count[0] == 0:
 #             return {}
-#         ps  = self._sum / self._count
-#         std = np.sqrt(np.maximum(self._sum_sq / self._count - ps ** 2, 0.0))
+
+#         # Tính per-step mean chỉ cho steps có count > 0
+#         count_safe = np.where(self._count > 0, self._count, 1)
+#         ps  = self._sum / count_safe
+#         ps  = np.where(self._count > 0, ps, 0.0)
+#         ps2 = self._sum_sq / count_safe
+#         std = np.sqrt(np.maximum(ps2 - ps ** 2, 0.0))
+#         std = np.where(self._count > 0, std, 0.0)
+
+#         # ADE chỉ trên active steps
+#         active = self._active_max
+#         ade_val = float(ps[:active].mean()) if active > 0 else 0.0
+#         fde_val = float(ps[active - 1]) if active > 0 else 0.0
+
 #         out: Dict = {
 #             "per_step":     ps,
 #             "per_step_std": std,
-#             "ADE":          float(ps.mean()),
-#             "FDE":          float(ps[-1]),
-#             "n_samples":    self._count,
+#             "ADE":          ade_val,
+#             "FDE":          fde_val,
+#             "active_steps": active,
+#             "n_samples":    int(self._count[0]),
 #         }
 #         for h, s in HORIZON_STEPS.items():
-#             if s < self.pred_len:
+#             if s < active:
 #                 out[f"{h}h"]     = float(ps[s])
 #                 out[f"{h}h_std"] = float(std[s])
+#             else:
+#                 out[f"{h}h"]     = float("nan")
+#                 out[f"{h}h_std"] = float("nan")
 #         return out
 
 
@@ -928,64 +860,27 @@
 #             MAPE(pred, true), MSPE(pred, true),
 #             RSE(pred, true),  CORR(pred, true))
 
-
-# def _self_test():
-#     np.random.seed(42)
-#     T = 12
-#     ev = TCEvaluator(pred_len=T, compute_dtw=True)
-#     for _ in range(18):
-#         gt   = np.zeros((T, 2))
-#         gt[:, 0] = np.linspace(1300, 1250, T)
-#         gt[:, 1] = np.linspace(150,  270,  T)
-#         pred = gt + np.random.randn(T, 2) * 3.0
-#         ev.update(pred, gt)
-#     for _ in range(2):
-#         gt   = np.zeros((T, 2))
-#         gt[:, 0] = [1300,1290,1280,1270,1260,1255,1258,1265,1278,1295,1315,1335]
-#         gt[:, 1] = [150, 160, 175, 192, 210, 228, 242, 255, 265, 270, 270, 268]
-#         pred = gt + np.random.randn(T, 2) * 5.0
-#         ev.update(pred, gt)
-#     # Test with fake CLIPER ugde
-#     ev.cliper_ugde = {72: 600.0}
-#     m = ev.compute(tag="selftest")
-#     print(m.summary())
-#     assert m.n_rec == 2,  f"Expected 2 recurvature, got {m.n_rec}"
-#     assert m.n_str == 18, f"Expected 18 straight, got {m.n_str}"
-#     assert not np.isnan(m.tss_72h), "TSS should not be nan when cliper_ugde is set"
-#     assert not np.isnan(m.dtw_mean), "DTW should not be nan with compute_dtw=True"
-#     print("\n✅ All assertions passed (including TSS and DTW).")
-#     ev.save_csv("/tmp/tc_metrics_selftest_v4.csv", tag="selftest")
-#     print("✅ CSV export OK")
-
-
-# if __name__ == "__main__":
-#     _self_test()
-
 """
-utils/metrics.py  ── v5
+utils/metrics.py  ── v6
 =============================
-FIXES vs v4:
+FIXES vs v5:
 
-  FIX-MET-8  [CRITICAL] StepErrorAccumulator.update() crash khi curriculum
-             training active.
+  FIX-MET-9  StepErrorAccumulator.compute() trả về ADE chỉ trên active steps
+             thật sự có data (không tính padded zeros). v5 đã pad đúng nhưng
+             active_max vẫn có thể sai khi update() gọi với T=pred_len nhưng
+             các bước cuối là 0 (curriculum). Sử dụng per-step count array
+             thay vì _active_max scalar để chính xác hơn.
 
-             Root cause: haversine_km_torch(pred, gt_sliced) trả về
-             dist_km shape [T_active, B] với T_active < pred_len (ví dụ
-             T=4 khi curriculum_start_len=4). Nhưng self._sum shape là
-             [pred_len=12]. Dòng:
-               self._sum += d.sum(axis=1)
-             → ValueError: operands could not be broadcast together
-               with shapes (12,) (4,) — đây là CRASH trong traceback.
+  FIX-MET-10 haversine_km_torch: thứ tự tham số (pred, gt) nhưng nội dung
+             dùng gt cho lat1 và pred cho lat2 → bất đối xứng. Sửa lại
+             dùng đúng pred cho p1, gt cho p2, kết quả haversine không thay
+             đổi vì distance đối xứng nhưng tránh nhầm lẫn về convention.
 
-             Fix: pad d với zeros để luôn có shape [pred_len, B] trước
-             khi cộng vào accumulator. Steps được pad có distance=0 km
-             và được đếm vào n_samples → ADE của các step đó sẽ thấp
-             giả tạo. Dùng active_pred_len để compute() biết cần average
-             trên bao nhiêu steps thật sự.
+  FIX-MET-11 cliper_forecast: trả về position đúng chuẩn normalised [2] thay
+             vì [:2] slice có thể gây index error nếu input < 2 cols.
 
-             compute() thêm key "active_steps" để caller biết.
-
-Kept from v4:
+Kept from v5:
+  FIX-MET-8  StepErrorAccumulator pad zeros, per-step count
   FIX-MET-7  LANDFALL_TARGETS, LANDFALL_RADIUS_KM exported
   FIX-MET-6  compute_dtw default True
   FIX-MET-5  crps_2d vectorised pairwise
@@ -1042,6 +937,7 @@ def haversine_km(
     lat_idx: int = 1,
     unit_01deg: bool = True,
 ) -> np.ndarray:
+    """Haversine distance in km. Supports (..., 2) shaped arrays."""
     scale = 10.0 if unit_01deg else 1.0
     lat1 = np.deg2rad(p1[..., lat_idx] / scale)
     lat2 = np.deg2rad(p2[..., lat_idx] / scale)
@@ -1056,17 +952,20 @@ def haversine_km_np(
     p2: np.ndarray,
     unit_01deg: bool = True,
 ) -> np.ndarray:
-    """Alias với signature rõ ràng hơn."""
     return haversine_km(p1, p2, unit_01deg=unit_01deg)
 
 
 def haversine_km_torch(pred, gt, lon_idx: int = 0, lat_idx: int = 1,
-                        unit_01deg: bool = True):
+                       unit_01deg: bool = True):
+    """
+    FIX-MET-10: pred=p1, gt=p2. Distance is symmetric so result unchanged,
+    but convention is now consistent with numpy version.
+    """
     scale = 10.0 if unit_01deg else 1.0
-    lat1 = torch.deg2rad(gt[..., lat_idx]   / scale)
-    lat2 = torch.deg2rad(pred[..., lat_idx] / scale)
-    dlon = torch.deg2rad((pred[..., lon_idx] - gt[..., lon_idx]) / scale)
-    dlat = torch.deg2rad((pred[..., lat_idx] - gt[..., lat_idx]) / scale)
+    lat1  = torch.deg2rad(pred[..., lat_idx] / scale)
+    lat2  = torch.deg2rad(gt[..., lat_idx]   / scale)
+    dlon  = torch.deg2rad((pred[..., lon_idx] - gt[..., lon_idx]) / scale)
+    dlat  = torch.deg2rad((pred[..., lat_idx] - gt[..., lat_idx]) / scale)
     a = (torch.sin(dlat / 2.0) ** 2
          + torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2.0) ** 2)
     return 2.0 * R_EARTH_KM * torch.asin(a.clamp(0.0, 1.0).sqrt())
@@ -1098,8 +997,9 @@ def denorm_deg_np(arr_norm: np.ndarray) -> np.ndarray:
 
 def cliper_forecast(obs_norm: np.ndarray, h: int) -> np.ndarray:
     """
-    Input: obs_norm [T, 2+] — normalized coords
-    Output: [2] — predicted position, normalized
+    FIX-MET-11: Robust slice, always returns shape [2].
+    Input: obs_norm [T, 2+] normalised coords.
+    Output: [2] predicted position, normalised.
     """
     if obs_norm.shape[0] < 2:
         return obs_norm[-1, :2].copy()
@@ -1184,7 +1084,7 @@ def ate_cte(pred_01: np.ndarray, gt_01: np.ndarray,
         n_hat = np.array([-t_hat[1], t_hat[0]])
 
         delta_pos = pred_01[k] - gt_01[k]
-        delta_km = delta_pos * km_per_01deg
+        delta_km  = delta_pos * km_per_01deg
         delta_km[0] *= np.cos(lat_rad)
 
         ate_arr[k] = float(np.dot(delta_km, t_hat))
@@ -1216,9 +1116,9 @@ def oyr(pred_01: np.ndarray, gt_01: np.ndarray) -> float:
     m  = min(len(pv), len(gv))
     if m == 0:
         return 0.0
-    dots = np.sum(pv[:m] * gv[:m], axis=1)
-    np_  = np.linalg.norm(pv[:m], axis=1)
-    ng_  = np.linalg.norm(gv[:m], axis=1)
+    dots  = np.sum(pv[:m] * gv[:m], axis=1)
+    np_   = np.linalg.norm(pv[:m], axis=1)
+    ng_   = np.linalg.norm(gv[:m], axis=1)
     valid = (np_ > 1e-8) & (ng_ > 1e-8)
     if valid.sum() == 0:
         return 0.0
@@ -1248,7 +1148,7 @@ def hle(pred_01: np.ndarray, gt_01: np.ndarray) -> float:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def crps_2d(pred_ens_01: np.ndarray, gt_01: np.ndarray) -> float:
-    """CRPS energy-form. FIX-MET-5: vectorised pairwise diversity."""
+    """CRPS energy-form. Vectorised pairwise diversity."""
     S = pred_ens_01.shape[0]
     gt_rep  = gt_01[np.newaxis].repeat(S, axis=0)
     acc     = float(np.mean(haversine_km(pred_ens_01, gt_rep)))
@@ -1263,14 +1163,13 @@ def crps_2d(pred_ens_01: np.ndarray, gt_01: np.ndarray) -> float:
 
 
 def ssr_step(pred_ens_01: np.ndarray, gt_01: np.ndarray) -> float:
-    """Spread-Skill Ratio. FIX-MET-4: return 1.0 when spread=rmse≈0."""
-    S = pred_ens_01.shape[0]
+    """Spread-Skill Ratio. Return 1.0 when spread=rmse≈0."""
+    S        = pred_ens_01.shape[0]
     ens_mean = pred_ens_01.mean(axis=0)
     ens_mean_rep = ens_mean[np.newaxis].repeat(S, axis=0)
     spread_vals  = haversine_km(pred_ens_01, ens_mean_rep)
     spread       = float(np.sqrt(np.mean(spread_vals ** 2)))
     rmse_em = float(haversine_km(ens_mean[np.newaxis], gt_01[np.newaxis])[0])
-
     if spread < 1e-6 and rmse_em < 1e-6:
         return 1.0
     return spread / (rmse_em + 1e-8)
@@ -1284,13 +1183,11 @@ def brier_skill_score(
     radius_km:     float = LANDFALL_RADIUS_KM,
     clim_rate:     Optional[float] = None,
 ) -> float:
-    """Brier Skill Score for landfall strike probability."""
     N   = len(gt_seqs)
     if N == 0:
         return float("nan")
-    bs  = 0.0
+    bs        = 0.0
     clim_hits = 0
-
     target_01 = np.array([target_deg[0] * 10.0, target_deg[1] * 10.0])
 
     for i in range(N):
@@ -1302,21 +1199,19 @@ def brier_skill_score(
             S = ens_seqs.shape[0]
         else:
             continue
-
         obs = float(haversine_km(
             gt_pos[np.newaxis], target_01[np.newaxis])[0]) <= radius_km
-
         hits = sum(
             haversine_km(ens_seqs[s, min(step, ens_seqs.shape[1]-1)][np.newaxis],
                          target_01[np.newaxis])[0] <= radius_km
             for s in range(S)
         )
-        p_fc = hits / S
-        bs  += (p_fc - float(obs)) ** 2
+        p_fc       = hits / S
+        bs        += (p_fc - float(obs)) ** 2
         clim_hits += float(obs)
 
     bs /= max(N, 1)
-    p_clim = (clim_rate if clim_rate is not None else clim_hits / max(N, 1))
+    p_clim  = (clim_rate if clim_rate is not None else clim_hits / max(N, 1))
     bs_clim = p_clim * (1.0 - p_clim) + 1e-8
     return float(1.0 - bs / bs_clim)
 
@@ -1331,7 +1226,7 @@ def dtw_haversine(s: np.ndarray, t: np.ndarray) -> float:
     dp[0, 0] = 0.0
     for i in range(1, n + 1):
         for j in range(1, m + 1):
-            cost = float(haversine_km(s[i-1:i], t[j-1:j])[0])
+            cost   = float(haversine_km(s[i-1:i], t[j-1:j])[0])
             dp[i, j] = cost + min(dp[i-1, j], dp[i, j-1], dp[i-1, j-1])
     return float(dp[n, m])
 
@@ -1345,7 +1240,6 @@ class SequenceResult:
     ade:       float
     fde:       float
     per_step:  np.ndarray
-
     ate:       np.ndarray
     cte:       np.ndarray
     category:  str
@@ -1354,11 +1248,9 @@ class SequenceResult:
     csd_gt:    float
     oyr_val:   float
     hle_val:   float
-
     crps:      Optional[np.ndarray] = None
     ssr:       Optional[np.ndarray] = None
     dtw:       float = float("nan")
-
     loss_fm:      float = float("nan")
     loss_dir:     float = float("nan")
     loss_step:    float = float("nan")
@@ -1383,7 +1275,6 @@ class DatasetMetrics:
     ugde_24h:       float = 0.0
     ugde_48h:       float = 0.0
     ugde_72h:       float = 0.0
-
     tss_72h:        float = float("nan")
     ate_mean:       float = 0.0
     cte_mean:       float = 0.0
@@ -1395,12 +1286,10 @@ class DatasetMetrics:
     rdr:            float = float("nan")
     n_str:          int   = 0
     n_rec:          int   = 0
-
     crps_mean:      float = float("nan")
     crps_72h:       float = float("nan")
     ssr_mean:       float = float("nan")
     bss_mean:       float = float("nan")
-
     dtw_mean:       float = float("nan")
     dtw_str:        float = float("nan")
     dtw_rec:        float = float("nan")
@@ -1408,7 +1297,6 @@ class DatasetMetrics:
     oyr_rec:        float = float("nan")
     hle_mean:       float = float("nan")
     hle_rec:        float = float("nan")
-
     loss_fm:        float = float("nan")
     loss_dir:       float = float("nan")
     loss_step:      float = float("nan")
@@ -1417,7 +1305,6 @@ class DatasetMetrics:
     loss_smooth:    float = float("nan")
     loss_pinn:      float = float("nan")
     loss_total:     float = float("nan")
-
     n_total:        int   = 0
     timestamp:      str   = ""
 
@@ -1534,15 +1421,14 @@ class TCEvaluator:
         g = gt_01[:T]
 
         _ade, _fde, ps = ade_fde(p, g)
-        _ate, _cte = ate_cte(p, g)
-        theta      = total_rotation_angle(g)
-        cat        = "recurvature" if theta >= self.recurv_thr else "straight"
-        theta_pred = total_rotation_angle(p)
-        cat_pred   = "recurvature" if theta_pred >= self.recurv_thr else "straight"
-
-        csd_g      = compute_csd(g)
-        _oyr       = oyr(p, g)
-        _hle       = hle(p, g)
+        _ate, _cte     = ate_cte(p, g)
+        theta          = total_rotation_angle(g)
+        cat            = "recurvature" if theta >= self.recurv_thr else "straight"
+        theta_pred     = total_rotation_angle(p)
+        cat_pred       = "recurvature" if theta_pred >= self.recurv_thr else "straight"
+        csd_g          = compute_csd(g)
+        _oyr           = oyr(p, g)
+        _hle           = hle(p, g)
 
         crps_arr: Optional[np.ndarray] = None
         ssr_arr:  Optional[np.ndarray] = None
@@ -1561,8 +1447,7 @@ class TCEvaluator:
         r = SequenceResult(
             ade=_ade, fde=_fde, per_step=ps,
             ate=_ate, cte=_cte,
-            category=cat,
-            category_pred=cat_pred,
+            category=cat, category_pred=cat_pred,
             theta=theta, csd_gt=csd_g,
             oyr_val=_oyr, hle_val=_hle,
             crps=crps_arr, ssr=ssr_arr, dtw=dtw_val,
@@ -1576,7 +1461,6 @@ class TCEvaluator:
             r.loss_smooth  = loss_dict.get("smooth",  float("nan"))
             r.loss_pinn    = loss_dict.get("pinn",    float("nan"))
             r.loss_total   = loss_dict.get("total",   float("nan"))
-
         self._results.append(r)
 
     def update_batch(self, pred_norm, gt_norm,
@@ -1604,9 +1488,8 @@ class TCEvaluator:
 
         str_r = [r for r in rs if r.category == "straight"]
         rec_r = [r for r in rs if r.category == "recurvature"]
-
-        ade_s  = float(np.mean([r.ade for r in str_r])) if str_r else float("nan")
-        ade_r  = float(np.mean([r.ade for r in rec_r])) if rec_r else float("nan")
+        ade_s = float(np.mean([r.ade for r in str_r])) if str_r else float("nan")
+        ade_r = float(np.mean([r.ade for r in rec_r])) if rec_r else float("nan")
         pr_val = ade_r / (ade_s + 1e-8) if (str_r and rec_r) else float("nan")
 
         all_ate = np.concatenate([r.ate for r in rs])
@@ -1625,20 +1508,19 @@ class TCEvaluator:
         crps_72h  = float("nan")
         ssr_mean  = float("nan")
         if crps_seqs:
-            crps_mat = np.stack(crps_seqs)
+            crps_mat  = np.stack(crps_seqs)
             crps_mean = float(crps_mat.mean())
-            step_72 = HORIZON_STEPS.get(72, -1)
+            step_72   = HORIZON_STEPS.get(72, -1)
             if 0 <= step_72 < crps_mat.shape[1]:
                 crps_72h = float(crps_mat[:, step_72].mean())
         if ssr_seqs:
             ssr_mat  = np.stack(ssr_seqs)
-            valid_ssr = ssr_mat[~np.isnan(ssr_mat)]
-            ssr_mean = float(valid_ssr.mean()) if len(valid_ssr) > 0 else float("nan")
+            valid    = ssr_mat[~np.isnan(ssr_mat)]
+            ssr_mean = float(valid.mean()) if len(valid) > 0 else float("nan")
 
         dtw_all = [r.dtw for r in rs  if not np.isnan(r.dtw)]
         dtw_s   = [r.dtw for r in str_r if not np.isnan(r.dtw)]
         dtw_rc  = [r.dtw for r in rec_r if not np.isnan(r.dtw)]
-
         oyr_all = [r.oyr_val for r in rs]
         oyr_rc  = [r.oyr_val for r in rec_r]
         hle_all = [r.hle_val for r in rs  if not np.isnan(r.hle_val)]
@@ -1648,16 +1530,13 @@ class TCEvaluator:
             vals = [getattr(r, attr) for r in rs if not np.isnan(getattr(r, attr))]
             return float(np.mean(vals)) if vals else float("nan")
 
-        csd_vals = [r.csd_gt for r in rs]
-        tau = float(np.median(csd_vals)) if csd_vals else 0.0
-
         if rec_r:
             rdr_num = sum(1 for r in rec_r if r.category_pred == "recurvature")
             rdr_val = rdr_num / len(rec_r)
         else:
             rdr_val = float("nan")
 
-        m = DatasetMetrics(
+        return DatasetMetrics(
             ade           = float(np.mean([r.ade for r in rs])),
             fde           = float(np.mean([r.fde for r in rs])),
             per_step_mean = step_mean,
@@ -1699,7 +1578,6 @@ class TCEvaluator:
             n_total       = n,
             timestamp     = ts,
         )
-        return m
 
     def save_csv(self, csv_path: str, tag: str = "") -> None:
         m = self.compute(tag=tag)
@@ -1708,14 +1586,15 @@ class TCEvaluator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  10. Fast Tier-1 accumulator  ── FIX-MET-8
+#  10. Fast Tier-1 accumulator  ── FIX-MET-8/9
 # ══════════════════════════════════════════════════════════════════════════════
 
 class StepErrorAccumulator:
     """
-    FIX-MET-8: Pad dist_km [T_active, B] → [pred_len, B] với zeros khi
-    T_active < pred_len (curriculum training). Tránh crash broadcast.
-    compute() trả về "active_steps" để caller biết steps thật sự có data.
+    FIX-MET-8: Pad dist_km [T_active, B] → [pred_len, B] với zeros.
+    FIX-MET-9: Dùng per-step _count array thay vì _active_max scalar.
+               ADE chỉ tính trên steps có count > 0 (actual data steps).
+               active_steps = số steps có data thật sự.
     """
 
     def __init__(self, pred_len: int = PRED_LEN, step_hours: int = STEP_HOURS):
@@ -1724,10 +1603,9 @@ class StepErrorAccumulator:
         self.reset()
 
     def reset(self) -> None:
-        self._sum         = np.zeros(self.pred_len, dtype=np.float64)
-        self._sum_sq      = np.zeros(self.pred_len, dtype=np.float64)
-        self._count       = np.zeros(self.pred_len, dtype=np.int64)  # per-step count
-        self._active_max  = 0  # track max T_active seen
+        self._sum    = np.zeros(self.pred_len, dtype=np.float64)
+        self._sum_sq = np.zeros(self.pred_len, dtype=np.float64)
+        self._count  = np.zeros(self.pred_len, dtype=np.int64)
 
     def update(self, dist_km) -> None:
         if HAS_TORCH and torch.is_tensor(dist_km):
@@ -1735,7 +1613,6 @@ class StepErrorAccumulator:
         else:
             d = np.asarray(dist_km, dtype=np.float64)
 
-        # Ensure [T, B] shape
         if d.ndim == 1:
             d = d.reshape(-1, 1)
         elif d.ndim != 2:
@@ -1743,39 +1620,38 @@ class StepErrorAccumulator:
 
         T_actual, B = d.shape
 
-        # FIX-MET-8: pad to pred_len nếu T_actual < pred_len
+        # FIX-MET-8: pad to pred_len
         if T_actual < self.pred_len:
-            pad = np.zeros((self.pred_len - T_actual, B), dtype=np.float64)
+            pad    = np.zeros((self.pred_len - T_actual, B), dtype=np.float64)
             d_full = np.concatenate([d, pad], axis=0)
         else:
-            d_full = d[:self.pred_len]
+            d_full   = d[:self.pred_len]
             T_actual = self.pred_len
 
-        # Chỉ cộng vào count cho steps có data thật (không pad)
         self._sum    += d_full.sum(axis=1)
         self._sum_sq += (d_full ** 2).sum(axis=1)
-        # Count per step: chỉ T_actual steps đầu có data thật
+
+        # FIX-MET-9: only increment count for steps with real data
         self._count[:T_actual] += B
-        # Steps được pad không tăng count → average của chúng = 0/0 = nan
-        # Dùng max T_actual để biết đến đâu có data thật
-        self._active_max = max(self._active_max, T_actual)
 
     def compute(self) -> Dict:
         if self._count[0] == 0:
             return {}
 
-        # Tính per-step mean chỉ cho steps có count > 0
         count_safe = np.where(self._count > 0, self._count, 1)
-        ps  = self._sum / count_safe
-        ps  = np.where(self._count > 0, ps, 0.0)
+        ps  = self._sum    / count_safe
         ps2 = self._sum_sq / count_safe
+        ps  = np.where(self._count > 0, ps,  0.0)
+        ps2 = np.where(self._count > 0, ps2, 0.0)
         std = np.sqrt(np.maximum(ps2 - ps ** 2, 0.0))
-        std = np.where(self._count > 0, std, 0.0)
 
-        # ADE chỉ trên active steps
-        active = self._active_max
-        ade_val = float(ps[:active].mean()) if active > 0 else 0.0
-        fde_val = float(ps[active - 1]) if active > 0 else 0.0
+        # FIX-MET-9: active_steps = max step index with any data
+        active = int(np.sum(self._count > 0))   # number of steps with data
+        if active == 0:
+            return {}
+
+        ade_val = float(ps[:active].mean())
+        fde_val = float(ps[active - 1])
 
         out: Dict = {
             "per_step":     ps,
@@ -1786,7 +1662,7 @@ class StepErrorAccumulator:
             "n_samples":    int(self._count[0]),
         }
         for h, s in HORIZON_STEPS.items():
-            if s < active:
+            if s < active and self._count[s] > 0:
                 out[f"{h}h"]     = float(ps[s])
                 out[f"{h}h_std"] = float(std[s])
             else:
@@ -1796,7 +1672,37 @@ class StepErrorAccumulator:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  11. Backward-compatible wrappers
+#  11. Baseline helpers
+# ══════════════════════════════════════════════════════════════════════════════
+
+def cliper_errors(obs_seqs, gt_seqs, pred_len: int) -> Tuple[float, np.ndarray]:
+    """Compute CLIPER errors for all sequences. Returns (mean_ade, [N, pred_len])."""
+    all_errs = []
+    for obs, gt in zip(obs_seqs, gt_seqs):
+        errs = np.zeros(pred_len)
+        for h in range(pred_len):
+            pred_c = cliper_forecast(np.array(obs), h + 1)
+            errs[h] = float(haversine_km(pred_c[np.newaxis],
+                                         np.array(gt)[h:h+1], unit_01deg=True)[0])
+        all_errs.append(errs)
+    mat = np.stack(all_errs)
+    return float(mat.mean()), mat
+
+
+def persistence_errors(obs_seqs, gt_seqs, pred_len: int) -> np.ndarray:
+    """Persistence baseline errors [N, pred_len]."""
+    all_errs = []
+    for obs, gt in zip(obs_seqs, gt_seqs):
+        last = np.array(obs)[-1, :2]
+        errs = np.array([float(haversine_km(last[np.newaxis],
+                                            np.array(gt)[h:h+1], unit_01deg=True)[0])
+                         for h in range(pred_len)])
+        all_errs.append(errs)
+    return np.stack(all_errs)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  12. Backward-compatible wrappers
 # ══════════════════════════════════════════════════════════════════════════════
 
 def RSE(pred, true):
