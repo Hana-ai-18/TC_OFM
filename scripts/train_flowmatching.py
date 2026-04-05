@@ -1718,28 +1718,50 @@ def main(args):
         mean_rr = float(np.mean(recurv_ratio_buf)) if recurv_ratio_buf else 0.0
 
         # ── Val loss ───────────────────────────────────────────────────────────
-        if epoch % args.val_freq == 0:
-            model.eval()
-            val_loss = 0.0
-            t_val    = time.perf_counter()
-            with torch.no_grad():
-                for batch in val_loader:
-                    bl_v = move(list(batch), device)
-                    with autocast(device_type='cuda', enabled=args.use_amp):
-                        val_loss += model.get_loss(bl_v).item()
-            last_val_loss = val_loss / len(val_loader)
-            t_val_s = time.perf_counter() - t_val
-            saver.update_val_loss(last_val_loss, model, args.output_dir,
-                                   epoch, optimizer, avg_t)
-            print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
-                  f"  rr={mean_rr:.2f}"
-                  f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
-                  f"  ens={current_ens}  alpha={step_alpha:.2f}"
-                  f"  recurv_w={epoch_weights['recurv']:.2f}")
-        else:
-            print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
-                  f"  val={last_val_loss:.3f}(cached)"
-                  f"  rr={mean_rr:.2f}  t={ep_s:.0f}s")
+        # if epoch % args.val_freq == 0:
+        #     model.eval()
+        #     val_loss = 0.0
+        #     t_val    = time.perf_counter()
+        #     with torch.no_grad():
+        #         for batch in val_loader:
+        #             bl_v = move(list(batch), device)
+        #             with autocast(device_type='cuda', enabled=args.use_amp):
+        #                 val_loss += model.get_loss(bl_v).item()
+        #     last_val_loss = val_loss / len(val_loader)
+        #     t_val_s = time.perf_counter() - t_val
+        #     saver.update_val_loss(last_val_loss, model, args.output_dir,
+        #                            epoch, optimizer, avg_t)
+        #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
+        #           f"  rr={mean_rr:.2f}"
+        #           f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
+        #           f"  ens={current_ens}  alpha={step_alpha:.2f}"
+        #           f"  recurv_w={epoch_weights['recurv']:.2f}")
+        # else:
+        #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
+        #           f"  val={last_val_loss:.3f}(cached)"
+        #           f"  rr={mean_rr:.2f}  t={ep_s:.0f}s")
+
+        # ── Val loss (Tính mỗi epoch, không cached) ──────────────────────────
+        model.eval()
+        val_loss = 0.0
+        t_val    = time.perf_counter()
+        with torch.no_grad():
+            for batch in val_loader:
+                bl_v = move(list(batch), device)
+                with autocast(device_type='cuda', enabled=args.use_amp):
+                    val_loss += model.get_loss(bl_v).item()
+        
+        last_val_loss = val_loss / len(val_loader)
+        t_val_s = time.perf_counter() - t_val
+        
+        saver.update_val_loss(last_val_loss, model, args.output_dir,
+                               epoch, optimizer, avg_t)
+        
+        print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
+              f"  rr={mean_rr:.2f}"
+              f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
+              f"  ens={current_ens}  alpha={step_alpha:.2f}"
+              f"  recurv_w={epoch_weights['recurv']:.2f}")
 
         # ── Fast ADE (subset, monitor only) ───────────────────────────────────
         t_ade  = time.perf_counter()
