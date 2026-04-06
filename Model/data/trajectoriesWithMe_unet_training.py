@@ -921,14 +921,15 @@ _NPY_KEY_REMAP = {
     "gph500_center_n" : "gph500_center",
 }
  
-# FIX: remap sang "u500_raw_mean" (không phải "u500_mean")
+# FIX-DATA-28: Remap sang "u500_mean" (key mà env_net đọc),
+# không remap sang "u500_raw_mean" nữa.
+# uv500_already_normed=True sẽ được set → env_net v20 xử lý đúng.
 _NPY_U500_KEY_REMAP = {
-    "u500_mean_n"   : "u500_raw_mean",
-    "u500_center_n" : "u500_raw_center",
-    "v500_mean_n"   : "v500_raw_mean",
-    "v500_center_n" : "v500_raw_center",
+    "u500_mean_n"   : "u500_mean",     # FIX-DATA-28: đúng key
+    "u500_center_n" : "u500_center",
+    "v500_mean_n"   : "v500_mean",
+    "v500_center_n" : "v500_center",
 }
-
 
 # ── CSV fallback builder ──────────────────────────────────────────────────────
 
@@ -942,71 +943,74 @@ def _build_csv_env_lookup(csv_path: str) -> dict:
     try:
         import pandas as pd
     except ImportError:
-        logger.warning("pandas không có → CSV fallback không khả dụng")
         return {}
-
+ 
+    import os, logging
+    logger = logging.getLogger(__name__)
+ 
     if not os.path.exists(csv_path):
         logger.warning(f"CSV fallback không tìm thấy: {csv_path}")
         return {}
-
-    logger.info(f"Loading CSV env fallback: {csv_path}")
+ 
+    logger.info(f"Loading CSV env fallback v25: {csv_path}")
     try:
         df = pd.read_csv(csv_path, dtype={"storm_name": str, "dt": str})
     except Exception as e:
         logger.warning(f"CSV load failed: {e}")
         return {}
-
+ 
+    _MOVE_VEL_NORM = 1219.84
     lookup: dict = {}
     for _, row in df.iterrows():
         yr         = str(int(float(row["year"])))
         name_raw   = str(row["storm_name"])
         name_strip = name_raw.lstrip("0") or "0"
         ts         = str(row["dt"])
-
+ 
         dir12   = [float(row.get(f"env_dir12_{i}",  0.0)) for i in range(8)]
         dir24   = [float(row.get(f"env_dir24_{i}",  0.0)) for i in range(8)]
         inten24 = [float(row.get(f"env_inten24_{i}", 0.0)) for i in range(4)]
-
+ 
         gph_mean   = float(row.get("env_gph500_mean",   -29.5))
         gph_center = float(row.get("env_gph500_center", -29.5))
-
+ 
         mv_norm = float(row.get("env_move_velocity", 0.0))
         mv_raw  = mv_norm * _MOVE_VEL_NORM
-
-        # FIX-DATA-24: actual u/v500 steering flow (raw m²/s²)
-        # Sentinel: 0.0 hoặc > 10000 → missing → _normalize_uv500 trả 0.0
+ 
+        # FIX-DATA-29: Actual u/v500 raw values (m/s)
         u500_raw_mean   = float(row.get("d3d_u500_mean_raw",   0.0))
         v500_raw_mean   = float(row.get("d3d_v500_mean_raw",   0.0))
         u500_raw_center = float(row.get("d3d_u500_center_raw", 0.0))
         v500_raw_center = float(row.get("d3d_v500_center_raw", 0.0))
-
-        # GPH500 raw → dam: d3d_gph500_mean_raw / 380 ≈ env_gph500_mean
-        # Dùng env_gph500_mean trực tiếp (raw dam) như trước
+ 
         d = {
             "gph500_mean"            : gph_mean,
             "gph500_center"          : gph_center,
             "gph500_already_normed"  : False,
-            "u500_mean"              : 1.0,         # legacy boolean (ignored now)
-            "u500_center"            : 1.0,
-            "v500_mean"              : 1.0,
-            "v500_center"            : 1.0,
-            # FIX-DATA-24: actual raw values → build_env_features dùng keys này
-            "u500_raw_mean"          : u500_raw_mean,
+            # FIX-DATA-28/29: lưu cả 2 key để env_net v20 đọc qua priority 1
+            "u500_raw_mean"          : u500_raw_mean,    # env_net v20 priority 1
             "v500_raw_mean"          : v500_raw_mean,
             "u500_raw_center"        : u500_raw_center,
             "v500_raw_center"        : v500_raw_center,
+            # legacy keys (env_net v20 priority 2, nhưng uv500_already_normed=False → skip)
+            "u500_mean"              : u500_raw_mean,    # actual m/s value
+            "u500_center"            : u500_raw_center,
+            "v500_mean"              : v500_raw_mean,
+            "v500_center"            : v500_raw_center,
+            "uv500_already_normed"   : False,            # raw m/s, cần normalize
             "move_velocity"          : mv_raw,
             "history_direction12"    : dir12,
             "history_direction24"    : dir24,
             "history_inte_change24"  : inten24,
         }
-
+ 
         for name_try in (name_raw, name_strip, name_raw.zfill(4), name_raw.zfill(2)):
             lookup[(yr, name_try, ts)] = d
-
+ 
     n_storms = df['storm_name'].nunique()
-    logger.info(f"CSV env lookup built: {len(lookup)} entries ({n_storms} storms)")
+    logger.info(f"CSV env lookup v25 built: {len(lookup)} entries ({n_storms} storms)")
     return lookup
+
 
 
 def _auto_discover_csv(root_path: str) -> str | None:
@@ -1043,28 +1047,30 @@ def _auto_discover_synthetic_csv(root_path: str) -> str | None:
 def env_data_processing(env_dict: dict) -> dict:
     if not isinstance(env_dict, dict):
         return {}
-    
-    # FIX: copy cả hai already_normed flags
+ 
     already_normed_gph = bool(env_dict.get("gph500_already_normed", False))
     already_normed_uv  = bool(env_dict.get("uv500_already_normed",  False))
-    
-    cleaned = {
-        "gph500_already_normed": already_normed_gph,
-        "uv500_already_normed" : already_normed_uv,   # ← THÊM
-    }
-    
+ 
+    # Keys không stack thành tensor
     _SKIP_KEYS = {
-        "gph500_already_normed", 
+        "gph500_already_normed",
         "uv500_already_normed",
         "has_data3d",
-        "gph500_mean_already_normed", "gph500_center_already_normed",
-         # ← THÊM vào skip để không bị copy lại lần 2
+        "gph500_mean_already_normed",
+        "gph500_center_already_normed",
     }
-    
+ 
+    cleaned = {
+        "gph500_already_normed": already_normed_gph,
+        "uv500_already_normed" : already_normed_uv,
+    }
+ 
     for k, v in env_dict.items():
         if k in _SKIP_KEYS:
             continue
-        if isinstance(v, (list, np.ndarray)):
+        if isinstance(v, (list,)):
+            cleaned[k] = v
+        elif hasattr(v, '__len__'):  # numpy array etc
             cleaned[k] = v
         elif isinstance(v, bool):
             cleaned[k] = v
@@ -1072,13 +1078,13 @@ def env_data_processing(env_dict: dict) -> dict:
             cleaned[k] = 0.0
         else:
             cleaned[k] = v
-    
+ 
     for sst_key in ("sst_mean", "sst_center", "sst"):
         if sst_key in cleaned:
             val = cleaned[sst_key]
             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
                 cleaned[sst_key] = _SST_FILL_K
-    
+ 
     if not already_normed_gph:
         for gph_key in ("gph500_mean", "gph500_center"):
             if gph_key in cleaned:
@@ -1086,6 +1092,7 @@ def env_data_processing(env_dict: dict) -> dict:
                 if val is not None and isinstance(val, (int, float)):
                     if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
                         cleaned[gph_key] = None
+ 
     return cleaned
 # ── seq_collate ───────────────────────────────────────────────────────────────
 
@@ -1140,7 +1147,9 @@ def seq_collate(data):
             "gph500_mean_already_normed", "gph500_center_already_normed",
             "history_direction12_valid", "history_direction24_valid",
             "history_inte_change24_valid",
-            "uv500_already_normed",   # ← THÊM: flag boolean, không stack thành tensor
+            "uv500_already_normed",
+            # FIX-DATA-30: raw keys là scalar, cần stack bình thường (không skip)
+            # "u500_raw_mean", "v500_raw_mean" etc → giữ lại để stack # ← THÊM: flag boolean, không stack thành tensor
         }
         all_keys -= _skip_keys
 
@@ -1602,6 +1611,7 @@ class TrajectoryDataset(Dataset):
         import numpy as np
         import logging
         logger = logging.getLogger(__name__)
+    
         folder = os.path.join(self.env_path, str(year), str(ty_name))
         if os.path.exists(folder):
             candidates = []
@@ -1618,7 +1628,7 @@ class TrajectoryDataset(Dataset):
                     ]
                 except Exception:
                     pass
-
+    
             for p in candidates:
                 try:
                     raw = np.load(p, allow_pickle=True).item()
@@ -1627,34 +1637,38 @@ class TrajectoryDataset(Dataset):
                     remapped = dict(raw)
                     has_old_gph = False
                     has_old_uv  = False
-
+    
                     for old_k, new_k in _NPY_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
                             has_old_gph = True
-
+    
+                    # FIX-DATA-28: remap u/v500_mean_n → u/v500_mean (key đúng)
                     for old_k, new_k in _NPY_U500_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
                             has_old_uv = True
-
+    
                     if has_old_gph:
                         remapped["gph500_already_normed"] = True
                     if has_old_uv:
                         remapped["uv500_already_normed"] = True
-
-                    # FIX: set flag TRƯỚC khi gọi env_data_processing
+    
+                    # Xử lý env_data
+                    from Model.data.trajectoriesWithMe_unet_training import env_data_processing
                     result = env_data_processing(remapped)
-                    
-                    # Verify flag survived
+    
+                    # Verify flags survived
                     if has_old_uv and not result.get("uv500_already_normed", False):
-                        logger.warning(f"uv500_already_normed flag lost after processing: {p}")
-                        result["uv500_already_normed"] = True  # force set
+                        result["uv500_already_normed"] = True
+                    if has_old_gph and not result.get("gph500_already_normed", False):
+                        result["gph500_already_normed"] = True
+    
                     return result
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
-
-        # CSV fallback — CSV data KHÔNG already_normed
+    
+        # CSV fallback
         if self._csv_env_lookup:
             yr_str = str(year)
             ts_str = str(timestamp)
@@ -1664,9 +1678,9 @@ class TrajectoryDataset(Dataset):
             for name_try in (str(ty_name), name_strip, name_padded, name_padded2):
                 raw_dict = self._csv_env_lookup.get((yr_str, name_try, ts_str))
                 if raw_dict is not None:
+                    from Model.data.trajectoriesWithMe_unet_training import env_data_processing
                     return env_data_processing(dict(raw_dict))
-                    # ↑ CSV data không set uv500_already_normed → False → đúng
-
+    
         return None
 
     def _get_env_features(self, year, ty_name, dates, obs_traj, obs_Me):

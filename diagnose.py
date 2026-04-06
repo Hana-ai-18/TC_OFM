@@ -32,13 +32,13 @@ def run_diagnosis(train_loader, val_loader, device, n_batches=5):
         # --- env_data check ---
         env_data = bl[13]
         if isinstance(env_data, dict):
-            for key in ["u500_mean", "v500_mean", "u500_center", "v500_center"]:
+            for key in ["u500_mean_n", "v500_mean_n", "u500_center", "v500_center"]:
                 if key in env_data:
                     v = env_data[key]
                     nz = (v.abs() > 1e-6).float().mean().item()
-                    if key == "u500_mean":
+                    if key == "u500_mean_n":
                         u500_nonzero_ratios.append(nz)
-                    elif key == "v500_mean":
+                    elif key == "v500_mean_n":
                         v500_nonzero_ratios.append(nz)
             if "gph500_mean" in env_data:
                 gph500_vals.append(env_data["gph500_mean"].mean().item())
