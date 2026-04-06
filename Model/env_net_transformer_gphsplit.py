@@ -1094,11 +1094,31 @@ def build_env_features_one_step(
                     val = float(np.clip(val, -5.0, 5.0))
         feat[k] = [val]
 
-    # ── U500 / V500 — FIX-ENV-20: actual steering flow ─────────────────────
-    # Key priority (env_npy):
-    #   1. "u500_raw_mean"   / "v500_raw_mean"   (mới, từ CSV v20 / .npy mới)
-    #   2. "u500_raw_center" / "v500_raw_center"
-    #   3. Fallback → 0.0 (boolean "u500_mean"=1.0 bị bỏ qua)
+    # # ── U500 / V500 — FIX-ENV-20: actual steering flow ─────────────────────
+    # # Key priority (env_npy):
+    # #   1. "u500_raw_mean"   / "v500_raw_mean"   (mới, từ CSV v20 / .npy mới)
+    # #   2. "u500_raw_center" / "v500_raw_center"
+    # #   3. Fallback → 0.0 (boolean "u500_mean"=1.0 bị bỏ qua)
+    # for feat_key, raw_keys, mean_val, std_val in [
+    #     ("u500_mean",   ["u500_raw_mean",   "u500_mean_raw"],   _U500_MEAN, _U500_STD),
+    #     ("u500_center", ["u500_raw_center", "u500_center_raw"], _U500_MEAN, _U500_STD),
+    #     ("v500_mean",   ["v500_raw_mean",   "v500_mean_raw"],   _V500_MEAN, _V500_STD),
+    #     ("v500_center", ["v500_raw_center", "v500_center_raw"], _V500_MEAN, _V500_STD),
+    # ]:
+    #     val = 0.0
+    #     if isinstance(env_npy, dict):
+    #         for rk in raw_keys:
+    #             if rk in env_npy:
+    #                 val = _normalize_uv500(env_npy[rk], mean_val, std_val)
+    #                 break
+    #         # Legacy boolean key: ignore (FIX-ENV-20)
+    #         # if val == 0.0 and feat_key in env_npy:
+    #         #     val = float(np.clip(float(env_npy[feat_key]), 0.0, 1.0))
+    #     feat[feat_key] = [val]
+    # Thay thế đoạn U500/V500 hiện tại:
+    uv_already_normed = (isinstance(env_npy, dict) 
+                        and env_npy.get("uv500_already_normed", False))
+
     for feat_key, raw_keys, mean_val, std_val in [
         ("u500_mean",   ["u500_raw_mean",   "u500_mean_raw"],   _U500_MEAN, _U500_STD),
         ("u500_center", ["u500_raw_center", "u500_center_raw"], _U500_MEAN, _U500_STD),
@@ -1109,13 +1129,18 @@ def build_env_features_one_step(
         if isinstance(env_npy, dict):
             for rk in raw_keys:
                 if rk in env_npy:
-                    val = _normalize_uv500(env_npy[rk], mean_val, std_val)
+                    if uv_already_normed:
+                        # .npy cũ: giá trị đã /30, range [-1,1]
+                        # Clip để tránh outlier, dùng trực tiếp
+                        try:
+                            val = float(np.clip(float(env_npy[rk]), -5.0, 5.0))
+                        except (TypeError, ValueError):
+                            val = 0.0
+                    else:
+                        # CSV hoặc .npy mới: raw m²/s²
+                        val = _normalize_uv500(env_npy[rk], mean_val, std_val)
                     break
-            # Legacy boolean key: ignore (FIX-ENV-20)
-            # if val == 0.0 and feat_key in env_npy:
-            #     val = float(np.clip(float(env_npy[feat_key]), 0.0, 1.0))
         feat[feat_key] = [val]
-
     return feat
 
 

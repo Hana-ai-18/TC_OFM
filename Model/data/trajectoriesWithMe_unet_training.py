@@ -921,10 +921,10 @@ _NPY_KEY_REMAP = {
     "gph500_center_n" : "gph500_center",
 }
 _NPY_U500_KEY_REMAP = {
-    "u500_mean_n"   : "u500_mean",
-    "u500_center_n" : "u500_center",
-    "v500_mean_n"   : "v500_mean",
-    "v500_center_n" : "v500_center",
+    "u500_mean_n"   : "u500_raw_mean",
+    "u500_center_n" : "u500_raw_center",
+    "v500_mean_n"   : "v500_raw_mean",
+    "v500_center_n" : "v500_raw_center",
 }
 
 
@@ -1592,6 +1592,8 @@ class TrajectoryDataset(Dataset):
                         continue
                     remapped = dict(raw)
                     has_old_gph = False
+                    has_old_uv  = False      
+
                     for old_k, new_k in _NPY_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
@@ -1599,8 +1601,11 @@ class TrajectoryDataset(Dataset):
                     for old_k, new_k in _NPY_U500_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
+                            has_old_uv = True     
                     if has_old_gph:
                         remapped["gph500_already_normed"] = True
+                    if has_old_uv:
+                        remapped["uv500_already_normed"] = True 
                     return env_data_processing(remapped)
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
