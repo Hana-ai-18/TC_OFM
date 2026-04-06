@@ -473,7 +473,7 @@ _GPH500_SENTINEL_LO = 25.0
 _GPH500_SENTINEL_HI = 95.0
 
 # FIX-ENV-20A/B: u/v500 raw normalization constant (m/s)
-_UV500_RAW_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
+_UV500_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
 
 _WIND_NORM_DENOM = 150.0
 _INTENSITY_THRESHOLDS_MS = [17.2, 32.7, 41.5, 51.5, 65.0]
@@ -541,65 +541,101 @@ def intensity_class_onehot(wind_ms: float) -> list[int]:
     return v
 
 
-def _get_uv500_val(env_npy: dict, key_base: str, already_normed_uv: bool) -> float:
+# def _get_uv500_val(env_npy: dict, key_base: str, already_normed_uv: bool) -> float:
+#     """
+#     FIX-ENV-20A/B: Đọc u/v500 đúng cách.
+    
+#     Priority:
+#     1. "{key_base}_raw_mean" → raw m/s từ CSV (FIX-DATA-24) → normalize /30
+#     2. "{key_base}_mean" với already_normed_uv=True → .npy cũ đã normed → dùng trực tiếp
+#     3. "{key_base}_mean" với already_normed_uv=False → boolean flag legacy → bỏ qua (→ 0)
+#     4. Không có → 0.0
+    
+#     Ví dụ: key_base="u500" → đọc "u500_raw_mean" hoặc "u500_mean"
+#     """
+#     if not isinstance(env_npy, dict):
+#         return 0.0
+
+#     # Mapping: key_base → các key name có thể có
+#     # "u500" → "u500_raw_mean", "u500_mean"
+#     # "u500_center" → "u500_raw_center", "u500_center"
+#     raw_key    = key_base + "_raw"   # e.g. "u500_mean_raw" → not correct
+#     # Correct: raw key được lưu là "u500_raw_mean", "v500_raw_mean" etc
+#     # key_base = "u500_mean" → base = "u500", sub = "mean"
+#     # Let's parse properly
+#     parts = key_base.rsplit("_", 1)  # ["u500", "mean"] or ["u500", "center"]
+#     if len(parts) == 2:
+#         uv_var, stat = parts  # e.g. "u500", "mean"
+#         raw_key_csv = f"{uv_var}_raw_{stat}"  # "u500_raw_mean"
+#     else:
+#         raw_key_csv = None
+
+#     # Priority 1: raw từ CSV
+#     if raw_key_csv and raw_key_csv in env_npy:
+#         raw = env_npy[raw_key_csv]
+#         try:
+#             raw = float(raw)
+#             if math.isnan(raw) or raw == 0.0:
+#                 return 0.0
+#             return float(np.clip(raw / _UV500_RAW_NORM, -1.0, 1.0))
+#         except (TypeError, ValueError):
+#             pass
+
+#     # Priority 2: key thường
+#     if key_base in env_npy:
+#         raw = env_npy[key_base]
+#         try:
+#             raw = float(raw)
+#             if math.isnan(raw):
+#                 return 0.0
+#             if already_normed_uv:
+#                 # .npy cũ: đã normalized bởi build_env (/U500_NORM=30) → range [-1,1]
+#                 return float(np.clip(raw, -1.0, 1.0))
+#             else:
+#                 # CSV legacy: boolean flag 0.0 hoặc 1.0 → vô nghĩa → bỏ qua
+#                 # Trả 0.0 thay vì dùng boolean
+#                 return 0.0
+#         except (TypeError, ValueError):
+#             pass
+
+#     return 0.0
+
+def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
     """
-    FIX-ENV-20A/B: Đọc u/v500 đúng cách.
-    
-    Priority:
-    1. "{key_base}_raw_mean" → raw m/s từ CSV (FIX-DATA-24) → normalize /30
-    2. "{key_base}_mean" với already_normed_uv=True → .npy cũ đã normed → dùng trực tiếp
-    3. "{key_base}_mean" với already_normed_uv=False → boolean flag legacy → bỏ qua (→ 0)
-    4. Không có → 0.0
-    
-    Ví dụ: key_base="u500" → đọc "u500_raw_mean" hoặc "u500_mean"
+    FIX-ENV-22: Đọc u/v500 từ .npy (đã normalized [-1,1] bởi /30.0).
+    Trả về 0.0 nếu missing hoặc has_data3d=False.
+    Clip [-1, 1] để đảm bảo không có outlier.
     """
     if not isinstance(env_npy, dict):
         return 0.0
+    # has_data3d=False → tất cả u/v = 0.0 (fallback trong builder)
+    if not env_npy.get("has_data3d", True):
+        return 0.0
+    raw = env_npy.get(key, None)
+    if raw is None:
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    # Trong .npy: đã clip(-1,1) — giá trị hợp lệ trong [-1,1]
+    # Nếu = 0.0 → Data3d miss cho timestep này (builder fallback)
+    return float(np.clip(v, -1.0, 1.0))
 
-    # Mapping: key_base → các key name có thể có
-    # "u500" → "u500_raw_mean", "u500_mean"
-    # "u500_center" → "u500_raw_center", "u500_center"
-    raw_key    = key_base + "_raw"   # e.g. "u500_mean_raw" → not correct
-    # Correct: raw key được lưu là "u500_raw_mean", "v500_raw_mean" etc
-    # key_base = "u500_mean" → base = "u500", sub = "mean"
-    # Let's parse properly
-    parts = key_base.rsplit("_", 1)  # ["u500", "mean"] or ["u500", "center"]
-    if len(parts) == 2:
-        uv_var, stat = parts  # e.g. "u500", "mean"
-        raw_key_csv = f"{uv_var}_raw_{stat}"  # "u500_raw_mean"
-    else:
-        raw_key_csv = None
-
-    # Priority 1: raw từ CSV
-    if raw_key_csv and raw_key_csv in env_npy:
-        raw = env_npy[raw_key_csv]
-        try:
-            raw = float(raw)
-            if math.isnan(raw) or raw == 0.0:
-                return 0.0
-            return float(np.clip(raw / _UV500_RAW_NORM, -1.0, 1.0))
-        except (TypeError, ValueError):
-            pass
-
-    # Priority 2: key thường
-    if key_base in env_npy:
-        raw = env_npy[key_base]
-        try:
-            raw = float(raw)
-            if math.isnan(raw):
-                return 0.0
-            if already_normed_uv:
-                # .npy cũ: đã normalized bởi build_env (/U500_NORM=30) → range [-1,1]
-                return float(np.clip(raw, -1.0, 1.0))
-            else:
-                # CSV legacy: boolean flag 0.0 hoặc 1.0 → vô nghĩa → bỏ qua
-                # Trả 0.0 thay vì dùng boolean
-                return 0.0
-        except (TypeError, ValueError):
-            pass
-
-    return 0.0
-
+def _read_uv500_from_csv(raw_val, norm: float = _UV500_NORM) -> float:
+    """
+    FIX-ENV-22: Normalize u/v500 raw từ CSV (m²/s² ~5843).
+    Công thức giống build_env_data_scs_v10.py: clip(raw/30.0, -1, 1).
+    """
+    if raw_val is None:
+        return 0.0
+    try:
+        v = float(raw_val)
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0.0 or v > 50000.0:   # sentinel/missing
+        return 0.0
+    return float(np.clip(v / norm, -1.0, 1.0))
 
 def build_env_features_one_step(
     lon_norm: float,
@@ -696,14 +732,52 @@ def build_env_features_one_step(
 
         feat[k] = [val]
 
-    # ── U500 / V500 ────────────────────────────────────────────────────────────
-    # FIX-ENV-20A/B: Dùng actual steering flow values thay vì boolean flags
-    already_normed_uv = isinstance(env_npy, dict) and env_npy.get("uv500_already_normed", False)
-
-    for k in ("u500_mean", "u500_center", "v500_mean", "v500_center"):
-        val = _get_uv500_val(env_npy if isinstance(env_npy, dict) else {}, k, already_normed_uv)
-        feat[k] = [val]
-
+      # ── U500 / V500 (FIX-ENV-22) ───────────────────────────────────────────────
+    # Source priority:
+    #   1. .npy: key "u500_mean" đã trong [-1,1]  (build_env_data_scs_v10)
+    #   2. CSV:  key "u500_raw_mean" (raw m²/s²)  → normalize /30
+    #   3. 0.0 fallback
+ 
+    for feat_key, npy_key, csv_raw_keys in [
+        ("u500_mean",   "u500_mean",   ["u500_raw_mean",   "d3d_u500_mean_raw"]),
+        ("u500_center", "u500_center", ["u500_raw_center", "d3d_u500_center_raw"]),
+        ("v500_mean",   "v500_mean",   ["v500_raw_mean",   "d3d_v500_mean_raw"]),
+        ("v500_center", "v500_center", ["v500_raw_center", "d3d_v500_center_raw"]),
+    ]:
+        val = 0.0
+        if isinstance(env_npy, dict):
+            # Ưu tiên .npy key (đã normalized)
+            if npy_key in env_npy:
+                candidate = env_npy[npy_key]
+                try:
+                    candidate_f = float(candidate)
+                    # Phân biệt: .npy normalized = trong [-1,1]
+                    # CSV boolean flag = luôn 0.0 hoặc 1.0 (và = 1.0 nghĩa là available)
+                    # .npy với has_data3d=False → = 0.0 (miss)
+                    # Cần check: nếu has_data3d=True và value trong [-1,1] → dùng
+                    has_3d = env_npy.get("has_data3d", True)
+                    if has_3d and candidate_f != 0.0:
+                        # Có actual data
+                        val = float(np.clip(candidate_f, -1.0, 1.0))
+                    elif has_3d and candidate_f == 0.0:
+                        # Có thể là miss hoặc actual 0 wind — dùng 0.0
+                        val = 0.0
+                    else:
+                        # has_data3d=False: explicitly missing
+                        val = 0.0
+                except (TypeError, ValueError):
+                    val = 0.0
+ 
+            # Nếu vẫn 0 → thử CSV raw keys
+            if val == 0.0:
+                for rk in csv_raw_keys:
+                    if rk in env_npy:
+                        val = _read_uv500_from_csv(env_npy[rk])
+                        if val != 0.0:
+                            break
+ 
+        feat[feat_key] = [val]
+ 
     return feat
 
 
@@ -816,3 +890,4 @@ class Env_net(nn.Module):
         e_env_time = self.transformer_env(e_env)
         ctx = self.out_proj(e_env_time[:, -1, :])
         return ctx, 0, 0
+
