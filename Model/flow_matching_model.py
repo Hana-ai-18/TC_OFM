@@ -1196,6 +1196,27 @@ ROOT CAUSE FIXES:
 Kept:
   FIX-M23..M26 (val alignment, lat_shift_aug, jitter_aug, etc.)
 """
+"""
+Model/flow_matching_model.py  ── v26
+==========================================
+FIXES vs v25:
+  FIX-M33  [P0] ctx_fc1 input dim sai: khi d_model=32, FNO3D proj_bottleneck
+           output 128 channels → bottleneck_pool→proj → enc_1d nhận 128.
+           Nhưng f_spatial = e_3d_dec.mean(dim=(2,3,4)) shape [B,1] (out_ch=1)
+           → decoder_proj(Linear(1,16)) → 16 dims.
+           Tổng: h_t(128) + e_env(64) + f_spatial(16) = 208.
+           ctx_fc1 = Linear(208, 512) ← đúng.
+           Bug thực sự: với d_model=32 FNO3D encoder, enc_1d nhận feat_3d_dim=128
+           từ bottleneck (proj_bottleneck: 32→128), output enc_1d = lstm_hidden=128.
+           Tất cả đã đúng, nhưng cần explicit constant để tránh drift.
+
+  FIX-M34  [P0] d_model FNO3D: hard-code 32 (không phải 64).
+
+  FIX-M35  [P1] uv500_already_normed flag: flow_matching không cần xử lý,
+           flag được handle trong trajectoriesWithMe + env_net.
+
+Giữ từ v25: FIX-M27..M32
+"""
 from __future__ import annotations
 
 import csv
@@ -1216,12 +1237,22 @@ from Model.losses import (
     pinn_speed_constraint,
 )
 
-# Minimum ensemble size để AFCRPS có ý nghĩa
 _MIN_TRAIN_ENS = 4
+
+# ── Architecture constants (tất cả explicit để tránh mismatch) ────────────────
+_FNO_D_MODEL      = 32      # FNO3D internal channels
+_FNO_BOTTLENECK   = 128     # proj_bottleneck output: d_model→128
+_FNO_SUMMARY_CH   = 1       # summary_conv output channels
+_ENC1D_HIDDEN     = 128     # DataEncoder1D lstm_hidden / output dim
+_ENV_D_MODEL      = 64      # Env_net d_model output dim
+_F_SPATIAL_DIM    = 16      # decoder_proj output: Linear(summary_ch, 16)
+_CTX_FULL_DIM     = _ENC1D_HIDDEN + _ENV_D_MODEL + _F_SPATIAL_DIM  # 208
+_CTX_1D_DIM       = _ENC1D_HIDDEN + _ENV_D_MODEL                   # 192
+_CTX_MID_DIM      = 512
+_CTX_OUT_DIM      = 256
 
 
 def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
-    """Normalised → degrees. Handles [T, B, 2] and [B, 2]."""
     out = traj_norm.clone()
     out[..., 0] = (traj_norm[..., 0] * 50.0 + 1800.0) / 10.0
     out[..., 1] = (traj_norm[..., 1] * 50.0) / 10.0
@@ -1229,7 +1260,6 @@ def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
 
 
 def _img_obs_valid_ratio(image_obs: torch.Tensor) -> float:
-    """Check ratio of nonzero pixels để detect Data3d missing."""
     return (image_obs.abs() > 1e-6).float().mean().item()
 
 
@@ -1242,7 +1272,7 @@ class VelocityField(nn.Module):
         self,
         pred_len:   int   = 12,
         obs_len:    int   = 8,
-        ctx_dim:    int   = 256,
+        ctx_dim:    int   = _CTX_OUT_DIM,
         sigma_min:  float = 0.02,
         unet_in_ch: int   = 13,
     ):
@@ -1251,10 +1281,12 @@ class VelocityField(nn.Module):
         self.obs_len   = obs_len
         self.sigma_min = sigma_min
 
+        # ── Spatial encoder (FNO3D) ──────────────────────────────────────────
+        # d_model=32 → proj_bottleneck output=128, summary_conv output=1
         self.spatial_enc = FNO3DEncoder(
             in_channel   = unet_in_ch,
-            out_channel  = 1,
-            d_model      = 32,
+            out_channel  = _FNO_SUMMARY_CH,   # 1
+            d_model      = _FNO_D_MODEL,       # 32
             n_layers     = 4,
             modes_t      = 4,
             modes_h      = 4,
@@ -1263,51 +1295,60 @@ class VelocityField(nn.Module):
             dropout      = 0.05,
         )
 
+        # bottleneck: [B, 128, T, 4, 4] → pool → [B, T, 128] → proj → [B, T, 128]
         self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
-        self.bottleneck_proj = nn.Linear(128, 128)
-        self.decoder_proj    = nn.Linear(1, 16)
+        self.bottleneck_proj = nn.Linear(_FNO_BOTTLENECK, _FNO_BOTTLENECK)  # 128→128
 
+        # summary: [B, 1, T, 1, 1] → mean → [B, 1] → proj → [B, 16]
+        self.decoder_proj = nn.Linear(_FNO_SUMMARY_CH, _F_SPATIAL_DIM)     # 1→16
+
+        # ── 1D encoder (Mamba) ───────────────────────────────────────────────
+        # Input: [B, T, 4] traj + [B, T, 128] spatial → output [B, 128]
         self.enc_1d = DataEncoder1D(
             in_1d       = 4,
-            feat_3d_dim = 128,
+            feat_3d_dim = _FNO_BOTTLENECK,   # 128
             mlp_h       = 64,
-            lstm_hidden = 128,
+            lstm_hidden = _ENC1D_HIDDEN,     # 128
             lstm_layers = 3,
             dropout     = 0.1,
             d_state     = 16,
         )
 
-        self.env_enc = Env_net(obs_len=obs_len, d_model=32)
+        # ── Env encoder ─────────────────────────────────────────────────────
+        # output: [B, 64]
+        self.env_enc = Env_net(obs_len=obs_len, d_model=_ENV_D_MODEL)
 
-        # FIX-M27: fallback projection khi spatial features = 0
-        self.ctx_fc1  = nn.Linear(128 + 64 + 16, 512)
-        self.ctx_ln   = nn.LayerNorm(512)
+        # ── Context heads ────────────────────────────────────────────────────
+        # Full path (spatial valid): 128 + 64 + 16 = 208
+        self.ctx_fc1  = nn.Linear(_CTX_FULL_DIM, _CTX_MID_DIM)   # 208→512
+        self.ctx_ln   = nn.LayerNorm(_CTX_MID_DIM)
         self.ctx_drop = nn.Dropout(0.15)
-        self.ctx_fc2  = nn.Linear(512, ctx_dim)
+        self.ctx_fc2  = nn.Linear(_CTX_MID_DIM, ctx_dim)          # 512→256
 
-        # FIX-M27: 1D-only fallback path khi img_obs toàn zeros
-        self.ctx_fc1_1d  = nn.Linear(128 + 32, 512)
-        self.ctx_ln_1d   = nn.LayerNorm(512)
-        self.ctx_fc2_1d  = nn.Linear(512, ctx_dim)
+        # 1D-only fallback path: 128 + 64 = 192
+        self.ctx_fc1_1d = nn.Linear(_CTX_1D_DIM, _CTX_MID_DIM)   # 192→512
+        self.ctx_ln_1d  = nn.LayerNorm(_CTX_MID_DIM)
+        self.ctx_fc2_1d = nn.Linear(_CTX_MID_DIM, ctx_dim)        # 512→256
 
-        self.time_fc1 = nn.Linear(256, 512)
-        self.time_fc2 = nn.Linear(512, 256)
+        # ── Transformer decoder ──────────────────────────────────────────────
+        self.time_fc1 = nn.Linear(ctx_dim, _CTX_MID_DIM)
+        self.time_fc2 = nn.Linear(_CTX_MID_DIM, ctx_dim)
 
-        self.traj_embed = nn.Linear(4, 256)
-        self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
+        self.traj_embed = nn.Linear(4, ctx_dim)
+        self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, ctx_dim) * 0.02)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=256, nhead=8, dim_feedforward=1024,
+                d_model=ctx_dim, nhead=8, dim_feedforward=1024,
                 dropout=0.15, activation="gelu", batch_first=True,
             ),
             num_layers=4,
         )
-        self.out_fc1 = nn.Linear(256, 512)
-        self.out_fc2 = nn.Linear(512, 4)
+        self.out_fc1 = nn.Linear(ctx_dim, _CTX_MID_DIM)
+        self.out_fc2 = nn.Linear(_CTX_MID_DIM, 4)
 
         self.physics_scale = nn.Parameter(torch.ones(4) * 0.5)
 
-    def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
+    def _time_emb(self, t: torch.Tensor, dim: int = _CTX_OUT_DIM) -> torch.Tensor:
         half = dim // 2
         freq = torch.exp(
             torch.arange(half, dtype=torch.float32, device=t.device)
@@ -1318,35 +1359,43 @@ class VelocityField(nn.Module):
         return F.pad(emb, (0, dim % 2))
 
     def _context(self, batch_list: List) -> Tuple[torch.Tensor, bool]:
-        """
-        FIX-M27: Returns (raw_ctx, spatial_valid).
-        spatial_valid=False khi img_obs toàn zeros → dùng 1D-only path.
-        """
-        obs_traj  = batch_list[0]
-        obs_Me    = batch_list[7]
-        image_obs = batch_list[11]
+        obs_traj  = batch_list[0]   # [T_obs, B, 2]
+        obs_Me    = batch_list[7]   # [T_obs, B, 2]
+        image_obs = batch_list[11]  # [B, T_obs, H, W, C] or [B, C, T, H, W]
         env_data  = batch_list[13]
 
+        # Ensure [B, C, T, H, W]
+        if image_obs.dim() == 5 and image_obs.shape[-1] == 13:
+            # [B, T, H, W, C] → [B, C, T, H, W]
+            image_obs = image_obs.permute(0, 4, 1, 2, 3)
         if image_obs.dim() == 4:
             image_obs = image_obs.unsqueeze(1)
 
-        expected_ch = self.spatial_enc.in_channel
-        if image_obs.shape[1] == 1 and expected_ch != 1:
-            image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
+        B      = obs_traj.shape[1]
+        T_obs  = obs_traj.shape[0]
+        device = obs_traj.device
 
-        # FIX-M27: check spatial data quality
+        expected_ch = self.spatial_enc.in_channel  # 13
+        if image_obs.shape[1] != expected_ch:
+            if image_obs.shape[1] == 1:
+                image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
+
         spatial_valid = _img_obs_valid_ratio(image_obs) > 0.05
 
+        # obs_in: [B, T_obs, 4]
         obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
 
         if spatial_valid:
+            # e_3d_bot: [B, 128, T, 4, 4]
+            # e_3d_dec: [B, 1,   T, 1, 1]
             e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
-            T_obs = obs_traj.shape[0]
 
-            e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
-            e_3d_s = e_3d_s.permute(0, 2, 1)
-            e_3d_s = self.bottleneck_proj(e_3d_s)
+            # bottleneck → [B, T_bot, 128]
+            e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)  # [B, 128, T_bot]
+            e_3d_s = e_3d_s.permute(0, 2, 1)                                 # [B, T_bot, 128]
+            e_3d_s = self.bottleneck_proj(e_3d_s)                            # [B, T_bot, 128]
 
+            # align T
             T_bot = e_3d_s.shape[1]
             if T_bot != T_obs:
                 e_3d_s = F.interpolate(
@@ -1354,22 +1403,32 @@ class VelocityField(nn.Module):
                     mode="linear", align_corners=False,
                 ).permute(0, 2, 1)
 
-            f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))
-            f_spatial     = self.decoder_proj(f_spatial_raw)
+            # f_spatial: e_3d_dec [B, 1, T, 1, 1] → mean → [B, 1] → [B, 16]
+            f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))  # [B, 1]
+            f_spatial     = self.decoder_proj(f_spatial_raw)  # [B, 16]
 
+            # enc_1d: [B, 128]
             h_t = self.enc_1d(obs_in, e_3d_s)
+
+            # env: [B, 64]
             e_env, _, _ = self.env_enc(env_data, image_obs)
 
+            # concat: [B, 128+64+16] = [B, 208]
             raw = torch.cat([h_t, e_env, f_spatial], dim=-1)
+            assert raw.shape[-1] == _CTX_FULL_DIM, \
+                f"ctx_full dim mismatch: {raw.shape[-1]} != {_CTX_FULL_DIM}"
             raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))
+
         else:
-            # FIX-M27: 1D-only fallback — spatial zeros không contribute
-            B = obs_traj.shape[1]
-            device = obs_traj.device
-            e_3d_s_dummy = torch.zeros(B, obs_traj.shape[0], 128, device=device)
+            # 1D fallback
+            e_3d_s_dummy = torch.zeros(B, T_obs, _FNO_BOTTLENECK, device=device)
             h_t = self.enc_1d(obs_in, e_3d_s_dummy)
             e_env, _, _ = self.env_enc(env_data, image_obs)
+
+            # concat: [B, 128+64] = [B, 192]
             raw = torch.cat([h_t, e_env], dim=-1)
+            assert raw.shape[-1] == _CTX_1D_DIM, \
+                f"ctx_1d dim mismatch: {raw.shape[-1]} != {_CTX_1D_DIM}"
             raw = F.gelu(self.ctx_ln_1d(self.ctx_fc1_1d(raw)))
 
         return raw, spatial_valid
@@ -1393,28 +1452,25 @@ class VelocityField(nn.Module):
         lat_deg  = lat_norm * 5.0
         lat_rad  = torch.deg2rad(lat_deg.clamp(-85, 85))
 
-        beta   = 2 * OMEGA_val * torch.cos(lat_rad) / R_val
-        R_tc   = 3e5
-        v_lon  = -beta * R_tc ** 2 / 2
-        v_lat  =  beta * R_tc ** 2 / 4
-
-        v_lon_norm = v_lon * DT / M_PER_NORM
-        v_lat_norm = v_lat * DT / M_PER_NORM
+        beta  = 2 * OMEGA_val * torch.cos(lat_rad) / R_val
+        R_tc  = 3e5
+        v_lon = -beta * R_tc ** 2 / 2
+        v_lat =  beta * R_tc ** 2 / 4
 
         v_phys = torch.zeros_like(x_t)
-        v_phys[:, :, 0] = v_lon_norm
-        v_phys[:, :, 1] = v_lat_norm
+        v_phys[:, :, 0] = v_lon * DT / M_PER_NORM
+        v_phys[:, :, 1] = v_lat * DT / M_PER_NORM
         return v_phys
 
     def _decode(self, x_t: torch.Tensor, t: torch.Tensor,
                 ctx: torch.Tensor) -> torch.Tensor:
-        t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
+        t_emb = F.gelu(self.time_fc1(self._time_emb(t, _CTX_OUT_DIM)))
         t_emb = self.time_fc2(t_emb)
 
-        T_seq  = min(x_t.size(1), self.pos_enc.shape[1])
-        x_emb  = (self.traj_embed(x_t[:, :T_seq, :])
-                  + self.pos_enc[:, :T_seq, :]
-                  + t_emb.unsqueeze(1))
+        T_seq = min(x_t.size(1), self.pos_enc.shape[1])
+        x_emb = (self.traj_embed(x_t[:, :T_seq, :])
+                 + self.pos_enc[:, :T_seq, :]
+                 + t_emb.unsqueeze(1))
         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
 
         v_neural = self.out_fc2(F.gelu(self.out_fc1(
@@ -1429,7 +1485,7 @@ class VelocityField(nn.Module):
 
     def forward(self, x_t, t, batch_list):
         raw, spatial_valid = self._context(batch_list)
-        ctx = self._apply_ctx_head(raw, use_spatial=spatial_valid, noise_scale=0.0)
+        ctx = self._apply_ctx_head(raw, use_spatial=spatial_valid)
         return self._decode(x_t, t, ctx)
 
     def forward_with_ctx(self, x_t, t, raw_ctx, spatial_valid: bool = True,
@@ -1453,7 +1509,7 @@ class TCFlowMatching(nn.Module):
         n_train_ens:          int   = 6,
         unet_in_ch:           int   = 13,
         ctx_noise_scale:      float = 0.02,
-        initial_sample_sigma: float = 0.3,   # FIX-M29: 0.1 → 0.3
+        initial_sample_sigma: float = 0.3,
         **kwargs,
     ):
         super().__init__()
@@ -1491,13 +1547,8 @@ class TCFlowMatching(nn.Module):
         )
 
     def _cfm_noisy(self, x1):
-        """
-        FIX-M29: x0 noise level 0.5 thay vì sigma_min.
-        Cao hơn → ensemble có spread tốt hơn sau reverse process.
-        """
         B, device = x1.shape[0], x1.device
         sm  = self.sigma_min
-        # FIX-M29: base noise 0.5 thay vì sigma_min=0.02
         x0  = torch.randn_like(x1) * 0.5
         t   = torch.rand(B, device=device)
         te  = t.view(B, 1, 1)
@@ -1523,9 +1574,7 @@ class TCFlowMatching(nn.Module):
         for idx in [0, 1, 2, 3]:
             t = aug[idx]
             if torch.is_tensor(t) and t.shape[-1] >= 1:
-                t = t.clone()
-                t[..., 0] = -t[..., 0]
-                aug[idx] = t
+                t = t.clone(); t[..., 0] = -t[..., 0]; aug[idx] = t
         return aug
 
     @staticmethod
@@ -1541,14 +1590,11 @@ class TCFlowMatching(nn.Module):
         for idx in [0, 1, 2, 3]:
             t = aug[idx]
             if torch.is_tensor(t) and t.shape[-1] >= 2:
-                t = t.clone()
-                t[..., 1] = t[..., 1] + shift
-                aug[idx] = t
+                t = t.clone(); t[..., 1] = t[..., 1] + shift; aug[idx] = t
         return aug
 
     @staticmethod
-    def _jitter_aug(batch_list: List, p: float = 0.3,
-                    std: float = 0.002) -> List:
+    def _jitter_aug(batch_list: List, p: float = 0.3, std: float = 0.002) -> List:
         if torch.rand(1).item() > p:
             return batch_list
         aug = list(batch_list)
@@ -1556,9 +1602,7 @@ class TCFlowMatching(nn.Module):
             t = aug[idx]
             if torch.is_tensor(t) and t.shape[-1] >= 2:
                 noise = torch.randn_like(t[..., :2]) * std
-                t = t.clone()
-                t[..., :2] = t[..., :2] + noise
-                aug[idx] = t
+                t = t.clone(); t[..., :2] = t[..., :2] + noise; aug[idx] = t
         return aug
 
     def get_loss(self, batch_list: List,
@@ -1572,10 +1616,10 @@ class TCFlowMatching(nn.Module):
             batch_list = self._lat_shift_aug(batch_list, p=0.2)
             batch_list = self._jitter_aug(batch_list, p=0.3)
 
-        traj_gt  = batch_list[1]
-        Me_gt    = batch_list[8]
-        obs_t    = batch_list[0]
-        obs_Me   = batch_list[7]
+        traj_gt = batch_list[1]
+        Me_gt   = batch_list[8]
+        obs_t   = batch_list[0]
+        obs_Me  = batch_list[7]
 
         try:
             env_data = batch_list[13]
@@ -1585,7 +1629,6 @@ class TCFlowMatching(nn.Module):
         lp, lm = obs_t[-1], obs_Me[-1]
         x1 = self._to_rel(traj_gt, Me_gt, lp, lm)
 
-        # FIX-M27: get context with spatial validity flag
         raw_ctx, spatial_valid = self.net._context(batch_list)
         intensity_w = self._intensity_weights(obs_Me)
 
@@ -1594,21 +1637,18 @@ class TCFlowMatching(nn.Module):
                                              spatial_valid=spatial_valid,
                                              noise_scale=0.0)
 
-        # FIX-M28: guarantee minimum ensemble size
         ens_size = max(self.n_train_ens, _MIN_TRAIN_ENS)
 
         samples: List[torch.Tensor] = []
         for _ in range(ens_size):
             xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
-            pv_s  = self.net.forward_with_ctx(xt_s, ts, raw_ctx,
-                                              spatial_valid=spatial_valid,
-                                              noise_scale=0.0)
-            x1_s  = xt_s + dens_s * pv_s
+            pv_s = self.net.forward_with_ctx(xt_s, ts, raw_ctx,
+                                             spatial_valid=spatial_valid,
+                                             noise_scale=0.0)
+            x1_s = xt_s + dens_s * pv_s
             pa_s, _ = self._to_abs(x1_s, lp, lm)
             samples.append(pa_s)
         pred_samples = torch.stack(samples)  # [ens_size, T, B, 2]
-
-        all_trajs_4d = pred_samples
 
         l_fm_physics = fm_physics_consistency_loss(
             pred_samples, gt_norm=traj_gt, last_pos=lp)
@@ -1621,27 +1661,25 @@ class TCFlowMatching(nn.Module):
         ref_deg      = _denorm_to_deg(lp)
 
         breakdown = compute_total_loss(
-            pred_abs           = pred_abs_deg,
-            gt                 = traj_gt_deg,
-            ref                = ref_deg,
-            batch_list         = batch_list,
-            pred_samples       = pred_samples,
-            gt_norm            = traj_gt,
-            weights            = WEIGHTS,
-            intensity_w        = intensity_w,
-            env_data           = env_data,
-            step_weight_alpha  = step_weight_alpha,
-            all_trajs          = all_trajs_4d,
+            pred_abs          = pred_abs_deg,
+            gt                = traj_gt_deg,
+            ref               = ref_deg,
+            batch_list        = batch_list,
+            pred_samples      = pred_samples,
+            gt_norm           = traj_gt,
+            weights           = WEIGHTS,
+            intensity_w       = intensity_w,
+            env_data          = env_data,
+            step_weight_alpha = step_weight_alpha,
+            all_trajs         = pred_samples,
         )
 
         fm_phys_w = WEIGHTS.get("fm_physics", 0.1)
-        breakdown["total"]      = breakdown["total"] + fm_phys_w * l_fm_physics
-        breakdown["fm_physics"] = l_fm_physics.item()
+        breakdown["total"]        = breakdown["total"] + fm_phys_w * l_fm_physics
+        breakdown["fm_physics"]   = l_fm_physics.item()
         breakdown["spatial_valid"] = float(spatial_valid)
 
         return breakdown
-
-    # ── sample() ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(
@@ -1650,8 +1688,8 @@ class TCFlowMatching(nn.Module):
         num_ensemble: int = 50,
         ddim_steps:   int = 20,
         predict_csv:  Optional[str] = None,
-        temperature:  float = 1.2,   # FIX-M31: diversity control
-        epoch:        int   = 0,     # FIX-M30: physics correction từ ep50
+        temperature:  float = 1.2,
+        epoch:        int   = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         lp  = batch_list[0][-1]
         lm  = batch_list[7][-1]
@@ -1666,7 +1704,6 @@ class TCFlowMatching(nn.Module):
         me_s:   List[torch.Tensor] = []
 
         for k in range(num_ensemble):
-            # FIX-M29 + M31: higher initial sigma * temperature
             init_sigma = self.initial_sample_sigma * temperature
             x_t = torch.randn(B, T, 4, device=device) * init_sigma
 
@@ -1678,7 +1715,6 @@ class TCFlowMatching(nn.Module):
                                                 noise_scale=ns)
                 x_t = x_t + dt * vel
 
-            # FIX-M30: physics correction chỉ sau epoch 50
             if epoch >= 50:
                 x_t = self._physics_correct(x_t, lp, lm, n_steps=3, lr=0.001)
 
@@ -1698,16 +1734,8 @@ class TCFlowMatching(nn.Module):
 
         return pred_mean, me_mean, all_trajs
 
-    # ── Physics correction ────────────────────────────────────────────────────
-
-    def _physics_correct(
-        self,
-        x_pred: torch.Tensor,
-        last_pos: torch.Tensor,
-        last_Me:  torch.Tensor,
-        n_steps:  int   = 3,
-        lr:       float = 0.001,
-    ) -> torch.Tensor:
+    def _physics_correct(self, x_pred, last_pos, last_Me,
+                         n_steps=3, lr=0.001) -> torch.Tensor:
         with torch.enable_grad():
             x = x_pred.detach().requires_grad_(True)
             optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)
@@ -1717,8 +1745,7 @@ class TCFlowMatching(nn.Module):
                 pred_deg    = _denorm_to_deg(pred_abs)
                 l_speed = self._pinn_speed_constraint(pred_deg)
                 l_accel = self._pinn_beta_plane_simplified(pred_deg)
-                physics_loss = l_speed + 0.3 * l_accel
-                physics_loss.backward()
+                (l_speed + 0.3 * l_accel).backward()
                 torch.nn.utils.clip_grad_norm_([x], max_norm=0.05)
                 optimizer.step()
         return x.detach()
@@ -1745,8 +1772,7 @@ class TCFlowMatching(nn.Module):
         cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
         a_lon_km = a[:, :, 0] * cos_lat * 111.0
         a_lat_km = a[:, :, 1] * 111.0
-        max_accel = 50.0
-        violation = F.relu(torch.sqrt(a_lon_km**2 + a_lat_km**2) - max_accel)
+        violation = F.relu(torch.sqrt(a_lon_km**2 + a_lat_km**2) - 50.0)
         return violation.pow(2).mean() * 0.1
 
     @staticmethod
@@ -1756,13 +1782,10 @@ class TCFlowMatching(nn.Module):
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
         ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
         T, B, _ = traj_mean.shape
-        S       = all_trajs.shape[0]
-
         mean_lon = ((traj_mean[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
         mean_lat = ((traj_mean[..., 1] * 50.0) / 10.0).cpu().numpy()
         all_lon  = ((all_trajs[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
         all_lat  = ((all_trajs[..., 1] * 50.0) / 10.0).cpu().numpy()
-
         fields = ["timestamp", "batch_idx", "step_idx", "lead_h",
                   "lon_mean_deg", "lat_mean_deg",
                   "lon_std_deg", "lat_std_deg", "ens_spread_km"]
@@ -1790,5 +1813,4 @@ class TCFlowMatching(nn.Module):
                     ))
 
 
-# Backward-compat alias
 TCDiffusion = TCFlowMatching
