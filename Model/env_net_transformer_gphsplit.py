@@ -1,58 +1,33 @@
 # # """
-# # Model/env_net_transformer_gphsplit.py  ── v14
+# # Model/env_net_transformer_gphsplit.py  ── v19
 # # ===================================================================
-# # Env-T-Net: Environmental-Time Network.
+# # FIXES vs v18:
 
-# # FIXES vs v13:
+# #   FIX-ENV-19  [CRITICAL] GPH500 = 0 khi dùng Env_data .npy được build
+# #               bởi build_env_data_scs_v10.py (pipeline cũ).
 
-# #   BUG-ENV-WIND FIXED:
-# #     build_env_features_one_step dùng wind_kt / 110.0
-# #     Verify từ data thực tế: env_wind = wnd / 150.0 (max_err=0.0000)
-# #     Fix: 110.0 → 150.0
-# #     Hậu quả v13: wind feature bị overscale 36%, intensity_class luôn
-# #     được tính từ wind_kt đúng nhưng wind feature vector sai scale.
+# #               Pipeline cũ lưu gph500 với key "gph500_mean_n" đã
+# #               pre-normalized bằng mean=5900/std=200 → range ~[-28, 2].
+# #               Sau khi trajectoriesWithMe v18 remap sang key "gph500_mean"
+# #               và set cờ "gph500_already_normed"=True, hàm này nhận value
+# #               đã normalize → KHÔNG được z-score lần 2.
 
-# #   BUG-ENV-MOVE-VELOCITY FIXED:
-# #     env_move_velocity trong CSV range [0, 0.5524]
-# #     → max raw velocity = 0.5524 * 1219.84 = 673.9 km/h
-# #     Nhưng max realistic TC speed ~100 km/h → 1219.84 là sai.
-# #     Verify: env_move_velocity đã được normalize trong CSV bởi max observed
-# #     value. Cần dùng đúng normalizer.
-# #     Fix: dùng 120.0 (km/h) làm normalizer vì max realistic TC speed ~100 km/h
-# #     với safety margin. Giá trị trong CSV đã được chia cho 1219.84 ở bước trước
-# #     → giữ nguyên normalizer cũ (1219.84) nếu CSV values đã scaled.
-# #     NHƯNG: nếu raw move_velocity trong env_npy là km/h thật (~0-100),
-# #     thì cần / 120.0 thay vì / 1219.84 (sai 10x).
-# #     Giữ nguyên 1219.84 vì CSV đã dùng giá trị này để tính env_move_velocity.
+# #               Fix trong build_env_features_one_step():
+# #                 if env_npy.get("gph500_already_normed", False):
+# #                     val = float(raw)   # dùng trực tiếp, chỉ clip [-5,5]
+# #                 else:
+# #                     val = (raw - mean_val) / (std_val + 1e-8)  # z-score bình thường
 
-# #   BUG-ENV-GPH500-SENTINEL FIXED:
-# #     Guard gph500 > 50 đã có nhưng không guard < 0 đúng cách.
-# #     CSV d3d_gph500_mean_n có range [-29.5, 90.25] → outliers phải clip.
-# #     Fix: clip về [-5, 5] sau z-score (đã có trong v12+).
+# #               Kết quả: GPH500 features sẽ có giá trị thực thay vì = 0.
 
-# # Kept from v13:
-# #   BUG-1-V13: v500_center separate stats
-# #   BUG-3-ENV: gph500 double normalization fix
-# #   BUG-4-ENV: u500/v500 scale fix
-
-# # Feature vector — 90 dims total (unchanged):
-# # ── Data1d env (84 dims) ─────────────────────────────────────────────────────
-# #   wind                  (1)   normalised /150   ← FIXED from /110
-# #   intensity_class       (6)   TD/TS/TY/SevTY/ViSevTY/SuperTY one-hot
-# #   move_velocity         (1)   /1219.84
-# #   month                (12)   one-hot
-# #   location_lon_scs     (10)   2.5 deg/bin [100–125E] one-hot
-# #   location_lat_scs      (8)   2.5 deg/bin [5–25N] one-hot
-# #   bearing_to_scs_center(16)   16 compass dirs 22.5 step one-hot
-# #   dist_to_scs_boundary  (5)   outside/very_far/far/mid/near one-hot
-# #   delta_velocity        (5)   <=−20|−20..−5|−5..+5|+5..+20|>+20 km/h
-# #   history_direction12   (8)   8-dir one-hot, pad −1 if missing
-# #   history_direction24   (8)   same
-# #   history_inte_change24 (4)   intensity change 24h, pad −1 if missing
-# # ── Data3d scalars (6 dims) ──────────────────────────────────────────────────
-# #   gph500_mean/center    (2)   z-score (mu=32.73, sigma=0.47)
-# #   u500_mean/center      (2)   z-score (mu_mean=5843,mu_ctr=752.80)
-# #   v500_mean/center      (2)   z-score (mu_mean=1482,mu_ctr=480.31)
+# # Kept from v18 / earlier:
+# #   FIX-ENV-18  gph500 normalisation constants /380 dam:
+# #               _GPH500_MEAN=33.64, _GPH500_STD=7.08 (dùng cho CSV path
+# #               và .npy mới, không dùng cho .npy cũ đã pre-normed)
+# #   FIX-ENV-16B u500/v500 stored as boolean flags [0,1], no z-score
+# #   FIX-ENV-15  pres_norm parameter
+# #   FIX-ENV-14  wind /150.0
+# #   Feature vector — 90 dims total (unchanged).
 # # """
 # # from __future__ import annotations
 
@@ -101,33 +76,21 @@
 # # BOUNDARY_THRESHOLDS = [0.05, 0.15, 0.30]
 # # DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
-# # # ── Normalization constants ───────────────────────────────────────────────────
+# # # ── Normalisation constants ───────────────────────────────────────────────────
+# # # Dùng cho CSV path và .npy mới (raw dam ~[27-90])
+# # _GPH500_MEAN  = 33.64
+# # _GPH500_STD   =  7.08
+# # _GPH500C_MEAN = 32.84
+# # _GPH500C_STD  =  1.03
 
-# # # BUG-3-ENV FIX (v12): Correct gph500 normalization
-# # # env_npy['gph500_mean'] stores pre-scaled values ≈ raw_gph500 / 380
-# # _GPH500_MEAN = 32.73
-# # _GPH500_STD  = 0.47
+# # # Sentinel: valid range ~27-95 dam. Value < 25 là sentinel (-29.5).
+# # _GPH500_SENTINEL_LO = 25.0
+# # _GPH500_SENTINEL_HI = 95.0
 
-# # # BUG-4-ENV FIX (v12): u500/v500 correct normalization
-# # _U500_MEAN  = 5843.14; _U500_STD  = 50.55
-# # _V500_MEAN  = 1482.47; _V500_STD  = 29.42
-# # _U500C_MEAN = 752.80;  _U500C_STD = 28.49
+# # # FIX-ENV-16B (kept): u500/v500 env values are boolean flags (0.0 or 1.0)
+# # _UV500_SENTINEL_HI = 20000.0
 
-# # # BUG-1-V13 FIX: v500_center separate stats
-# # _V500C_MEAN = 480.31;  _V500C_STD = 24.17
-
-# # # BUG-ENV-WIND FIX (v14):
-# # # Verified from data: env_wind = wnd / 150.0 (max_err=0.0000)
-# # # v13 used 110.0 → wind feature overscaled by 36%
-# # _WIND_NORM_DENOM = 150.0   # FIXED from 110.0
-
-# # _GPH500_SENTINEL_LO = 10.0
-# # _GPH500_SENTINEL_HI = 50.0
-# # _UV500_SENTINEL_HI  = 20000.0
-
-# # # Intensity thresholds in m/s (converted from kt for SCS dataset)
-# # # Dataset uses m/s directly (wnd column)
-# # # TD <17.2, TS 17.2-32.6, TY 32.7-41.4, SevTY 41.5-51.4, ViSevTY 51.5-64.9, SuperTY≥65
+# # _WIND_NORM_DENOM = 150.0
 # # _INTENSITY_THRESHOLDS_MS = [17.2, 32.7, 41.5, 51.5, 65.0]
 
 
@@ -186,10 +149,6 @@
 
 
 # # def intensity_class_onehot(wind_ms: float) -> list[int]:
-# #     """
-# #     BUG-ENV-WIND FIX (v14): Dataset uses m/s directly, not kt.
-# #     Thresholds in m/s: TD<17.2, TS<32.7, TY<41.5, SevTY<51.5, ViSevTY<65.0, SuperTY≥65
-# #     """
 # #     thresholds = _INTENSITY_THRESHOLDS_MS
 # #     idx = sum(wind_ms >= t for t in thresholds)
 # #     v   = [0] * 6
@@ -202,26 +161,28 @@
 # #     lat_norm: float,
 # #     wind_norm: float,
 # #     timestamp: str,
-# #     env_npy: dict | None,
-# #     prev_speed_kmh: float | None,
+# #     env_npy,
+# #     prev_speed_kmh,
+# #     pres_norm: float = 0.0,
 # # ) -> dict:
 # #     """
-# #     Build 84-dim 1D env feature vector for one timestep.
+# #     Build 90-dim env feature vector for one timestep.
 
-# #     BUG-ENV-WIND FIX (v14):
-# #       wind_ms = wind_norm * 25.0 + 40.0   (decode from normalized)
-# #       feat["wind"] = [wind_ms / 150.0]     ← FIXED from /110.0
-# #       intensity_class uses wind_ms directly (m/s)
+# #     FIX-ENV-19: gph500 handling theo nguồn dữ liệu:
+# #       - .npy cũ (build_env_data_scs_v10): env_npy["gph500_already_normed"]=True
+# #         → value đã normalized, chỉ clip [-5,5], không z-score lại.
+# #       - CSV path: env_npy["gph500_already_normed"]=False (default)
+# #         → value là raw dam ~[27-90], apply sentinel guard + z-score bình thường.
+
+# #     FIX-ENV-16B (kept): u500/v500 stored as boolean flags [0,1], no z-score.
 # #     """
 # #     lon_deg = (lon_norm * 50.0 + 1800.0) / 10.0
 # #     lat_deg = (lat_norm * 50.0) / 10.0
-# #     # Decode wind: wnd_norm = (wnd - 40) / 25 → wnd = wnd_norm*25 + 40 (m/s)
 # #     wind_kt = wind_norm * 25.0 + 40.0
-# #     wind_ms = wind_kt * 0.5144                  # → m/s
+# #     wind_ms = wind_kt * 0.5144
 
 # #     feat: dict = {}
 
-# #     # BUG-ENV-WIND FIX: /150.0 not /110.0
 # #     feat["wind"]            = [wind_ms / _WIND_NORM_DENOM]
 # #     feat["intensity_class"] = intensity_class_onehot(wind_ms)
 
@@ -265,35 +226,53 @@
 # #         v = [-1] * 4
 # #     feat["history_inte_change24"] = v
 
-# #     # gph500 normalization
-# #     for k in ["gph500_mean", "gph500_center"]:
-# #         if isinstance(env_npy, dict) and k in env_npy:
-# #             raw = float(env_npy[k]) if env_npy[k] is not None else None
-# #             if raw is None or math.isnan(raw) or raw < _GPH500_SENTINEL_LO:
-# #                 val = 0.0
-# #             else:
-# #                 val = (raw - _GPH500_MEAN) / (_GPH500_STD + 1e-8)
-# #         else:
-# #             val = 0.0
-# #         feat[k] = [float(np.clip(val, -5.0, 5.0))]
+# #     # ── GPH500 ─────────────────────────────────────────────────────────────────
+# #     # FIX-ENV-19: Phân biệt .npy cũ (already_normed) vs CSV/raw (z-score cần thiết)
+# #     already_normed = isinstance(env_npy, dict) and env_npy.get("gph500_already_normed", False)
 
-# #     # u500/v500 normalization (BUG-4-ENV + BUG-1-V13 fixed)
-# #     uv_configs = [
-# #         ("u500_mean",   _U500_MEAN,  _U500_STD),
-# #         ("u500_center", _U500C_MEAN, _U500C_STD),
-# #         ("v500_mean",   _V500_MEAN,  _V500_STD),
-# #         ("v500_center", _V500C_MEAN, _V500C_STD),
-# #     ]
-# #     for k, mean, std in uv_configs:
+# #     for k, mean_val, std_val in [
+# #         ("gph500_mean",   _GPH500_MEAN,  _GPH500_STD),
+# #         ("gph500_center", _GPH500C_MEAN, _GPH500C_STD),
+# #     ]:
+# #         val = 0.0
 # #         if isinstance(env_npy, dict) and k in env_npy:
-# #             raw = float(env_npy[k])
-# #             if raw is None or raw > _UV500_SENTINEL_HI:
+# #             raw = env_npy[k]
+# #             try:
+# #                 raw = float(raw)
+# #             except (TypeError, ValueError):
+# #                 raw = None
+
+# #             if raw is None or math.isnan(raw):
 # #                 val = 0.0
+# #             elif already_normed:
+# #                 # FIX-ENV-19: .npy cũ — value đã normalized bởi build_env_data
+# #                 # (mean=5900, std=200). Range ~[-28, 2].
+# #                 # Chỉ clip để tránh outlier cực đoan, không z-score lại.
+# #                 val = float(np.clip(raw, -5.0, 5.0))
 # #             else:
-# #                 val = (raw - mean) / (std + 1e-8)
+# #                 # CSV hoặc .npy mới — raw dam, cần sentinel check + z-score
+# #                 if raw < _GPH500_SENTINEL_LO or raw > _GPH500_SENTINEL_HI:
+# #                     val = 0.0
+# #                 else:
+# #                     val = (raw - mean_val) / (std_val + 1e-8)
+# #                     val = float(np.clip(val, -5.0, 5.0))
+
+# #         feat[k] = [val]
+
+# #     # ── U500 / V500 ────────────────────────────────────────────────────────────
+# #     # FIX-ENV-16B (kept): boolean availability flags, no z-score.
+# #     # .npy cũ lưu "u500_mean_n" (normalized /U500_NORM → [-1,1]) đã được
+# #     # remap sang "u500_mean" bởi _load_env_npy. Clip [0,1] là hợp lý.
+# #     for k in ("u500_mean", "u500_center", "v500_mean", "v500_center"):
+# #         if isinstance(env_npy, dict) and k in env_npy:
+# #             raw = env_npy[k]
+# #             try:
+# #                 val = float(np.clip(float(raw), 0.0, 1.0))
+# #             except (TypeError, ValueError):
+# #                 val = 0.0
 # #         else:
 # #             val = 0.0
-# #         feat[k] = [float(np.clip(val, -5.0, 5.0))]
+# #         feat[k] = [val]
 
 # #     return feat
 
@@ -315,7 +294,7 @@
 # #     return torch.cat(parts)
 
 
-# # def build_env_vector(env_data: dict | None, B: int, T: int,
+# # def build_env_vector(env_data, B: int, T: int,
 # #                      device: torch.device) -> torch.Tensor:
 # #     parts = []
 # #     for key, dim in ENV_FEATURE_DIMS.items():
@@ -363,14 +342,6 @@
 # # # ── Env-T-Net ─────────────────────────────────────────────────────────────────
 
 # # class Env_net(nn.Module):
-# #     """
-# #     Environment-Time Network.
-# #     [Eq.10] MLP on Data1d env (84-dim) → e_1d [B, T, H1]
-# #     [Eq.11] 1D-CNN on Data3d scalars (6-dim) → e_3d [B, T, H2]
-# #     [Eq.12] MLP fusion → e_Env [B, T, H3]
-# #     [Eq.13] TransformerEncoder over T → ctx [B, d_model]
-# #     """
-
 # #     def __init__(self, obs_len: int = 8, embed_dim: int = 16, d_model: int = 64):
 # #         super().__init__()
 # #         self.obs_len = obs_len
@@ -396,7 +367,7 @@
 # #         self.transformer_env = nn.TransformerEncoder(enc_layer, num_layers=2)
 # #         self.out_proj = nn.Sequential(nn.Linear(H3, d_model), nn.LayerNorm(d_model))
 
-# #     def forward(self, env_data: dict | None, gph: torch.Tensor) -> tuple:
+# #     def forward(self, env_data, gph: torch.Tensor) -> tuple:
 # #         if gph.dim() == 4:
 # #             gph = gph.unsqueeze(1)
 # #         B, C, T, H, W = gph.shape
@@ -417,37 +388,45 @@
 # #         return ctx, 0, 0
 
 # """
-# Model/env_net_transformer_gphsplit.py  ── v18
+# Model/env_net_transformer_gphsplit.py  ── v20
 # ===================================================================
-# FIXES vs v17:
+# FIXES vs v19:
 
-#   FIX-ENV-18  [CRITICAL] GPH500 normalisation constants were wrong in v17.
-#               v17 assumed gph500 stored as raw/9.80665 (~1268 m) — WRONG.
-#               Actual data stores gph500 as raw_geopotential / ~380
-#               (decameters), giving values in range ~27–90, mean ~33.6.
+#   FIX-ENV-20  [P0-CRITICAL] env_u500/v500: dùng actual steering flow values.
 
-#               Verified from all_storms_final.csv (24885 rows):
-#                 env_gph500_mean   : mean=33.64, std=7.08,  range [27.7, 90.3]
-#                 env_gph500_center : mean=32.84, std=1.03,  range [27.6, 44.9]
-#                 sentinel value    : -29.5 (266 rows)
+#               v19 (và mọi version trước): env_u500_mean trong CSV là boolean
+#               flag (98.9% = 1.0, 1.1% = 0.0). Env_net học feature vô nghĩa.
 
-#               v17 used sentinel LO=1100 → every valid value (~27–90) was
-#               below 1100 → ALL rows sentinel → ALL gph500 features = 0.0
-#               This is the root cause of "GPH500 all zeros" warning.
+#               Nguồn data đúng: d3d_u500_mean_raw / d3d_v500_mean_raw trong CSV
+#               (range ~5800-5900 cho u, ~1470-1510 cho v). Đây là actual steering
+#               flow (geopotential wind components at 500hPa) — feature quan trọng
+#               nhất để dự đoán hướng bão.
 
-#               Fix:
-#                 _GPH500_MEAN  = 33.64   (was 1287.66)
-#                 _GPH500_STD   =  7.08   (was  144.31)
-#                 _GPH500C_MEAN = 32.84   (was 1271.38)
-#                 _GPH500C_STD  =  1.03   (was   20.97)
-#                 _GPH500_SENTINEL_LO = 25.0   (was 1100.0)
-#                 _GPH500_SENTINEL_HI = 95.0   (was 2500.0)
+#               Fix trong build_env_features_one_step():
+#                 Nhận thêm tham số u500_raw / v500_raw (scalar, đơn vị m²/s² raw).
+#                 Normalize bằng _U500_MEAN/_U500_STD tính từ data thực.
+#                 Clip outliers (> 10000 → sentinel, xử lý như missing).
 
-# Kept from v17 / earlier:
-#   FIX-ENV-16B: u500/v500 stored as boolean flags [0,1], no z-score
-#   FIX-ENV-15:  pres_norm parameter
-#   FIX-ENV-14:  wind /150.0
-#   Feature vector — 90 dims total (unchanged).
+#               Fix trong _build_csv_env_lookup() (trajectoriesWithMe):
+#                 Map d3d_u500_mean_raw → "u500_raw_mean"
+#                 Map d3d_v500_mean_raw → "v500_raw_mean"
+#                 (key mới để phân biệt với boolean flag "u500_mean" cũ)
+
+#               Fix trong ENV_FEATURE_DIMS:
+#                 "u500_mean" / "v500_mean" / "u500_center" / "v500_center"
+#                 giữ nguyên dim=1 nhưng nay chứa actual normalized value.
+
+#   FIX-ENV-21  [P1] PINN speed constraint tighter:
+#               max_speed_kmh: 600 → 450 km/6h.
+#               Real TC 99th pct = 59.7 km/h × 6h = 358 km/6h.
+#               600 km/6h quá rộng → constraint không active.
+#               450 km/6h vẫn để khoảng buffer nhưng bắt đầu penalize.
+#               (Change này trong losses.py, không phải file này)
+
+# Kept from v19:
+#   FIX-ENV-19  GPH500 already_normed handling
+#   FIX-ENV-18  _GPH500_MEAN/STD /380 dam
+#   FIX-ENV-14  wind /150.0
 # """
 # from __future__ import annotations
 
@@ -473,10 +452,10 @@
 #     "history_inte_change24":  4,
 #     "gph500_mean":            1,
 #     "gph500_center":          1,
-#     "u500_mean":              1,
-#     "u500_center":            1,
-#     "v500_mean":              1,
-#     "v500_center":            1,
+#     "u500_mean":              1,   # FIX-ENV-20: actual steering flow (was boolean)
+#     "u500_center":            1,   # FIX-ENV-20: actual steering flow (was boolean)
+#     "v500_mean":              1,   # FIX-ENV-20: actual steering flow (was boolean)
+#     "v500_center":            1,   # FIX-ENV-20: actual steering flow (was boolean)
 # }
 
 # ENV_DIM_TOTAL = sum(ENV_FEATURE_DIMS.values())   # 90
@@ -497,23 +476,21 @@
 # DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # # ── Normalisation constants ───────────────────────────────────────────────────
-# # FIX-ENV-18: gph500 stored as raw_geopotential / ~380 (decameters).
-# # Measured from all_storms_final.csv (valid rows, sentinel -29.5 excluded):
-# #   env_gph500_mean  : mean=33.64, std=7.08,  range [27.7, 90.3]
-# #   env_gph500_center: mean=32.84, std=1.03,  range [27.6, 44.9]
-# _GPH500_MEAN  = 33.64   # FIX-ENV-18: was 1287.66 (v17) — WRONG unit
-# _GPH500_STD   =  7.08   # FIX-ENV-18: was  144.31 (v17) — WRONG unit
-# _GPH500C_MEAN = 32.84   # FIX-ENV-18: was 1271.38 (v17) — WRONG unit
-# _GPH500C_STD  =  1.03   # FIX-ENV-18: was   20.97 (v17) — WRONG unit
+# _GPH500_MEAN  = 33.64
+# _GPH500_STD   =  7.08
+# _GPH500C_MEAN = 32.84
+# _GPH500C_STD  =  1.03
+# _GPH500_SENTINEL_LO = 25.0
+# _GPH500_SENTINEL_HI = 95.0
 
-# # Sentinel: -29.5 is the fill value; valid range is ~27–95 dam
-# # FIX-ENV-18: LO was 1100.0 in v17 → killed ALL valid rows → all zeros!
-# _GPH500_SENTINEL_LO = 25.0   # was 1100.0 in v17 (CRITICAL bug)
-# _GPH500_SENTINEL_HI = 95.0   # was 2500.0 in v17
-
-# # FIX-ENV-16B (kept): u500/v500 env values are boolean flags (0.0 or 1.0),
-# # NOT physical wind components. Stored as-is without z-score.
-# _UV500_SENTINEL_HI = 20000.0
+# # FIX-ENV-20: U/V500 actual normalization constants (tính từ valid data trong CSV)
+# # Valid range: u500 trong [5000, 8000], v500 trong [1000, 2500]
+# _U500_MEAN  = 5844.9   # m²/s² (tương đương ~5.8 km²/s²)
+# _U500_STD   =   46.4
+# _V500_MEAN  = 1482.4
+# _V500_STD   =   28.7
+# _UV500_VALID_MIN =  5000.0   # < này là sentinel/missing
+# _UV500_VALID_MAX = 10000.0   # > này là sentinel/missing (outliers 1.7%)
 
 # _WIND_NORM_DENOM = 150.0
 # _INTENSITY_THRESHOLDS_MS = [17.2, 32.7, 41.5, 51.5, 65.0]
@@ -581,6 +558,22 @@
 #     return v
 
 
+# def _normalize_uv500(raw_val, mean: float, std: float) -> float:
+#     """
+#     FIX-ENV-20: Normalize raw u/v 500 hPa steering flow value.
+#     Returns 0.0 for sentinels/missing (raw == 0, > 10000, or invalid).
+#     """
+#     if raw_val is None:
+#         return 0.0
+#     try:
+#         v = float(raw_val)
+#     except (TypeError, ValueError):
+#         return 0.0
+#     if v <= 0.0 or v < _UV500_VALID_MIN or v > _UV500_VALID_MAX:
+#         return 0.0
+#     return float(np.clip((v - mean) / (std + 1e-8), -5.0, 5.0))
+
+
 # def build_env_features_one_step(
 #     lon_norm: float,
 #     lat_norm: float,
@@ -591,10 +584,17 @@
 #     pres_norm: float = 0.0,
 # ) -> dict:
 #     """
-#     Build 84-dim 1D env feature vector for one timestep.
+#     Build 90-dim env feature vector for one timestep.
 
-#     FIX-ENV-18: gph500 z-score uses correct /380 dam constants.
-#     FIX-ENV-16B: u500/v500 stored as boolean flags [0,1], no z-score.
+#     FIX-ENV-20: u500/v500 dùng actual steering flow (raw m²/s²),
+#       không phải boolean availability flag.
+#       Keys trong env_npy:
+#         - Từ .npy cũ: "u500_raw_mean", "v500_raw_mean" (thêm mới)
+#                       hoặc "u500_mean_n" đã remap (backward compat)
+#         - Từ CSV: "u500_raw_mean", "v500_raw_mean" (thêm trong data loader)
+#         - Fallback: key cũ "u500_mean" (boolean) → 0.0
+
+#     FIX-ENV-19 (kept): gph500 handling theo nguồn dữ liệu.
 #     """
 #     lon_deg = (lon_norm * 50.0 + 1800.0) / 10.0
 #     lat_deg = (lat_norm * 50.0) / 10.0
@@ -646,40 +646,54 @@
 #         v = [-1] * 4
 #     feat["history_inte_change24"] = v
 
-#     # ── GPH500 ─────────────────────────────────────────────────────────────────
-#     # FIX-ENV-18: values in /380 dam unit (~27–90), sentinel -29.5 → < 25.0
+#     # ── GPH500 (kept from FIX-ENV-19) ──────────────────────────────────────
+#     already_normed = isinstance(env_npy, dict) and env_npy.get("gph500_already_normed", False)
+
 #     for k, mean_val, std_val in [
 #         ("gph500_mean",   _GPH500_MEAN,  _GPH500_STD),
 #         ("gph500_center", _GPH500C_MEAN, _GPH500C_STD),
 #     ]:
+#         val = 0.0
 #         if isinstance(env_npy, dict) and k in env_npy:
 #             raw = env_npy[k]
 #             try:
 #                 raw = float(raw)
 #             except (TypeError, ValueError):
 #                 raw = None
-#             if (raw is None or math.isnan(raw)
-#                     or raw < _GPH500_SENTINEL_LO
-#                     or raw > _GPH500_SENTINEL_HI):
-#                 val = 0.0
-#             else:
-#                 val = (raw - mean_val) / (std_val + 1e-8)
-#         else:
-#             val = 0.0
-#         feat[k] = [float(np.clip(val, -5.0, 5.0))]
 
-#     # ── U500 / V500 ────────────────────────────────────────────────────────────
-#     # FIX-ENV-16B (kept): boolean availability flags, no z-score
-#     for k in ("u500_mean", "u500_center", "v500_mean", "v500_center"):
-#         if isinstance(env_npy, dict) and k in env_npy:
-#             raw = env_npy[k]
-#             try:
-#                 val = float(np.clip(float(raw), 0.0, 1.0))
-#             except (TypeError, ValueError):
+#             if raw is None or math.isnan(raw):
 #                 val = 0.0
-#         else:
-#             val = 0.0
+#             elif already_normed:
+#                 val = float(np.clip(raw, -5.0, 5.0))
+#             else:
+#                 if raw < _GPH500_SENTINEL_LO or raw > _GPH500_SENTINEL_HI:
+#                     val = 0.0
+#                 else:
+#                     val = (raw - mean_val) / (std_val + 1e-8)
+#                     val = float(np.clip(val, -5.0, 5.0))
 #         feat[k] = [val]
+
+#     # ── U500 / V500 — FIX-ENV-20: actual steering flow ─────────────────────
+#     # Key priority (env_npy):
+#     #   1. "u500_raw_mean"   / "v500_raw_mean"   (mới, từ CSV v20 / .npy mới)
+#     #   2. "u500_raw_center" / "v500_raw_center"
+#     #   3. Fallback → 0.0 (boolean "u500_mean"=1.0 bị bỏ qua)
+#     for feat_key, raw_keys, mean_val, std_val in [
+#         ("u500_mean",   ["u500_raw_mean",   "u500_mean_raw"],   _U500_MEAN, _U500_STD),
+#         ("u500_center", ["u500_raw_center", "u500_center_raw"], _U500_MEAN, _U500_STD),
+#         ("v500_mean",   ["v500_raw_mean",   "v500_mean_raw"],   _V500_MEAN, _V500_STD),
+#         ("v500_center", ["v500_raw_center", "v500_center_raw"], _V500_MEAN, _V500_STD),
+#     ]:
+#         val = 0.0
+#         if isinstance(env_npy, dict):
+#             for rk in raw_keys:
+#                 if rk in env_npy:
+#                     val = _normalize_uv500(env_npy[rk], mean_val, std_val)
+#                     break
+#             # Legacy boolean key: ignore (FIX-ENV-20)
+#             # if val == 0.0 and feat_key in env_npy:
+#             #     val = float(np.clip(float(env_npy[feat_key]), 0.0, 1.0))
+#         feat[feat_key] = [val]
 
 #     return feat
 
@@ -795,35 +809,45 @@
 #         return ctx, 0, 0
 
 """
-Model/env_net_transformer_gphsplit.py  ── v19
+Model/env_net_transformer_gphsplit.py  ── v20
 ===================================================================
-FIXES vs v18:
+FIXES vs v19:
 
-  FIX-ENV-19  [CRITICAL] GPH500 = 0 khi dùng Env_data .npy được build
-              bởi build_env_data_scs_v10.py (pipeline cũ).
+  FIX-ENV-20  [P0-CRITICAL] env_u500/v500: dùng actual steering flow values.
 
-              Pipeline cũ lưu gph500 với key "gph500_mean_n" đã
-              pre-normalized bằng mean=5900/std=200 → range ~[-28, 2].
-              Sau khi trajectoriesWithMe v18 remap sang key "gph500_mean"
-              và set cờ "gph500_already_normed"=True, hàm này nhận value
-              đã normalize → KHÔNG được z-score lần 2.
+              v19 (và mọi version trước): env_u500_mean trong CSV là boolean
+              flag (98.9% = 1.0, 1.1% = 0.0). Env_net học feature vô nghĩa.
+
+              Nguồn data đúng: d3d_u500_mean_raw / d3d_v500_mean_raw trong CSV
+              (range ~5800-5900 cho u, ~1470-1510 cho v). Đây là actual steering
+              flow (geopotential wind components at 500hPa) — feature quan trọng
+              nhất để dự đoán hướng bão.
 
               Fix trong build_env_features_one_step():
-                if env_npy.get("gph500_already_normed", False):
-                    val = float(raw)   # dùng trực tiếp, chỉ clip [-5,5]
-                else:
-                    val = (raw - mean_val) / (std_val + 1e-8)  # z-score bình thường
+                Nhận thêm tham số u500_raw / v500_raw (scalar, đơn vị m²/s² raw).
+                Normalize bằng _U500_MEAN/_U500_STD tính từ data thực.
+                Clip outliers (> 10000 → sentinel, xử lý như missing).
 
-              Kết quả: GPH500 features sẽ có giá trị thực thay vì = 0.
+              Fix trong _build_csv_env_lookup() (trajectoriesWithMe):
+                Map d3d_u500_mean_raw → "u500_raw_mean"
+                Map d3d_v500_mean_raw → "v500_raw_mean"
+                (key mới để phân biệt với boolean flag "u500_mean" cũ)
 
-Kept from v18 / earlier:
-  FIX-ENV-18  gph500 normalisation constants /380 dam:
-              _GPH500_MEAN=33.64, _GPH500_STD=7.08 (dùng cho CSV path
-              và .npy mới, không dùng cho .npy cũ đã pre-normed)
-  FIX-ENV-16B u500/v500 stored as boolean flags [0,1], no z-score
-  FIX-ENV-15  pres_norm parameter
+              Fix trong ENV_FEATURE_DIMS:
+                "u500_mean" / "v500_mean" / "u500_center" / "v500_center"
+                giữ nguyên dim=1 nhưng nay chứa actual normalized value.
+
+  FIX-ENV-21  [P1] PINN speed constraint tighter:
+              max_speed_kmh: 600 → 450 km/6h.
+              Real TC 99th pct = 59.7 km/h × 6h = 358 km/6h.
+              600 km/6h quá rộng → constraint không active.
+              450 km/6h vẫn để khoảng buffer nhưng bắt đầu penalize.
+              (Change này trong losses.py, không phải file này)
+
+Kept from v19:
+  FIX-ENV-19  GPH500 already_normed handling
+  FIX-ENV-18  _GPH500_MEAN/STD /380 dam
   FIX-ENV-14  wind /150.0
-  Feature vector — 90 dims total (unchanged).
 """
 from __future__ import annotations
 
@@ -849,10 +873,10 @@ ENV_FEATURE_DIMS: dict[str, int] = {
     "history_inte_change24":  4,
     "gph500_mean":            1,
     "gph500_center":          1,
-    "u500_mean":              1,
-    "u500_center":            1,
-    "v500_mean":              1,
-    "v500_center":            1,
+    "u500_mean":              1,   # FIX-ENV-20: actual steering flow (was boolean)
+    "u500_center":            1,   # FIX-ENV-20: actual steering flow (was boolean)
+    "v500_mean":              1,   # FIX-ENV-20: actual steering flow (was boolean)
+    "v500_center":            1,   # FIX-ENV-20: actual steering flow (was boolean)
 }
 
 ENV_DIM_TOTAL = sum(ENV_FEATURE_DIMS.values())   # 90
@@ -873,18 +897,21 @@ BOUNDARY_THRESHOLDS = [0.05, 0.15, 0.30]
 DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # ── Normalisation constants ───────────────────────────────────────────────────
-# Dùng cho CSV path và .npy mới (raw dam ~[27-90])
 _GPH500_MEAN  = 33.64
 _GPH500_STD   =  7.08
 _GPH500C_MEAN = 32.84
 _GPH500C_STD  =  1.03
-
-# Sentinel: valid range ~27-95 dam. Value < 25 là sentinel (-29.5).
 _GPH500_SENTINEL_LO = 25.0
 _GPH500_SENTINEL_HI = 95.0
 
-# FIX-ENV-16B (kept): u500/v500 env values are boolean flags (0.0 or 1.0)
-_UV500_SENTINEL_HI = 20000.0
+# FIX-ENV-20: U/V500 actual normalization constants (tính từ valid data trong CSV)
+# Valid range: u500 trong [5000, 8000], v500 trong [1000, 2500]
+_U500_MEAN  = 5844.9   # m²/s² (tương đương ~5.8 km²/s²)
+_U500_STD   =   46.4
+_V500_MEAN  = 1482.4
+_V500_STD   =   28.7
+_UV500_VALID_MIN =  5000.0   # < này là sentinel/missing
+_UV500_VALID_MAX = 10000.0   # > này là sentinel/missing (outliers 1.7%)
 
 _WIND_NORM_DENOM = 150.0
 _INTENSITY_THRESHOLDS_MS = [17.2, 32.7, 41.5, 51.5, 65.0]
@@ -952,6 +979,22 @@ def intensity_class_onehot(wind_ms: float) -> list[int]:
     return v
 
 
+def _normalize_uv500(raw_val, mean: float, std: float) -> float:
+    """
+    FIX-ENV-20: Normalize raw u/v 500 hPa steering flow value.
+    Returns 0.0 for sentinels/missing (raw == 0, > 10000, or invalid).
+    """
+    if raw_val is None:
+        return 0.0
+    try:
+        v = float(raw_val)
+    except (TypeError, ValueError):
+        return 0.0
+    if v <= 0.0 or v < _UV500_VALID_MIN or v > _UV500_VALID_MAX:
+        return 0.0
+    return float(np.clip((v - mean) / (std + 1e-8), -5.0, 5.0))
+
+
 def build_env_features_one_step(
     lon_norm: float,
     lat_norm: float,
@@ -964,13 +1007,15 @@ def build_env_features_one_step(
     """
     Build 90-dim env feature vector for one timestep.
 
-    FIX-ENV-19: gph500 handling theo nguồn dữ liệu:
-      - .npy cũ (build_env_data_scs_v10): env_npy["gph500_already_normed"]=True
-        → value đã normalized, chỉ clip [-5,5], không z-score lại.
-      - CSV path: env_npy["gph500_already_normed"]=False (default)
-        → value là raw dam ~[27-90], apply sentinel guard + z-score bình thường.
+    FIX-ENV-20: u500/v500 dùng actual steering flow (raw m²/s²),
+      không phải boolean availability flag.
+      Keys trong env_npy:
+        - Từ .npy cũ: "u500_raw_mean", "v500_raw_mean" (thêm mới)
+                      hoặc "u500_mean_n" đã remap (backward compat)
+        - Từ CSV: "u500_raw_mean", "v500_raw_mean" (thêm trong data loader)
+        - Fallback: key cũ "u500_mean" (boolean) → 0.0
 
-    FIX-ENV-16B (kept): u500/v500 stored as boolean flags [0,1], no z-score.
+    FIX-ENV-19 (kept): gph500 handling theo nguồn dữ liệu.
     """
     lon_deg = (lon_norm * 50.0 + 1800.0) / 10.0
     lat_deg = (lat_norm * 50.0) / 10.0
@@ -1022,8 +1067,7 @@ def build_env_features_one_step(
         v = [-1] * 4
     feat["history_inte_change24"] = v
 
-    # ── GPH500 ─────────────────────────────────────────────────────────────────
-    # FIX-ENV-19: Phân biệt .npy cũ (already_normed) vs CSV/raw (z-score cần thiết)
+    # ── GPH500 (kept from FIX-ENV-19) ──────────────────────────────────────
     already_normed = isinstance(env_npy, dict) and env_npy.get("gph500_already_normed", False)
 
     for k, mean_val, std_val in [
@@ -1041,34 +1085,36 @@ def build_env_features_one_step(
             if raw is None or math.isnan(raw):
                 val = 0.0
             elif already_normed:
-                # FIX-ENV-19: .npy cũ — value đã normalized bởi build_env_data
-                # (mean=5900, std=200). Range ~[-28, 2].
-                # Chỉ clip để tránh outlier cực đoan, không z-score lại.
                 val = float(np.clip(raw, -5.0, 5.0))
             else:
-                # CSV hoặc .npy mới — raw dam, cần sentinel check + z-score
                 if raw < _GPH500_SENTINEL_LO or raw > _GPH500_SENTINEL_HI:
                     val = 0.0
                 else:
                     val = (raw - mean_val) / (std_val + 1e-8)
                     val = float(np.clip(val, -5.0, 5.0))
-
         feat[k] = [val]
 
-    # ── U500 / V500 ────────────────────────────────────────────────────────────
-    # FIX-ENV-16B (kept): boolean availability flags, no z-score.
-    # .npy cũ lưu "u500_mean_n" (normalized /U500_NORM → [-1,1]) đã được
-    # remap sang "u500_mean" bởi _load_env_npy. Clip [0,1] là hợp lý.
-    for k in ("u500_mean", "u500_center", "v500_mean", "v500_center"):
-        if isinstance(env_npy, dict) and k in env_npy:
-            raw = env_npy[k]
-            try:
-                val = float(np.clip(float(raw), 0.0, 1.0))
-            except (TypeError, ValueError):
-                val = 0.0
-        else:
-            val = 0.0
-        feat[k] = [val]
+    # ── U500 / V500 — FIX-ENV-20: actual steering flow ─────────────────────
+    # Key priority (env_npy):
+    #   1. "u500_raw_mean"   / "v500_raw_mean"   (mới, từ CSV v20 / .npy mới)
+    #   2. "u500_raw_center" / "v500_raw_center"
+    #   3. Fallback → 0.0 (boolean "u500_mean"=1.0 bị bỏ qua)
+    for feat_key, raw_keys, mean_val, std_val in [
+        ("u500_mean",   ["u500_raw_mean",   "u500_mean_raw"],   _U500_MEAN, _U500_STD),
+        ("u500_center", ["u500_raw_center", "u500_center_raw"], _U500_MEAN, _U500_STD),
+        ("v500_mean",   ["v500_raw_mean",   "v500_mean_raw"],   _V500_MEAN, _V500_STD),
+        ("v500_center", ["v500_raw_center", "v500_center_raw"], _V500_MEAN, _V500_STD),
+    ]:
+        val = 0.0
+        if isinstance(env_npy, dict):
+            for rk in raw_keys:
+                if rk in env_npy:
+                    val = _normalize_uv500(env_npy[rk], mean_val, std_val)
+                    break
+            # Legacy boolean key: ignore (FIX-ENV-20)
+            # if val == 0.0 and feat_key in env_npy:
+            #     val = float(np.clip(float(env_npy[feat_key]), 0.0, 1.0))
+        feat[feat_key] = [val]
 
     return feat
 

@@ -1,35 +1,45 @@
 
 # """
-# scripts/train_flowmatching.py  ── v22
+# scripts/train_flowmatching.py  ── v23
 # ======================================
-# FIXES vs v21:
+# FIXES vs v22:
 
-# FIX-V22-1  [CRASH FIX] StepErrorAccumulator.update() nhận dist_km shape
-#            [T_active, B] (ví dụ [4, 32] khi curriculum) nhưng self._sum
-#            shape [12] → broadcast crash.
-#            Fix: metrics.py v5 StepErrorAccumulator tự pad zeros, dùng
-#            per-step count để tính average đúng. evaluate_fast() không cần
-#            thay đổi logic slice, chỉ cần đảm bảo truyền đúng.
+#   FIX-T23-1  CURRICULUM REMOVED (FIX-DATA-22).
+#              Curriculum gây ADE tụt 282→444 km mỗi lần tăng len.
+#              Thay bằng step_weight_alpha: giảm dần từ 1.0 → 0.0 theo epoch,
+#              làm cho AFCRPS weight các bước gần hơn ở epoch đầu (soft curriculum),
+#              KHÔNG cắt ngắn sequence pred_len=12.
 
-# FIX-V22-2  [FULL VAL ADE] Thêm evaluate_full_val_ade() — mỗi 2 epoch
-#            (val_ade_freq=2) chạy full val set với ode_steps_val ensemble
-#            để tính ADE chính xác trên toàn bộ val. Kết quả được:
-#              - Print ra console với format rõ ràng
-#              - Lưu vào metrics_csv với tag "val_full_ep{epoch}"
-#              - Dùng làm criteria cho BestModelSaver thay vì ADE từ
-#                val_subset_loader
-#            Khi curriculum active, dùng pred_len đầy đủ (không slice)
-#            để ADE full val phản ánh performance thật.
+#   FIX-T23-2  BestModelSaver: CHỈ dùng full_val ADE làm criteria lưu best model.
+#              Subset ADE chỉ dùng để monitor nhanh, KHÔNG ảnh hưởng patience.
+#              Khi full-val chưa chạy, saver giữ nguyên counter.
 
-# FIX-V22-3  [ADE REPORT] evaluate_fast() log thêm "active_steps" từ
-#            StepErrorAccumulator.compute() để biết curriculum đang ở
-#            bước nào.
+#   FIX-T23-3  ODE steps tăng: train=20, val=30, test=50 (từ 10/10/10).
+#              10 steps quá thấp cho OT-CFM với 12-step trajectory.
 
-# Kept from v21:
-#     FIX-V21-1  evaluate_fast() slice gt → T_active (vẫn giữ)
-#     FIX-V21-2  evaluate_full() CLIPER fix đơn vị
-#     FIX-V21-3  BSS fix transpose ens_seqs_01
-#     FIX-V20-1..3 ensemble collapse, early stop, spread monitor
+#   FIX-T23-4  initial_sample_sigma: 0.1 (từ 0.3). 0.3 quá lớn trong
+#              normalised space, gây spread bùng nổ ngay từ đầu.
+
+#   FIX-T23-5  ctx_noise_scale: 0.02 (từ 0.05). Giảm context noise để
+#              kiểm soát ensemble spread.
+
+#   FIX-T23-6  patience: 15 (từ 6). Với val_ade_freq=2, patience=6 chỉ
+#              tương đương 12 epoch thực → stop quá sớm sau curriculum jump.
+
+#   FIX-T23-7  step_weight_alpha schedule: giảm từ 1.0 (ep 0) → 0.0 (ep 30)
+#              tuyến tính. Sau ep 30 → uniform weights = standard AFCRPS.
+
+#   FIX-T23-8  evaluate_full_val_ade: log thêm PINN loss trung bình để
+#              verify PINN đang học (không còn = 100 constant).
+
+#   FIX-T23-9  GPH500 verification: check mean trong range (27-90) thay vì
+#              check == 0 (mean=-0.058 là pre-normed gph500 cũ, không đúng).
+#              Với FIX-DATA-18, CSV gph500 là raw dam → mean ≈ 33 sau sentinel.
+
+# Kept from v22:
+#   FIX-V22-1  StepErrorAccumulator pad zeros (v5/v6)
+#   FIX-V22-2  evaluate_full_val_ade mỗi val_ade_freq epoch
+#   FIX-V22-3  Log active_steps từ accumulator
 # """
 # from __future__ import annotations
 
@@ -55,22 +65,23 @@
 # from Model.losses import WEIGHTS as _BASE_WEIGHTS
 # from utils.metrics import (
 #     TCEvaluator, StepErrorAccumulator,
-#     save_metrics_csv, haversine_km_torch, haversine_km,
+#     save_metrics_csv, haversine_km_torch,
 #     denorm_torch, denorm_np, denorm_deg_np, HORIZON_STEPS,
 #     cliper_forecast, LANDFALL_TARGETS, LANDFALL_RADIUS_KM,
-#     brier_skill_score,
+#     brier_skill_score, cliper_errors, persistence_errors,
 # )
 # from utils.evaluation_tables import (
 #     ModelResult, AblationRow, StatTestRow, PINNSensRow, ComputeRow,
 #     export_all_tables, DEFAULT_ABLATION, DEFAULT_PINN_SENSITIVITY,
-#     DEFAULT_COMPUTE, paired_tests, persistence_errors, cliper_errors,
+#     DEFAULT_COMPUTE, paired_tests,
 # )
 # from scripts.statistical_tests import run_all_tests
 
 
 # # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# def haversine_km_np_local(pred_deg: np.ndarray, gt_deg: np.ndarray) -> np.ndarray:
+# def haversine_km_np_local(pred_deg: np.ndarray,
+#                            gt_deg: np.ndarray) -> np.ndarray:
 #     pred_deg = np.atleast_2d(pred_deg)
 #     gt_deg   = np.atleast_2d(gt_deg)
 #     R = 6371.0
@@ -88,11 +99,18 @@
 
 # # ── Adaptive weight schedules ─────────────────────────────────────────────────
 
-# def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.01, w_end=0.1):
+# # def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.001, w_end=0.05):
+# #     """
+# #     FIX-T23-8: w_start=0.001 (từ 0.01), w_end=0.05 (từ 0.1).
+# #     PINN bắt đầu rất nhỏ để FM học trước, sau đó tăng dần.
+# #     """
+# #     if epoch >= warmup_epochs:
+# #         return w_end
+# #     return w_start + (epoch / max(warmup_epochs-1, 1)) * (w_end - w_start)
+# def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.01, w_end=0.05): # Sửa w_start ở đây
 #     if epoch >= warmup_epochs:
 #         return w_end
 #     return w_start + (epoch / max(warmup_epochs-1, 1)) * (w_end - w_start)
-
 
 # def get_velocity_weight(epoch, warmup_epochs=20, w_start=0.5, w_end=1.5):
 #     if epoch >= warmup_epochs:
@@ -112,8 +130,20 @@
 #     return clip_start - (epoch / max(warmup_epochs-1, 1)) * (clip_start - clip_end)
 
 
+# def get_step_weight_alpha(epoch, decay_epochs=30) -> float:
+#     """
+#     FIX-T23-7: step_weight_alpha replaces curriculum.
+#     alpha=1.0 at ep 0 → 0.0 at ep decay_epochs.
+#     After decay_epochs: uniform AFCRPS weights.
+#     """
+#     if epoch >= decay_epochs:
+#         return 0.0
+#     return 1.0 - (epoch / decay_epochs)
+
+
 # def get_args():
-#     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+#     p = argparse.ArgumentParser(
+#         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 #     p.add_argument("--dataset_root",    default="TCND_vn",      type=str)
 #     p.add_argument("--obs_len",         default=8,              type=int)
 #     p.add_argument("--pred_len",        default=12,             type=int)
@@ -125,59 +155,79 @@
 #     p.add_argument("--warmup_epochs",   default=3,              type=int)
 #     p.add_argument("--grad_clip",       default=2.0,            type=float)
 #     p.add_argument("--grad_accum",      default=2,              type=int)
-#     p.add_argument("--patience",        default=50,             type=int)
+#     p.add_argument("--patience",        default=15,             type=int,
+#                    help="FIX-T23-6: tăng từ 6 lên 15 để tránh stop sớm.")
 #     p.add_argument("--min_epochs",      default=80,             type=int)
 #     p.add_argument("--n_train_ens",     default=6,              type=int)
 #     p.add_argument("--use_amp",         action="store_true")
 #     p.add_argument("--num_workers",     default=2,              type=int)
-#     p.add_argument("--sigma_min",       default=0.05,           type=float)
-#     p.add_argument("--ctx_noise_scale",      default=0.05, type=float)
-#     p.add_argument("--initial_sample_sigma", default=0.3,  type=float)
-#     p.add_argument("--ode_steps_train", default=20,             type=int)
-#     p.add_argument("--ode_steps_val",   default=30,             type=int)
-#     p.add_argument("--ode_steps_test",  default=50,             type=int)
-#     p.add_argument("--ode_steps",       default=None,           type=int)
+
+#     # FIX-T23-4/5: sigma giảm
+#     p.add_argument("--sigma_min",            default=0.02,  type=float)
+#     p.add_argument("--ctx_noise_scale",      default=0.02,  type=float,
+#                    help="FIX-T23-5: giảm từ 0.05 → 0.02")
+#     p.add_argument("--initial_sample_sigma", default=0.1,   type=float,
+#                    help="FIX-T23-4: giảm từ 0.3 → 0.1")
+
+#     # FIX-T23-3: ODE steps tăng
+#     p.add_argument("--ode_steps_train", default=20,  type=int,
+#                    help="FIX-T23-3: từ 10 → 20")
+#     p.add_argument("--ode_steps_val",   default=30,  type=int,
+#                    help="FIX-T23-3: từ 10 → 30")
+#     p.add_argument("--ode_steps_test",  default=50,  type=int)
+#     p.add_argument("--ode_steps",       default=None, type=int,
+#                    help="Override train/val/test steps (for testing)")
+
 #     p.add_argument("--val_ensemble",    default=30,             type=int)
 #     p.add_argument("--fast_ensemble",   default=8,              type=int)
-#     p.add_argument("--fno_modes_h",     default=4,              type=int)
-#     p.add_argument("--fno_modes_t",     default=4,              type=int)
-#     p.add_argument("--fno_layers",      default=4,              type=int)
-#     p.add_argument("--fno_d_model",     default=32,             type=int)
-#     p.add_argument("--fno_spatial_down",default=32,             type=int)
-#     p.add_argument("--mamba_d_state",   default=16,             type=int)
-#     p.add_argument("--val_loss_freq",   default=2,              type=int)
-#     p.add_argument("--val_freq",        default=2,              type=int)
-#     p.add_argument("--val_ade_freq",    default=2,              type=int,
-#                    help="Full val ADE evaluation frequency (epochs). "
-#                         "Chạy toàn bộ val set, tốn ~2-5 phút/lần.")
+
+#     p.add_argument("--fno_modes_h",      default=4,             type=int)
+#     p.add_argument("--fno_modes_t",      default=4,             type=int)
+#     p.add_argument("--fno_layers",       default=4,             type=int)
+#     p.add_argument("--fno_d_model",      default=32,            type=int)
+#     p.add_argument("--fno_spatial_down", default=32,            type=int)
+#     p.add_argument("--mamba_d_state",    default=16,            type=int)
+
+#     p.add_argument("--val_loss_freq",   default=1,              type=int)
+#     p.add_argument("--val_freq",        default=1,              type=int)
+#     p.add_argument("--val_ade_freq",    default=1,              type=int)
 #     p.add_argument("--full_eval_freq",  default=10,             type=int)
 #     p.add_argument("--val_subset_size", default=600,            type=int)
-#     p.add_argument("--output_dir",      default="runs/v22",     type=str)
+
+#     p.add_argument("--output_dir",      default="runs/v23",     type=str)
 #     p.add_argument("--save_interval",   default=10,             type=int)
-#     p.add_argument("--metrics_csv",     default="metrics.csv",        type=str)
-#     p.add_argument("--predict_csv",     default="predictions.csv",    type=str)
+#     p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
+#     p.add_argument("--predict_csv",     default="predictions.csv", type=str)
 #     p.add_argument("--lstm_errors_npy",      default=None, type=str)
 #     p.add_argument("--diffusion_errors_npy", default=None, type=str)
+
 #     p.add_argument("--gpu_num",         default="0",            type=str)
 #     p.add_argument("--delim",           default=" ")
 #     p.add_argument("--skip",            default=1,              type=int)
 #     p.add_argument("--min_ped",         default=1,              type=int)
 #     p.add_argument("--threshold",       default=0.002,          type=float)
 #     p.add_argument("--other_modal",     default="gph")
-#     p.add_argument("--curriculum",      default=True,
-#                    type=lambda x: x.lower() != 'false')
-#     p.add_argument("--curriculum_start_len", default=4,         type=int)
-#     p.add_argument("--curriculum_end_epoch", default=40,        type=int)
+
+#     # FIX-T23-1: curriculum params REMOVED, replaced by step_weight_alpha
+#     p.add_argument("--step_weight_decay_epochs", default=30, type=int,
+#                    help="FIX-T23-7: epochs over which alpha decays 1→0")
+
 #     p.add_argument("--lon_flip_prob",   default=0.3,            type=float)
+
+#     # PINN warmup with smaller values
 #     p.add_argument("--pinn_warmup_epochs", default=30,          type=int)
-#     p.add_argument("--pinn_w_start",    default=0.01,           type=float)
-#     p.add_argument("--pinn_w_end",      default=0.1,            type=float)
+#     p.add_argument("--pinn_w_start",    default=0.01,          type=float,
+#                    help="FIX-T23-8: 0.001 (từ 0.01)")
+#     p.add_argument("--pinn_w_end",      default=0.1,           type=float,
+#                    help="FIX-T23-8: 0.05 (từ 0.1)")
+
 #     p.add_argument("--vel_warmup_epochs",  default=20,          type=float)
 #     p.add_argument("--vel_w_start",        default=0.5,         type=float)
 #     p.add_argument("--vel_w_end",          default=1.5,         type=float)
 #     p.add_argument("--recurv_warmup_epochs", default=10,        type=int)
 #     p.add_argument("--recurv_w_start",       default=0.3,       type=float)
 #     p.add_argument("--recurv_w_end",         default=1.0,       type=float)
+
 #     return p.parse_args()
 
 
@@ -199,7 +249,7 @@
 
 
 # def make_val_subset_loader(val_dataset, subset_size, batch_size,
-#                            collate_fn, num_workers):
+#                             collate_fn, num_workers):
 #     n   = len(val_dataset)
 #     rng = random.Random(42)
 #     idx = rng.sample(range(n), min(subset_size, n))
@@ -208,24 +258,10 @@
 #                       collate_fn=collate_fn, num_workers=0, drop_last=False)
 
 
-# def get_curriculum_len(epoch, args) -> int:
-#     if not args.curriculum:
-#         return args.pred_len
-#     if epoch >= args.curriculum_end_epoch:
-#         return args.pred_len
-#     frac = epoch / max(args.curriculum_end_epoch, 1)
-#     return int(args.curriculum_start_len
-#                + frac * (args.pred_len - args.curriculum_start_len))
-
-
-# # ── evaluate_fast: monitor nhanh trên val subset ──────────────────────────────
+# # ── evaluate_fast ─────────────────────────────────────────────────────────────
 
 # def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=8):
-#     """
-#     FIX-V21-1: Slice gt → T_active để shapes khớp.
-#     FIX-V22-1: StepErrorAccumulator v5 tự pad zeros → không crash.
-#     FIX-V22-3: Log active_steps từ accumulator.
-#     """
+#     """Monitor nhanh trên val subset. Không dùng để quyết định best model."""
 #     model.eval()
 #     acc = StepErrorAccumulator(pred_len)
 #     t0  = time.perf_counter()
@@ -237,18 +273,14 @@
 #             bl = move(list(batch), device)
 #             pred, _, all_trajs = model.sample(bl, num_ensemble=fast_ensemble,
 #                                               ddim_steps=ode_steps)
-#             # FIX-V21-1: pred.shape = [T_active, B, 2], bl[1].shape = [T_pred, B, 2]
 #             T_active  = pred.shape[0]
 #             gt_sliced = bl[1][:T_active]
-
 #             dist = haversine_km_torch(denorm_torch(pred), denorm_torch(gt_sliced))
-#             # dist shape: [T_active, B] — accumulator v5 tự pad nếu T_active < pred_len
 #             acc.update(dist)
 
-#             # Spread: std ensemble tại step cuối
-#             last_step = all_trajs[:, -1, :, :]   # [S, B, 2]
-#             std_lon = last_step[:, :, 0].std(0)
-#             std_lat = last_step[:, :, 1].std(0)
+#             last_step = all_trajs[:, -1, :, :]
+#             std_lon   = last_step[:, :, 0].std(0)
+#             std_lat   = last_step[:, :, 1].std(0)
 #             spread_km = ((std_lon**2 + std_lat**2).sqrt() * 500.0).mean().item()
 #             spread_buf.append(spread_km)
 #             n += 1
@@ -259,95 +291,86 @@
 #     return r
 
 
-# # ── evaluate_full_val_ade: full val ADE mỗi 2 epoch ──────────────────────────
+# # ── evaluate_full_val_ade ─────────────────────────────────────────────────────
 
 # def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
 #                            fast_ensemble, metrics_csv, epoch, tag=""):
 #     """
-#     FIX-V22-2: Chạy toàn bộ val set, dùng pred_len đầy đủ (không curriculum
-#     slice) để ADE phản ánh khả năng dự báo 72h thật sự.
-
-#     Dùng fast_ensemble (không phải val_ensemble) để tiết kiệm thời gian.
-#     Kết quả được lưu vào CSV và print ra console.
-
-#     Returns: dict với ADE, FDE, per-horizon errors.
+#     FIX-T23-2: Full val ADE là DUY NHẤT criteria để lưu best model.
+#     FIX-T23-8: Log PINN loss trung bình để verify không còn saturate.
 #     """
 #     model.eval()
-#     acc = StepErrorAccumulator(pred_len)
-#     t0  = time.perf_counter()
-#     n_batch = 0
+#     acc      = StepErrorAccumulator(pred_len)
+#     t0       = time.perf_counter()
+#     n_batch  = 0
+#     pinn_buf = []
 
 #     with torch.no_grad():
 #         for batch in val_loader:
 #             bl = move(list(batch), device)
 
-#             # QUAN TRỌNG: Tạm thời set active_pred_len = pred_len
-#             # để sample() trả về T = pred_len đầy đủ, không bị curriculum cắt
-#             original_active = getattr(model, 'active_pred_len', pred_len)
-#             if hasattr(model, 'set_curriculum_len'):
-#                 model.set_curriculum_len(pred_len)
-
+#             # Luôn sample full pred_len (không curriculum)
 #             pred, _, _ = model.sample(bl, num_ensemble=fast_ensemble,
-#                                       ddim_steps=ode_steps)
-
-#             # Restore curriculum len sau khi sample
-#             if hasattr(model, 'set_curriculum_len'):
-#                 model.set_curriculum_len(original_active)
-
-#             # pred.shape: [pred_len, B, 2]
-#             # bl[1].shape: [pred_len, B, 2]
+#                                        ddim_steps=ode_steps)
 #             T_pred = pred.shape[0]
-#             gt = bl[1][:T_pred]
-
-#             dist = haversine_km_torch(denorm_torch(pred), denorm_torch(gt))
+#             gt     = bl[1][:T_pred]
+#             dist   = haversine_km_torch(denorm_torch(pred), denorm_torch(gt))
 #             acc.update(dist)
+
+#             # FIX-T23-8: compute PINN để verify
+#             try:
+#                 from Model.losses import pinn_bve_loss, _haversine_deg
+#                 from utils.metrics import denorm_deg_np
+#                 pred_deg = pred.clone()
+#                 pred_deg[..., 0] = (pred[..., 0] * 50.0 + 1800.0) / 10.0
+#                 pred_deg[..., 1] = (pred[..., 1] * 50.0) / 10.0
+#                 env_d = bl[13] if len(bl) > 13 else None
+#                 pinn_val = pinn_bve_loss(pred_deg, bl, env_data=env_d).item()
+#                 pinn_buf.append(pinn_val)
+#             except Exception:
+#                 pass
+
 #             n_batch += 1
 
 #     elapsed = time.perf_counter() - t0
-#     r = acc.compute()
+#     r       = acc.compute()
 
-#     # Format output
-#     tag_str = tag or f"val_full_ep{epoch:03d}"
 #     ade_str = f"{r.get('ADE', float('nan')):.1f}"
 #     fde_str = f"{r.get('FDE', float('nan')):.1f}"
-#     h12_str = f"{r.get('12h', float('nan')):.0f}"
-#     h24_str = f"{r.get('24h', float('nan')):.0f}"
-#     h48_str = f"{r.get('48h', float('nan')):.0f}"
-#     h72_str = f"{r.get('72h', float('nan')):.0f}"
+#     h12     = f"{r.get('12h', float('nan')):.0f}"
+#     h24     = f"{r.get('24h', float('nan')):.0f}"
+#     h48     = f"{r.get('48h', float('nan')):.0f}"
+#     h72     = f"{r.get('72h', float('nan')):.0f}"
+#     pinn_mean = f"{np.mean(pinn_buf):.3f}" if pinn_buf else "N/A"
 
 #     print(f"\n{'='*64}")
 #     print(f"  [FULL VAL ADE  ep={epoch}  {elapsed:.0f}s  {n_batch} batches]")
 #     print(f"  ADE={ade_str} km  FDE={fde_str} km")
-#     print(f"  12h={h12_str}  24h={h24_str}  48h={h48_str}  72h={h72_str} km")
-#     print(f"  samples={r.get('n_samples',0)}  ens={fast_ensemble}  steps={ode_steps}")
+#     print(f"  12h={h12}  24h={h24}  48h={h48}  72h={h72} km")
+#     print(f"  PINN_mean={pinn_mean}  "  # FIX-T23-8
+#           f"samples={r.get('n_samples',0)}  ens={fast_ensemble}  steps={ode_steps}")
 #     print(f"{'='*64}\n")
 
-#     # Lưu vào CSV
-#     from dataclasses import fields as dc_fields
-#     from utils.metrics import DatasetMetrics, save_metrics_csv
 #     from datetime import datetime
-
+#     tag_str = tag or f"val_full_ep{epoch:03d}"
+#     from utils.metrics import DatasetMetrics, save_metrics_csv
 #     dm = DatasetMetrics(
-#         ade      = r.get("ADE", float("nan")),
-#         fde      = r.get("FDE", float("nan")),
-#         ugde_12h = r.get("12h", float("nan")),
-#         ugde_24h = r.get("24h", float("nan")),
-#         ugde_48h = r.get("48h", float("nan")),
-#         ugde_72h = r.get("72h", float("nan")),
+#         ade      = r.get("ADE",  float("nan")),
+#         fde      = r.get("FDE",  float("nan")),
+#         ugde_12h = r.get("12h",  float("nan")),
+#         ugde_24h = r.get("24h",  float("nan")),
+#         ugde_48h = r.get("48h",  float("nan")),
+#         ugde_72h = r.get("72h",  float("nan")),
 #         n_total  = r.get("n_samples", 0),
 #         timestamp= datetime.now().strftime("%Y%m%d_%H%M%S"),
 #     )
 #     save_metrics_csv(dm, metrics_csv, tag=tag_str)
-
 #     return r
 
 
 # def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
 #                   metrics_csv, tag="", predict_csv=""):
-#     """
-#     FIX-V21-2: Sửa CLIPER error đơn vị.
-#     FIX-V21-3: Bỏ transpose ens_seqs_01.
-#     """
+#     """Full 4-tier evaluation."""
 #     model.eval()
 #     cliper_step_errors = []
 #     ev = TCEvaluator(pred_len=pred_len, compute_dtw=True)
@@ -375,25 +398,23 @@
 #                 pred_seqs_01.append(pd_np[:, b, :])
 #                 ens_seqs_01.append(ens_b)
 
-#                 # CLIPER error per step (FIX-V21-2)
 #                 obs_b_norm = obs.cpu().numpy()[:, b, :]
 #                 cliper_errors_b = np.zeros(pred_len)
 #                 for h in range(pred_len):
 #                     pred_cliper_norm = cliper_forecast(obs_b_norm, h + 1)
-#                     pred_cliper_01 = denorm_np(pred_cliper_norm[np.newaxis])
-#                     gt_01 = gd_np[h, b, :][np.newaxis]
+#                     pred_cliper_01   = denorm_np(pred_cliper_norm[np.newaxis])
+#                     gt_01            = gd_np[h, b, :][np.newaxis]
 #                     from utils.metrics import haversine_km_np
 #                     cliper_errors_b[h] = float(
-#                         haversine_km_np(pred_cliper_01, gt_01, unit_01deg=True)[0]
-#                     )
+#                         haversine_km_np(pred_cliper_01, gt_01, unit_01deg=True)[0])
 #                 cliper_step_errors.append(cliper_errors_b)
 
 #     if cliper_step_errors:
-#         cliper_mat = np.stack(cliper_step_errors)
+#         cliper_mat       = np.stack(cliper_step_errors)
 #         cliper_ugde_dict = {h: float(cliper_mat[:, s].mean())
 #                             for h, s in HORIZON_STEPS.items()
 #                             if s < cliper_mat.shape[1]}
-#         ev.cliper_ugde = cliper_ugde_dict
+#         ev.cliper_ugde   = cliper_ugde_dict
 #         print(f"  [CLIPER UGDE] 72h={cliper_ugde_dict.get(72, float('nan')):.1f} km")
 
 #     dm = ev.compute(tag=tag)
@@ -404,10 +425,8 @@
 #             step_72  = HORIZON_STEPS.get(72, pred_len - 1)
 #             for tname, t_lon, t_lat in LANDFALL_TARGETS:
 #                 bv = brier_skill_score(
-#                     ens_seqs_01,
-#                     gt_seqs_01, min(step_72, pred_len-1),
-#                     (t_lon * 10.0, t_lat * 10.0),
-#                     LANDFALL_RADIUS_KM)
+#                     ens_seqs_01, gt_seqs_01, min(step_72, pred_len-1),
+#                     (t_lon * 10.0, t_lat * 10.0), LANDFALL_RADIUS_KM)
 #                 if not math.isnan(bv):
 #                     bss_vals.append(bv)
 #             if bss_vals:
@@ -420,8 +439,15 @@
 #     return dm, obs_seqs_01, gt_seqs_01, pred_seqs_01
 
 
+# # ── BestModelSaver ────────────────────────────────────────────────────────────
+
 # class BestModelSaver:
-#     def __init__(self, patience=50, ade_tol=5.0):
+#     """
+#     FIX-T23-2: CHỈ dùng full_val ADE để quyết định best model và patience.
+#     Subset ADE không ảnh hưởng đến saver logic.
+#     """
+
+#     def __init__(self, patience=15, ade_tol=5.0):
 #         self.patience      = patience
 #         self.ade_tol       = ade_tol
 #         self.best_ade      = float("inf")
@@ -434,53 +460,63 @@
 #         self.counter_ade  = 0
 #         self.counter_loss = 0
 #         if reason:
-#             print(f"  [SAVER] Patience counters reset: {reason}")
+#             print(f"  [SAVER] Patience reset: {reason}")
 
 #     def update_val_loss(self, val_loss, model, out_dir, epoch, optimizer, tl):
 #         if val_loss < self.best_val_loss - 1e-4:
-#             self.best_val_loss = val_loss;  self.counter_loss = 0
-#             torch.save(dict(epoch=epoch, model_state_dict=model.state_dict(),
-#                             optimizer_state=optimizer.state_dict(),
-#                             train_loss=tl, val_loss=val_loss,
-#                             model_version="v22-valloss"),
-#                        os.path.join(out_dir, "best_model_valloss.pth"))
+#             self.best_val_loss = val_loss
+#             self.counter_loss  = 0
+#             torch.save(dict(
+#                 epoch=epoch, model_state_dict=model.state_dict(),
+#                 optimizer_state=optimizer.state_dict(),
+#                 train_loss=tl, val_loss=val_loss,
+#                 model_version="v23-valloss"),
+#                 os.path.join(out_dir, "best_model_valloss.pth"))
 #         else:
 #             self.counter_loss += 1
 
-#     def update_ade(self, ade, model, out_dir, epoch, optimizer, tl, vl,
-#                    min_epochs=80, source="full_val"):
+#     def update_ade_full_val(self, ade, model, out_dir, epoch,
+#                              optimizer, tl, vl, min_epochs=80):
 #         """
-#         FIX-V22-2: source parameter để log rõ ADE đến từ full val hay subset.
+#         FIX-T23-2: Chỉ gọi khi có full_val ADE. Đây là criteria duy nhất.
 #         """
 #         if ade < self.best_ade - self.ade_tol:
-#             self.best_ade = ade;  self.counter_ade = 0
-#             torch.save(dict(epoch=epoch, model_state_dict=model.state_dict(),
-#                             optimizer_state=optimizer.state_dict(),
-#                             train_loss=tl, val_loss=vl, val_ade_km=ade,
-#                             model_version="v22-FNO-Mamba-recurv"),
-#                        os.path.join(out_dir, "best_model.pth"))
-#             print(f"  ✅ Best ADE {ade:.1f} km  (epoch {epoch}, src={source})")
+#             self.best_ade     = ade
+#             self.counter_ade  = 0
+#             torch.save(dict(
+#                 epoch=epoch, model_state_dict=model.state_dict(),
+#                 optimizer_state=optimizer.state_dict(),
+#                 train_loss=tl, val_loss=vl, val_ade_km=ade,
+#                 model_version="v23-FNO-Mamba-OT-CFM"),
+#                 os.path.join(out_dir, "best_model.pth"))
+#             print(f"  ✅ Best full-val ADE {ade:.1f} km  (epoch {epoch})")
 #         else:
 #             self.counter_ade += 1
 #             print(f"  No ADE improvement {self.counter_ade}/{self.patience}"
-#                   f"  (Δ={self.best_ade-ade:.1f} km < tol={self.ade_tol} km)"
+#                   f"  (Δ={self.best_ade - ade:.1f} km < tol={self.ade_tol} km)"
 #                   f"  | Loss counter {self.counter_loss}/{self.patience}"
-#                   f"  [src={source}]")
+#                   f"  [full_val]")
 
 #         if epoch >= min_epochs:
-#             if self.counter_ade >= self.patience and self.counter_loss >= self.patience:
+#             if (self.counter_ade >= self.patience
+#                     and self.counter_loss >= self.patience):
 #                 self.early_stop = True
 #                 print(f"  ⛔ Early stop @ epoch {epoch}")
 #         else:
-#             if self.counter_ade >= self.patience and self.counter_loss >= self.patience:
-#                 print(f"  ⚠  Would stop but min_epochs={min_epochs} not reached. Continuing...")
-#                 self.counter_ade = 0;  self.counter_loss = 0
+#             if (self.counter_ade >= self.patience
+#                     and self.counter_loss >= self.patience):
+#                 print(f"  ⚠  Would stop but min_epochs={min_epochs} not reached.")
+#                 self.counter_ade  = 0
+#                 self.counter_loss = 0
+
+#     def log_subset_ade(self, ade: float, epoch: int):
+#         """FIX-T23-2: subset ADE chỉ để log, không ảnh hưởng patience."""
+#         print(f"  [SUBSET-ADE ep{epoch}]  {ade:.1f} km  (monitor only, not used for best model)")
 
 
 # def _load_baseline_errors(path, name):
 #     if path is None:
-#         print(f"\n  ⚠  WARNING: --{name.lower().replace(' ','_')}_errors_npy not provided.")
-#         print(f"     Statistical comparison vs {name} will be SKIPPED.\n")
+#         print(f"\n  ⚠  {name} errors not provided — skip stat comparison.\n")
 #         return None
 #     if not os.path.exists(path):
 #         print(f"\n  ⚠  {path} not found — {name} skipped.\n")
@@ -506,12 +542,18 @@
 #     ode_train, ode_val, ode_test = _resolve_ode_steps(args)
 
 #     print("=" * 68)
-#     print("  TC-FlowMatching v22  |  FNO3D + Mamba + OT-CFM + PINN")
-#     print("  v22 FIXES:")
-#     print("    FIX-V22-1: StepErrorAccumulator crash → pad zeros, per-step count")
-#     print("    FIX-V22-2: Full val ADE mỗi 2 epoch trên toàn bộ val set")
-#     print("    FIX-V22-3: Log active_steps từ accumulator")
-#     print("    FIX-DATA-15: GPH500 key remap '_n' → chuẩn (không 0 nữa)")
+#     print("  TC-FlowMatching v23  |  FNO3D + Mamba + OT-CFM + PINN")
+#     print("  v23 FIXES:")
+#     print("    FIX-T23-1: CURRICULUM REMOVED → step_weight_alpha soft weighting")
+#     print("    FIX-T23-2: Best model CHỈ từ full_val ADE (không dùng subset)")
+#     print("    FIX-T23-3: ODE steps train=20, val=30 (từ 10/10)")
+#     print("    FIX-T23-4: initial_sample_sigma=0.1 (từ 0.3)")
+#     print("    FIX-T23-5: ctx_noise_scale=0.02 (từ 0.05)")
+#     print("    FIX-T23-6: patience=15 (từ 6)")
+#     print("    FIX-T23-7: step_weight_alpha 1.0→0.0 over 30 epochs")
+#     print("    FIX-T23-8: PINN w_start=0.001 (từ 0.01), log PINN trong eval")
+#     print("    FIX-DATA-18/21: GPH500 từ CSV = raw dam, xử lý đúng")
+#     print("    FIX-L39/42: PINN scale=1e-3, clamp=50 → gradient không saturate")
 #     print("=" * 68)
 #     print(f"  device               : {device}")
 #     print(f"  sigma_min            : {args.sigma_min}")
@@ -521,6 +563,8 @@
 #     print(f"  val_ensemble         : {args.val_ensemble}")
 #     print(f"  val_ade_freq         : every {args.val_ade_freq} epochs (full val set)")
 #     print(f"  patience             : {args.patience} epochs  (min_epochs={args.min_epochs})")
+#     print(f"  step_weight_decay    : {args.step_weight_decay_epochs} epochs")
+#     print(f"  NO CURRICULUM        : pred_len={args.pred_len} from epoch 0")
 #     print()
 
 #     train_dataset, train_loader = data_loader(
@@ -574,27 +618,26 @@
 #     except Exception:
 #         pass
 
-#     optimizer = optim.AdamW(model.parameters(),
-#                              lr=args.g_learning_rate,
-#                              weight_decay=args.weight_decay)
+#     optimizer       = optim.AdamW(model.parameters(),
+#                                    lr=args.g_learning_rate,
+#                                    weight_decay=args.weight_decay)
 #     steps_per_epoch = math.ceil(len(train_loader) / max(args.grad_accum, 1))
 #     total_steps     = steps_per_epoch * args.num_epochs
 #     warmup          = steps_per_epoch * args.warmup_epochs
 #     scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, total_steps)
-#     saver  = BestModelSaver(patience=args.patience, ade_tol=5.0)
-#     scaler = GradScaler('cuda', enabled=args.use_amp)
+#     saver     = BestModelSaver(patience=args.patience, ade_tol=1.0)
+#     scaler    = GradScaler('cuda', enabled=args.use_amp)
 
 #     print("=" * 68)
-#     print(f"  TRAINING  ({steps_per_epoch} steps/epoch)")
+#     print(f"  TRAINING  ({steps_per_epoch} steps/epoch, NO CURRICULUM)")
 #     print("=" * 68)
 
-#     epoch_times    = []
-#     train_start    = time.perf_counter()
-#     last_val_loss  = float("inf")
-#     last_full_ade  = float("inf")   # FIX-V22-2: track full val ADE
-#     _lr_ep30_done  = False
-#     _lr_ep60_done  = False
-#     _prev_ens      = 1
+#     epoch_times   = []
+#     train_start   = time.perf_counter()
+#     last_val_loss = float("inf")
+#     _lr_ep30_done = False
+#     _lr_ep60_done = False
+#     _prev_ens     = 1
 
 #     import Model.losses as _losses_mod
 
@@ -605,56 +648,49 @@
 #         effective_fast_ens = min(args.fast_ensemble, max(current_ens*2, args.fast_ensemble))
 
 #         if current_ens != _prev_ens:
-#             saver.reset_counters(
-#                 f"n_train_ens {_prev_ens}→{current_ens} at epoch {epoch}")
+#             saver.reset_counters(f"n_train_ens {_prev_ens}→{current_ens} at ep {epoch}")
 #             _prev_ens = current_ens
 
-#         curr_len = get_curriculum_len(epoch, args)
-#         if hasattr(model, "set_curriculum_len"):
-#             model.set_curriculum_len(curr_len)
+#         # FIX-T23-1: NO curriculum. Always train on full pred_len.
+#         # FIX-T23-7: step_weight_alpha replaces curriculum
+#         step_alpha = get_step_weight_alpha(epoch, args.step_weight_decay_epochs)
 
+#         # Weight schedule
 #         epoch_weights = copy.copy(_BASE_WEIGHTS)
-#         epoch_weights["pinn"]     = get_pinn_weight(epoch, args.pinn_warmup_epochs,
-#                                                     args.pinn_w_start, args.pinn_w_end)
-#         epoch_weights["velocity"] = get_velocity_weight(epoch, args.vel_warmup_epochs,
-#                                                         args.vel_w_start, args.vel_w_end)
-#         epoch_weights["recurv"]   = get_recurv_weight(epoch, args.recurv_warmup_epochs,
-#                                                       args.recurv_w_start, args.recurv_w_end)
+#         epoch_weights["pinn"] = get_pinn_weight(
+#             epoch, args.pinn_warmup_epochs, args.pinn_w_start, args.pinn_w_end)
+#         epoch_weights["velocity"] = get_velocity_weight(
+#             epoch, args.vel_warmup_epochs, args.vel_w_start, args.vel_w_end)
+#         epoch_weights["recurv"]   = get_recurv_weight(
+#             epoch, args.recurv_warmup_epochs, args.recurv_w_start, args.recurv_w_end)
 #         _losses_mod.WEIGHTS.update(epoch_weights)
 #         if hasattr(model, 'weights'):
 #             model.weights = epoch_weights
-#         _losses_mod.WEIGHTS["pinn"]     = epoch_weights["pinn"]
-#         _losses_mod.WEIGHTS["velocity"] = epoch_weights["velocity"]
-#         _losses_mod.WEIGHTS["recurv"]   = epoch_weights["recurv"]
 
 #         current_clip = get_grad_clip(epoch, warmup_epochs=20,
-#                                      clip_start=args.grad_clip, clip_end=1.0)
+#                                       clip_start=args.grad_clip, clip_end=1.0)
 
-#         # LR restarts
+#         # LR warm restarts
 #         if epoch == 30 and not _lr_ep30_done:
 #             _lr_ep30_done = True
-#             warmup_steps = steps_per_epoch * 1
 #             scheduler = get_cosine_schedule_with_warmup(
-#                 optimizer, warmup_steps,
-#                 steps_per_epoch * (args.num_epochs - 30),
-#                 min_lr=5e-6)
+#                 optimizer, steps_per_epoch,
+#                 steps_per_epoch * (args.num_epochs - 30), min_lr=5e-6)
 #             saver.reset_counters("LR warm restart at epoch 30")
 #             print(f"  ↺  Warm Restart LR at epoch 30")
 
 #         if epoch == 60 and not _lr_ep60_done:
 #             _lr_ep60_done = True
-#             warmup_steps = steps_per_epoch * 1
 #             scheduler = get_cosine_schedule_with_warmup(
-#                 optimizer, warmup_steps,
-#                 steps_per_epoch * (args.num_epochs - 60),
-#                 min_lr=1e-6)
+#                 optimizer, steps_per_epoch,
+#                 steps_per_epoch * (args.num_epochs - 60), min_lr=1e-6)
 #             saver.reset_counters("LR warm restart at epoch 60")
 #             print(f"  ↺  Warm Restart LR at epoch 60")
 
 #         # ── Training loop ─────────────────────────────────────────────────────
 #         model.train()
-#         sum_loss = 0.0
-#         t0 = time.perf_counter()
+#         sum_loss      = 0.0
+#         t0            = time.perf_counter()
 #         optimizer.zero_grad()
 #         recurv_ratio_buf = []
 
@@ -662,102 +698,99 @@
 #             bl = move(list(batch), device)
 
 #             if epoch == 0 and i == 0:
-#                 test_env = bl[13]
-#                 if test_env is not None and "gph500_mean" in test_env:
-#                     gph_val = test_env["gph500_mean"]
-#                     n_zero  = (gph_val == 0).sum().item()
-#                     n_total = gph_val.numel()
-#                     zero_pct = 100.0 * n_zero / max(n_total, 1)
-
-#                     if torch.all(gph_val == 0):
-#                         env_source = getattr(train_dataset, '_env_path_missing', None)
-#                         has_csv    = bool(getattr(train_dataset, '_csv_env_lookup', {}))
-#                         print("\n" + "!" * 60)
-#                         if env_source is True and not has_csv:
-#                             print("  ⚠️  GPH500 = 0: Env_data .npy KHÔNG TỒN TẠI")
-#                             print("  → all_storms_final.csv cũng KHÔNG TÌM THẤY")
-#                         elif env_source is True and has_csv:
-#                             print("  ⚠️  GPH500 = 0 dù CSV fallback đã load!")
-#                             print("  → Có thể storm_name format mismatch")
-#                         else:
-#                             print("  ⚠️  GPH500 = 0 dù Env_data tồn tại!")
-#                             print("  → FIX-DATA-15: key '_n' chưa được remap?")
-#                             print("  → Kiểm tra trajectoriesWithMe_unet_training v18")
-#                         print("!" * 60 + "\n")
-#                     elif zero_pct > 50.0:
-#                         print(f"  ⚠️  GPH500 {zero_pct:.1f}% = 0 "
-#                               f"(mean non-zero: {gph_val[gph_val != 0].mean().item():.4f})")
-#                     else:
-#                         print(f"  ✅ GPH500 OK "
-#                               f"(mean={gph_val.mean().item():.4f}, "
-#                               f"zero={zero_pct:.1f}% = sentinel rows)")
+#                 _check_gph500(bl, train_dataset)
 
 #             with autocast(device_type='cuda', enabled=args.use_amp):
-#                 bd = model.get_loss_breakdown(bl)
+#                 # FIX-T23-1: pass step_weight_alpha to model
+#                 bd = model.get_loss_breakdown(bl, step_weight_alpha=step_alpha)
 
 #             loss_to_backpass = bd["total"] / max(args.grad_accum, 1)
 #             scaler.scale(loss_to_backpass).backward()
 
-#             if (i + 1) % args.grad_accum == 0 or (i + 1) == len(train_loader):
+#             if ((i + 1) % args.grad_accum == 0
+#                     or (i + 1) == len(train_loader)):
 #                 scaler.unscale_(optimizer)
-#                 torch.nn.utils.clip_grad_norm_(model.parameters(), current_clip)
+#                 torch.nn.utils.clip_grad_norm_(
+#                     model.parameters(), current_clip)
 #                 scaler.step(optimizer)
 #                 scaler.update()
 #                 scheduler.step()
 #                 optimizer.zero_grad()
 
 #             sum_loss += bd["total"].item()
-
 #             if "recurv_ratio" in bd:
 #                 recurv_ratio_buf.append(bd["recurv_ratio"])
 
 #             if i % 20 == 0:
-#                 lr  = optimizer.param_groups[0]["lr"]
-#                 rr  = bd.get("recurv_ratio", 0.0)
-#                 elapsed = time.perf_counter() - t0
+#                 lr       = optimizer.param_groups[0]["lr"]
+#                 rr       = bd.get("recurv_ratio", 0.0)
+#                 elapsed  = time.perf_counter() - t0
 #                 print(f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
 #                       f"  loss={bd['total'].item():.3f}"
 #                       f"  fm={bd.get('fm',0):.2f}"
-#                       f"  vel={bd.get('velocity',0):.6f}"
-#                       f"  pinn={bd.get('pinn', 0):.6f}"
+#                       f"  vel={bd.get('velocity',0):.4f}"
+#                       f"  pinn={bd.get('pinn', 0):.4f}"  # FIX-T23-8: more precision
 #                       f"  recurv={bd.get('recurv',0):.3f}"
 #                       f"  rr={rr:.2f}"
-#                       f"  pinn_w={epoch_weights['pinn']:.3f}"
+#                       f"  pinn_w={epoch_weights['pinn']:.4f}"
+#                       f"  alpha={step_alpha:.2f}"
 #                       f"  clip={current_clip:.1f}"
-#                       f"  ens={current_ens}  len={curr_len}"
+#                       f"  ens={current_ens}"
 #                       f"  lr={lr:.2e}  t={elapsed:.0f}s")
 
-#         ep_s  = time.perf_counter() - t0
+#         ep_s    = time.perf_counter() - t0
 #         epoch_times.append(ep_s)
-#         avg_t = sum_loss / len(train_loader)
+#         avg_t   = sum_loss / len(train_loader)
 #         mean_rr = float(np.mean(recurv_ratio_buf)) if recurv_ratio_buf else 0.0
 
 #         # ── Val loss ───────────────────────────────────────────────────────────
-#         if epoch % args.val_freq == 0:
-#             model.eval()
-#             val_loss = 0.0
-#             t_val = time.perf_counter()
-#             with torch.no_grad():
-#                 for batch in val_loader:
-#                     bl_v = move(list(batch), device)
-#                     with autocast(device_type='cuda', enabled=args.use_amp):
-#                         val_loss += model.get_loss(bl_v).item()
-#             last_val_loss = val_loss / len(val_loader)
-#             t_val_s = time.perf_counter() - t_val
-#             saver.update_val_loss(last_val_loss, model, args.output_dir,
-#                                   epoch, optimizer, avg_t)
-#             print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
-#                   f"  rr={mean_rr:.2f}"
-#                   f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
-#                   f"  ens={current_ens}  len={curr_len}"
-#                   f"  recurv_w={epoch_weights['recurv']:.2f}")
-#         else:
-#             print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
-#                   f"  val={last_val_loss:.3f}(cached)"
-#                   f"  rr={mean_rr:.2f}  t={ep_s:.0f}s")
+#         # if epoch % args.val_freq == 0:
+#         #     model.eval()
+#         #     val_loss = 0.0
+#         #     t_val    = time.perf_counter()
+#         #     with torch.no_grad():
+#         #         for batch in val_loader:
+#         #             bl_v = move(list(batch), device)
+#         #             with autocast(device_type='cuda', enabled=args.use_amp):
+#         #                 val_loss += model.get_loss(bl_v).item()
+#         #     last_val_loss = val_loss / len(val_loader)
+#         #     t_val_s = time.perf_counter() - t_val
+#         #     saver.update_val_loss(last_val_loss, model, args.output_dir,
+#         #                            epoch, optimizer, avg_t)
+#         #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
+#         #           f"  rr={mean_rr:.2f}"
+#         #           f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
+#         #           f"  ens={current_ens}  alpha={step_alpha:.2f}"
+#         #           f"  recurv_w={epoch_weights['recurv']:.2f}")
+#         # else:
+#         #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
+#         #           f"  val={last_val_loss:.3f}(cached)"
+#         #           f"  rr={mean_rr:.2f}  t={ep_s:.0f}s")
 
-#         # ── Fast ADE trên val subset (mỗi epoch, dùng để monitor) ─────────────
-#         t_ade = time.perf_counter()
+#         # ── Val loss (Tính mỗi epoch, không cached) ──────────────────────────
+#         model.eval()
+#         val_loss = 0.0
+#         t_val    = time.perf_counter()
+#         with torch.no_grad():
+#             for batch in val_loader:
+#                 bl_v = move(list(batch), device)
+#                 with autocast(device_type='cuda', enabled=args.use_amp):
+#                     val_loss += model.get_loss(bl_v).item()
+        
+#         last_val_loss = val_loss / len(val_loader)
+#         t_val_s = time.perf_counter() - t_val
+        
+#         saver.update_val_loss(last_val_loss, model, args.output_dir,
+#                                epoch, optimizer, avg_t)
+        
+#         print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
+#               f"  rr={mean_rr:.2f}"
+#               f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
+#               f"  ens={current_ens}  alpha={step_alpha:.2f}"
+#               f"  recurv_w={epoch_weights['recurv']:.2f}")
+
+#         # ── Fast ADE (subset, monitor only) ───────────────────────────────────
+#         t_ade  = time.perf_counter()
 #         m_fast = evaluate_fast(model, val_subset_loader, device,
 #                                ode_train, args.pred_len, effective_fast_ens)
 #         t_ade_s = time.perf_counter() - t_ade
@@ -765,6 +798,7 @@
 #         spread_72h    = m_fast.get("spread_72h_km", 0.0)
 #         active_steps  = m_fast.get("active_steps", args.pred_len)
 #         collapse_warn = "  ⚠️ COLLAPSE!" if spread_72h < 10.0 else ""
+#         spread_warn   = "  ⚠️ SPREAD HIGH!" if spread_72h > 600.0 else ""
 
 #         print(f"  [FAST-ADE ep{epoch} {t_ade_s:.0f}s]"
 #               f"  ADE={m_fast['ADE']:.1f} km  FDE={m_fast['FDE']:.1f} km"
@@ -773,39 +807,36 @@
 #               f"  72h={m_fast.get('72h', float('nan')):.0f} km"
 #               f"  spread={spread_72h:.1f} km"
 #               f"  active_steps={active_steps}/{args.pred_len}"
-#               f"  (subset, ens={effective_fast_ens})"
-#               f"{collapse_warn}")
+#               f"  (subset, monitor only)"
+#               f"{collapse_warn}{spread_warn}")
 
-#         # ── FIX-V22-2: Full val ADE mỗi val_ade_freq epoch ───────────────────
-#         ade_for_saver = m_fast["ADE"]
-#         ade_source    = "subset"
+#         # FIX-T23-2: Subset ADE chỉ để log, KHÔNG dùng cho best model
+#         saver.log_subset_ade(m_fast["ADE"], epoch)
 
+#         # ── Full val ADE (mỗi val_ade_freq epoch) → là criteria chính ────────
 #         if epoch % args.val_ade_freq == 0:
-#             t_full_ade = time.perf_counter()
 #             try:
 #                 r_full = evaluate_full_val_ade(
 #                     model, val_loader, device,
-#                     ode_steps   = ode_train,   # dùng train steps để nhanh hơn val
-#                     pred_len    = args.pred_len,
+#                     ode_steps     = ode_train,
+#                     pred_len      = args.pred_len,
 #                     fast_ensemble = effective_fast_ens,
-#                     metrics_csv = metrics_csv,
-#                     epoch       = epoch,
-#                     tag         = f"val_full_ep{epoch:03d}",
+#                     metrics_csv   = metrics_csv,
+#                     epoch         = epoch,
+#                     tag           = f"val_full_ep{epoch:03d}",
 #                 )
-#                 last_full_ade = r_full.get("ADE", float("inf"))
-#                 ade_for_saver = last_full_ade
-#                 ade_source    = "full_val"
+#                 full_ade = r_full.get("ADE", float("inf"))
+
+#                 # FIX-T23-2: CHỈ đây mới trigger best model save và patience
+#                 saver.update_ade_full_val(
+#                     full_ade, model, args.output_dir, epoch,
+#                     optimizer, avg_t, last_val_loss,
+#                     min_epochs=args.min_epochs)
 #             except Exception as e:
 #                 print(f"  ⚠  Full val ADE failed: {e}")
 #                 import traceback; traceback.print_exc()
 
-#         # Dùng ADE (full val nếu có, subset nếu không) để update saver
-#         saver.update_ade(ade_for_saver, model, args.output_dir, epoch,
-#                          optimizer, avg_t, last_val_loss,
-#                          min_epochs=args.min_epochs,
-#                          source=ade_source)
-
-#         # ── Full eval (TCEvaluator đầy đủ 4-tier) ─────────────────────────────
+#         # ── Full eval (4-tier) ────────────────────────────────────────────────
 #         if epoch % args.full_eval_freq == 0 and epoch > 0:
 #             print(f"  [Full eval epoch {epoch}, ode_steps={ode_val}]")
 #             try:
@@ -818,7 +849,7 @@
 #                 print(f"  ⚠  full_eval failed at epoch {epoch}: {e}")
 #                 import traceback; traceback.print_exc()
 
-#         if (epoch+1) % args.save_interval == 0:
+#         if (epoch + 1) % args.save_interval == 0:
 #             torch.save({"epoch": epoch, "model_state_dict": model.state_dict()},
 #                        os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"))
 
@@ -833,6 +864,7 @@
 #             print(f"  ⏱  {elapsed_h:.1f}h elapsed | ~{remaining:.1f}h remaining"
 #                   f"  (avg {avg_ep:.0f}s/epoch)")
 
+#     # Restore final weights
 #     _losses_mod.WEIGHTS["pinn"]     = args.pinn_w_end
 #     _losses_mod.WEIGHTS["velocity"] = args.vel_w_end
 #     _losses_mod.WEIGHTS["recurv"]   = args.recurv_w_end
@@ -865,7 +897,7 @@
 #         print(dm_test.summary())
 
 #         all_results.append(ModelResult(
-#             model_name   = "FM+PINN-v22",
+#             model_name   = "FM+PINN-v23",
 #             split        = "test",
 #             ADE          = dm_test.ade,
 #             FDE          = dm_test.fde,
@@ -883,7 +915,7 @@
 #             n_total      = dm_test.n_total,
 #             n_recurv     = dm_test.n_rec,
 #             train_time_h = total_train_h,
-#             params_M     = sum(p.numel() for p in model.parameters()) / 1e6,
+#             params_M     = n_params / 1e6,
 #         ))
 
 #         _, cliper_errs = cliper_errors(obs_seqs, gt_seqs, args.pred_len)
@@ -895,41 +927,19 @@
 #         np.save(os.path.join(stat_dir, "cliper.npy"),      cliper_errs.mean(1))
 #         np.save(os.path.join(stat_dir, "persistence.npy"), persist_errs.mean(1))
 
-#         lstm_per_seq      = _load_baseline_errors(args.lstm_errors_npy,      "LSTM")
+#         lstm_per_seq      = _load_baseline_errors(args.lstm_errors_npy, "LSTM")
 #         diffusion_per_seq = _load_baseline_errors(args.diffusion_errors_npy, "Diffusion")
-#         if lstm_per_seq is not None:
-#             np.save(os.path.join(stat_dir, "lstm.npy"), lstm_per_seq)
-#         if diffusion_per_seq is not None:
-#             np.save(os.path.join(stat_dir, "diffusion.npy"), diffusion_per_seq)
-
-#         _dummy = np.array([float("nan")])
-#         run_all_tests(
-#             fmpinn_ade    = fmpinn_per_seq,
-#             cliper_ade    = cliper_errs.mean(1),
-#             lstm_ade      = lstm_per_seq if lstm_per_seq is not None else _dummy,
-#             diffusion_ade = diffusion_per_seq if diffusion_per_seq is not None else _dummy,
-#             persist_ade   = persist_errs.mean(1),
-#             out_dir       = stat_dir)
-
-#         all_results += [
-#             ModelResult("CLIPER", "test",
-#                         ADE=float(cliper_errs.mean()),
-#                         FDE=float(cliper_errs[:, -1].mean()),
-#                         n_total=len(gt_seqs)),
-#             ModelResult("Persistence", "test",
-#                         ADE=float(persist_errs.mean()),
-#                         FDE=float(persist_errs[:, -1].mean()),
-#                         n_total=len(gt_seqs)),
-#         ]
 
 #         stat_rows = [
-#             paired_tests(fmpinn_per_seq, cliper_errs.mean(1),  "FM+PINN vs CLIPER",      5),
-#             paired_tests(fmpinn_per_seq, persist_errs.mean(1), "FM+PINN vs Persistence", 5),
+#             paired_tests(fmpinn_per_seq, cliper_errs.mean(1),  "FM+PINN vs CLIPER", 5),
+#             paired_tests(fmpinn_per_seq, persist_errs.mean(1), "FM+PINN vs Persist", 5),
 #         ]
 #         if lstm_per_seq is not None:
-#             stat_rows.append(paired_tests(fmpinn_per_seq, lstm_per_seq, "FM+PINN vs LSTM", 5))
+#             stat_rows.append(
+#                 paired_tests(fmpinn_per_seq, lstm_per_seq, "FM+PINN vs LSTM", 5))
 #         if diffusion_per_seq is not None:
-#             stat_rows.append(paired_tests(fmpinn_per_seq, diffusion_per_seq, "FM+PINN vs Diffusion", 5))
+#             stat_rows.append(
+#                 paired_tests(fmpinn_per_seq, diffusion_per_seq, "FM+PINN vs Diffusion", 5))
 
 #         compute_rows = DEFAULT_COMPUTE
 #         try:
@@ -947,73 +957,109 @@
 
 #         with open(os.path.join(args.output_dir, "test_results.txt"), "w") as fh:
 #             fh.write(dm_test.summary())
-#             fh.write(f"\n\nmodel_version         : FM+PINN v22\n")
+#             fh.write(f"\n\nmodel_version         : FM+PINN v23\n")
 #             fh.write(f"sigma_min             : {args.sigma_min}\n")
 #             fh.write(f"ctx_noise_scale       : {args.ctx_noise_scale}\n")
 #             fh.write(f"initial_sample_sigma  : {args.initial_sample_sigma}\n")
 #             fh.write(f"ode_steps_test        : {ode_test}\n")
 #             fh.write(f"eval_ensemble         : {final_ens}\n")
 #             fh.write(f"train_time_h          : {total_train_h:.2f}\n")
-#             fh.write(f"n_params_M            : "
-#                      f"{sum(p.numel() for p in model.parameters())/1e6:.2f}\n")
+#             fh.write(f"n_params_M            : {n_params/1e6:.2f}\n")
 
 #     avg_ep = sum(epoch_times)/len(epoch_times) if epoch_times else 0
-#     print(f"\n  Best val ADE   : {saver.best_ade:.1f} km")
-#     print(f"  Best val loss  : {saver.best_val_loss:.4f}")
-#     print(f"  Avg epoch time : {avg_ep:.0f}s")
-#     print(f"  Total training : {total_train_h:.2f}h")
-#     print(f"  Tables dir     : {tables_dir}")
+#     print(f"\n  Best full-val ADE  : {saver.best_ade:.1f} km")
+#     print(f"  Best val loss      : {saver.best_val_loss:.4f}")
+#     print(f"  Avg epoch time     : {avg_ep:.0f}s")
+#     print(f"  Total training     : {total_train_h:.2f}h")
+#     print(f"  Tables dir         : {tables_dir}")
 #     print("=" * 68)
+
+
+# # ── GPH500 verification ───────────────────────────────────────────────────────
+
+# def _check_gph500(bl, train_dataset):
+#     """
+#     FIX-T23-9: Verify GPH500 range (27-90 raw dam từ CSV).
+#     Mean ~33 là đúng. Mean ≈ 0 hoặc ≈ -0.06 là sai (pre-normalized chưa fix).
+#     """
+#     env_data = bl[13]
+#     if env_data is None or "gph500_mean" not in env_data:
+#         print("  ⚠️  GPH500 key not found in env_data")
+#         return
+
+#     gph_val = env_data["gph500_mean"]
+#     n_zero  = (gph_val == 0).sum().item()
+#     n_total = gph_val.numel()
+#     zero_pct = 100.0 * n_zero / max(n_total, 1)
+#     gph_mean = gph_val.mean().item()
+
+#     if abs(gph_mean) < 1.0 and zero_pct > 50.0:
+#         print("\n" + "!" * 60)
+#         print("  ⚠️  GPH500 mean ≈ 0 → Data not loading correctly from CSV")
+#         print(f"     mean={gph_mean:.4f}, zero={zero_pct:.1f}%")
+#         print("     Check FIX-DATA-18: env_gph500_mean should be raw dam (27-90)")
+#         print("!" * 60 + "\n")
+#     elif 25.0 < gph_mean < 95.0:
+#         print(f"  ✅ GPH500 OK (mean={gph_mean:.2f} dam, zero={zero_pct:.1f}%)")
+#     elif -30.0 < gph_mean < 5.0:
+#         # Pre-normalized: mean ≈ -0.06 is the old npy format with _n keys
+#         print(f"  ℹ️  GPH500 pre-normalized detected (mean={gph_mean:.4f})")
+#         print(f"     This is acceptable if loading from .npy with _n keys")
+#         print(f"     zero={zero_pct:.1f}%")
+#     else:
+#         print(f"  ⚠️  GPH500 unexpected range (mean={gph_mean:.4f}, zero={zero_pct:.1f}%)")
 
 
 # if __name__ == "__main__":
 #     args = get_args()
-#     np.random.seed(42);  torch.manual_seed(42)
+#     np.random.seed(42); torch.manual_seed(42)
 #     if torch.cuda.is_available():
 #         torch.cuda.manual_seed_all(42)
 #     main(args)
 
 """
-scripts/train_flowmatching.py  ── v23
+scripts/train_flowmatching.py  ── v24
 ======================================
-FIXES vs v22:
+FIXES vs v23:
 
-  FIX-T23-1  CURRICULUM REMOVED (FIX-DATA-22).
-             Curriculum gây ADE tụt 282→444 km mỗi lần tăng len.
-             Thay bằng step_weight_alpha: giảm dần từ 1.0 → 0.0 theo epoch,
-             làm cho AFCRPS weight các bước gần hơn ở epoch đầu (soft curriculum),
-             KHÔNG cắt ngắn sequence pred_len=12.
+  FIX-T24-1  [P0-CRITICAL] Val loss alignment:
+             get_loss(bl_v) → get_loss(bl_v, step_weight_alpha=step_alpha)
+             Val loss phải dùng cùng alpha với train loss để so sánh được.
+             Trước đây val loss tính với alpha=0.0 còn train với alpha>0
+             → hai objective khác nhau → val loss không phản ánh training.
 
-  FIX-T23-2  BestModelSaver: CHỈ dùng full_val ADE làm criteria lưu best model.
-             Subset ADE chỉ dùng để monitor nhanh, KHÔNG ảnh hưởng patience.
-             Khi full-val chưa chạy, saver giữ nguyên counter.
+  FIX-T24-2  [P0-CRITICAL] evaluate_full_val_ade dùng FIXED ensemble=50:
+             effective_fast_ens thay đổi theo epoch (2→4→12) làm ADE
+             không comparable. ep26 dùng ens=8 → ADE=361 nhưng ep60+
+             dùng ens=12 → ADE=378. Fix: always use FIXED_VAL_ENS=50.
+             ODE steps trong val ADE: ode_train → ode_val (30 steps thay 20).
 
-  FIX-T23-3  ODE steps tăng: train=20, val=30, test=50 (từ 10/10/10).
-             10 steps quá thấp cho OT-CFM với 12-step trajectory.
+  FIX-T24-3  [P1] Progressive ensemble: bỏ phase ens=1.
+             ens=1 tại ep0-29 → AFCRPS = MAE (không phải probabilistic)
+             → model học single prediction, không học distribution.
+             Fix: bắt đầu với ens=2, tăng lên n_train_ens tại ep60.
+             Patience reset vẫn giữ khi ens thay đổi.
 
-  FIX-T23-4  initial_sample_sigma: 0.1 (từ 0.3). 0.3 quá lớn trong
-             normalised space, gây spread bùng nổ ngay từ đầu.
+  FIX-T24-4  [P2] min_epochs=120, patience=20:
+             min_epochs=80 với avg 173s/epoch = 3.8h, chưa đủ.
+             Tăng min_epochs=120 (~5.8h), patience=20 (từ 15).
 
-  FIX-T23-5  ctx_noise_scale: 0.02 (từ 0.05). Giảm context noise để
-             kiểm soát ensemble spread.
+  FIX-T24-5  [P2] pinn_w_end=0.05 (từ 0.1):
+             PINN BVE không converge, đã thay bằng speed-only (FIX-L46).
+             Speed-only đơn giản hơn, không cần weight cao. 0.05 đủ.
+             pinn_w_start=0.01 giữ nguyên.
 
-  FIX-T23-6  patience: 15 (từ 6). Với val_ade_freq=2, patience=6 chỉ
-             tương đương 12 epoch thực → stop quá sớm sau curriculum jump.
+  FIX-T24-6  [P0] Log ade_proxy trong training để monitor:
+             bd.get('ade_proxy', 0) hiển thị mỗi 20 step.
 
-  FIX-T23-7  step_weight_alpha schedule: giảm từ 1.0 (ep 0) → 0.0 (ep 30)
-             tuyến tính. Sau ep 30 → uniform weights = standard AFCRPS.
+  FIX-T24-7  [P2] LR restart ep60 min_lr giảm từ 1e-6 → 5e-7:
+             Sau ep60 model đã mature, cần lr nhỏ hơn để fine-tune.
 
-  FIX-T23-8  evaluate_full_val_ade: log thêm PINN loss trung bình để
-             verify PINN đang học (không còn = 100 constant).
+  FIX-T24-8  [P1] Thêm ade_proxy weight vào get_args:
+             --ade_proxy_weight default=1.5
 
-  FIX-T23-9  GPH500 verification: check mean trong range (27-90) thay vì
-             check == 0 (mean=-0.058 là pre-normed gph500 cũ, không đúng).
-             Với FIX-DATA-18, CSV gph500 là raw dam → mean ≈ 33 sau sentinel.
-
-Kept from v22:
-  FIX-V22-1  StepErrorAccumulator pad zeros (v5/v6)
-  FIX-V22-2  evaluate_full_val_ade mỗi val_ade_freq epoch
-  FIX-V22-3  Log active_steps từ accumulator
+Kept from v23:
+  FIX-T23-1..9 logic (curriculum removed, step_weight_alpha, etc.)
 """
 from __future__ import annotations
 
@@ -1051,8 +1097,9 @@ from utils.evaluation_tables import (
 )
 from scripts.statistical_tests import run_all_tests
 
+# FIX-T24-2: Fixed ensemble size cho full val ADE — không thay đổi theo epoch
+FIXED_VAL_ENS = 50
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def haversine_km_np_local(pred_deg: np.ndarray,
                            gt_deg: np.ndarray) -> np.ndarray:
@@ -1073,18 +1120,12 @@ def seq_ade_km(pred_norm: np.ndarray, gt_norm: np.ndarray) -> float:
 
 # ── Adaptive weight schedules ─────────────────────────────────────────────────
 
-# def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.001, w_end=0.05):
-#     """
-#     FIX-T23-8: w_start=0.001 (từ 0.01), w_end=0.05 (từ 0.1).
-#     PINN bắt đầu rất nhỏ để FM học trước, sau đó tăng dần.
-#     """
-#     if epoch >= warmup_epochs:
-#         return w_end
-#     return w_start + (epoch / max(warmup_epochs-1, 1)) * (w_end - w_start)
-def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.01, w_end=0.05): # Sửa w_start ở đây
+def get_pinn_weight(epoch, warmup_epochs=30, w_start=0.01, w_end=0.05):
+    """FIX-T24-5: w_end=0.05 (từ 0.1) vì dùng speed-only constraint."""
     if epoch >= warmup_epochs:
         return w_end
     return w_start + (epoch / max(warmup_epochs-1, 1)) * (w_end - w_start)
+
 
 def get_velocity_weight(epoch, warmup_epochs=20, w_start=0.5, w_end=1.5):
     if epoch >= warmup_epochs:
@@ -1105,11 +1146,7 @@ def get_grad_clip(epoch, warmup_epochs=20, clip_start=2.0, clip_end=1.0):
 
 
 def get_step_weight_alpha(epoch, decay_epochs=30) -> float:
-    """
-    FIX-T23-7: step_weight_alpha replaces curriculum.
-    alpha=1.0 at ep 0 → 0.0 at ep decay_epochs.
-    After decay_epochs: uniform AFCRPS weights.
-    """
+    """alpha=1.0 at ep 0 → 0.0 at ep decay_epochs."""
     if epoch >= decay_epochs:
         return 0.0
     return 1.0 - (epoch / decay_epochs)
@@ -1129,30 +1166,27 @@ def get_args():
     p.add_argument("--warmup_epochs",   default=3,              type=int)
     p.add_argument("--grad_clip",       default=2.0,            type=float)
     p.add_argument("--grad_accum",      default=2,              type=int)
-    p.add_argument("--patience",        default=15,             type=int,
-                   help="FIX-T23-6: tăng từ 6 lên 15 để tránh stop sớm.")
-    p.add_argument("--min_epochs",      default=80,             type=int)
+    p.add_argument("--patience",        default=20,             type=int,
+                   help="FIX-T24-4: 15 → 20")
+    p.add_argument("--min_epochs",      default=120,            type=int,
+                   help="FIX-T24-4: 80 → 120")
     p.add_argument("--n_train_ens",     default=6,              type=int)
     p.add_argument("--use_amp",         action="store_true")
     p.add_argument("--num_workers",     default=2,              type=int)
 
-    # FIX-T23-4/5: sigma giảm
     p.add_argument("--sigma_min",            default=0.02,  type=float)
-    p.add_argument("--ctx_noise_scale",      default=0.02,  type=float,
-                   help="FIX-T23-5: giảm từ 0.05 → 0.02")
-    p.add_argument("--initial_sample_sigma", default=0.1,   type=float,
-                   help="FIX-T23-4: giảm từ 0.3 → 0.1")
+    p.add_argument("--ctx_noise_scale",      default=0.02,  type=float)
+    p.add_argument("--initial_sample_sigma", default=0.1,   type=float)
 
-    # FIX-T23-3: ODE steps tăng
-    p.add_argument("--ode_steps_train", default=20,  type=int,
-                   help="FIX-T23-3: từ 10 → 20")
-    p.add_argument("--ode_steps_val",   default=30,  type=int,
-                   help="FIX-T23-3: từ 10 → 30")
+    p.add_argument("--ode_steps_train", default=20,  type=int)
+    p.add_argument("--ode_steps_val",   default=30,  type=int)
     p.add_argument("--ode_steps_test",  default=50,  type=int)
-    p.add_argument("--ode_steps",       default=None, type=int,
-                   help="Override train/val/test steps (for testing)")
+    p.add_argument("--ode_steps",       default=None, type=int)
 
-    p.add_argument("--val_ensemble",    default=30,             type=int)
+    # FIX-T24-2: Fixed val ensemble
+    p.add_argument("--fixed_val_ens",   default=50,             type=int,
+                   help="FIX-T24-2: Fixed ensemble size for full val ADE eval")
+    p.add_argument("--val_ensemble",    default=50,             type=int)
     p.add_argument("--fast_ensemble",   default=8,              type=int)
 
     p.add_argument("--fno_modes_h",      default=4,             type=int)
@@ -1168,7 +1202,7 @@ def get_args():
     p.add_argument("--full_eval_freq",  default=10,             type=int)
     p.add_argument("--val_subset_size", default=600,            type=int)
 
-    p.add_argument("--output_dir",      default="runs/v23",     type=str)
+    p.add_argument("--output_dir",      default="runs/v24",     type=str)
     p.add_argument("--save_interval",   default=10,             type=int)
     p.add_argument("--metrics_csv",     default="metrics.csv",     type=str)
     p.add_argument("--predict_csv",     default="predictions.csv", type=str)
@@ -1182,18 +1216,18 @@ def get_args():
     p.add_argument("--threshold",       default=0.002,          type=float)
     p.add_argument("--other_modal",     default="gph")
 
-    # FIX-T23-1: curriculum params REMOVED, replaced by step_weight_alpha
-    p.add_argument("--step_weight_decay_epochs", default=30, type=int,
-                   help="FIX-T23-7: epochs over which alpha decays 1→0")
-
+    p.add_argument("--step_weight_decay_epochs", default=30, type=int)
     p.add_argument("--lon_flip_prob",   default=0.3,            type=float)
 
-    # PINN warmup with smaller values
+    # FIX-T24-5: pinn_w_end giảm
     p.add_argument("--pinn_warmup_epochs", default=30,          type=int)
-    p.add_argument("--pinn_w_start",    default=0.01,          type=float,
-                   help="FIX-T23-8: 0.001 (từ 0.01)")
-    p.add_argument("--pinn_w_end",      default=0.1,           type=float,
-                   help="FIX-T23-8: 0.05 (từ 0.1)")
+    p.add_argument("--pinn_w_start",    default=0.01,           type=float)
+    p.add_argument("--pinn_w_end",      default=0.05,           type=float,
+                   help="FIX-T24-5: 0.1 → 0.05 vì dùng speed-only PINN")
+
+    # FIX-T24-8: ade_proxy weight
+    p.add_argument("--ade_proxy_weight", default=1.5,           type=float,
+                   help="FIX-T24-8: weight cho ADE proxy loss trực tiếp")
 
     p.add_argument("--vel_warmup_epochs",  default=20,          type=float)
     p.add_argument("--vel_w_start",        default=0.5,         type=float)
@@ -1255,7 +1289,7 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=8):
             last_step = all_trajs[:, -1, :, :]
             std_lon   = last_step[:, :, 0].std(0)
             std_lat   = last_step[:, :, 1].std(0)
-            spread_km = ((std_lon**2 + std_lat**2).sqrt() * 500.0).mean().item()
+            spread_km = ((std_lon**2 + std_lat**2).sqrt() * 555.5).mean().item()
             spread_buf.append(spread_km)
             n += 1
 
@@ -1268,10 +1302,11 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=8):
 # ── evaluate_full_val_ade ─────────────────────────────────────────────────────
 
 def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
-                           fast_ensemble, metrics_csv, epoch, tag=""):
+                           fixed_val_ens, metrics_csv, epoch, tag=""):
     """
-    FIX-T23-2: Full val ADE là DUY NHẤT criteria để lưu best model.
-    FIX-T23-8: Log PINN loss trung bình để verify không còn saturate.
+    FIX-T24-2: Dùng FIXED ensemble size (fixed_val_ens=50) để ADE comparable
+               across epochs. Không phụ thuộc vào current_ens.
+    FIX-T24-2: ode_steps nên là ode_val (30), không phải ode_train (20).
     """
     model.eval()
     acc      = StepErrorAccumulator(pred_len)
@@ -1283,23 +1318,20 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
         for batch in val_loader:
             bl = move(list(batch), device)
 
-            # Luôn sample full pred_len (không curriculum)
-            pred, _, _ = model.sample(bl, num_ensemble=fast_ensemble,
+            # FIX-T24-2: fixed_val_ens luôn cố định
+            pred, _, _ = model.sample(bl, num_ensemble=fixed_val_ens,
                                        ddim_steps=ode_steps)
             T_pred = pred.shape[0]
             gt     = bl[1][:T_pred]
             dist   = haversine_km_torch(denorm_torch(pred), denorm_torch(gt))
             acc.update(dist)
 
-            # FIX-T23-8: compute PINN để verify
             try:
-                from Model.losses import pinn_bve_loss, _haversine_deg
-                from utils.metrics import denorm_deg_np
+                from Model.losses import pinn_bve_loss
                 pred_deg = pred.clone()
                 pred_deg[..., 0] = (pred[..., 0] * 50.0 + 1800.0) / 10.0
                 pred_deg[..., 1] = (pred[..., 1] * 50.0) / 10.0
-                env_d = bl[13] if len(bl) > 13 else None
-                pinn_val = pinn_bve_loss(pred_deg, bl, env_data=env_d).item()
+                pinn_val = pinn_bve_loss(pred_deg, bl, env_data=None).item()
                 pinn_buf.append(pinn_val)
             except Exception:
                 pass
@@ -1321,8 +1353,8 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
     print(f"  [FULL VAL ADE  ep={epoch}  {elapsed:.0f}s  {n_batch} batches]")
     print(f"  ADE={ade_str} km  FDE={fde_str} km")
     print(f"  12h={h12}  24h={h24}  48h={h48}  72h={h72} km")
-    print(f"  PINN_mean={pinn_mean}  "  # FIX-T23-8
-          f"samples={r.get('n_samples',0)}  ens={fast_ensemble}  steps={ode_steps}")
+    print(f"  PINN_mean={pinn_mean}  "
+          f"samples={r.get('n_samples',0)}  ens={fixed_val_ens}  steps={ode_steps}")
     print(f"{'='*64}\n")
 
     from datetime import datetime
@@ -1417,11 +1449,11 @@ def evaluate_full(model, loader, device, ode_steps, pred_len, val_ensemble,
 
 class BestModelSaver:
     """
-    FIX-T23-2: CHỈ dùng full_val ADE để quyết định best model và patience.
-    Subset ADE không ảnh hưởng đến saver logic.
+    FIX-T24-4: patience=20, min_epochs=120.
+    Logic giống v23 nhưng với thresholds cao hơn.
     """
 
-    def __init__(self, patience=15, ade_tol=5.0):
+    def __init__(self, patience=20, ade_tol=5.0):
         self.patience      = patience
         self.ade_tol       = ade_tol
         self.best_ade      = float("inf")
@@ -1444,16 +1476,13 @@ class BestModelSaver:
                 epoch=epoch, model_state_dict=model.state_dict(),
                 optimizer_state=optimizer.state_dict(),
                 train_loss=tl, val_loss=val_loss,
-                model_version="v23-valloss"),
+                model_version="v24-valloss"),
                 os.path.join(out_dir, "best_model_valloss.pth"))
         else:
             self.counter_loss += 1
 
     def update_ade_full_val(self, ade, model, out_dir, epoch,
-                             optimizer, tl, vl, min_epochs=80):
-        """
-        FIX-T23-2: Chỉ gọi khi có full_val ADE. Đây là criteria duy nhất.
-        """
+                             optimizer, tl, vl, min_epochs=120):
         if ade < self.best_ade - self.ade_tol:
             self.best_ade     = ade
             self.counter_ade  = 0
@@ -1461,7 +1490,7 @@ class BestModelSaver:
                 epoch=epoch, model_state_dict=model.state_dict(),
                 optimizer_state=optimizer.state_dict(),
                 train_loss=tl, val_loss=vl, val_ade_km=ade,
-                model_version="v23-FNO-Mamba-OT-CFM"),
+                model_version="v24-FNO-Mamba-OT-CFM"),
                 os.path.join(out_dir, "best_model.pth"))
             print(f"  ✅ Best full-val ADE {ade:.1f} km  (epoch {epoch})")
         else:
@@ -1484,13 +1513,12 @@ class BestModelSaver:
                 self.counter_loss = 0
 
     def log_subset_ade(self, ade: float, epoch: int):
-        """FIX-T23-2: subset ADE chỉ để log, không ảnh hưởng patience."""
         print(f"  [SUBSET-ADE ep{epoch}]  {ade:.1f} km  (monitor only, not used for best model)")
 
 
 def _load_baseline_errors(path, name):
     if path is None:
-        print(f"\n  ⚠  {name} errors not provided — skip stat comparison.\n")
+        print(f"\n  ⚠  {path} not found — {name} skipped.\n")
         return None
     if not os.path.exists(path):
         print(f"\n  ⚠  {path} not found — {name} skipped.\n")
@@ -1515,30 +1543,28 @@ def main(args):
 
     ode_train, ode_val, ode_test = _resolve_ode_steps(args)
 
+    # FIX-T24-2: fixed val ens
+    fixed_val_ens = getattr(args, 'fixed_val_ens', FIXED_VAL_ENS)
+
     print("=" * 68)
-    print("  TC-FlowMatching v23  |  FNO3D + Mamba + OT-CFM + PINN")
-    print("  v23 FIXES:")
-    print("    FIX-T23-1: CURRICULUM REMOVED → step_weight_alpha soft weighting")
-    print("    FIX-T23-2: Best model CHỈ từ full_val ADE (không dùng subset)")
-    print("    FIX-T23-3: ODE steps train=20, val=30 (từ 10/10)")
-    print("    FIX-T23-4: initial_sample_sigma=0.1 (từ 0.3)")
-    print("    FIX-T23-5: ctx_noise_scale=0.02 (từ 0.05)")
-    print("    FIX-T23-6: patience=15 (từ 6)")
-    print("    FIX-T23-7: step_weight_alpha 1.0→0.0 over 30 epochs")
-    print("    FIX-T23-8: PINN w_start=0.001 (từ 0.01), log PINN trong eval")
-    print("    FIX-DATA-18/21: GPH500 từ CSV = raw dam, xử lý đúng")
-    print("    FIX-L39/42: PINN scale=1e-3, clamp=50 → gradient không saturate")
+    print("  TC-FlowMatching v24  |  FNO3D + Mamba + OT-CFM + PINN")
+    print("  v24 FIXES:")
+    print("    FIX-T24-1: Val loss dùng step_weight_alpha aligned với train")
+    print("    FIX-T24-2: Full val ADE dùng FIXED ensemble=50 (comparable)")
+    print("    FIX-T24-3: Progressive ens: bỏ phase ens=1 → bắt đầu ens=2")
+    print("    FIX-T24-4: min_epochs=120, patience=20")
+    print("    FIX-T24-5: pinn_w_end=0.05 (speed-only PINN đơn giản hơn)")
+    print("    FIX-T24-6: Log ade_proxy trong training")
+    print("    FIX-L44:   ADE proxy loss trực tiếp weight=1.5")
+    print("    FIX-L45:   Spread loss weight=2.0, max_spread=150km")
+    print("    FIX-L46:   PINN speed-only (BVE deprecated)")
     print("=" * 68)
     print(f"  device               : {device}")
-    print(f"  sigma_min            : {args.sigma_min}")
-    print(f"  ctx_noise_scale      : {args.ctx_noise_scale}")
-    print(f"  initial_sample_sigma : {args.initial_sample_sigma}")
     print(f"  ode_steps            : train={ode_train}  val={ode_val}  test={ode_test}")
-    print(f"  val_ensemble         : {args.val_ensemble}")
-    print(f"  val_ade_freq         : every {args.val_ade_freq} epochs (full val set)")
-    print(f"  patience             : {args.patience} epochs  (min_epochs={args.min_epochs})")
-    print(f"  step_weight_decay    : {args.step_weight_decay_epochs} epochs")
-    print(f"  NO CURRICULUM        : pred_len={args.pred_len} from epoch 0")
+    print(f"  fixed_val_ens        : {fixed_val_ens} (FIX-T24-2: constant)")
+    print(f"  min_epochs           : {args.min_epochs}  patience={args.patience}")
+    print(f"  pinn_w_end           : {args.pinn_w_end} (FIX-T24-5)")
+    print(f"  ade_proxy_weight     : {args.ade_proxy_weight} (FIX-L44)")
     print()
 
     train_dataset, train_loader = data_loader(
@@ -1559,10 +1585,13 @@ def main(args):
     except Exception as e:
         print(f"  Warning: test loader: {e}")
 
-    print(f"  train : {len(train_dataset)} seq  ({len(train_loader)} batches)")
-    print(f"  val   : {len(val_dataset)} seq")
+    n_train = len(train_dataset)
+    n_val   = len(val_dataset)
+    n_test  = len(test_loader.dataset) if test_loader else 0
+    print(f"  train : {n_train} seq  ({len(train_loader)} batches)")
+    print(f"  val   : {n_val} seq")
     if test_loader:
-        print(f"  test  : {len(test_loader.dataset)} seq")
+        print(f"  test  : {n_test} seq")
 
     model = TCFlowMatching(
         pred_len             = args.pred_len,
@@ -1611,22 +1640,24 @@ def main(args):
     last_val_loss = float("inf")
     _lr_ep30_done = False
     _lr_ep60_done = False
-    _prev_ens     = 1
+    _prev_ens     = None
 
     import Model.losses as _losses_mod
 
     for epoch in range(args.num_epochs):
-        # Progressive ensemble
-        current_ens = 1 if epoch < 30 else (2 if epoch < 60 else args.n_train_ens)
+        # FIX-T24-3: bỏ phase ens=1, bắt đầu với ens=2
+        current_ens = 2 if epoch < 60 else args.n_train_ens
         model.n_train_ens = current_ens
-        effective_fast_ens = min(args.fast_ensemble, max(current_ens*2, args.fast_ensemble))
 
-        if current_ens != _prev_ens:
+        if _prev_ens is not None and current_ens != _prev_ens:
             saver.reset_counters(f"n_train_ens {_prev_ens}→{current_ens} at ep {epoch}")
-            _prev_ens = current_ens
+        _prev_ens = current_ens
 
-        # FIX-T23-1: NO curriculum. Always train on full pred_len.
-        # FIX-T23-7: step_weight_alpha replaces curriculum
+        # Fast eval ensemble: nhỏ để nhanh, nhưng không quá nhỏ
+        fast_eval_ens = min(args.fast_ensemble, current_ens * 4)
+        fast_eval_ens = max(fast_eval_ens, 4)  # tối thiểu 4
+
+        # FIX-T23-7: step_weight_alpha
         step_alpha = get_step_weight_alpha(epoch, args.step_weight_decay_epochs)
 
         # Weight schedule
@@ -1637,6 +1668,8 @@ def main(args):
             epoch, args.vel_warmup_epochs, args.vel_w_start, args.vel_w_end)
         epoch_weights["recurv"]   = get_recurv_weight(
             epoch, args.recurv_warmup_epochs, args.recurv_w_start, args.recurv_w_end)
+        # FIX-T24-8: ade_proxy weight từ args
+        epoch_weights["ade_proxy"] = args.ade_proxy_weight
         _losses_mod.WEIGHTS.update(epoch_weights)
         if hasattr(model, 'weights'):
             model.weights = epoch_weights
@@ -1655,9 +1688,10 @@ def main(args):
 
         if epoch == 60 and not _lr_ep60_done:
             _lr_ep60_done = True
+            # FIX-T24-7: min_lr giảm thêm sau ep60
             scheduler = get_cosine_schedule_with_warmup(
                 optimizer, steps_per_epoch,
-                steps_per_epoch * (args.num_epochs - 60), min_lr=1e-6)
+                steps_per_epoch * (args.num_epochs - 60), min_lr=5e-7)
             saver.reset_counters("LR warm restart at epoch 60")
             print(f"  ↺  Warm Restart LR at epoch 60")
 
@@ -1675,7 +1709,7 @@ def main(args):
                 _check_gph500(bl, train_dataset)
 
             with autocast(device_type='cuda', enabled=args.use_amp):
-                # FIX-T23-1: pass step_weight_alpha to model
+                # FIX-T24-1: pass step_alpha (đã đúng từ v23, giữ nguyên)
                 bd = model.get_loss_breakdown(bl, step_weight_alpha=step_alpha)
 
             loss_to_backpass = bd["total"] / max(args.grad_accum, 1)
@@ -1699,11 +1733,14 @@ def main(args):
                 lr       = optimizer.param_groups[0]["lr"]
                 rr       = bd.get("recurv_ratio", 0.0)
                 elapsed  = time.perf_counter() - t0
+                # FIX-T24-6: log ade_proxy
                 print(f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
                       f"  loss={bd['total'].item():.3f}"
                       f"  fm={bd.get('fm',0):.2f}"
+                      f"  ade_p={bd.get('ade_proxy',0):.1f}"   # FIX-T24-6
                       f"  vel={bd.get('velocity',0):.4f}"
-                      f"  pinn={bd.get('pinn', 0):.4f}"  # FIX-T23-8: more precision
+                      f"  pinn={bd.get('pinn', 0):.4f}"
+                      f"  sprd={bd.get('spread',0):.3f}"        # spread monitor
                       f"  recurv={bd.get('recurv',0):.3f}"
                       f"  rr={rr:.2f}"
                       f"  pinn_w={epoch_weights['pinn']:.4f}"
@@ -1717,31 +1754,7 @@ def main(args):
         avg_t   = sum_loss / len(train_loader)
         mean_rr = float(np.mean(recurv_ratio_buf)) if recurv_ratio_buf else 0.0
 
-        # ── Val loss ───────────────────────────────────────────────────────────
-        # if epoch % args.val_freq == 0:
-        #     model.eval()
-        #     val_loss = 0.0
-        #     t_val    = time.perf_counter()
-        #     with torch.no_grad():
-        #         for batch in val_loader:
-        #             bl_v = move(list(batch), device)
-        #             with autocast(device_type='cuda', enabled=args.use_amp):
-        #                 val_loss += model.get_loss(bl_v).item()
-        #     last_val_loss = val_loss / len(val_loader)
-        #     t_val_s = time.perf_counter() - t_val
-        #     saver.update_val_loss(last_val_loss, model, args.output_dir,
-        #                            epoch, optimizer, avg_t)
-        #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
-        #           f"  rr={mean_rr:.2f}"
-        #           f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
-        #           f"  ens={current_ens}  alpha={step_alpha:.2f}"
-        #           f"  recurv_w={epoch_weights['recurv']:.2f}")
-        # else:
-        #     print(f"  Epoch {epoch:>3}  train={avg_t:.3f}"
-        #           f"  val={last_val_loss:.3f}(cached)"
-        #           f"  rr={mean_rr:.2f}  t={ep_s:.0f}s")
-
-        # ── Val loss (Tính mỗi epoch, không cached) ──────────────────────────
+        # ── Val loss (FIX-T24-1: dùng step_alpha aligned với train) ──────────
         model.eval()
         val_loss = 0.0
         t_val    = time.perf_counter()
@@ -1749,14 +1762,16 @@ def main(args):
             for batch in val_loader:
                 bl_v = move(list(batch), device)
                 with autocast(device_type='cuda', enabled=args.use_amp):
-                    val_loss += model.get_loss(bl_v).item()
-        
+                    # FIX-T24-1: CRITICAL — truyền step_alpha vào val loss
+                    val_loss += model.get_loss(bl_v,
+                                               step_weight_alpha=step_alpha).item()
+
         last_val_loss = val_loss / len(val_loader)
         t_val_s = time.perf_counter() - t_val
-        
+
         saver.update_val_loss(last_val_loss, model, args.output_dir,
                                epoch, optimizer, avg_t)
-        
+
         print(f"  Epoch {epoch:>3}  train={avg_t:.3f}  val={last_val_loss:.3f}"
               f"  rr={mean_rr:.2f}"
               f"  train_t={ep_s:.0f}s  val_t={t_val_s:.0f}s"
@@ -1766,13 +1781,13 @@ def main(args):
         # ── Fast ADE (subset, monitor only) ───────────────────────────────────
         t_ade  = time.perf_counter()
         m_fast = evaluate_fast(model, val_subset_loader, device,
-                               ode_train, args.pred_len, effective_fast_ens)
+                               ode_train, args.pred_len, fast_eval_ens)
         t_ade_s = time.perf_counter() - t_ade
 
         spread_72h    = m_fast.get("spread_72h_km", 0.0)
         active_steps  = m_fast.get("active_steps", args.pred_len)
         collapse_warn = "  ⚠️ COLLAPSE!" if spread_72h < 10.0 else ""
-        spread_warn   = "  ⚠️ SPREAD HIGH!" if spread_72h > 600.0 else ""
+        spread_warn   = "  ⚠️ SPREAD HIGH!" if spread_72h > 400.0 else ""  # threshold thấp hơn
 
         print(f"  [FAST-ADE ep{epoch} {t_ade_s:.0f}s]"
               f"  ADE={m_fast['ADE']:.1f} km  FDE={m_fast['FDE']:.1f} km"
@@ -1784,24 +1799,21 @@ def main(args):
               f"  (subset, monitor only)"
               f"{collapse_warn}{spread_warn}")
 
-        # FIX-T23-2: Subset ADE chỉ để log, KHÔNG dùng cho best model
         saver.log_subset_ade(m_fast["ADE"], epoch)
 
-        # ── Full val ADE (mỗi val_ade_freq epoch) → là criteria chính ────────
+        # ── Full val ADE → criteria chính (FIX-T24-2: fixed ens) ─────────────
         if epoch % args.val_ade_freq == 0:
             try:
                 r_full = evaluate_full_val_ade(
                     model, val_loader, device,
-                    ode_steps     = ode_train,
+                    ode_steps     = ode_val,           # FIX-T24-2: dùng ode_val
                     pred_len      = args.pred_len,
-                    fast_ensemble = effective_fast_ens,
+                    fixed_val_ens = fixed_val_ens,      # FIX-T24-2: fixed=50
                     metrics_csv   = metrics_csv,
                     epoch         = epoch,
                     tag           = f"val_full_ep{epoch:03d}",
                 )
                 full_ade = r_full.get("ADE", float("inf"))
-
-                # FIX-T23-2: CHỈ đây mới trigger best model save và patience
                 saver.update_ade_full_val(
                     full_ade, model, args.output_dir, epoch,
                     optimizer, avg_t, last_val_loss,
@@ -1821,7 +1833,6 @@ def main(args):
                 print(dm.summary())
             except Exception as e:
                 print(f"  ⚠  full_eval failed at epoch {epoch}: {e}")
-                import traceback; traceback.print_exc()
 
         if (epoch + 1) % args.save_interval == 0:
             torch.save({"epoch": epoch, "model_state_dict": model.state_dict()},
@@ -1871,7 +1882,7 @@ def main(args):
         print(dm_test.summary())
 
         all_results.append(ModelResult(
-            model_name   = "FM+PINN-v23",
+            model_name   = "FM+PINN-v24",
             split        = "test",
             ADE          = dm_test.ade,
             FDE          = dm_test.fde,
@@ -1929,17 +1940,6 @@ def main(args):
             stat_rows=stat_rows, pinn_sens_rows=DEFAULT_PINN_SENSITIVITY,
             compute_rows=compute_rows, out_dir=tables_dir)
 
-        with open(os.path.join(args.output_dir, "test_results.txt"), "w") as fh:
-            fh.write(dm_test.summary())
-            fh.write(f"\n\nmodel_version         : FM+PINN v23\n")
-            fh.write(f"sigma_min             : {args.sigma_min}\n")
-            fh.write(f"ctx_noise_scale       : {args.ctx_noise_scale}\n")
-            fh.write(f"initial_sample_sigma  : {args.initial_sample_sigma}\n")
-            fh.write(f"ode_steps_test        : {ode_test}\n")
-            fh.write(f"eval_ensemble         : {final_ens}\n")
-            fh.write(f"train_time_h          : {total_train_h:.2f}\n")
-            fh.write(f"n_params_M            : {n_params/1e6:.2f}\n")
-
     avg_ep = sum(epoch_times)/len(epoch_times) if epoch_times else 0
     print(f"\n  Best full-val ADE  : {saver.best_ade:.1f} km")
     print(f"  Best val loss      : {saver.best_val_loss:.4f}")
@@ -1949,34 +1949,21 @@ def main(args):
     print("=" * 68)
 
 
-# ── GPH500 verification ───────────────────────────────────────────────────────
-
 def _check_gph500(bl, train_dataset):
-    """
-    FIX-T23-9: Verify GPH500 range (27-90 raw dam từ CSV).
-    Mean ~33 là đúng. Mean ≈ 0 hoặc ≈ -0.06 là sai (pre-normalized chưa fix).
-    """
     env_data = bl[13]
     if env_data is None or "gph500_mean" not in env_data:
         print("  ⚠️  GPH500 key not found in env_data")
         return
-
     gph_val = env_data["gph500_mean"]
     n_zero  = (gph_val == 0).sum().item()
     n_total = gph_val.numel()
     zero_pct = 100.0 * n_zero / max(n_total, 1)
     gph_mean = gph_val.mean().item()
-
     if abs(gph_mean) < 1.0 and zero_pct > 50.0:
-        print("\n" + "!" * 60)
-        print("  ⚠️  GPH500 mean ≈ 0 → Data not loading correctly from CSV")
-        print(f"     mean={gph_mean:.4f}, zero={zero_pct:.1f}%")
-        print("     Check FIX-DATA-18: env_gph500_mean should be raw dam (27-90)")
-        print("!" * 60 + "\n")
+        print(f"  ⚠️  GPH500 mean ≈ 0 → Data not loading correctly from CSV")
     elif 25.0 < gph_mean < 95.0:
         print(f"  ✅ GPH500 OK (mean={gph_mean:.2f} dam, zero={zero_pct:.1f}%)")
     elif -30.0 < gph_mean < 5.0:
-        # Pre-normalized: mean ≈ -0.06 is the old npy format with _n keys
         print(f"  ℹ️  GPH500 pre-normalized detected (mean={gph_mean:.4f})")
         print(f"     This is acceptable if loading from .npy with _n keys")
         print(f"     zero={zero_pct:.1f}%")

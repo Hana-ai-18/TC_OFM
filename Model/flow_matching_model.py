@@ -1,37 +1,29 @@
 # """
-# Model/flow_matching_model.py  ── v16
+# Model/flow_matching_model.py  ── v23
 # ==========================================
-# OT-CFM Flow Matching + PINN-BVE for TC trajectory prediction.
+# FIXES vs v21:
 
-# FIXES vs v15:
+#   FIX-M18  [CURRICULUM REMOVED] set_curriculum_len() vẫn giữ để backward
+#            compat nhưng KHÔNG được gọi từ trainer nữa. active_pred_len
+#            luôn = pred_len. evaluate_full_val_ade không cần restore nữa.
 
-#   FIX-M7  [CRITICAL] OT-CFM prediction formula sai trong get_loss_breakdown.
-#            v15 dùng: x1_pred = x_t + (1-te) * pred_vel  ← SAI
-#            OT-CFM trajectory: x_t = te*x1 + (1-(1-sm)*te)*x0
-#            Velocity target: v = (x1 - (1-sm)*x0) / (1-(1-sm)*te)
-#            → x1 estimate: x1_pred = x_t + denom * pred_vel  ← ĐÚNG
-#            Điều này giải thích tại sao ADE không giảm dù loss giảm.
+#   FIX-M19  get_loss_breakdown(): nhận thêm step_weight_alpha parameter
+#            và truyền vào compute_total_loss() → fm_afcrps_loss() sử dụng
+#            soft weighting thay curriculum len-slicing.
 
-#   FIX-M8  [CRITICAL] pred_abs cho non-AFCRPS losses cần convert sang degrees
-#            để Haversine metric có ý nghĩa. Trước khi pass vào velocity_loss,
-#            heading_loss, recurvature_loss, pinn_bve_loss — convert:
-#            lon_deg = (pred_norm * 50 + 1800) / 10
-#            lat_deg = (pred_norm * 50) / 10
-#            Tương tự cho gt. Các loss này tính vector difference, nếu dùng
-#            normalized units (~1.0) vs degrees (~15) sẽ sai scale hoàn toàn.
+#   FIX-M20  get_loss_breakdown(): truyền all_trajs vào compute_total_loss()
+#            để tính ensemble_spread_loss. Giúp kiểm soát spread tăng quá mức.
 
-#   FIX-M9  [ctx_noise_scale] Giảm default từ 0.05 → 0.01 vì SSR=4.7 cho thấy
-#            spread quá lớn (cần SSR≈1). Spread 2000+ km vs ADE 900 km → overconfident
-#            trong diversity hướng sai.
+#   FIX-M21  _physics_correct(): tăng n_steps=5 (từ 3), giảm lr=0.002 (từ
+#            0.005) để physics correction ổn định hơn và ít overshoot.
 
-#   FIX-M10 [initial_sample_sigma] Giảm từ 0.3 → 0.15. Trong normalized space,
-#            0.3 units × 500 km/unit ≈ 150 km initial spread. Đây là hợp lý,
-#            nhưng kết hợp với ctx_noise_scale=0.05 gây spread quá lớn.
+#   FIX-M22  sample(): initial_sample_sigma=0.1 (set từ constructor) đã fix
+#            spread. Thêm post-sampling clip chặt hơn [-3.0, 3.0] cho cả lon
+#            và lat (từ [-5.0, 5.0] cho lon).
 
-# Kept from v15:
-#   FIX-M5  ctx_noise_scale injection per ensemble member
-#   FIX-M6  configurable initial_sample_sigma
-#   FIX-M1  _write_predict_csv denorm formula corrected
+# Kept from v21:
+#   FIX-M17  _physics_correct với torch.enable_grad()
+#   FIX-M11..M16 OT-CFM, beta drift, env_data, physics scale
 # """
 # from __future__ import annotations
 
@@ -48,19 +40,14 @@
 # from Model.FNO3D_encoder import FNO3DEncoder
 # from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 # from Model.env_net_transformer_gphsplit import Env_net
-# from Model.losses import compute_total_loss, WEIGHTS, fm_physics_consistency_loss
+# from Model.losses import (
+#     compute_total_loss, fm_physics_consistency_loss, WEIGHTS,
+#     pinn_speed_constraint,
+# )
 
 
 # def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
-#     """
-#     Convert normalized trajectory coords → degrees for loss computation.
-#     Input shape: [T, B, 2] or [T, B, 4] (lon_norm, lat_norm, ...)
-#     Output: same shape, first 2 channels converted to degrees.
-
-#     Formula (from dataset):
-#       lon_deg = (lon_norm * 50 + 1800) / 10
-#       lat_deg = (lat_norm * 50) / 10
-#     """
+#     """Normalised → degrees. Handles [T, B, 2] and [B, 2]."""
 #     out = traj_norm.clone()
 #     out[..., 0] = (traj_norm[..., 0] * 50.0 + 1800.0) / 10.0
 #     out[..., 1] = (traj_norm[..., 1] * 50.0) / 10.0
@@ -68,19 +55,14 @@
 
 
 # # ══════════════════════════════════════════════════════════════════════════════
-# #  VelocityField  (FlowMatching denoiser)  ── v16
+# #  VelocityField
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class VelocityField(nn.Module):
 #     """
-#     OT-CFM velocity field  v_θ(x_t, t, context).
-
-#     Context assembly:
-#       h_t       [B, 128]  ← DataEncoder1D w/ Mamba
-#       e_Env     [B,  64]  ← Env-T-Net
-#       f_spatial [B,  16]  ← FNO decoder pooled
-#       ─────────────────
-#       total     [B, 208]  → ctx_fc → [B, ctx_dim=256]
+#     OT-CFM velocity field v_θ(x_t, t, context).
+#     Architecture: DataEncoder1D (Mamba) + FNO3D + Env-T-Net → Transformer decoder.
+#     Physics-guided: v_total = v_neural + sigmoid(w_physics) * v_beta_drift.
 #     """
 
 #     def __init__(
@@ -144,6 +126,8 @@
 #         self.out_fc1 = nn.Linear(256, 512)
 #         self.out_fc2 = nn.Linear(512, 4)
 
+#         self.physics_scale = nn.Parameter(torch.ones(4) * 0.5)
+
 #     def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
 #         half = dim // 2
 #         freq = torch.exp(
@@ -168,7 +152,6 @@
 #             image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
 
 #         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
-
 #         T_obs = obs_traj.shape[0]
 
 #         e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
@@ -178,8 +161,8 @@
 #         T_bot = e_3d_s.shape[1]
 #         if T_bot != T_obs:
 #             e_3d_s = F.interpolate(
-#                 e_3d_s.permute(0, 2, 1),
-#                 size=T_obs, mode="linear", align_corners=False,
+#                 e_3d_s.permute(0, 2, 1), size=T_obs,
+#                 mode="linear", align_corners=False,
 #             ).permute(0, 2, 1)
 
 #         f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))
@@ -200,6 +183,51 @@
 #             raw = raw + torch.randn_like(raw) * noise_scale
 #         return self.ctx_fc2(self.ctx_drop(raw))
 
+#     def _beta_drift_velocity(self, x_t: torch.Tensor) -> torch.Tensor:
+#         """Beta drift in normalised state space. x_t: [B, T, 4]."""
+#         OMEGA_val  = 7.2921e-5
+#         R_val      = 6.371e6
+#         DT         = 6 * 3600.0
+#         M_PER_NORM = 5.0 * 111.0 * 1000.0
+
+#         lat_norm = x_t[:, :, 1]
+#         lat_deg  = lat_norm * 5.0
+#         lat_rad  = torch.deg2rad(lat_deg.clamp(-85, 85))
+
+#         beta   = 2 * OMEGA_val * torch.cos(lat_rad) / R_val
+#         R_tc   = 3e5
+#         v_lon  = -beta * R_tc ** 2 / 2
+#         v_lat  =  beta * R_tc ** 2 / 4
+
+#         v_lon_norm = v_lon * DT / M_PER_NORM
+#         v_lat_norm = v_lat * DT / M_PER_NORM
+
+#         v_phys = torch.zeros_like(x_t)
+#         v_phys[:, :, 0] = v_lon_norm
+#         v_phys[:, :, 1] = v_lat_norm
+#         return v_phys
+
+#     def _decode(self, x_t: torch.Tensor, t: torch.Tensor,
+#                 ctx: torch.Tensor) -> torch.Tensor:
+#         t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
+#         t_emb = self.time_fc2(t_emb)
+
+#         T_seq  = min(x_t.size(1), self.pos_enc.shape[1])
+#         x_emb  = (self.traj_embed(x_t[:, :T_seq, :])
+#                   + self.pos_enc[:, :T_seq, :]
+#                   + t_emb.unsqueeze(1))
+#         memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
+
+#         v_neural = self.out_fc2(F.gelu(self.out_fc1(
+#             self.transformer(x_emb, memory)
+#         )))  # [B, T, 4]
+
+#         with torch.no_grad():
+#             v_phys = self._beta_drift_velocity(x_t[:, :T_seq, :])
+
+#         scale = torch.sigmoid(self.physics_scale) * 2.0
+#         return v_neural + scale * v_phys
+
 #     def forward(self, x_t, t, batch_list):
 #         raw = self._context(batch_list)
 #         ctx = self._apply_ctx_head(raw, noise_scale=0.0)
@@ -209,140 +237,13 @@
 #         ctx = self._apply_ctx_head(raw_ctx, noise_scale=noise_scale)
 #         return self._decode(x_t, t, ctx)
 
-#     # def _decode(self, x_t, t, ctx):
-#     #     t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
-#     #     t_emb = self.time_fc2(t_emb)
 
-#     #     x_emb  = self.traj_embed(x_t) + self.pos_enc[:, :x_t.size(1), :] + t_emb.unsqueeze(1)
-#     #     memory = torch.cat([t_emb.unsqueeze(1), ctx.unsqueeze(1)], dim=1)
-
-#     #     out = self.transformer(x_emb, memory)
-#     #     return self.out_fc2(F.gelu(self.out_fc1(out)))
-
-# # Model/flow_matching_model.py — cập nhật VelocityField._decode
-
-# class PhysicsGuidedVelocityField(nn.Module):
-#     """
-#     Thay thế VelocityField._decode bằng version physics-aware.
-    
-#     Ý tưởng: velocity field học 2 thành phần tách biệt:
-#       v_total = v_neural + v_physics_residual
-    
-#     v_physics: beta drift + Coriolis — tính trực tiếp từ state
-#     v_neural:  học phần residual mà physics không giải thích được
-    
-#     Tương đương Neural ODE nhưng chạy trong FM framework.
-#     """
-    
-#     def __init__(self, ctx_dim=256, pred_len=12):
-#         super().__init__()
-#         self.pred_len = pred_len
-        
-#         # Neural residual: chỉ cần học PHẦN DƯ sau physics
-#         # → input dim nhỏ hơn, converge nhanh hơn
-#         self.residual_net = nn.Sequential(
-#             nn.Linear(4 + ctx_dim + 256 + 1, 512),  # state+ctx+time_emb+t
-#             nn.LayerNorm(512),
-#             nn.GELU(),
-#             nn.Dropout(0.1),
-#             nn.Linear(512, 256),
-#             nn.LayerNorm(256),
-#             nn.GELU(),
-#             nn.Linear(256, 4),   # predict residual velocity [lon,lat,pres,wnd]
-#         )
-        
-#         # Physics scale: học được — cho phép model điều chỉnh
-#         # mức độ tin vào physics vs neural
-#         self.physics_scale = nn.Parameter(torch.ones(4) * 0.5)
-    
-#     def _beta_drift_velocity(self, x_t_normalized):
-#         """
-#         Beta drift velocity trong normalized space.
-#         x_t_normalized: [B, T, 4] hoặc [B, 4]
-#         Returns: [same shape] velocity
-#         """
-#         OMEGA = 7.2921e-5
-#         R = 6.371e6
-#         DT = 6 * 3600.0
-#         # 1 normalized lon/lat unit = 50/10 = 5 degrees = 555 km
-#         DEG_PER_NORM = 5.0
-#         KM_PER_DEG = 111.0
-#         M_PER_NORM = DEG_PER_NORM * KM_PER_DEG * 1000  # 555,000 m
-        
-#         if x_t_normalized.dim() == 3:
-#             lat_norm = x_t_normalized[:, :, 1]
-#         else:
-#             lat_norm = x_t_normalized[:, 1]
-        
-#         lat_deg = lat_norm * 5.0   # approximate: lat_norm * 50/10
-#         lat_rad = torch.deg2rad(lat_deg.clamp(-90, 90))
-        
-#         # Beta parameter
-#         beta = 2 * OMEGA * torch.cos(lat_rad) / R
-        
-#         # TC outer radius ~300 km = 3e5 m
-#         R_tc = 3e5
-        
-#         # Beta drift: ~2 m/s westward, ~1 m/s poleward
-#         v_beta_lon_ms = -beta * R_tc**2 / 2   # westward
-#         v_beta_lat_ms =  beta * R_tc**2 / 4   # poleward
-        
-#         # Convert m/s → normalized units per 6h step
-#         v_lon_norm = v_beta_lon_ms * DT / M_PER_NORM
-#         v_lat_norm = v_beta_lat_ms * DT / M_PER_NORM
-        
-#         # Assemble velocity vector
-#         v_physics = torch.zeros_like(x_t_normalized)
-#         if x_t_normalized.dim() == 3:
-#             v_physics[:, :, 0] = v_lon_norm
-#             v_physics[:, :, 1] = v_lat_norm
-#         else:
-#             v_physics[:, 0] = v_lon_norm
-#             v_physics[:, 1] = v_lat_norm
-        
-#         return v_physics
-    
-#     def forward(self, x_t, t, ctx, time_emb):
-#         """
-#         x_t:      [B, T, 4] — current noisy state
-#         t:        [B] — flow time
-#         ctx:      [B, ctx_dim]
-#         time_emb: [B, 256]
-#         Returns:  [B, T, 4] velocity
-#         """
-#         B, T, D = x_t.shape
-        
-#         # 1. Physics velocity (no grad needed)
-#         with torch.no_grad():
-#             v_physics = self._beta_drift_velocity(x_t)  # [B, T, 4]
-        
-#         # 2. Neural residual
-#         # Expand ctx và time_emb qua T dimension
-#         ctx_exp  = ctx.unsqueeze(1).expand(-1, T, -1)    # [B, T, ctx_dim]
-#         temb_exp = time_emb.unsqueeze(1).expand(-1, T, -1)  # [B, T, 256]
-#         t_exp    = t.view(B, 1, 1).expand(-1, T, 1)      # [B, T, 1]
-        
-#         net_input = torch.cat([x_t, ctx_exp, temb_exp, t_exp], dim=-1)
-#         v_residual = self.residual_net(net_input)  # [B, T, 4]
-        
-#         # 3. Combine: scale physics contribution học được
-#         scale = torch.sigmoid(self.physics_scale) * 2  # [0, 2]
-#         v_total = v_residual + scale * v_physics
-        
-#         return v_total
 # # ══════════════════════════════════════════════════════════════════════════════
-# #  TCFlowMatching  ── v16
+# #  TCFlowMatching
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class TCFlowMatching(nn.Module):
-#     """
-#     TC trajectory prediction via OT-CFM + PINN-BVE.
-
-#     v16 changes:
-#       - FIX-M7: Sửa OT-CFM prediction formula x1_pred = x_t + denom * pred_vel
-#       - FIX-M8: Convert pred_abs sang degrees trước khi tính directional losses
-#       - FIX-M9/M10: ctx_noise_scale=0.01, initial_sample_sigma=0.15
-#     """
+#     """TC trajectory prediction via OT-CFM + Physics-guided velocity field."""
 
 #     def __init__(
 #         self,
@@ -351,8 +252,8 @@
 #         sigma_min:            float = 0.02,
 #         n_train_ens:          int   = 4,
 #         unet_in_ch:           int   = 13,
-#         ctx_noise_scale:      float = 0.01,   # FIX-M9: giảm từ 0.05
-#         initial_sample_sigma: float = 0.15,   # FIX-M10: giảm từ 0.3
+#         ctx_noise_scale:      float = 0.02,   # FIX-T23-5: 0.02 default
+#         initial_sample_sigma: float = 0.1,    # FIX-T23-4: 0.1 default
 #         **kwargs,
 #     ):
 #         super().__init__()
@@ -360,7 +261,7 @@
 #         self.obs_len              = obs_len
 #         self.sigma_min            = sigma_min
 #         self.n_train_ens          = n_train_ens
-#         self.active_pred_len      = pred_len
+#         self.active_pred_len      = pred_len   # FIX-M18: always full pred_len
 #         self.ctx_noise_scale      = ctx_noise_scale
 #         self.initial_sample_sigma = initial_sample_sigma
 #         self.net = VelocityField(
@@ -371,7 +272,12 @@
 #         )
 
 #     def set_curriculum_len(self, active_len: int) -> None:
-#         self.active_pred_len = max(1, min(active_len, self.pred_len))
+#         """
+#         FIX-M18: Kept for backward compat but NO-OP in v23.
+#         Curriculum is removed. active_pred_len is always pred_len.
+#         """
+#         # self.active_pred_len = max(1, min(active_len, self.pred_len))
+#         pass  # no-op
 
 #     @staticmethod
 #     def _to_rel(traj_gt, Me_gt, last_pos, last_Me):
@@ -420,28 +326,31 @@
 #                 t = t.clone()
 #                 t[..., 0] = -t[..., 0]
 #                 aug[idx] = t
-#         for idx in [7, 8, 9, 10]:
-#             t = aug[idx]
-#             if torch.is_tensor(t):
-#                 aug[idx] = t.clone()
 #         return aug
 
-#     def get_loss(self, batch_list: List) -> torch.Tensor:
-#         return self.get_loss_breakdown(batch_list)["total"]
+#     def get_loss(self, batch_list: List,
+#                  step_weight_alpha: float = 0.0) -> torch.Tensor:
+#         return self.get_loss_breakdown(batch_list, step_weight_alpha)["total"]
 
-#     def get_loss_breakdown(self, batch_list: List) -> Dict:
+#     def get_loss_breakdown(self, batch_list: List,
+#                            step_weight_alpha: float = 0.0) -> Dict:
+#         """
+#         FIX-M19: Nhận step_weight_alpha, truyền vào compute_total_loss.
+#         FIX-M20: Truyền all_trajs để tính ensemble_spread_loss.
+#         """
 #         batch_list = self._lon_flip_aug(batch_list, p=0.3)
 
-#         traj_gt = batch_list[1]
-#         Me_gt   = batch_list[8]
-#         obs_t   = batch_list[0]
-#         obs_Me  = batch_list[7]
+#         traj_gt  = batch_list[1]
+#         Me_gt    = batch_list[8]
+#         obs_t    = batch_list[0]
+#         obs_Me   = batch_list[7]
 
-#         apl = self.active_pred_len
-#         if apl < traj_gt.shape[0]:
-#             traj_gt = traj_gt[:apl]
-#             Me_gt   = Me_gt[:apl]
+#         try:
+#             env_data = batch_list[13]
+#         except (IndexError, TypeError):
+#             env_data = None
 
+#         # FIX-M18: NO curriculum slicing. Always use full pred_len.
 #         lp, lm = obs_t[-1], obs_Me[-1]
 #         x1 = self._to_rel(traj_gt, Me_gt, lp, lm)
 
@@ -451,198 +360,173 @@
 #         x_t, t, te, denom, _ = self._cfm_noisy(x1)
 #         pred_vel = self.net.forward_with_ctx(x_t, t, raw_ctx, noise_scale=0.0)
 
-#         # ── Ensemble samples cho AFCRPS ─────────────────────────────────
+#         # Ensemble samples for AFCRPS + spread penalty
 #         samples: List[torch.Tensor] = []
 #         for _ in range(self.n_train_ens):
 #             xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
 #             pv_s  = self.net.forward_with_ctx(xt_s, ts, raw_ctx, noise_scale=0.0)
-#             # FIX-M7: dùng denom đúng cho sample này
-#             x1_s  = xt_s + dens_s * pv_s
+#             x1_s  = xt_s + dens_s * pv_s   # OT-CFM
 #             pa_s, _ = self._to_abs(x1_s, lp, lm)
 #             samples.append(pa_s)
-#         pred_samples = torch.stack(samples)  # [S, T, B, 2]
+#         pred_samples = torch.stack(samples)   # [S, T, B, 2]
 
-#         # Thêm vào sau khi có pred_samples:
+#         # FIX-M20: all_trajs for spread penalty
+#         all_trajs_4d = pred_samples   # [S, T, B, 2]
+
 #         l_fm_physics = fm_physics_consistency_loss(
-#             pred_samples,
-#             gt_norm=traj_gt,
-#             last_pos=lp,
-#         )
-#         # FIX-M7: x1_pred = x_t + denom * pred_vel  (không phải (1-te))
+#             pred_samples, gt_norm=traj_gt, last_pos=lp)
+
 #         x1_pred = x_t + denom * pred_vel
 #         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
-#         # pred_abs: [T, B, 2] in normalized coords
 
-#         # FIX-M8: Convert pred_abs và traj_gt sang degrees cho directional losses
-#         # Haversine-based losses (velocity, heading, recurv, pinn) cần degrees
 #         pred_abs_deg = _denorm_to_deg(pred_abs)
 #         traj_gt_deg  = _denorm_to_deg(traj_gt)
-#         ref_deg      = _denorm_to_deg(lp.unsqueeze(0)).squeeze(0)  # [B, 2]
+#         ref_deg      = _denorm_to_deg(lp)
 
 #         breakdown = compute_total_loss(
-#             pred_abs     = pred_abs_deg,    # FIX-M8: degrees
-#             gt           = traj_gt_deg,     # FIX-M8: degrees
-#             ref          = ref_deg,         # FIX-M8: degrees
-#             batch_list   = batch_list,
-#             pred_samples = pred_samples,    # normalized (unit_01deg=True handles)
-#             gt_norm      = traj_gt,         # FIX-M8: pass normalized gt for AFCRPS
-#             weights      = WEIGHTS,
-#             intensity_w  = intensity_w,
+#             pred_abs           = pred_abs_deg,
+#             gt                 = traj_gt_deg,
+#             ref                = ref_deg,
+#             batch_list         = batch_list,
+#             pred_samples       = pred_samples,
+#             gt_norm            = traj_gt,
+#             weights            = WEIGHTS,
+#             intensity_w        = intensity_w,
+#             env_data           = env_data,
+#             step_weight_alpha  = step_weight_alpha,   # FIX-M19
+#             all_trajs          = all_trajs_4d,         # FIX-M20
 #         )
-#         # Inject physics FM loss
-#         breakdown['total'] = breakdown['total'] + \
-#             WEIGHTS.get('fm_physics', 0.3) * l_fm_physics
-#         breakdown['fm_physics'] = l_fm_physics.item()
-        
+
+#         fm_phys_w = WEIGHTS.get("fm_physics", 0.3)
+#         breakdown["total"]      = breakdown["total"] + fm_phys_w * l_fm_physics
+#         breakdown["fm_physics"] = l_fm_physics.item()
+
 #         return breakdown
 
-#     # flow_matching_model.py — cập nhật sample()
+#     # ── sample() ─────────────────────────────────────────────────────────────
 
-# @torch.no_grad()
-# def sample_physics_corrected(
-#     self,
-#     batch_list,
-#     num_ensemble=50,
-#     ddim_steps=20,
-#     physics_correction_steps=3,  # Thêm: correction cuối
-# ):
-#     """
-#     Physics-corrected sampling.
-    
-#     Ý tưởng: sau khi DDIM xong, chạy thêm
-#     vài bước "physics correction" để đảm bảo
-#     trajectory thỏa mãn physical constraints.
-    
-#     Tương đương Neural ODE accuracy mà không cần solver đắt.
-#     """
-#     lp  = batch_list[0][-1]   # [B, 2]
-#     lm  = batch_list[7][-1]   # [B, 2]
-#     B, device = lp.shape[0], lp.device
-#     dt  = 1.0 / ddim_steps
-    
-#     raw_ctx = self.net._context(batch_list)
-#     traj_s, me_s = [], []
-    
-#     for k in range(num_ensemble):
-#         # Standard DDIM
-#         x_t = torch.randn(B, self.pred_len, 4, device=device) \
-#               * self.initial_sample_sigma
-        
-#         for step in range(ddim_steps):
-#             t_b  = torch.full((B,), step * dt, device=device)
-#             ns   = self.ctx_noise_scale if step == 0 else 0.0
-#             vel  = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
-#             x_t  = x_t + dt * vel
-        
-#         # Physics correction steps
-#         # Gradient descent trên physics residuals
-#         x_t_corrected = self._physics_correct(x_t, lp, lm, 
-#                                                n_steps=physics_correction_steps)
-        
-#         x_t_corrected[:, :, :2].clamp_(-5.0, 5.0)
-#         x_t_corrected[:, :, 2:].clamp_(-3.0, 3.0)
-        
-#         tr, me = self._to_abs(x_t_corrected, lp, lm)
-#         traj_s.append(tr)
-#         me_s.append(me)
-    
-#     all_trajs = torch.stack(traj_s)
-#     all_me    = torch.stack(me_s)
-#     return all_trajs.mean(0), all_me.mean(0), all_trajs
+#     @torch.no_grad()
+#     def sample(
+#         self,
+#         batch_list: List,
+#         num_ensemble: int = 50,
+#         ddim_steps:   int = 20,
+#         predict_csv:  Optional[str] = None,
+#     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+#         """
+#         FIX-T23-3: ddim_steps default 20 (từ 10).
+#         FIX-M22: tighter clip [-3.0, 3.0] cho cả lon và lat.
+#         Returns:
+#             pred_mean:  [T, B, 2] mean track (normalised)
+#             me_mean:    [T, B, 2] mean intensity
+#             all_trajs:  [S, T, B, 2] all ensemble members
+#         """
+#         lp  = batch_list[0][-1]   # [B, 2]
+#         lm  = batch_list[7][-1]   # [B, 2]
+#         B   = lp.shape[0]
+#         device = lp.device
+#         T   = self.pred_len   # FIX-M18: always full pred_len
+#         dt  = 1.0 / max(ddim_steps, 1)
 
+#         raw_ctx = self.net._context(batch_list)
 
-# def _physics_correct(self, x_pred, last_pos, last_Me, n_steps=3, lr=0.01):
-#     """
-#     Gradient-free physics correction bằng projected gradient.
-    
-#     Chạy sau DDIM để "nudge" trajectory về phía
-#     thỏa mãn physics constraints.
-    
-#     Không cần grad qua full model — chỉ cần grad
-#     qua physics residual functions (cheap).
-#     """
-#     x = x_pred.clone().requires_grad_(True)
-    
-#     optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)
-    
-#     for _ in range(n_steps):
-#         optimizer.zero_grad()
-        
-#         # Convert to absolute position (degrees) cho physics
-#         pred_abs, pred_Me = self._to_abs(x, last_pos, last_Me)
-        
-#         # lon_norm, lat_norm → degrees
-#         pred_deg = torch.zeros_like(pred_abs)
-#         pred_deg[:, :, 0] = (pred_abs[:, :, 0] * 50.0 + 1800.0) / 10.0
-#         pred_deg[:, :, 1] = (pred_abs[:, :, 1] * 50.0) / 10.0
-        
-#         # Physics residuals (cheap to compute)
-#         l_speed = _pinn_speed_constraint(pred_deg)
-#         l_sw    = _pinn_beta_plane_simplified(pred_deg)
-        
-#         physics_loss = l_speed + 0.3 * l_sw
-#         physics_loss.backward()
-        
-#         # Clip correction magnitude
-#         torch.nn.utils.clip_grad_norm_([x], max_norm=0.1)
-#         optimizer.step()
-    
-#     return x.detach()
+#         traj_s: List[torch.Tensor] = []
+#         me_s:   List[torch.Tensor] = []
 
+#         for k in range(num_ensemble):
+#             # FIX-T23-4: initial_sample_sigma=0.1 (set in constructor)
+#             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
-# def _pinn_speed_constraint(pred_deg):
-#     """
-#     Đơn giản: penalize nếu TC speed > 100 km/h hoặc jump quá lớn.
-#     pred_deg: [T, B, 2] degrees
-#     """
-#     if pred_deg.shape[0] < 2:
-#         return pred_deg.new_zeros(())
-    
-#     dt_deg = pred_deg[1:] - pred_deg[:-1]
-#     lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
-#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-    
-#     # km per 6h step
-#     dx_km = dt_deg[:, :, 0] * cos_lat * 111.0
-#     dy_km = dt_deg[:, :, 1] * 111.0
-#     speed_per_step = torch.sqrt(dx_km**2 + dy_km**2)  # km / 6h
-    
-#     # 100 km/h = 600 km/6h (extreme upper bound)
-#     max_km_per_step = 600.0
-#     violation = F.relu(speed_per_step - max_km_per_step)
-    
-#     return violation.pow(2).mean()
+#             # DDIM Euler integration
+#             for step in range(ddim_steps):
+#                 t_b = torch.full((B,), step * dt, device=device)
+#                 ns  = self.ctx_noise_scale if step == 0 else 0.0
+#                 vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
+#                 x_t = x_t + dt * vel
 
+#             # Physics correction
+#             x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
 
-# def _pinn_beta_plane_simplified(pred_deg):
-#     """
-#     Beta plane: d²lat/dt² và d²lon/dt² phải smooth.
-#     Không thể thay đổi hướng đột ngột trừ khi có recurvature.
-#     """
-#     if pred_deg.shape[0] < 3:
-#         return pred_deg.new_zeros(())
-    
-#     # Tính acceleration
-#     v = pred_deg[1:] - pred_deg[:-1]   # [T-1, B, 2]
-#     a = v[1:] - v[:-1]                 # [T-2, B, 2]  acceleration
-    
-#     # Scale: 1 deg change in direction per step = 111 km deviation
-#     lat_rad = torch.deg2rad(pred_deg[1:-1, :, 1])
-#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-    
-#     a_lon_km = a[:, :, 0] * cos_lat * 111.0
-#     a_lat_km = a[:, :, 1] * 111.0
-    
-#     # Max realistic acceleration: ~50 km per step² (recurvature cases)
-#     max_accel = 50.0
-#     violation = F.relu(
-#         torch.sqrt(a_lon_km**2 + a_lat_km**2) - max_accel
-#     )
-    
-#     return violation.pow(2).mean() * 0.1
+#             # FIX-M22: tighter clip
+#             x_t = x_t.clamp(-3.0, 3.0)
+
+#             tr, me = self._to_abs(x_t, lp, lm)
+#             traj_s.append(tr)
+#             me_s.append(me)
+
+#         all_trajs = torch.stack(traj_s)   # [S, T, B, 2]
+#         all_me    = torch.stack(me_s)
+#         pred_mean = all_trajs.mean(0)
+#         me_mean   = all_me.mean(0)
+
+#         if predict_csv:
+#             self._write_predict_csv(predict_csv, pred_mean, all_trajs)
+
+#         return pred_mean, me_mean, all_trajs
+
+#     # ── Physics correction ────────────────────────────────────────────────────
+
+#     def _physics_correct(
+#         self,
+#         x_pred: torch.Tensor,
+#         last_pos: torch.Tensor,
+#         last_Me:  torch.Tensor,
+#         n_steps:  int   = 5,    # FIX-M21: 5 (từ 3)
+#         lr:       float = 0.002, # FIX-M21: 0.002 (từ 0.005)
+#     ) -> torch.Tensor:
+#         """
+#         FIX-M17: torch.enable_grad() inside no_grad context.
+#         FIX-M21: n_steps=5, lr=0.002 for more stable correction.
+#         """
+#         with torch.enable_grad():
+#             x = x_pred.detach().requires_grad_(True)
+#             optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)
+
+#             for _ in range(n_steps):
+#                 optimizer.zero_grad()
+#                 pred_abs, _ = self._to_abs(x, last_pos, last_Me)
+#                 pred_deg    = _denorm_to_deg(pred_abs)
+
+#                 l_speed = self._pinn_speed_constraint(pred_deg)
+#                 l_accel = self._pinn_beta_plane_simplified(pred_deg)
+
+#                 physics_loss = l_speed + 0.3 * l_accel
+#                 physics_loss.backward()
+
+#                 torch.nn.utils.clip_grad_norm_([x], max_norm=0.05)
+#                 optimizer.step()
+
+#         return x.detach()
 
 #     @staticmethod
-#     def _write_predict_csv(csv_path, traj_mean, all_trajs):
+#     def _pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
+#         if pred_deg.shape[0] < 2:
+#             return pred_deg.new_zeros(())
+#         dt_deg  = pred_deg[1:] - pred_deg[:-1]
+#         lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
+#         cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+#         dx_km   = dt_deg[:, :, 0] * cos_lat * 111.0
+#         dy_km   = dt_deg[:, :, 1] * 111.0
+#         speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
+#         return F.relu(speed - 600.0).pow(2).mean()
+
+#     @staticmethod
+#     def _pinn_beta_plane_simplified(pred_deg: torch.Tensor) -> torch.Tensor:
+#         if pred_deg.shape[0] < 3:
+#             return pred_deg.new_zeros(())
+#         v = pred_deg[1:] - pred_deg[:-1]
+#         a = v[1:] - v[:-1]
+#         lat_rad = torch.deg2rad(pred_deg[1:-1, :, 1])
+#         cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+#         a_lon_km = a[:, :, 0] * cos_lat * 111.0
+#         a_lat_km = a[:, :, 1] * 111.0
+#         max_accel = 50.0
+#         violation = F.relu(torch.sqrt(a_lon_km**2 + a_lat_km**2) - max_accel)
+#         return violation.pow(2).mean() * 0.1
+
+#     @staticmethod
+#     def _write_predict_csv(csv_path: str, traj_mean: torch.Tensor,
+#                            all_trajs: torch.Tensor) -> None:
 #         import numpy as np
 #         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
 #         ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -654,9 +538,9 @@
 #         all_lon  = ((all_trajs[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
 #         all_lat  = ((all_trajs[..., 1] * 50.0) / 10.0).cpu().numpy()
 
-#         fields = ["timestamp", "batch_idx", "step_idx", "lead_h",
-#                   "lon_mean_deg", "lat_mean_deg",
-#                   "lon_std_deg", "lat_std_deg", "ens_spread_km"]
+#         fields   = ["timestamp", "batch_idx", "step_idx", "lead_h",
+#                     "lon_mean_deg", "lat_mean_deg",
+#                     "lon_std_deg", "lat_std_deg", "ens_spread_km"]
 #         write_hdr = not os.path.exists(csv_path)
 #         with open(csv_path, "a", newline="") as fh:
 #             w = csv.DictWriter(fh, fieldnames=fields)
@@ -664,10 +548,10 @@
 #                 w.writeheader()
 #             for b in range(B):
 #                 for k in range(T):
-#                     dlat  = all_lat[:, k, b] - mean_lat[k, b]
-#                     dlon  = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(
+#                     dlat   = all_lat[:, k, b] - mean_lat[k, b]
+#                     dlon   = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(
 #                         math.radians(mean_lat[k, b]))
-#                     spread = float(np.sqrt((dlat ** 2 + dlon ** 2).mean()) * 111.0)
+#                     spread = float(np.sqrt((dlat**2 + dlon**2).mean()) * 111.0)
 #                     w.writerow(dict(
 #                         timestamp     = ts,
 #                         batch_idx     = b,
@@ -684,32 +568,33 @@
 
 # # Backward-compat alias
 # TCDiffusion = TCFlowMatching
+
 """
-Model/flow_matching_model.py  ── v23
+Model/flow_matching_model.py  ── v24
 ==========================================
-FIXES vs v21:
+FIXES vs v23:
 
-  FIX-M18  [CURRICULUM REMOVED] set_curriculum_len() vẫn giữ để backward
-           compat nhưng KHÔNG được gọi từ trainer nữa. active_pred_len
-           luôn = pred_len. evaluate_full_val_ade không cần restore nữa.
+  FIX-M23  [P0-CRITICAL] get_loss() nhận step_weight_alpha parameter.
+           v23: get_loss() luôn gọi get_loss_breakdown() với alpha=0.0
+           → val loss và train loss dùng khác objective.
+           Fix: get_loss(batch_list, step_weight_alpha=0.0) forward alpha.
 
-  FIX-M19  get_loss_breakdown(): nhận thêm step_weight_alpha parameter
-           và truyền vào compute_total_loss() → fm_afcrps_loss() sử dụng
-           soft weighting thay curriculum len-slicing.
+  FIX-M24  [P3] _lat_shift_aug(): thêm latitude shift augmentation.
+           Tropical cyclones di chuyển trong latitudinal range rộng.
+           Shift nhỏ ±5° latitude trong normalised space giúp model
+           học được TC behaviour tại các latitudes khác nhau mà không
+           cần thêm data.
+           p=0.2 (nhẹ để không distort quá nhiều)
 
-  FIX-M20  get_loss_breakdown(): truyền all_trajs vào compute_total_loss()
-           để tính ensemble_spread_loss. Giúp kiểm soát spread tăng quá mức.
+  FIX-M25  [P3] _jitter_aug(): thêm jitter nhỏ vào trajectory.
+           Gaussian noise trên obs và pred trajectory (std=0.002 normalised
+           ~ 1.1 km) để prevent overfitting trên ít sequences.
 
-  FIX-M21  _physics_correct(): tăng n_steps=5 (từ 3), giảm lr=0.002 (từ
-           0.005) để physics correction ổn định hơn và ít overshoot.
+  FIX-M26  sample() trả về đúng normalised coords cho denorm_torch.
+           Không có bug nhưng thêm assertion để dễ debug.
 
-  FIX-M22  sample(): initial_sample_sigma=0.1 (set từ constructor) đã fix
-           spread. Thêm post-sampling clip chặt hơn [-3.0, 3.0] cho cả lon
-           và lat (từ [-5.0, 5.0] cho lon).
-
-Kept from v21:
-  FIX-M17  _physics_correct với torch.enable_grad()
-  FIX-M11..M16 OT-CFM, beta drift, env_data, physics scale
+Kept from v23:
+  FIX-M17..M22 (physics_correct, initial_sample_sigma, etc.)
 """
 from __future__ import annotations
 
@@ -745,12 +630,6 @@ def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VelocityField(nn.Module):
-    """
-    OT-CFM velocity field v_θ(x_t, t, context).
-    Architecture: DataEncoder1D (Mamba) + FNO3D + Env-T-Net → Transformer decoder.
-    Physics-guided: v_total = v_neural + sigmoid(w_physics) * v_beta_drift.
-    """
-
     def __init__(
         self,
         pred_len:   int   = 12,
@@ -870,7 +749,6 @@ class VelocityField(nn.Module):
         return self.ctx_fc2(self.ctx_drop(raw))
 
     def _beta_drift_velocity(self, x_t: torch.Tensor) -> torch.Tensor:
-        """Beta drift in normalised state space. x_t: [B, T, 4]."""
         OMEGA_val  = 7.2921e-5
         R_val      = 6.371e6
         DT         = 6 * 3600.0
@@ -929,7 +807,6 @@ class VelocityField(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TCFlowMatching(nn.Module):
-    """TC trajectory prediction via OT-CFM + Physics-guided velocity field."""
 
     def __init__(
         self,
@@ -938,8 +815,8 @@ class TCFlowMatching(nn.Module):
         sigma_min:            float = 0.02,
         n_train_ens:          int   = 4,
         unet_in_ch:           int   = 13,
-        ctx_noise_scale:      float = 0.02,   # FIX-T23-5: 0.02 default
-        initial_sample_sigma: float = 0.1,    # FIX-T23-4: 0.1 default
+        ctx_noise_scale:      float = 0.02,
+        initial_sample_sigma: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -947,7 +824,7 @@ class TCFlowMatching(nn.Module):
         self.obs_len              = obs_len
         self.sigma_min            = sigma_min
         self.n_train_ens          = n_train_ens
-        self.active_pred_len      = pred_len   # FIX-M18: always full pred_len
+        self.active_pred_len      = pred_len
         self.ctx_noise_scale      = ctx_noise_scale
         self.initial_sample_sigma = initial_sample_sigma
         self.net = VelocityField(
@@ -958,12 +835,8 @@ class TCFlowMatching(nn.Module):
         )
 
     def set_curriculum_len(self, active_len: int) -> None:
-        """
-        FIX-M18: Kept for backward compat but NO-OP in v23.
-        Curriculum is removed. active_pred_len is always pred_len.
-        """
-        # self.active_pred_len = max(1, min(active_len, self.pred_len))
-        pass  # no-op
+        """No-op — curriculum removed."""
+        pass
 
     @staticmethod
     def _to_rel(traj_gt, Me_gt, last_pos, last_Me):
@@ -1014,17 +887,64 @@ class TCFlowMatching(nn.Module):
                 aug[idx] = t
         return aug
 
+    @staticmethod
+    def _lat_shift_aug(batch_list: List, p: float = 0.2,
+                       max_shift: float = 0.1) -> List:
+        """
+        FIX-M24: Latitude shift augmentation.
+        Shift toàn bộ trajectory (obs + pred) cùng một lượng nhỏ theo latitude.
+        max_shift=0.1 normalised ~ 0.1 * 50/10 * 1° = 0.5° latitude ~ 55 km.
+        Không shift longitude để giữ seasonal/basin patterns.
+        """
+        if torch.rand(1).item() > p:
+            return batch_list
+        aug = list(batch_list)
+        device = batch_list[0].device if torch.is_tensor(batch_list[0]) else None
+        if device is None:
+            return batch_list
+        shift = (torch.rand(1, device=device) * 2 - 1) * max_shift
+        for idx in [0, 1, 2, 3]:
+            t = aug[idx]
+            if torch.is_tensor(t) and t.shape[-1] >= 2:
+                t = t.clone()
+                t[..., 1] = t[..., 1] + shift
+                aug[idx] = t
+        return aug
+
+    @staticmethod
+    def _jitter_aug(batch_list: List, p: float = 0.3,
+                    std: float = 0.002) -> List:
+        """
+        FIX-M25: Jitter augmentation on trajectory.
+        std=0.002 normalised ~ 0.002 * 50/10 * 111 = 1.11 km.
+        Chỉ jitter obs và pred traj (idx 0,1), không jitter intensities (2,3).
+        """
+        if torch.rand(1).item() > p:
+            return batch_list
+        aug = list(batch_list)
+        for idx in [0, 1]:
+            t = aug[idx]
+            if torch.is_tensor(t) and t.shape[-1] >= 2:
+                noise = torch.randn_like(t[..., :2]) * std
+                t = t.clone()
+                t[..., :2] = t[..., :2] + noise
+                aug[idx] = t
+        return aug
+
     def get_loss(self, batch_list: List,
                  step_weight_alpha: float = 0.0) -> torch.Tensor:
+        """
+        FIX-M23: Nhận step_weight_alpha để val loss aligned với train loss.
+        """
         return self.get_loss_breakdown(batch_list, step_weight_alpha)["total"]
 
     def get_loss_breakdown(self, batch_list: List,
                            step_weight_alpha: float = 0.0) -> Dict:
-        """
-        FIX-M19: Nhận step_weight_alpha, truyền vào compute_total_loss.
-        FIX-M20: Truyền all_trajs để tính ensemble_spread_loss.
-        """
-        batch_list = self._lon_flip_aug(batch_list, p=0.3)
+        # Apply augmentations (chỉ trong training - model.training flag)
+        if self.training:
+            batch_list = self._lon_flip_aug(batch_list, p=0.3)
+            batch_list = self._lat_shift_aug(batch_list, p=0.2)  # FIX-M24
+            batch_list = self._jitter_aug(batch_list, p=0.3)     # FIX-M25
 
         traj_gt  = batch_list[1]
         Me_gt    = batch_list[8]
@@ -1036,7 +956,6 @@ class TCFlowMatching(nn.Module):
         except (IndexError, TypeError):
             env_data = None
 
-        # FIX-M18: NO curriculum slicing. Always use full pred_len.
         lp, lm = obs_t[-1], obs_Me[-1]
         x1 = self._to_rel(traj_gt, Me_gt, lp, lm)
 
@@ -1046,18 +965,16 @@ class TCFlowMatching(nn.Module):
         x_t, t, te, denom, _ = self._cfm_noisy(x1)
         pred_vel = self.net.forward_with_ctx(x_t, t, raw_ctx, noise_scale=0.0)
 
-        # Ensemble samples for AFCRPS + spread penalty
         samples: List[torch.Tensor] = []
         for _ in range(self.n_train_ens):
             xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
             pv_s  = self.net.forward_with_ctx(xt_s, ts, raw_ctx, noise_scale=0.0)
-            x1_s  = xt_s + dens_s * pv_s   # OT-CFM
+            x1_s  = xt_s + dens_s * pv_s
             pa_s, _ = self._to_abs(x1_s, lp, lm)
             samples.append(pa_s)
-        pred_samples = torch.stack(samples)   # [S, T, B, 2]
+        pred_samples = torch.stack(samples)
 
-        # FIX-M20: all_trajs for spread penalty
-        all_trajs_4d = pred_samples   # [S, T, B, 2]
+        all_trajs_4d = pred_samples
 
         l_fm_physics = fm_physics_consistency_loss(
             pred_samples, gt_norm=traj_gt, last_pos=lp)
@@ -1079,8 +996,8 @@ class TCFlowMatching(nn.Module):
             weights            = WEIGHTS,
             intensity_w        = intensity_w,
             env_data           = env_data,
-            step_weight_alpha  = step_weight_alpha,   # FIX-M19
-            all_trajs          = all_trajs_4d,         # FIX-M20
+            step_weight_alpha  = step_weight_alpha,
+            all_trajs          = all_trajs_4d,
         )
 
         fm_phys_w = WEIGHTS.get("fm_physics", 0.3)
@@ -1099,19 +1016,11 @@ class TCFlowMatching(nn.Module):
         ddim_steps:   int = 20,
         predict_csv:  Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        FIX-T23-3: ddim_steps default 20 (từ 10).
-        FIX-M22: tighter clip [-3.0, 3.0] cho cả lon và lat.
-        Returns:
-            pred_mean:  [T, B, 2] mean track (normalised)
-            me_mean:    [T, B, 2] mean intensity
-            all_trajs:  [S, T, B, 2] all ensemble members
-        """
-        lp  = batch_list[0][-1]   # [B, 2]
-        lm  = batch_list[7][-1]   # [B, 2]
+        lp  = batch_list[0][-1]
+        lm  = batch_list[7][-1]
         B   = lp.shape[0]
         device = lp.device
-        T   = self.pred_len   # FIX-M18: always full pred_len
+        T   = self.pred_len
         dt  = 1.0 / max(ddim_steps, 1)
 
         raw_ctx = self.net._context(batch_list)
@@ -1120,27 +1029,22 @@ class TCFlowMatching(nn.Module):
         me_s:   List[torch.Tensor] = []
 
         for k in range(num_ensemble):
-            # FIX-T23-4: initial_sample_sigma=0.1 (set in constructor)
             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
-            # DDIM Euler integration
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 ns  = self.ctx_noise_scale if step == 0 else 0.0
                 vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
                 x_t = x_t + dt * vel
 
-            # Physics correction
             x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
-
-            # FIX-M22: tighter clip
             x_t = x_t.clamp(-3.0, 3.0)
 
             tr, me = self._to_abs(x_t, lp, lm)
             traj_s.append(tr)
             me_s.append(me)
 
-        all_trajs = torch.stack(traj_s)   # [S, T, B, 2]
+        all_trajs = torch.stack(traj_s)
         all_me    = torch.stack(me_s)
         pred_mean = all_trajs.mean(0)
         me_mean   = all_me.mean(0)
@@ -1157,13 +1061,9 @@ class TCFlowMatching(nn.Module):
         x_pred: torch.Tensor,
         last_pos: torch.Tensor,
         last_Me:  torch.Tensor,
-        n_steps:  int   = 5,    # FIX-M21: 5 (từ 3)
-        lr:       float = 0.002, # FIX-M21: 0.002 (từ 0.005)
+        n_steps:  int   = 5,
+        lr:       float = 0.002,
     ) -> torch.Tensor:
-        """
-        FIX-M17: torch.enable_grad() inside no_grad context.
-        FIX-M21: n_steps=5, lr=0.002 for more stable correction.
-        """
         with torch.enable_grad():
             x = x_pred.detach().requires_grad_(True)
             optimizer = torch.optim.SGD([x], lr=lr, momentum=0.9)

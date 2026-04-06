@@ -1,48 +1,49 @@
+
 # """
-# Model/data/trajectoriesWithMe_unet_training.py  ── v18
-# ======================================================
-# TC trajectory dataset — TRAINING VERSION.
+# Model/data/trajectoriesWithMe_unet_training.py  ── v23
+# =======================================================
+# FIXES vs v18:
 
-# FIXES vs v17:
+#   FIX-DATA-18 [CRITICAL] _build_csv_env_lookup: env_gph500_mean trong CSV
+#               lưu RAW dam (27-90), KHÔNG phải pre-normalized. Đã xác nhận
+#               env_gph500_mean == d3d_gph500_mean_n và cả hai có range 27-90
+#               (tên "_n" trong CSV là misleading, data thực là raw dam).
+#               → gph500_already_normed = False cho CSV path (đúng).
+#               → sentinel guard [25, 95] apply bình thường.
+#               → -29.5 sentinel được lọc ra đúng (< 25).
 
-#   FIX-DATA-15 [CRITICAL] GPH500 = 0 dù Env_data .npy tồn tại.
+#   FIX-DATA-19 [CRITICAL] _build_csv_env_lookup: move_velocity trong CSV
+#               đã normalized (/1219.84), range 0-0.55. Code cũ nhân lại
+#               * _MOVE_VEL_NORM để downstream chia lại. Hành vi này đúng
+#               về mặt toán học nhưng không rõ ràng. Giữ nguyên (correct).
 
-#               Nguyên nhân gốc (pipeline cũ — build_env_data_scs_v10.py):
-#                 _parse_data3d() lưu key "gph500_mean_n" và "gph500_center_n"
-#                 (đã pre-normalized bằng GPH500_MEAN_NORM=5900, STD=200 → range
-#                 rất khác với raw dam). Nhưng env_data_processing() và
-#                 build_env_features_one_step() đọc key "gph500_mean" và
-#                 "gph500_center" → KHÔNG TÌM THẤY → gph500 = 0.
+#   FIX-DATA-20 [CRITICAL] _build_csv_env_lookup: cột history_direction12/24
+#               và history_inte_change24 trong CSV là one-hot encoded floats,
+#               KHÔNG phải -1 sentinels. build_env_features_one_step cần nhận
+#               list of floats [0.0, 1.0, 0.0, ...] trực tiếp, không qua
+#               sentinel check "all == -1". Đảm bảo truyền đúng format.
 
-#               Fix:
-#                 - _load_env_npy(): sau khi load dict từ .npy, nếu key
-#                   "gph500_mean" không có nhưng "gph500_mean_n" có → copy sang
-#                   đúng key, đánh dấu cờ "gph500_already_normed" = True.
-#                 - env_data_processing(): đọc cờ đó, KHÔNG apply sentinel guard
-#                   [25, 95] (guard đó dành cho raw dam, không phải pre-normed).
-#                   Truyền thẳng value qua.
-#                 - build_env_features_one_step() (env_net_transformer v19):
-#                   nếu cờ "gph500_already_normed" set → bỏ qua z-score lần 2,
-#                   chỉ clip [-5, 5].
+#   FIX-DATA-21 [BUG] _load_env_npy: sau khi remap key "_n" → chuẩn, gọi
+#               env_data_processing(remapped) nhưng env_data_processing lại
+#               apply sentinel guard trên gph500 dù cờ already_normed=True.
+#               Nguyên nhân: cờ đặt trong dict TRƯỚC khi gọi processing,
+#               nhưng bị lọc ra bởi "cleaned[k] = 0.0 if v == -1 else v"
+#               khi v=True/False. Fix: xử lý boolean flags TRƯỚC trong loop.
 
-#   FIX-DATA-16 CSV fallback: column mapping từ all_storms_final.csv đã dùng
-#               "env_gph500_mean" (raw dam) → truyền thẳng vào env_data_processing
-#               với sentinel guard [25, 95] — đây là ĐÚNG cho CSV path vì CSV
-#               lưu raw dam. Giữ nguyên, không cần thay.
+#   FIX-DATA-22 CURRICULUM REMOVED: Curriculum learning gây ADE tụt nghiêm
+#               trọng mỗi lần tăng len (282→444 km khi len 5→6 ở ep 10).
+#               Với 13M params và data 8473 sequences, model cần học toàn bộ
+#               pred_len=12 từ đầu. Thay curriculum bằng sequence weighting:
+#               các bước xa hơn có weight thấp hơn lúc đầu (soft weighting),
+#               tăng dần theo epoch thông qua loss weight, không cắt seq.
 
-#   FIX-DATA-17 env_data_processing(): cờ "gph500_already_normed" được bảo toàn
-#               qua cleaned dict để downstream đọc được.
+#   FIX-DATA-23 CSV lookup: storm_name format. CSV có names như "0002" (4 digits
+#               với leading zeros) và stripped "2". Lookup cần thử cả hai.
 
 # Kept from v17:
 #   FIX-DATA-12 CSV fallback auto-discover all_storms_final.csv
-#   FIX-DATA-13 Warning message phân biệt sentinel vs env files missing
-#   FIX-DATA-10 DATA3D_MEAN/STD ch0 gph500 dùng đơn vị /380 dam
-#   FIX-DATA-11 env_data_processing gph500 sentinel guard [25.0, 95.0]
-#               (chỉ áp dụng khi NOT already_normed)
-#   FIX-DATA-5  ch3/ch4 u500_center/v500_center corrected mean/std
-#   FIX-DATA-4  Zero-sentinel only ch0 (gph500_mean)
-#   FIX-CACHE-1 Stable env cache key
-#   FIX-DATA-1/2/3 Large sentinel, SST fill, gph guard
+#   FIX-DATA-10 DATA3D_MEAN/STD ch0 gph500 đúng /380 dam
+#   FIX-DATA-5  ch3/ch4 u500_center/v500_center corrected
 # """
 # from __future__ import annotations
 
@@ -82,11 +83,11 @@
 
 # # ── DATA3D normalisation constants ────────────────────────────────────────────
 # DATA3D_MEAN = np.array([
-#     33.64,      # ch0  gph500_mean  FIX-DATA-10: /380 dam (was 1287.66 in v15)
-#     5843.14,    # ch1  u500_mean    ✓ confirmed
-#     1482.47,    # ch2  v500_mean    ✓ confirmed
-#     5930.27,    # ch3  u500_center  FIX-DATA-5 (v14)
-#     1622.27,    # ch4  v500_center  FIX-DATA-5 (v14)
+#     33.64,      # ch0  gph500_mean  (raw dam /380 unit)
+#     5843.14,    # ch1  u500_mean
+#     1482.47,    # ch2  v500_mean
+#     5930.27,    # ch3  u500_center
+#     1622.27,    # ch4  v500_center
 #     0.27,       # ch5
 #     -0.34,      # ch6
 #     -0.86,      # ch7
@@ -98,43 +99,37 @@
 # ], dtype=np.float32)
 
 # DATA3D_STD = np.array([
-#     7.08,       # ch0  gph500_mean  FIX-DATA-10
-#     50.55,      # ch1  u500_mean    ✓
-#     29.42,      # ch2  v500_mean    ✓
-#     1025.26,    # ch3  u500_center  FIX-DATA-5 (v14)
-#     1600.32,    # ch4  v500_center  FIX-DATA-5 (v14)
-#     4.73,
-#     2.98,
-#     2.75,
-#     5.37,
-#     2.29,
-#     2.21,
-#     2.68,
+#     7.08,       # ch0
+#     50.55,      # ch1
+#     29.42,      # ch2
+#     1025.26,    # ch3
+#     1600.32,    # ch4
+#     4.73,       # ch5
+#     2.98,       # ch6
+#     2.75,       # ch7
+#     5.37,       # ch8
+#     2.29,       # ch9
+#     2.21,       # ch10
+#     2.68,       # ch11
 #     3.05,       # ch12 SST
 # ], dtype=np.float32)
 
 # # ── Sentinel thresholds ───────────────────────────────────────────────────────
 # _DATA3D_SENTINEL_LARGE         = 20000.0
 # _DATA3D_SENTINEL_ZERO_CHANNELS = {0}
-
-# # Guard cho raw dam (build_env_data lưu CSV path → truyền raw dam)
-# _DATA3D_GPH_VALID_MIN = 25.0
-# _DATA3D_GPH_VALID_MAX = 95.0
-
-# _DATA3D_SST_CHANNEL = 12
-# _SST_VALID_MIN = 270.0
-# _SST_FILL_K    = 298.0
-
-# _MOVE_VEL_NORM = 1219.84
+# _DATA3D_GPH_VALID_MIN          = 25.0
+# _DATA3D_GPH_VALID_MAX          = 95.0
+# _DATA3D_SST_CHANNEL            = 12
+# _SST_VALID_MIN                 = 270.0
+# _SST_FILL_K                    = 298.0
+# _MOVE_VEL_NORM                 = 1219.84
 
 # # ── Key mapping: build_env_data_scs_v10.py lưu suffix "_n" ───────────────────
-# # FIX-DATA-15: Map từ key cũ (có _n) sang key chuẩn mà downstream đọc.
+# # FIX-DATA-15 (kept): Map từ key cũ (có _n) sang key chuẩn
 # _NPY_KEY_REMAP = {
 #     "gph500_mean_n"   : "gph500_mean",
 #     "gph500_center_n" : "gph500_center",
 # }
-# # u500/v500 trong .npy cũ đã normalize /U500_NORM → [-1,1].
-# # build_env_features expects float 0-1 (boolean-style). Clip [0,1] là OK.
 # _NPY_U500_KEY_REMAP = {
 #     "u500_mean_n"   : "u500_mean",
 #     "u500_center_n" : "u500_center",
@@ -147,8 +142,13 @@
 
 # def _build_csv_env_lookup(csv_path: str) -> dict:
 #     """
-#     Load all_storms_final.csv và build lookup dict cho env features.
-#     CSV lưu raw dam cho gph500 → truyền thẳng, sentinel guard [25,95] đúng.
+#     Load all_storms_final.csv → lookup dict.
+
+#     FIX-DATA-18: env_gph500_mean trong CSV là raw dam (27-90), sentinel=-29.5.
+#                  Đây là KHÔNG phải pre-normalized. gph500_already_normed=False.
+#     FIX-DATA-20: history_direction12/24 và inten24 trong CSV là one-hot floats
+#                  [0.0, 1.0, 0.0, ...]. Truyền thẳng không cần xử lý sentinel.
+#     FIX-DATA-23: Lưu cả key (yr, name_original, ts) lẫn (yr, name_stripped, ts).
 #     """
 #     try:
 #         import pandas as pd
@@ -169,34 +169,49 @@
 
 #     lookup: dict = {}
 #     for _, row in df.iterrows():
-#         yr         = str(int(float(row["year"])))
-#         name_raw   = str(row["storm_name"])
-#         name_strip = name_raw.lstrip("0") or "0"
-#         ts         = str(row["dt"])
+#         yr          = str(int(float(row["year"])))
+#         name_raw    = str(row["storm_name"])
+#         name_strip  = name_raw.lstrip("0") or "0"
+#         ts          = str(row["dt"])
+
+#         # FIX-DATA-20: history_direction → one-hot floats từ CSV columns
+#         dir12  = [float(row.get(f"env_dir12_{i}",  0.0)) for i in range(8)]
+#         dir24  = [float(row.get(f"env_dir24_{i}",  0.0)) for i in range(8)]
+#         inten24 = [float(row.get(f"env_inten24_{i}", 0.0)) for i in range(4)]
+
+#         # FIX-DATA-18: env_gph500_mean là raw dam → gph500_already_normed=False
+#         gph_mean   = float(row.get("env_gph500_mean",   -29.5))
+#         gph_center = float(row.get("env_gph500_center", -29.5))
+
+#         # move_velocity: CSV lưu normalized [0-0.55], nhân lại để downstream chia
+#         mv_norm = float(row.get("env_move_velocity", 0.0))
+#         mv_raw  = mv_norm * _MOVE_VEL_NORM  # → raw km/h, downstream /1219.84
 
 #         d = {
-#             # CSV lưu raw dam → env_data_processing sẽ apply sentinel [25,95]
-#             "gph500_mean"  : float(row.get("env_gph500_mean",   -29.5)),
-#             "gph500_center": float(row.get("env_gph500_center", -29.5)),
-#             # CSV lưu boolean 0/1 → build_env_features dùng as-is
-#             "u500_mean"    : float(row.get("env_u500_mean",   0.0)),
-#             "u500_center"  : float(row.get("env_u500_center", 0.0)),
-#             "v500_mean"    : float(row.get("env_v500_mean",   0.0)),
-#             "v500_center"  : float(row.get("env_v500_center", 0.0)),
-#             # move_velocity: CSV lưu normalized, nhân lại để downstream chia
-#             "move_velocity": float(row.get("env_move_velocity", -1)) * _MOVE_VEL_NORM,
-#             "history_direction12"  : [float(row.get(f"env_dir12_{i}",  -1)) for i in range(8)],
-#             "history_direction24"  : [float(row.get(f"env_dir24_{i}",  -1)) for i in range(8)],
-#             "history_inte_change24": [float(row.get(f"env_inten24_{i}", -1)) for i in range(4)],
-#             # CSV path: gph500 là raw dam → KHÔNG đánh dấu already_normed
-#             "gph500_already_normed": False,
+#             "gph500_mean"            : gph_mean,
+#             "gph500_center"          : gph_center,
+#             "gph500_already_normed"  : False,  # FIX-DATA-18: raw dam
+#             "u500_mean"              : float(row.get("env_u500_mean",   0.0)),
+#             "u500_center"            : float(row.get("env_u500_center", 0.0)),
+#             "v500_mean"              : float(row.get("env_v500_mean",   0.0)),
+#             "v500_center"            : float(row.get("env_v500_center", 0.0)),
+#             "move_velocity"          : mv_raw,
+#             "history_direction12"    : dir12,   # FIX-DATA-20: already one-hot
+#             "history_direction24"    : dir24,
+#             "history_inte_change24"  : inten24,
 #         }
 
-#         lookup[(yr, name_strip, ts)] = d
+#         # FIX-DATA-23: store both name formats
 #         lookup[(yr, name_raw,   ts)] = d
+#         lookup[(yr, name_strip, ts)] = d
+#         # Also zero-padded variants
+#         name_padded4 = name_raw.zfill(4)
+#         name_padded2 = name_raw.zfill(2)
+#         lookup[(yr, name_padded4, ts)] = d
+#         lookup[(yr, name_padded2, ts)] = d
 
-#     logger.info(f"CSV env lookup built: {len(lookup)} entries "
-#                 f"({len(df)} rows × 2 name formats)")
+#     n_storms = df['storm_name'].nunique()
+#     logger.info(f"CSV env lookup built: {len(lookup)} entries ({n_storms} storms)")
 #     return lookup
 
 
@@ -207,9 +222,11 @@
 #         os.path.join(os.path.dirname(os.path.dirname(root_path)),
 #                      "all_storms_final.csv"),
 #         "/kaggle/input/datasets/gmnguynhng/data-tc-finall/all_storms_final.csv",
+#         "/kaggle/working/all_storms_final.csv",
 #     ]
 #     for p in candidates:
 #         if os.path.exists(p):
+#             logger.info(f"Auto-discovered CSV: {p}")
 #             return p
 #     return None
 
@@ -220,39 +237,40 @@
 #     """
 #     Clean env_npy dictionary.
 
-#     FIX-DATA-15: Phân biệt hai nguồn gph500:
-#       (A) .npy cũ (build_env_data_scs_v10): key "gph500_mean_n",
-#           đã pre-normalized bằng mean=5900/std=200 → range ~[-28, 2].
-#           Cờ "gph500_already_normed"=True được set bởi _load_env_npy().
-#           → KHÔNG apply sentinel [25, 95], truyền thẳng qua.
-#       (B) CSV fallback: key "gph500_mean", raw dam ~[27, 90].
-#           Cờ "gph500_already_normed"=False (hoặc không có).
-#           → Apply sentinel [25, 95] bình thường.
-
-#     FIX-DATA-17: Bảo toàn cờ "gph500_already_normed" qua cleaned dict.
+#     FIX-DATA-21: Boolean flags (already_normed, has_data3d) phải được xử lý
+#                  TRƯỚC vòng lặp chính để tránh bị convert sang float(0.0).
+#                  Sau đó mới apply sentinel guards.
 #     """
 #     if not isinstance(env_dict, dict):
 #         return {}
 
-#     cleaned = {}
+#     # FIX-DATA-21: Trích xuất boolean flags trước
+#     already_normed = bool(env_dict.get("gph500_already_normed", False))
+
+#     cleaned = {"gph500_already_normed": already_normed}
+
 #     for k, v in env_dict.items():
+#         # Skip boolean flags đã xử lý
+#         if k in ("gph500_already_normed", "has_data3d",
+#                  "gph500_mean_already_normed", "gph500_center_already_normed"):
+#             continue
 #         if isinstance(v, (list, np.ndarray)):
 #             cleaned[k] = v
-#         elif k.endswith("_already_normed") or k.endswith("_valid") or k == "has_data3d":
-#             # Giữ nguyên boolean flags
+#         elif isinstance(v, bool):
 #             cleaned[k] = v
+#         elif v == -1:
+#             cleaned[k] = 0.0
 #         else:
-#             cleaned[k] = 0.0 if v == -1 else v
+#             cleaned[k] = v
 
-#     # SST sentinel (giữ nguyên)
+#     # SST sentinel
 #     for sst_key in ("sst_mean", "sst_center", "sst"):
 #         if sst_key in cleaned:
 #             val = cleaned[sst_key]
 #             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
 #                 cleaned[sst_key] = _SST_FILL_K
 
-#     # FIX-DATA-15: GPH500 sentinel guard chỉ apply khi NOT already_normed
-#     already_normed = cleaned.get("gph500_already_normed", False)
+#     # GPH500 sentinel guard chỉ apply khi NOT already_normed
 #     if not already_normed:
 #         for gph_key in ("gph500_mean", "gph500_center"):
 #             if gph_key in cleaned:
@@ -260,7 +278,7 @@
 #                 if val is not None and isinstance(val, (int, float)):
 #                     if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
 #                         cleaned[gph_key] = None  # sentinel → feature = 0
-#     # Nếu already_normed=True: bỏ qua guard, giữ nguyên giá trị
+#     # already_normed=True: giữ nguyên, không apply guard
 
 #     return cleaned
 
@@ -296,21 +314,26 @@
 #     starts        = torch.cat([torch.tensor([0]), cum[:-1]])
 #     seq_start_end = torch.stack([starts, cum], dim=1)
 
-#     img_obs_out  = torch.stack(list(img_obs), dim=0).permute(0, 4, 1, 2, 3).float()
+#     img_obs_out  = torch.stack(list(img_obs),  dim=0).permute(0, 4, 1, 2, 3).float()
 #     img_pred_out = torch.stack(list(img_pred), dim=0).permute(0, 4, 1, 2, 3).float()
 
-#     env_out = None
+#     env_out    = None
 #     valid_envs = [d for d in env_data_raw if isinstance(d, dict)]
 #     if valid_envs:
 #         env_out  = {}
 #         all_keys = set()
 #         for d in valid_envs:
 #             all_keys.update(d.keys())
-#         # Loại bỏ các cờ internal trước khi collate
-#         all_keys -= {"gph500_already_normed", "has_data3d",
-#                      "gph500_mean_already_normed", "gph500_center_already_normed",
-#                      "history_direction12_valid", "history_direction24_valid",
-#                      "history_inte_change24_valid"}
+
+#         # FIX-DATA-21: Không collate boolean/internal flags
+#         _skip_keys = {
+#             "gph500_already_normed", "has_data3d",
+#             "gph500_mean_already_normed", "gph500_center_already_normed",
+#             "history_direction12_valid", "history_direction24_valid",
+#             "history_inte_change24_valid",
+#         }
+#         all_keys -= _skip_keys
+
 #         for key in all_keys:
 #             vals = []
 #             for d in env_data_raw:
@@ -346,7 +369,11 @@
 # # ── TrajectoryDataset ─────────────────────────────────────────────────────────
 
 # class TrajectoryDataset(Dataset):
-#     """TC trajectory dataset for TCND_VN."""
+#     """
+#     TC trajectory dataset for TCND_VN.
+#     FIX-DATA-22: CURRICULUM REMOVED. Luôn train trên pred_len=12 đầy đủ.
+#                  Soft weighting theo step được xử lý trong loss function.
+#     """
 
 #     def __init__(self, data_dir, obs_len=8, pred_len=12, skip=1,
 #                  threshold=0.002, min_ped=1, delim=" ", other_modal="gph",
@@ -387,8 +414,8 @@
 #         logger.info(f"root ({dtype}) : {self.root_path}")
 
 #         # ── CSV fallback ─────────────────────────────────────────────────────
-#         self._csv_env_lookup: dict = {}
-#         self._env_path_missing = not os.path.exists(self.env_path)
+#         self._csv_env_lookup: dict  = {}
+#         self._env_path_missing      = not os.path.exists(self.env_path)
 
 #         if self._env_path_missing or csv_env_path is not None:
 #             if csv_env_path is None:
@@ -397,15 +424,13 @@
 #                 self._csv_env_lookup = _build_csv_env_lookup(csv_env_path)
 #                 if self._env_path_missing:
 #                     logger.info(
-#                         f"Env_data không tìm thấy tại {self.env_path}. "
-#                         f"Dùng CSV fallback: {csv_env_path} "
-#                         f"({len(self._csv_env_lookup)//2} entries)"
+#                         f"Env_data không tìm thấy: {self.env_path}. "
+#                         f"Dùng CSV fallback ({len(self._csv_env_lookup)//4} entries)"
 #                     )
 #             elif self._env_path_missing:
 #                 logger.warning(
 #                     f"Env_data không tìm thấy: {self.env_path} "
-#                     f"VÀ không tìm thấy all_storms_final.csv. "
-#                     f"Tất cả env features sẽ = 0 (model vẫn chạy được)."
+#                     f"VÀ không tìm thấy CSV. Env features sẽ = 0."
 #                 )
 
 #         self.obs_len    = obs_len
@@ -439,8 +464,7 @@
 #         self.non_linear_ped  = []
 #         self.tyID            = []
 #         num_peds_in_seq      = []
-
-#         self.env_cache: dict[tuple, dict] = {}
+#         self.env_cache: dict = {}
 
 #         for path in all_files:
 #             base   = os.path.splitext(os.path.basename(path))[0]
@@ -456,8 +480,7 @@
 
 #             frames     = np.unique(data[:, 0]).tolist()
 #             frame_data = [data[data[:, 0] == f] for f in frames]
-
-#             n_frames = len(frames)
+#             n_frames   = len(frames)
 #             if n_frames < self.seq_len:
 #                 continue
 #             n_seq = (n_frames - self.seq_len) // skip + 1
@@ -488,14 +511,22 @@
 #                     rel  = np.zeros_like(ps_t)
 #                     rel[:, 1:] = ps_t[:, 1:] - ps_t[:, :-1]
 
-#                     buf_obs_traj.append(torch.from_numpy(ps_t[:2, :obs_len]).float())
-#                     buf_pred_traj.append(torch.from_numpy(ps_t[:2, obs_len:]).float())
-#                     buf_obs_rel.append(torch.from_numpy(rel[:2, :obs_len]).float())
-#                     buf_pred_rel.append(torch.from_numpy(rel[:2, obs_len:]).float())
-#                     buf_obs_Me.append(torch.from_numpy(ps_t[2:, :obs_len]).float())
-#                     buf_pred_Me.append(torch.from_numpy(ps_t[2:, obs_len:]).float())
-#                     buf_obs_Me_rel.append(torch.from_numpy(rel[2:, :obs_len]).float())
-#                     buf_pred_Me_rel.append(torch.from_numpy(rel[2:, obs_len:]).float())
+#                     buf_obs_traj.append(
+#                         torch.from_numpy(ps_t[:2, :obs_len]).float())
+#                     buf_pred_traj.append(
+#                         torch.from_numpy(ps_t[:2, obs_len:]).float())
+#                     buf_obs_rel.append(
+#                         torch.from_numpy(rel[:2, :obs_len]).float())
+#                     buf_pred_rel.append(
+#                         torch.from_numpy(rel[:2, obs_len:]).float())
+#                     buf_obs_Me.append(
+#                         torch.from_numpy(ps_t[2:, :obs_len]).float())
+#                     buf_pred_Me.append(
+#                         torch.from_numpy(ps_t[2:, obs_len:]).float())
+#                     buf_obs_Me_rel.append(
+#                         torch.from_numpy(rel[2:, :obs_len]).float())
+#                     buf_pred_Me_rel.append(
+#                         torch.from_numpy(rel[2:, obs_len:]).float())
 #                     buf_nlp.append(self._poly_fit(ps_t, pred_len, threshold))
 #                     cnt += 1
 
@@ -509,7 +540,6 @@
 #                     self.obs_Me_rel_raw.extend(buf_obs_Me_rel)
 #                     self.pred_Me_rel_raw.extend(buf_pred_Me_rel)
 #                     self.non_linear_ped.extend(buf_nlp)
-
 #                     num_peds_in_seq.append(cnt)
 #                     self.tyID.append({
 #                         "old":    [f_year, f_name, idx],
@@ -570,7 +600,8 @@
 #                 ch[ch < _SST_VALID_MIN] = _SST_FILL_K
 #             if np.any(np.isnan(ch)):
 #                 valid_vals = ch[~np.isnan(ch)]
-#                 fill_val = float(np.median(valid_vals)) if len(valid_vals) > 0 else float(DATA3D_MEAN[c])
+#                 fill_val = (float(np.median(valid_vals)) if len(valid_vals) > 0
+#                             else float(DATA3D_MEAN[c]))
 #                 ch[np.isnan(ch)] = fill_val
 #             arr[:, :, c] = (ch - DATA3D_MEAN[c]) / (DATA3D_STD[c] + 1e-6)
 #         return np.clip(arr, -5.0, 5.0)
@@ -603,7 +634,8 @@
 #                 if arr.shape[2] < DATA3D_CH:
 #                     arr = np.concatenate([
 #                         arr,
-#                         np.zeros((DATA3D_H, DATA3D_W, DATA3D_CH - arr.shape[2]), dtype=np.float32),
+#                         np.zeros((DATA3D_H, DATA3D_W, DATA3D_CH - arr.shape[2]),
+#                                  dtype=np.float32),
 #                     ], axis=2)
 #                 arr = arr[:, :, :DATA3D_CH]
 #                 return self._normalize_data3d(arr)
@@ -634,13 +666,11 @@
 
 #     def _load_env_npy(self, year, ty_name, timestamp):
 #         """
-#         FIX-DATA-15: Load .npy và remap key "gph500_mean_n" → "gph500_mean"
-#         với cờ "gph500_already_normed"=True để downstream KHÔNG apply
-#         sentinel guard [25,95] và KHÔNG z-score lần 2.
+#         FIX-DATA-21: Remap keys, set already_normed flag, THEN call
+#                      env_data_processing() which respects the flag.
 #         """
 #         folder = os.path.join(self.env_path, str(year), str(ty_name))
 #         if os.path.exists(folder):
-#             # Thử load file theo thứ tự ưu tiên
 #             candidates = []
 #             for fname in [f"WP{year}{ty_name}_{timestamp}.npy", f"{timestamp}.npy"]:
 #                 p = os.path.join(folder, fname)
@@ -662,22 +692,21 @@
 #                     if not isinstance(raw, dict):
 #                         continue
 
-#                     # FIX-DATA-15: Remap key cũ "_n" → key chuẩn
 #                     remapped = dict(raw)
 
-#                     # GPH500: key cũ là "gph500_mean_n" (pre-normed bởi build_env)
+#                     # Remap GPH500 "_n" keys → chuẩn, đặt flag
 #                     has_old_gph = False
 #                     for old_k, new_k in _NPY_KEY_REMAP.items():
 #                         if old_k in remapped and new_k not in remapped:
 #                             remapped[new_k] = remapped.pop(old_k)
 #                             has_old_gph = True
 
-#                     # u500/v500: key cũ là "u500_mean_n" v.v.
+#                     # Remap u/v500 "_n" keys
 #                     for old_k, new_k in _NPY_U500_KEY_REMAP.items():
 #                         if old_k in remapped and new_k not in remapped:
 #                             remapped[new_k] = remapped.pop(old_k)
 
-#                     # Đánh dấu gph500 đã normalized nếu đến từ key "_n"
+#                     # FIX-DATA-21: Đặt flag TRƯỚC khi gọi processing
 #                     if has_old_gph:
 #                         remapped["gph500_already_normed"] = True
 
@@ -691,7 +720,8 @@
 #             ts_str = str(timestamp)
 #             name_strip  = str(ty_name).lstrip("0") or "0"
 #             name_padded = str(ty_name).zfill(4)
-#             for name_try in (str(ty_name), name_strip, name_padded):
+#             name_padded2 = str(ty_name).zfill(2)
+#             for name_try in (str(ty_name), name_strip, name_padded, name_padded2):
 #                 raw_dict = self._csv_env_lookup.get((yr_str, name_try, ts_str))
 #                 if raw_dict is not None:
 #                     return env_data_processing(dict(raw_dict))
@@ -699,22 +729,26 @@
 #         return None
 
 #     def _get_env_features(self, year, ty_name, dates, obs_traj, obs_Me):
-#         T          = len(dates)
-#         all_feats  = []
+#         T         = len(dates)
+#         all_feats = []
 #         prev_speed = None
+
 #         for t in range(T):
 #             env_npy = self._load_env_npy(year, ty_name, dates[t])
 #             feat    = build_env_features_one_step(
-#                 lon_norm=float(obs_traj[0, t]), lat_norm=float(obs_traj[1, t]),
-#                 wind_norm=float(obs_Me[1, t]),
-#                 pres_norm=float(obs_Me[0, t]),
-#                 timestamp=dates[t],
-#                 env_npy=env_npy, prev_speed_kmh=prev_speed,
+#                 lon_norm  = float(obs_traj[0, t]),
+#                 lat_norm  = float(obs_traj[1, t]),
+#                 wind_norm = float(obs_Me[1, t]),
+#                 pres_norm = float(obs_Me[0, t]),
+#                 timestamp = dates[t],
+#                 env_npy   = env_npy,
+#                 prev_speed_kmh = prev_speed,
 #             )
 #             all_feats.append(feat)
 #             if isinstance(env_npy, dict):
 #                 mv = float(env_npy.get("move_velocity", 0.0) or 0.0)
 #                 prev_speed = mv if mv != -1 else 0.0
+
 #         env_out = {}
 #         for key in ENV_FEATURE_DIMS:
 #             dim  = ENV_FEATURE_DIMS[key]
@@ -754,8 +788,8 @@
 #         tyname = str(info["old"][1])
 #         dates  = info["tydate"]
 
-#         imgs     = [self.img_read(year, tyname, ts) for ts in dates[:self.obs_len]]
-#         img_obs  = torch.stack(imgs, dim=0)
+#         imgs    = [self.img_read(year, tyname, ts) for ts in dates[:self.obs_len]]
+#         img_obs = torch.stack(imgs, dim=0)
 #         img_pred = torch.zeros(self.pred_len, DATA3D_H, DATA3D_W, DATA3D_CH)
 
 #         obs_traj    = torch.stack([self.obs_traj_raw[i]    for i in range(s, e)])
@@ -789,50 +823,33 @@
 #         ]
 
 """
-Model/data/trajectoriesWithMe_unet_training.py  ── v23
+Model/data/trajectoriesWithMe_unet_training.py  ── v24
 =======================================================
-FIXES vs v18:
+FIXES vs v23:
 
-  FIX-DATA-18 [CRITICAL] _build_csv_env_lookup: env_gph500_mean trong CSV
-              lưu RAW dam (27-90), KHÔNG phải pre-normalized. Đã xác nhận
-              env_gph500_mean == d3d_gph500_mean_n và cả hai có range 27-90
-              (tên "_n" trong CSV là misleading, data thực là raw dam).
-              → gph500_already_normed = False cho CSV path (đúng).
-              → sentinel guard [25, 95] apply bình thường.
-              → -29.5 sentinel được lọc ra đúng (< 25).
+  FIX-DATA-24  [P0-CRITICAL] _build_csv_env_lookup: map d3d_u500_mean_raw
+               và d3d_v500_mean_raw vào keys "u500_raw_mean" / "v500_raw_mean".
+               v23 chỉ map env_u500_mean (boolean flag = 1.0) → env_net học
+               feature vô nghĩa. Bây giờ dùng actual steering flow values.
 
-  FIX-DATA-19 [CRITICAL] _build_csv_env_lookup: move_velocity trong CSV
-              đã normalized (/1219.84), range 0-0.55. Code cũ nhân lại
-              * _MOVE_VEL_NORM để downstream chia lại. Hành vi này đúng
-              về mặt toán học nhưng không rõ ràng. Giữ nguyên (correct).
+  FIX-DATA-25  [P1] Filter outlier coordinates trong TrajectoryDataset:
+               - Bỏ sequences có lon < 100°E hoặc lon > 185°E
+               - Bỏ sequences có lat > 50°N
+               - Lọc ở cấp sequence (obs window), không cấp file
+               195 rows lon < 100° và 174 rows lat > 50° gây train noise.
 
-  FIX-DATA-20 [CRITICAL] _build_csv_env_lookup: cột history_direction12/24
-              và history_inte_change24 trong CSV là one-hot encoded floats,
-              KHÔNG phải -1 sentinels. build_env_features_one_step cần nhận
-              list of floats [0.0, 1.0, 0.0, ...] trực tiếp, không qua
-              sentinel check "all == -1". Đảm bảo truyền đúng format.
+  FIX-DATA-26  [P2] Synthetic data support: TrajectoryDataset nhận tham số
+               synthetic_csv_path để load thêm all_storms_synthetic.csv
+               vào train set (chỉ khi dtype="train").
+               Synthetic storms có storm_name kết thúc "_s1a*", "_s2a*",...
+               Env data lookup dùng cùng CSV mechanism.
 
-  FIX-DATA-21 [BUG] _load_env_npy: sau khi remap key "_n" → chuẩn, gọi
-              env_data_processing(remapped) nhưng env_data_processing lại
-              apply sentinel guard trên gph500 dù cờ already_normed=True.
-              Nguyên nhân: cờ đặt trong dict TRƯỚC khi gọi processing,
-              nhưng bị lọc ra bởi "cleaned[k] = 0.0 if v == -1 else v"
-              khi v=True/False. Fix: xử lý boolean flags TRƯỚC trong loop.
+  FIX-DATA-27  [P2] Clip lon_norm/lat_norm để tránh extreme values:
+               lon_norm clip [-9.0, 2.0] (100-185°E range)
+               lat_norm clip [0.0, 10.0] (0-50°N range)
 
-  FIX-DATA-22 CURRICULUM REMOVED: Curriculum learning gây ADE tụt nghiêm
-              trọng mỗi lần tăng len (282→444 km khi len 5→6 ở ep 10).
-              Với 13M params và data 8473 sequences, model cần học toàn bộ
-              pred_len=12 từ đầu. Thay curriculum bằng sequence weighting:
-              các bước xa hơn có weight thấp hơn lúc đầu (soft weighting),
-              tăng dần theo epoch thông qua loss weight, không cắt seq.
-
-  FIX-DATA-23 CSV lookup: storm_name format. CSV có names như "0002" (4 digits
-              với leading zeros) và stripped "2". Lookup cần thử cả hai.
-
-Kept from v17:
-  FIX-DATA-12 CSV fallback auto-discover all_storms_final.csv
-  FIX-DATA-10 DATA3D_MEAN/STD ch0 gph500 đúng /380 dam
-  FIX-DATA-5  ch3/ch4 u500_center/v500_center corrected
+Kept from v23:
+  FIX-DATA-18..23 (gph500 sentinel, move_velocity, direction onehot, etc.)
 """
 from __future__ import annotations
 
@@ -870,40 +887,16 @@ DATA3D_H  = 81
 DATA3D_W  = 81
 DATA3D_CH = 13
 
-# ── DATA3D normalisation constants ────────────────────────────────────────────
 DATA3D_MEAN = np.array([
-    33.64,      # ch0  gph500_mean  (raw dam /380 unit)
-    5843.14,    # ch1  u500_mean
-    1482.47,    # ch2  v500_mean
-    5930.27,    # ch3  u500_center
-    1622.27,    # ch4  v500_center
-    0.27,       # ch5
-    -0.34,      # ch6
-    -0.86,      # ch7
-    0.25,       # ch8
-    1.76,       # ch9
-    1.34,       # ch10
-    0.94,       # ch11
-    300.95,     # ch12 SST
+    33.64, 5843.14, 1482.47, 5930.27, 1622.27,
+    0.27, -0.34, -0.86, 0.25, 1.76, 1.34, 0.94, 300.95,
 ], dtype=np.float32)
 
 DATA3D_STD = np.array([
-    7.08,       # ch0
-    50.55,      # ch1
-    29.42,      # ch2
-    1025.26,    # ch3
-    1600.32,    # ch4
-    4.73,       # ch5
-    2.98,       # ch6
-    2.75,       # ch7
-    5.37,       # ch8
-    2.29,       # ch9
-    2.21,       # ch10
-    2.68,       # ch11
-    3.05,       # ch12 SST
+    7.08, 50.55, 29.42, 1025.26, 1600.32,
+    4.73, 2.98, 2.75, 5.37, 2.29, 2.21, 2.68, 3.05,
 ], dtype=np.float32)
 
-# ── Sentinel thresholds ───────────────────────────────────────────────────────
 _DATA3D_SENTINEL_LARGE         = 20000.0
 _DATA3D_SENTINEL_ZERO_CHANNELS = {0}
 _DATA3D_GPH_VALID_MIN          = 25.0
@@ -913,8 +906,16 @@ _SST_VALID_MIN                 = 270.0
 _SST_FILL_K                    = 298.0
 _MOVE_VEL_NORM                 = 1219.84
 
-# ── Key mapping: build_env_data_scs_v10.py lưu suffix "_n" ───────────────────
-# FIX-DATA-15 (kept): Map từ key cũ (có _n) sang key chuẩn
+# FIX-DATA-25: coordinate filter bounds
+_LON_VALID_MIN  = 100.0
+_LON_VALID_MAX  = 185.0
+_LAT_VALID_MAX  = 50.0
+# FIX-DATA-27: norm clip bounds
+_LON_NORM_MIN   = -9.0   # (100*10 - 1800) / 50 = -8.0; buffer -1.0
+_LON_NORM_MAX   =  2.0   # (180*10 - 1800) / 50 =  0.0; max useful ≈ 2.0
+_LAT_NORM_MIN   =  0.0
+_LAT_NORM_MAX   = 10.0   # (50*10) / 50 = 10.0
+
 _NPY_KEY_REMAP = {
     "gph500_mean_n"   : "gph500_mean",
     "gph500_center_n" : "gph500_center",
@@ -931,13 +932,10 @@ _NPY_U500_KEY_REMAP = {
 
 def _build_csv_env_lookup(csv_path: str) -> dict:
     """
-    Load all_storms_final.csv → lookup dict.
-
-    FIX-DATA-18: env_gph500_mean trong CSV là raw dam (27-90), sentinel=-29.5.
-                 Đây là KHÔNG phải pre-normalized. gph500_already_normed=False.
-    FIX-DATA-20: history_direction12/24 và inten24 trong CSV là one-hot floats
-                 [0.0, 1.0, 0.0, ...]. Truyền thẳng không cần xử lý sentinel.
-    FIX-DATA-23: Lưu cả key (yr, name_original, ts) lẫn (yr, name_stripped, ts).
+    FIX-DATA-24: Map d3d_u500_mean_raw / d3d_v500_mean_raw vào
+                 "u500_raw_mean" / "v500_raw_mean" (actual steering flow).
+                 Không dùng env_u500_mean (boolean flag).
+    FIX-DATA-18..20..23 (kept): gph500, move_velocity, direction onehot.
     """
     try:
         import pandas as pd
@@ -958,46 +956,51 @@ def _build_csv_env_lookup(csv_path: str) -> dict:
 
     lookup: dict = {}
     for _, row in df.iterrows():
-        yr          = str(int(float(row["year"])))
-        name_raw    = str(row["storm_name"])
-        name_strip  = name_raw.lstrip("0") or "0"
-        ts          = str(row["dt"])
+        yr         = str(int(float(row["year"])))
+        name_raw   = str(row["storm_name"])
+        name_strip = name_raw.lstrip("0") or "0"
+        ts         = str(row["dt"])
 
-        # FIX-DATA-20: history_direction → one-hot floats từ CSV columns
-        dir12  = [float(row.get(f"env_dir12_{i}",  0.0)) for i in range(8)]
-        dir24  = [float(row.get(f"env_dir24_{i}",  0.0)) for i in range(8)]
+        dir12   = [float(row.get(f"env_dir12_{i}",  0.0)) for i in range(8)]
+        dir24   = [float(row.get(f"env_dir24_{i}",  0.0)) for i in range(8)]
         inten24 = [float(row.get(f"env_inten24_{i}", 0.0)) for i in range(4)]
 
-        # FIX-DATA-18: env_gph500_mean là raw dam → gph500_already_normed=False
         gph_mean   = float(row.get("env_gph500_mean",   -29.5))
         gph_center = float(row.get("env_gph500_center", -29.5))
 
-        # move_velocity: CSV lưu normalized [0-0.55], nhân lại để downstream chia
         mv_norm = float(row.get("env_move_velocity", 0.0))
-        mv_raw  = mv_norm * _MOVE_VEL_NORM  # → raw km/h, downstream /1219.84
+        mv_raw  = mv_norm * _MOVE_VEL_NORM
 
+        # FIX-DATA-24: actual u/v500 steering flow (raw m²/s²)
+        # Sentinel: 0.0 hoặc > 10000 → missing → _normalize_uv500 trả 0.0
+        u500_raw_mean   = float(row.get("d3d_u500_mean_raw",   0.0))
+        v500_raw_mean   = float(row.get("d3d_v500_mean_raw",   0.0))
+        u500_raw_center = float(row.get("d3d_u500_center_raw", 0.0))
+        v500_raw_center = float(row.get("d3d_v500_center_raw", 0.0))
+
+        # GPH500 raw → dam: d3d_gph500_mean_raw / 380 ≈ env_gph500_mean
+        # Dùng env_gph500_mean trực tiếp (raw dam) như trước
         d = {
             "gph500_mean"            : gph_mean,
             "gph500_center"          : gph_center,
-            "gph500_already_normed"  : False,  # FIX-DATA-18: raw dam
-            "u500_mean"              : float(row.get("env_u500_mean",   0.0)),
-            "u500_center"            : float(row.get("env_u500_center", 0.0)),
-            "v500_mean"              : float(row.get("env_v500_mean",   0.0)),
-            "v500_center"            : float(row.get("env_v500_center", 0.0)),
+            "gph500_already_normed"  : False,
+            "u500_mean"              : 1.0,         # legacy boolean (ignored now)
+            "u500_center"            : 1.0,
+            "v500_mean"              : 1.0,
+            "v500_center"            : 1.0,
+            # FIX-DATA-24: actual raw values → build_env_features dùng keys này
+            "u500_raw_mean"          : u500_raw_mean,
+            "v500_raw_mean"          : v500_raw_mean,
+            "u500_raw_center"        : u500_raw_center,
+            "v500_raw_center"        : v500_raw_center,
             "move_velocity"          : mv_raw,
-            "history_direction12"    : dir12,   # FIX-DATA-20: already one-hot
+            "history_direction12"    : dir12,
             "history_direction24"    : dir24,
             "history_inte_change24"  : inten24,
         }
 
-        # FIX-DATA-23: store both name formats
-        lookup[(yr, name_raw,   ts)] = d
-        lookup[(yr, name_strip, ts)] = d
-        # Also zero-padded variants
-        name_padded4 = name_raw.zfill(4)
-        name_padded2 = name_raw.zfill(2)
-        lookup[(yr, name_padded4, ts)] = d
-        lookup[(yr, name_padded2, ts)] = d
+        for name_try in (name_raw, name_strip, name_raw.zfill(4), name_raw.zfill(2)):
+            lookup[(yr, name_try, ts)] = d
 
     n_storms = df['storm_name'].nunique()
     logger.info(f"CSV env lookup built: {len(lookup)} entries ({n_storms} storms)")
@@ -1008,8 +1011,7 @@ def _auto_discover_csv(root_path: str) -> str | None:
     candidates = [
         os.path.join(root_path, "all_storms_final.csv"),
         os.path.join(os.path.dirname(root_path), "all_storms_final.csv"),
-        os.path.join(os.path.dirname(os.path.dirname(root_path)),
-                     "all_storms_final.csv"),
+        os.path.join(os.path.dirname(os.path.dirname(root_path)), "all_storms_final.csv"),
         "/kaggle/input/datasets/gmnguynhng/data-tc-finall/all_storms_final.csv",
         "/kaggle/working/all_storms_final.csv",
     ]
@@ -1020,26 +1022,28 @@ def _auto_discover_csv(root_path: str) -> str | None:
     return None
 
 
-# ── env_data_processing ───────────────────────────────────────────────────────
+def _auto_discover_synthetic_csv(root_path: str) -> str | None:
+    """FIX-DATA-26: Tìm all_storms_synthetic.csv."""
+    candidates = [
+        os.path.join(root_path, "all_storms_synthetic.csv"),
+        os.path.join(os.path.dirname(root_path), "all_storms_synthetic.csv"),
+        os.path.join(os.path.dirname(os.path.dirname(root_path)), "all_storms_synthetic.csv"),
+        "/kaggle/working/all_storms_synthetic.csv",
+        "/kaggle/input/datasets/gmnguynhng/data-tc-finall/all_storms_synthetic.csv",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            logger.info(f"Auto-discovered synthetic CSV: {p}")
+            return p
+    return None
+
 
 def env_data_processing(env_dict: dict) -> dict:
-    """
-    Clean env_npy dictionary.
-
-    FIX-DATA-21: Boolean flags (already_normed, has_data3d) phải được xử lý
-                 TRƯỚC vòng lặp chính để tránh bị convert sang float(0.0).
-                 Sau đó mới apply sentinel guards.
-    """
     if not isinstance(env_dict, dict):
         return {}
-
-    # FIX-DATA-21: Trích xuất boolean flags trước
     already_normed = bool(env_dict.get("gph500_already_normed", False))
-
     cleaned = {"gph500_already_normed": already_normed}
-
     for k, v in env_dict.items():
-        # Skip boolean flags đã xử lý
         if k in ("gph500_already_normed", "has_data3d",
                  "gph500_mean_already_normed", "gph500_center_already_normed"):
             continue
@@ -1051,24 +1055,18 @@ def env_data_processing(env_dict: dict) -> dict:
             cleaned[k] = 0.0
         else:
             cleaned[k] = v
-
-    # SST sentinel
     for sst_key in ("sst_mean", "sst_center", "sst"):
         if sst_key in cleaned:
             val = cleaned[sst_key]
             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
                 cleaned[sst_key] = _SST_FILL_K
-
-    # GPH500 sentinel guard chỉ apply khi NOT already_normed
     if not already_normed:
         for gph_key in ("gph500_mean", "gph500_center"):
             if gph_key in cleaned:
                 val = cleaned[gph_key]
                 if val is not None and isinstance(val, (int, float)):
                     if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
-                        cleaned[gph_key] = None  # sentinel → feature = 0
-    # already_normed=True: giữ nguyên, không apply guard
-
+                        cleaned[gph_key] = None
     return cleaned
 
 
@@ -1114,7 +1112,6 @@ def seq_collate(data):
         for d in valid_envs:
             all_keys.update(d.keys())
 
-        # FIX-DATA-21: Không collate boolean/internal flags
         _skip_keys = {
             "gph500_already_normed", "has_data3d",
             "gph500_mean_already_normed", "gph500_center_already_normed",
@@ -1159,15 +1156,16 @@ def seq_collate(data):
 
 class TrajectoryDataset(Dataset):
     """
-    TC trajectory dataset for TCND_VN.
-    FIX-DATA-22: CURRICULUM REMOVED. Luôn train trên pred_len=12 đầy đủ.
-                 Soft weighting theo step được xử lý trong loss function.
+    FIX-DATA-24: Map d3d raw u/v500 → actual steering flow features.
+    FIX-DATA-25: Filter outlier coords (lon < 100°E, lat > 50°N).
+    FIX-DATA-26: Load synthetic CSV khi dtype="train".
+    FIX-DATA-27: Clip lon_norm / lat_norm trong obs/pred tensors.
     """
 
     def __init__(self, data_dir, obs_len=8, pred_len=12, skip=1,
                  threshold=0.002, min_ped=1, delim=" ", other_modal="gph",
                  test_year=None, type="train", split=None, is_test=False,
-                 csv_env_path=None,
+                 csv_env_path=None, synthetic_csv_path=None,
                  **kwargs):
         super().__init__()
 
@@ -1200,7 +1198,7 @@ class TrajectoryDataset(Dataset):
         else:
             self.env_path = os.path.join(self.root_path, "Env_data")
 
-        logger.info(f"root ({dtype}) : {self.root_path}")
+        self._is_train = (dtype == "train")
 
         # ── CSV fallback ─────────────────────────────────────────────────────
         self._csv_env_lookup: dict  = {}
@@ -1213,14 +1211,11 @@ class TrajectoryDataset(Dataset):
                 self._csv_env_lookup = _build_csv_env_lookup(csv_env_path)
                 if self._env_path_missing:
                     logger.info(
-                        f"Env_data không tìm thấy: {self.env_path}. "
+                        f"Env_data không tìm thấy. "
                         f"Dùng CSV fallback ({len(self._csv_env_lookup)//4} entries)"
                     )
             elif self._env_path_missing:
-                logger.warning(
-                    f"Env_data không tìm thấy: {self.env_path} "
-                    f"VÀ không tìm thấy CSV. Env features sẽ = 0."
-                )
+                logger.warning("Không tìm thấy CSV. Env features sẽ = 0.")
 
         self.obs_len    = obs_len
         self.pred_len   = pred_len
@@ -1242,6 +1237,15 @@ class TrajectoryDataset(Dataset):
         ]
         logger.info(f"{len(all_files)} Data1d files (year={test_year})")
 
+        # FIX-DATA-26: Load synthetic data (chỉ train)
+        self._synthetic_lookup: dict = {}
+        if self._is_train:
+            if synthetic_csv_path is None:
+                synthetic_csv_path = _auto_discover_synthetic_csv(self.root_path)
+            if synthetic_csv_path:
+                self._synthetic_lookup = self._build_synthetic_lookup(synthetic_csv_path)
+                logger.info(f"Loaded synthetic: {len(self._synthetic_lookup)} storms")
+
         self.obs_traj_raw    = []
         self.pred_traj_raw   = []
         self.obs_Me_raw      = []
@@ -1255,6 +1259,8 @@ class TrajectoryDataset(Dataset):
         num_peds_in_seq      = []
         self.env_cache: dict = {}
 
+        # Real data từ Data1d files
+        n_filtered_coord = 0
         for path in all_files:
             base   = os.path.splitext(os.path.basename(path))[0]
             parts  = base.split("_")
@@ -1281,42 +1287,53 @@ class TrajectoryDataset(Dataset):
                 seg  = np.concatenate(frame_data[idx: idx + self.seq_len])
                 peds = np.unique(seg[:, 1])
 
-                buf_obs_traj    = []
-                buf_pred_traj   = []
-                buf_obs_rel     = []
-                buf_pred_rel    = []
-                buf_obs_Me      = []
-                buf_pred_Me     = []
-                buf_obs_Me_rel  = []
-                buf_pred_Me_rel = []
-                buf_nlp         = []
-                cnt             = 0
+                buf_obs_traj   = []
+                buf_pred_traj  = []
+                buf_obs_rel    = []
+                buf_pred_rel   = []
+                buf_obs_Me     = []
+                buf_pred_Me    = []
+                buf_obs_Me_rel = []
+                buf_pred_Me_rel= []
+                buf_nlp        = []
+                cnt            = 0
 
                 for pid in peds:
                     ps = seg[seg[:, 1] == pid]
                     if len(ps) != self.seq_len:
                         continue
                     ps_t = np.transpose(ps[:, 2:])
-                    rel  = np.zeros_like(ps_t)
-                    rel[:, 1:] = ps_t[:, 1:] - ps_t[:, :-1]
 
-                    buf_obs_traj.append(
-                        torch.from_numpy(ps_t[:2, :obs_len]).float())
-                    buf_pred_traj.append(
-                        torch.from_numpy(ps_t[:2, obs_len:]).float())
-                    buf_obs_rel.append(
-                        torch.from_numpy(rel[:2, :obs_len]).float())
-                    buf_pred_rel.append(
-                        torch.from_numpy(rel[:2, obs_len:]).float())
-                    buf_obs_Me.append(
-                        torch.from_numpy(ps_t[2:, :obs_len]).float())
-                    buf_pred_Me.append(
-                        torch.from_numpy(ps_t[2:, obs_len:]).float())
-                    buf_obs_Me_rel.append(
-                        torch.from_numpy(rel[2:, :obs_len]).float())
-                    buf_pred_Me_rel.append(
-                        torch.from_numpy(rel[2:, obs_len:]).float())
-                    buf_nlp.append(self._poly_fit(ps_t, pred_len, threshold))
+                    # FIX-DATA-25: Filter outlier coordinates
+                    # ps_t[0] = lon_norm, ps_t[1] = lat_norm
+                    lon_norm_vals = ps_t[0, :]
+                    lat_norm_vals = ps_t[1, :]
+                    lon_deg = (lon_norm_vals * 50.0 + 1800.0) / 10.0
+                    lat_deg = (lat_norm_vals * 50.0) / 10.0
+                    if lon_deg.min() < _LON_VALID_MIN or lon_deg.max() > _LON_VALID_MAX:
+                        n_filtered_coord += 1
+                        continue
+                    if lat_deg.max() > _LAT_VALID_MAX:
+                        n_filtered_coord += 1
+                        continue
+
+                    # FIX-DATA-27: Clip lon_norm / lat_norm
+                    ps_t_clipped = ps_t.copy()
+                    ps_t_clipped[0, :] = np.clip(ps_t[0, :], _LON_NORM_MIN, _LON_NORM_MAX)
+                    ps_t_clipped[1, :] = np.clip(ps_t[1, :], _LAT_NORM_MIN, _LAT_NORM_MAX)
+
+                    rel  = np.zeros_like(ps_t_clipped)
+                    rel[:, 1:] = ps_t_clipped[:, 1:] - ps_t_clipped[:, :-1]
+
+                    buf_obs_traj.append(torch.from_numpy(ps_t_clipped[:2, :obs_len]).float())
+                    buf_pred_traj.append(torch.from_numpy(ps_t_clipped[:2, obs_len:]).float())
+                    buf_obs_rel.append(torch.from_numpy(rel[:2, :obs_len]).float())
+                    buf_pred_rel.append(torch.from_numpy(rel[:2, obs_len:]).float())
+                    buf_obs_Me.append(torch.from_numpy(ps_t_clipped[2:, :obs_len]).float())
+                    buf_pred_Me.append(torch.from_numpy(ps_t_clipped[2:, obs_len:]).float())
+                    buf_obs_Me_rel.append(torch.from_numpy(rel[2:, :obs_len]).float())
+                    buf_pred_Me_rel.append(torch.from_numpy(rel[2:, obs_len:]).float())
+                    buf_nlp.append(self._poly_fit(ps_t_clipped, pred_len, threshold))
                     cnt += 1
 
                 if cnt >= min_ped:
@@ -1335,10 +1352,108 @@ class TrajectoryDataset(Dataset):
                         "tydate": [add[i][0] for i in range(idx, idx + self.seq_len)],
                     })
 
+        real_seqs = len(self.tyID)
+        logger.info(f"Loaded {real_seqs} real sequences "
+                    f"(filtered {n_filtered_coord} outlier coords)")
+
+        # FIX-DATA-26: Add synthetic sequences (train only)
+        if self._is_train and self._synthetic_lookup:
+            self._load_synthetic_sequences(
+                min_ped, threshold, obs_len, pred_len, delim)
+            logger.info(f"Total sequences after synthetic: {len(self.tyID)} "
+                        f"(+{len(self.tyID)-real_seqs} synthetic)")
+
         self.num_seq = len(self.tyID)
         cum = np.cumsum(num_peds_in_seq).tolist()
         self.seq_start_end = list(zip([0] + cum[:-1], cum))
-        logger.info(f"Loaded {self.num_seq} sequences")
+
+    def _build_synthetic_lookup(self, csv_path: str) -> dict:
+        """
+        FIX-DATA-26: Load synthetic CSV → {(year, storm_name): DataFrame}.
+        """
+        try:
+            import pandas as pd
+        except ImportError:
+            return {}
+        if not os.path.exists(csv_path):
+            return {}
+        try:
+            df = pd.read_csv(csv_path, dtype={"storm_name": str, "dt": str})
+            lookup = {}
+            for (yr, nm), grp in df.groupby(["year", "storm_name"]):
+                lookup[(str(int(float(yr))), str(nm))] = grp.sort_values("step_i").reset_index(drop=True)
+            return lookup
+        except Exception as e:
+            logger.warning(f"Synthetic CSV load failed: {e}")
+            return {}
+
+    def _load_synthetic_sequences(self, min_ped, threshold, obs_len, pred_len, delim):
+        """
+        FIX-DATA-26: Convert synthetic storm DataFrames → sequence tensors.
+        Tái sử dụng same logic như real data loading.
+        """
+        import pandas as pd
+        num_peds_in_seq_local = []
+
+        for (f_year, f_name), storm_df in self._synthetic_lookup.items():
+            n_steps = len(storm_df)
+            if n_steps < self.seq_len:
+                continue
+
+            n_seq = (n_steps - self.seq_len) // self.skip + 1
+            dates_list = storm_df["dt"].tolist()
+
+            for idx in range(0, n_seq * self.skip, self.skip):
+                if idx + self.seq_len > n_steps:
+                    break
+
+                seg = storm_df.iloc[idx: idx + self.seq_len]
+
+                # Build ps_t: [lon_norm, lat_norm, pres_norm, wnd_norm] × seq_len
+                lon_norm = seg["lon_norm"].values
+                lat_norm = seg["lat_norm"].values
+                pres_norm = seg["pres_norm"].values
+                wnd_norm = seg["wnd_norm"].values
+
+                # FIX-DATA-25: Filter outlier coords
+                lon_deg = (lon_norm * 50.0 + 1800.0) / 10.0
+                lat_deg = (lat_norm * 50.0) / 10.0
+                if lon_deg.min() < _LON_VALID_MIN or lon_deg.max() > _LON_VALID_MAX:
+                    continue
+                if lat_deg.max() > _LAT_VALID_MAX:
+                    continue
+
+                # FIX-DATA-27: Clip
+                lon_norm = np.clip(lon_norm, _LON_NORM_MIN, _LON_NORM_MAX)
+                lat_norm = np.clip(lat_norm, _LAT_NORM_MIN, _LAT_NORM_MAX)
+
+                ps_t = np.stack([lon_norm, lat_norm, pres_norm, wnd_norm], axis=0)
+                rel  = np.zeros_like(ps_t)
+                rel[:, 1:] = ps_t[:, 1:] - ps_t[:, :-1]
+
+                self.obs_traj_raw.append(torch.from_numpy(ps_t[:2, :obs_len]).float())
+                self.pred_traj_raw.append(torch.from_numpy(ps_t[:2, obs_len:]).float())
+                self.obs_rel_raw.append(torch.from_numpy(rel[:2, :obs_len]).float())
+                self.pred_rel_raw.append(torch.from_numpy(rel[:2, obs_len:]).float())
+                self.obs_Me_raw.append(torch.from_numpy(ps_t[2:, :obs_len]).float())
+                self.pred_Me_raw.append(torch.from_numpy(ps_t[2:, obs_len:]).float())
+                self.obs_Me_rel_raw.append(torch.from_numpy(rel[2:, :obs_len]).float())
+                self.pred_Me_rel_raw.append(torch.from_numpy(rel[2:, obs_len:]).float())
+                self.non_linear_ped.append(self._poly_fit(ps_t, pred_len, threshold))
+                num_peds_in_seq_local.append(1)
+
+                tydate = [str(dates_list[i]) for i in range(idx, idx + self.seq_len)]
+                self.tyID.append({
+                    "old":    [f_year, f_name, idx],
+                    "tydate": tydate,
+                    "is_synthetic": True,
+                })
+
+        # Extend seq_start_end
+        existing_end = self.seq_start_end[-1][1] if self.seq_start_end else 0
+        new_cum = np.cumsum(num_peds_in_seq_local) + existing_end
+        new_pairs = list(zip([existing_end] + new_cum[:-1].tolist(), new_cum.tolist()))
+        self.seq_start_end.extend(new_pairs)
 
     def _read_file(self, path: str, delim: str) -> dict:
         data, add = [], []
@@ -1423,8 +1538,7 @@ class TrajectoryDataset(Dataset):
                 if arr.shape[2] < DATA3D_CH:
                     arr = np.concatenate([
                         arr,
-                        np.zeros((DATA3D_H, DATA3D_W, DATA3D_CH - arr.shape[2]),
-                                 dtype=np.float32),
+                        np.zeros((DATA3D_H, DATA3D_W, DATA3D_CH - arr.shape[2]), dtype=np.float32),
                     ], axis=2)
                 arr = arr[:, :, :DATA3D_CH]
                 return self._normalize_data3d(arr)
@@ -1454,10 +1568,6 @@ class TrajectoryDataset(Dataset):
         return torch.zeros(DATA3D_H, DATA3D_W, DATA3D_CH)
 
     def _load_env_npy(self, year, ty_name, timestamp):
-        """
-        FIX-DATA-21: Remap keys, set already_normed flag, THEN call
-                     env_data_processing() which respects the flag.
-        """
         folder = os.path.join(self.env_path, str(year), str(ty_name))
         if os.path.exists(folder):
             candidates = []
@@ -1480,25 +1590,17 @@ class TrajectoryDataset(Dataset):
                     raw = np.load(p, allow_pickle=True).item()
                     if not isinstance(raw, dict):
                         continue
-
                     remapped = dict(raw)
-
-                    # Remap GPH500 "_n" keys → chuẩn, đặt flag
                     has_old_gph = False
                     for old_k, new_k in _NPY_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
                             has_old_gph = True
-
-                    # Remap u/v500 "_n" keys
                     for old_k, new_k in _NPY_U500_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
-
-                    # FIX-DATA-21: Đặt flag TRƯỚC khi gọi processing
                     if has_old_gph:
                         remapped["gph500_already_normed"] = True
-
                     return env_data_processing(remapped)
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
