@@ -1041,11 +1041,24 @@ def _auto_discover_synthetic_csv(root_path: str) -> str | None:
 def env_data_processing(env_dict: dict) -> dict:
     if not isinstance(env_dict, dict):
         return {}
-    already_normed = bool(env_dict.get("gph500_already_normed", False))
-    cleaned = {"gph500_already_normed": already_normed}
+    
+    # FIX: copy cả hai already_normed flags
+    already_normed_gph = bool(env_dict.get("gph500_already_normed", False))
+    already_normed_uv  = bool(env_dict.get("uv500_already_normed",  False))
+    
+    cleaned = {
+        "gph500_already_normed": already_normed_gph,
+        "uv500_already_normed" : already_normed_uv,   # ← THÊM
+    }
+    
+    _SKIP_KEYS = {
+        "gph500_already_normed", "has_data3d",
+        "gph500_mean_already_normed", "gph500_center_already_normed",
+        "uv500_already_normed",   # ← THÊM vào skip để không bị copy lại lần 2
+    }
+    
     for k, v in env_dict.items():
-        if k in ("gph500_already_normed", "has_data3d",
-                 "gph500_mean_already_normed", "gph500_center_already_normed"):
+        if k in _SKIP_KEYS:
             continue
         if isinstance(v, (list, np.ndarray)):
             cleaned[k] = v
@@ -1055,12 +1068,14 @@ def env_data_processing(env_dict: dict) -> dict:
             cleaned[k] = 0.0
         else:
             cleaned[k] = v
+    
     for sst_key in ("sst_mean", "sst_center", "sst"):
         if sst_key in cleaned:
             val = cleaned[sst_key]
             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
                 cleaned[sst_key] = _SST_FILL_K
-    if not already_normed:
+    
+    if not already_normed_gph:
         for gph_key in ("gph500_mean", "gph500_center"):
             if gph_key in cleaned:
                 val = cleaned[gph_key]
@@ -1068,8 +1083,6 @@ def env_data_processing(env_dict: dict) -> dict:
                     if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
                         cleaned[gph_key] = None
     return cleaned
-
-
 # ── seq_collate ───────────────────────────────────────────────────────────────
 
 def seq_collate(data):
@@ -1112,11 +1125,18 @@ def seq_collate(data):
         for d in valid_envs:
             all_keys.update(d.keys())
 
+        # _skip_keys = {
+        #     "gph500_already_normed", "has_data3d",
+        #     "gph500_mean_already_normed", "gph500_center_already_normed",
+        #     "history_direction12_valid", "history_direction24_valid",
+        #     "history_inte_change24_valid",
+        # }
         _skip_keys = {
             "gph500_already_normed", "has_data3d",
             "gph500_mean_already_normed", "gph500_center_already_normed",
             "history_direction12_valid", "history_direction24_valid",
             "history_inte_change24_valid",
+            "uv500_already_normed",   # ← THÊM: flag boolean, không stack thành tensor
         }
         all_keys -= _skip_keys
 
@@ -1592,35 +1612,47 @@ class TrajectoryDataset(Dataset):
                         continue
                     remapped = dict(raw)
                     has_old_gph = False
-                    has_old_uv  = False      
+                    has_old_uv  = False
 
                     for old_k, new_k in _NPY_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
                             has_old_gph = True
+
                     for old_k, new_k in _NPY_U500_KEY_REMAP.items():
                         if old_k in remapped and new_k not in remapped:
                             remapped[new_k] = remapped.pop(old_k)
-                            has_old_uv = True     
+                            has_old_uv = True
+
                     if has_old_gph:
                         remapped["gph500_already_normed"] = True
                     if has_old_uv:
-                        remapped["uv500_already_normed"] = True 
-                    return env_data_processing(remapped)
+                        remapped["uv500_already_normed"] = True
+
+                    # FIX: set flag TRƯỚC khi gọi env_data_processing
+                    result = env_data_processing(remapped)
+                    
+                    # Verify flag survived
+                    if has_old_uv and not result.get("uv500_already_normed", False):
+                        logger.warning(f"uv500_already_normed flag lost after processing: {p}")
+                        result["uv500_already_normed"] = True  # force set
+                    
+                    return result
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
 
-        # CSV fallback
+        # CSV fallback — CSV data KHÔNG already_normed
         if self._csv_env_lookup:
             yr_str = str(year)
             ts_str = str(timestamp)
-            name_strip  = str(ty_name).lstrip("0") or "0"
-            name_padded = str(ty_name).zfill(4)
+            name_strip   = str(ty_name).lstrip("0") or "0"
+            name_padded  = str(ty_name).zfill(4)
             name_padded2 = str(ty_name).zfill(2)
             for name_try in (str(ty_name), name_strip, name_padded, name_padded2):
                 raw_dict = self._csv_env_lookup.get((yr_str, name_try, ts_str))
                 if raw_dict is not None:
                     return env_data_processing(dict(raw_dict))
+                    # ↑ CSV data không set uv500_already_normed → False → đúng
 
         return None
 

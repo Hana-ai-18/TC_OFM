@@ -1254,7 +1254,7 @@ class VelocityField(nn.Module):
         self.spatial_enc = FNO3DEncoder(
             in_channel   = unet_in_ch,
             out_channel  = 1,
-            d_model      = 64,
+            d_model      = 32,
             n_layers     = 4,
             modes_t      = 4,
             modes_h      = 4,
@@ -1277,7 +1277,7 @@ class VelocityField(nn.Module):
             d_state     = 16,
         )
 
-        self.env_enc = Env_net(obs_len=obs_len, d_model=64)
+        self.env_enc = Env_net(obs_len=obs_len, d_model=32)
 
         # FIX-M27: fallback projection khi spatial features = 0
         self.ctx_fc1  = nn.Linear(128 + 64 + 16, 512)
@@ -1286,7 +1286,7 @@ class VelocityField(nn.Module):
         self.ctx_fc2  = nn.Linear(512, ctx_dim)
 
         # FIX-M27: 1D-only fallback path khi img_obs toàn zeros
-        self.ctx_fc1_1d  = nn.Linear(128 + 64, 512)
+        self.ctx_fc1_1d  = nn.Linear(128 + 32, 512)
         self.ctx_ln_1d   = nn.LayerNorm(512)
         self.ctx_fc2_1d  = nn.Linear(512, ctx_dim)
 

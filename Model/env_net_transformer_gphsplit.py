@@ -1129,6 +1129,7 @@ def build_env_features_one_step(
         if isinstance(env_npy, dict):
             for rk in raw_keys:
                 if rk in env_npy:
+                    raw_v = env_npy[rk]
                     if uv_already_normed:
                         # .npy cũ: giá trị đã /30, range [-1,1]
                         # Clip để tránh outlier, dùng trực tiếp
