@@ -1748,37 +1748,52 @@ def _check_uv500(bl):
 
 def _check_gph500(bl, train_dataset):
     env_data = bl[13]
-    if env_data is None or "gph500_mean" not in env_data:
+    if env_data is None:
+        print("  ⚠️  env_data is None"); return
+
+    # Check has_data3d trước tiên
+    if "has_data3d" in env_data:
+        hd = env_data["has_data3d"]
+        if torch.is_tensor(hd):
+            has3d_count = int(hd.float().sum().item())
+            total       = hd.numel()
+            print(f"  has_data3d: {has3d_count}/{total} samples có Data3d")
+            if has3d_count == 0:
+                print("  ⚠️  TOÀN BỘ has_data3d=False!")
+                print("      → Kiểm tra OUTPUT_DIR trong build_env_data_scs_v12.py")
+                print("      → Kiểm tra loader đọc env từ đúng thư mục chưa")
+                print("      → Kiểm tra Data3d files có tồn tại không")
+                # In path đang dùng nếu có
+                try:
+                    print(f"      → train_dataset env_dir = {train_dataset.env_dir}")
+                except: pass
+                try:
+                    print(f"      → train_dataset env_dir = {train_dataset.dataset.env_dir}")
+                except: pass
+                return
+    else:
+        print("  ⚠️  'has_data3d' key không có trong env_data")
+
+    if "gph500_mean" not in env_data:
         print("  ⚠️  GPH500 key not found"); return
 
-    gph_tensor = env_data["gph500_mean"]   # raw m²/s² từ loader
+    gph_tensor = env_data["gph500_mean"]
     raw_mean = gph_tensor.mean().item()
     raw_std  = gph_tensor.std().item()
     raw_min  = gph_tensor.min().item()
     raw_max  = gph_tensor.max().item()
     zero_pct = 100.0 * (gph_tensor == 0).sum().item() / max(gph_tensor.numel(), 1)
-    has_3d_pct = 0.0
-    if "has_data3d" in env_data:
-        hd = env_data["has_data3d"]
-        has_3d_pct = 100.0 * hd.float().mean().item() if torch.is_tensor(hd) else 0.0
 
-    gph_m   = raw_mean / 9.80665        # → geopotential height (m)
-    gph_dam = gph_m / 10.0            # → dam
+    print(f"  GPH500 raw: mean={raw_mean:.1f} std={raw_std:.1f} "
+          f"min={raw_min:.1f} max={raw_max:.1f} zero%={zero_pct:.1f}%")
 
-    print(f"  GPH500 raw (từ loader, chưa normalize):")
-    print(f"    mean={raw_mean:.1f}  std={raw_std:.1f}")
-    print(f"    min={raw_min:.1f}    max={raw_max:.1f}")
-    print(f"    ÷9.8 → {gph_m:.1f} m  ({gph_dam:.1f} dam)  [WNP expected ~585-595 dam]")
-    print(f"    zero%={zero_pct:.1f}%   has_data3d%={has_3d_pct:.1f}%")
-
-    if zero_pct > 80.0:
-        print("  ⚠️  GPH500 zero >80% → Data3d miss hoàn toàn!")
-    elif raw_mean < 100.0:
-        print("  ⚠️  GPH500 raw quá nhỏ → sai channel index?")
-    elif not (55000 < raw_mean < 65000):
-        print(f"  ⚠️  GPH500 ngoài range expected [55000-65000] m²/s²")
+    if abs(raw_mean) < 100.0:
+        print("  ⚠️  GPH500 quá nhỏ → has_data3d=False hoặc sentinel sai")
+    elif 55000 < raw_mean < 65000:
+        gph_dam = raw_mean / 9.80665 / 10
+        print(f"  ✅ GPH500 OK raw≈{raw_mean:.0f} m²/s² → {gph_dam:.1f} dam")
     else:
-        print(f"  ✅ GPH500 OK  raw≈{raw_mean:.0f} m²/s² → {gph_dam:.1f} dam")
+        print(f"  ⚠️  GPH500 ngoài range [55000-65000]")
 
 def _load_baseline_errors(path, name):
     if path is None:
@@ -2066,7 +2081,28 @@ def main(args):
         for i, batch in enumerate(train_loader):
             bl = move(list(batch), device)
 
-            if epoch == 0 and i == 0:
+            # Thêm vào ngay sau _check_gph500() trong training loop
+        if epoch == 0 and i == 0:
+            # Kiểm tra env directory
+            try:
+                env_dir = train_dataset.env_dir
+            except:
+                try:
+                    env_dir = train_dataset.dataset.env_dir
+                except:
+                    env_dir = "UNKNOWN"
+            print(f"  Env dir: {env_dir}")
+            
+            # Kiểm tra 1 file npy mẫu
+            import glob
+            npy_files = glob.glob(f"{env_dir}/**/*.npy", recursive=True)
+            print(f"  Số .npy files tìm thấy: {len(npy_files)}")
+            if npy_files:
+                sample = np.load(npy_files[0], allow_pickle=True).item()
+                print(f"  Sample .npy keys: {list(sample.keys())}")
+                print(f"  Sample has_data3d: {sample.get('has_data3d')}")
+                print(f"  Sample gph500_mean: {sample.get('gph500_mean')}")
+                print(f"  Sample u500_mean: {sample.get('u500_mean')}")
                 _check_gph500(bl, train_dataset)
                 _check_uv500(bl)
 
