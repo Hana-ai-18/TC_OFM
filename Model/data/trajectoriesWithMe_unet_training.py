@@ -2597,7 +2597,21 @@ class TrajectoryDataset(Dataset):
                         # remapped["gph500_already_normed"] = True\
                         remapped["gph500_already_normed"] = False
 
-                    return env_data_processing(remapped)
+                    
+                    result = env_data_processing(remapped)
+                    if not hasattr(self, '_debug_printed'):
+                        self._debug_printed = True
+                        print(f"\n  [DEBUG _load_env_npy] file={p}")
+                        print(f"  raw keys     : {list(raw.keys())}")
+                        print(f"  raw has_data3d : {raw.get('has_data3d')}")
+                        print(f"  raw u500_mean  : {raw.get('u500_mean')}")
+                        print(f"  remapped has_data3d : {remapped.get('has_data3d')}")
+                        print(f"  remapped u500_mean  : {remapped.get('u500_mean')}")
+                        print(f"  result has_data3d   : {result.get('has_data3d')}")
+                        print(f"  result u500_mean    : {result.get('u500_mean')}")
+                        print()
+
+                    return result
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
 
