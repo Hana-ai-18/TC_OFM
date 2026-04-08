@@ -2645,6 +2645,15 @@ class TrajectoryDataset(Dataset):
                 env_npy   = env_npy,
                 prev_speed_kmh = prev_speed,
             )
+            # DEBUG một lần
+            if not hasattr(self, '_debug_feat_printed'):
+                self._debug_feat_printed = True
+                print(f"\n  [DEBUG _get_env_features] t={t} date={dates[t]}")
+                print(f"  env_npy has_data3d : {env_npy.get('has_data3d') if env_npy else None}")
+                print(f"  env_npy u500_mean  : {env_npy.get('u500_mean') if env_npy else None}")
+                print(f"  feat u500_mean     : {feat.get('u500_mean')}")
+                print(f"  feat gph500_mean   : {feat.get('gph500_mean')}")
+
             all_feats.append(feat)
             if isinstance(env_npy, dict):
                 mv = float(env_npy.get("move_velocity", 0.0) or 0.0)
