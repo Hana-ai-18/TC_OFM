@@ -766,7 +766,7 @@ WEIGHTS: Dict[str, float] = dict(
     smooth      = 0.5,
     accel       = 0.8,
     jerk        = 0.3,
-    pinn        = 0.02,
+    pinn        = 0.5,
     fm_physics  = 0.3,
     spread      = 0.8,        # ↑ từ 0.6  (FIX-L51)
     short_range = 5.0,        # NEW       (FIX-L49)
@@ -1166,15 +1166,6 @@ def _get_gph500_norm(env_data: dict, key: str,
 
 
 def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
-    """
-    FIX-L50: scale 1e-3 → 1e-2 so residuals are properly normalised.
-    Typical TC acceleration ~1e-4 m/s²:
-      old: res/1e-3 ~ 0.1  → loss ~ 0.01  (tiny gradient)
-      new: res/1e-2 ~ 0.01 → loss ~ 1e-4  then tanh brings to ~1e-4
-    But when trajectories are bad (spread 400km):
-      new: res/1e-2 ~ 0.15 → loss ~ 0.022 → tanh ~ 0.44  (still manageable)
-    → Gradient now flows even for bad trajectories.
-    """
     T, B, _ = pred_abs_deg.shape
     if T < 3:
         return pred_abs_deg.new_zeros(())
@@ -1184,32 +1175,34 @@ def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
     cos_lat = torch.cos(lat_rad[:-1]).clamp(min=1e-4)
 
-    u = dlat[:, :, 0] * cos_lat * 111000.0 / DT
-    v = dlat[:, :, 1] * 111000.0 / DT
+    u = dlat[:, :, 0] * cos_lat * 111000.0 / DT   # m/s
+    v = dlat[:, :, 1] * 111000.0 / DT              # m/s
 
     if u.shape[0] < 2:
         return pred_abs_deg.new_zeros(())
 
-    du = (u[1:] - u[:-1]) / DT
+    du = (u[1:] - u[:-1]) / DT   # m/s²  ~1e-4
     dv = (v[1:] - v[:-1]) / DT
 
-    f    = 2 * OMEGA * torch.sin(lat_rad[1:-1])
-    beta = 2 * OMEGA * torch.cos(lat_rad[1:-1]) / R_EARTH
+    f    = 2 * OMEGA * torch.sin(lat_rad[1:-1])    # ~1e-4
+    beta = 2 * OMEGA * torch.cos(lat_rad[1:-1]) / R_EARTH  # ~2e-11
 
     res_u = du - f * v[1:]
     res_v = dv + f * u[1:]
 
-    R_tc          = 3e5
-    v_beta_x      = -beta * R_tc ** 2 / 2
+    R_tc            = 3e5
+    v_beta_x        = -beta * R_tc ** 2 / 2        # ~1e-4 m/s²
     res_u_corrected = res_u - v_beta_x
 
-    # FIX-L50: scale = 1e-2  (was 1e-3)
-    scale = 1e-2
+    # FIX: scale phù hợp với magnitude m/s²
+    # Typical TC: du~1e-4, f*v~5e-4 → residual ~1e-3 m/s²
+    # scale=1e-3 → res/scale ~1 → loss ~1 → tanh không bão hòa
+    scale = 1e-3   # m/s²
     loss  = ((res_u_corrected / scale).pow(2).mean()
-             + (res_v / scale).pow(2).mean())
+           + (res_v / scale).pow(2).mean())
 
-    return _soft_clamp_loss(loss, max_val=20.0)
-
+    # Clip nhẹ để tránh outlier
+    return loss.clamp(max=10.0)
 
 # def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
 #                           env_data: Optional[dict]) -> torch.Tensor:
@@ -1642,23 +1635,23 @@ def compute_total_loss(
             # Fallback nếu traj quá ngắn (hiếm gặp)
             l_spread = ensemble_spread_loss(all_trajs, max_spread_km=150.0)
 
-            
+
     # 6. Total  (short_range added externally in get_loss_breakdown)
     total = (
         weights.get("fm",       2.0) * l_fm
-        + weights.get("velocity", 0.8) * l_vel       * NRM
-        + weights.get("disp",     0.5) * l_disp      * NRM
-        + weights.get("step",     0.5) * l_step      * NRM
-        + weights.get("heading",  2.0) * l_heading   * NRM
-        + weights.get("recurv",   1.5) * l_recurv    * NRM
+        + weights.get("velocity", 0.8) * l_vel     * NRM
+        + weights.get("disp",     0.5) * l_disp    * NRM
+        + weights.get("step",     0.5) * l_step    * NRM
+        + weights.get("heading",  2.0) * l_heading * NRM
+        + weights.get("recurv",   1.5) * l_recurv  * NRM
         + weights.get("dir",      1.0) * l_dir_final * NRM
-        + weights.get("smooth",   0.5) * l_smooth    * NRM
-        + weights.get("accel",    0.8) * l_accel     * NRM
-        + weights.get("jerk",     0.3) * l_jerk      * NRM
-        + weights.get("pinn",    0.02) * l_pinn
-        + weights.get("spread",   0.8) * l_spread    * NRM
+        + weights.get("smooth",   0.5) * l_smooth  * NRM
+        + weights.get("accel",    0.8) * l_accel   * NRM
+        + weights.get("jerk",     0.3) * l_jerk    * NRM
+        + weights.get("pinn",     0.5) * l_pinn    * NRM   # ← thêm * NRM
+        + weights.get("spread",   0.8) * l_spread  * NRM
     ) / NRM
-
+    
     if torch.isnan(total) or torch.isinf(total):
         total = pred_abs.new_zeros(())
 

@@ -2096,8 +2096,8 @@ def main(args):
                     model.parameters(), current_clip)
                 scaler.step(optimizer)
                 scaler.update()
-                scheduler.step()
                 optimizer.zero_grad()
+                scheduler.step() 
 
             sum_loss += bd["total"].item()
             if "recurv_ratio" in bd:
