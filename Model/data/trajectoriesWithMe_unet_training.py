@@ -2599,17 +2599,17 @@ class TrajectoryDataset(Dataset):
 
                     
                     result = env_data_processing(remapped)
-                    if not hasattr(self, '_debug_printed'):
-                        self._debug_printed = True
-                        print(f"\n  [DEBUG _load_env_npy] file={p}")
-                        print(f"  raw keys     : {list(raw.keys())}")
-                        print(f"  raw has_data3d : {raw.get('has_data3d')}")
-                        print(f"  raw u500_mean  : {raw.get('u500_mean')}")
-                        print(f"  remapped has_data3d : {remapped.get('has_data3d')}")
-                        print(f"  remapped u500_mean  : {remapped.get('u500_mean')}")
-                        print(f"  result has_data3d   : {result.get('has_data3d')}")
-                        print(f"  result u500_mean    : {result.get('u500_mean')}")
-                        print()
+                    # if not hasattr(self, '_debug_printed'):
+                    #     self._debug_printed = True
+                    #     print(f"\n  [DEBUG _load_env_npy] file={p}")
+                    #     print(f"  raw keys     : {list(raw.keys())}")
+                    #     print(f"  raw has_data3d : {raw.get('has_data3d')}")
+                    #     print(f"  raw u500_mean  : {raw.get('u500_mean')}")
+                    #     print(f"  remapped has_data3d : {remapped.get('has_data3d')}")
+                    #     print(f"  remapped u500_mean  : {remapped.get('u500_mean')}")
+                    #     print(f"  result has_data3d   : {result.get('has_data3d')}")
+                    #     print(f"  result u500_mean    : {result.get('u500_mean')}")
+                    #     print()
 
                     return result
                 except Exception as e:
@@ -2645,14 +2645,14 @@ class TrajectoryDataset(Dataset):
                 env_npy   = env_npy,
                 prev_speed_kmh = prev_speed,
             )
-            # DEBUG một lần
-            if not hasattr(self, '_debug_feat_printed'):
-                self._debug_feat_printed = True
-                print(f"\n  [DEBUG _get_env_features] t={t} date={dates[t]}")
-                print(f"  env_npy has_data3d : {env_npy.get('has_data3d') if env_npy else None}")
-                print(f"  env_npy u500_mean  : {env_npy.get('u500_mean') if env_npy else None}")
-                print(f"  feat u500_mean     : {feat.get('u500_mean')}")
-                print(f"  feat gph500_mean   : {feat.get('gph500_mean')}")
+            # # DEBUG một lần
+            # if not hasattr(self, '_debug_feat_printed'):
+            #     self._debug_feat_printed = True
+            #     print(f"\n  [DEBUG _get_env_features] t={t} date={dates[t]}")
+            #     print(f"  env_npy has_data3d : {env_npy.get('has_data3d') if env_npy else None}")
+            #     print(f"  env_npy u500_mean  : {env_npy.get('u500_mean') if env_npy else None}")
+            #     print(f"  feat u500_mean     : {feat.get('u500_mean')}")
+            #     print(f"  feat gph500_mean   : {feat.get('gph500_mean')}")
 
             all_feats.append(feat)
             if isinstance(env_npy, dict):
