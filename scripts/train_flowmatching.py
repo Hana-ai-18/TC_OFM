@@ -1732,68 +1732,54 @@ class BestModelSaver:
 #         print(f"  ⚠️  GPH500 unexpected (mean={gph_mean:.4f}, zero={zero_pct:.1f}%)")
 
 
-def _check_uv500(bl):
-    env_data = bl[13]
-    if env_data is None: return
-    for key in ("u500_mean", "v500_mean"):
-        if key not in env_data: continue
-        val = env_data[key]
-        zero_pct = 100.0 * (val == 0).sum().item() / max(val.numel(), 1)
-        mean_val = val.mean().item()
-        std_val  = val.std().item()
-        if zero_pct > 80.0:
-            print(f"  ⚠️  {key} = 0 cho {zero_pct:.1f}% samples!")
-        else:
-            print(f"  ✅ {key} OK: mean={mean_val:.4f}, std={std_val:.4f}")
-
 def _check_gph500(bl, train_dataset):
+    try:
+        env_dir = train_dataset.env_path
+    except AttributeError:
+        try:
+            env_dir = train_dataset.dataset.env_path
+        except AttributeError:
+            env_dir = "UNKNOWN"
+    print(f"  Env path   : {env_dir}  exists={os.path.exists(env_dir) if env_dir != 'UNKNOWN' else 'N/A'}")
+
     env_data = bl[13]
     if env_data is None:
         print("  ⚠️  env_data is None"); return
 
-    # Check has_data3d trước tiên
-    if "has_data3d" in env_data:
-        hd = env_data["has_data3d"]
-        if torch.is_tensor(hd):
-            has3d_count = int(hd.float().sum().item())
-            total       = hd.numel()
-            print(f"  has_data3d: {has3d_count}/{total} samples có Data3d")
-            if has3d_count == 0:
-                print("  ⚠️  TOÀN BỘ has_data3d=False!")
-                print("      → Kiểm tra OUTPUT_DIR trong build_env_data_scs_v12.py")
-                print("      → Kiểm tra loader đọc env từ đúng thư mục chưa")
-                print("      → Kiểm tra Data3d files có tồn tại không")
-                # In path đang dùng nếu có
-                try:
-                    print(f"      → train_dataset env_dir = {train_dataset.env_dir}")
-                except: pass
-                try:
-                    print(f"      → train_dataset env_dir = {train_dataset.dataset.env_dir}")
-                except: pass
-                return
-    else:
-        print("  ⚠️  'has_data3d' key không có trong env_data")
+    # has_data3d bị skip trong collate → không check nữa
+    for key, expected_range in [
+        ("gph500_mean",   (-3.0, 3.0)),   # đã normalized
+        ("gph500_center", (-3.0, 3.0)),
+    ]:
+        if key not in env_data:
+            print(f"  ⚠️  {key} MISSING"); continue
+        v    = env_data[key]
+        mn   = v.mean().item()
+        std  = v.std().item()
+        zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
+        lo, hi = expected_range
+        if zero > 80.0:
+            print(f"  ⚠️  {key}: zero={zero:.1f}% → env missing!")
+        elif lo <= mn <= hi:
+            print(f"  ✅ {key}: mean={mn:.3f} std={std:.3f} zero={zero:.1f}%")
+        else:
+            print(f"  ⚠️  {key}: mean={mn:.3f} ngoài range [{lo},{hi}]")
 
-    if "gph500_mean" not in env_data:
-        print("  ⚠️  GPH500 key not found"); return
-
-    gph_tensor = env_data["gph500_mean"]
-    raw_mean = gph_tensor.mean().item()
-    raw_std  = gph_tensor.std().item()
-    raw_min  = gph_tensor.min().item()
-    raw_max  = gph_tensor.max().item()
-    zero_pct = 100.0 * (gph_tensor == 0).sum().item() / max(gph_tensor.numel(), 1)
-
-    print(f"  GPH500 raw: mean={raw_mean:.1f} std={raw_std:.1f} "
-          f"min={raw_min:.1f} max={raw_max:.1f} zero%={zero_pct:.1f}%")
-
-    if abs(raw_mean) < 100.0:
-        print("  ⚠️  GPH500 quá nhỏ → has_data3d=False hoặc sentinel sai")
-    elif 55000 < raw_mean < 65000:
-        gph_dam = raw_mean / 9.80665 / 10
-        print(f"  ✅ GPH500 OK raw≈{raw_mean:.0f} m²/s² → {gph_dam:.1f} dam")
-    else:
-        print(f"  ⚠️  GPH500 ngoài range [55000-65000]")
+def _check_uv500(bl):
+    env_data = bl[13]
+    if env_data is None: return
+    for key in ("u500_mean", "v500_mean"):
+        if key not in env_data:
+            print(f"  ⚠️  {key} MISSING"); continue
+        v    = env_data[key]
+        mn   = v.mean().item()
+        std  = v.std().item()
+        zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
+        if zero > 80.0:
+            print(f"  ⚠️  {key}: zero={zero:.1f}% → u/v500 missing!")
+        else:
+            # expected: normalized [-1,1], mean ~0, std ~0.1-0.3
+            print(f"  ✅ {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
 
 def _load_baseline_errors(path, name):
     if path is None:
