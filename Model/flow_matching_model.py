@@ -1170,6 +1170,10 @@ class TCFlowMatching(nn.Module):
         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
 
         pred_abs_deg = _denorm_to_deg(pred_abs)
+        # Thêm debug vào get_loss_breakdown, sau khi tính pred_abs_deg:
+        print(f"  pred_abs requires_grad: {pred_abs.requires_grad}")
+        print(f"  pred_abs_deg requires_grad: {pred_abs_deg.requires_grad}")
+
         traj_gt_deg  = _denorm_to_deg(traj_gt)
         ref_deg      = _denorm_to_deg(lp)
 

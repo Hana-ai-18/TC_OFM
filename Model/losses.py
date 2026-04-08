@@ -1194,15 +1194,28 @@ def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     v_beta_x        = -beta * R_tc ** 2 / 2        # ~1e-4 m/s²
     res_u_corrected = res_u - v_beta_x
 
-    # FIX: scale phù hợp với magnitude m/s²
-    # Typical TC: du~1e-4, f*v~5e-4 → residual ~1e-3 m/s²
-    # scale=1e-3 → res/scale ~1 → loss ~1 → tanh không bão hòa
-    scale = 1e-3   # m/s²
-    loss  = ((res_u_corrected / scale).pow(2).mean()
-           + (res_v / scale).pow(2).mean())
+    # # FIX: scale phù hợp với magnitude m/s²
+    # # Typical TC: du~1e-4, f*v~5e-4 → residual ~1e-3 m/s²
+    # # scale=1e-3 → res/scale ~1 → loss ~1 → tanh không bão hòa
+    # Scale = typical TC acceleration magnitude
+    # TC speed ~5 m/s, changes over 6h → du ~ 5/21600 ~ 2e-4 m/s²
+    # f*v ~ 1e-4 * 5 ~ 5e-4 m/s²
+    # Tổng residual ~ 1e-3 m/s²
+    # Scale = 1.0 m/s² → normalized residual ~ 1e-3 → loss ~ 1e-6 (quá nhỏ)
+    # Scale = 1e-3 m/s² → normalized ~ 1 → loss ~ 1 ✓
+    # Nhưng khi trajectory sai (rand init): speed ~500 m/s → du ~500/21600 ~0.02
+    # → res ~ 0.02 / 1e-3 = 20 → loss = 400 → clamp/tanh cần max_val lớn
 
-    # Clip nhẹ để tránh outlier
-    return loss.clamp(max=10.0)
+    # Giải pháp: normalize bằng magnitude thực tế của residual
+    scale = torch.sqrt(
+        res_u_corrected.detach().pow(2).mean() +
+        res_v.detach().pow(2).mean()
+    ).clamp(min=1e-6)
+
+    loss = (res_u_corrected.pow(2).mean() + res_v.pow(2).mean()) / (scale + 1e-8)
+
+    # loss ~ 1.0-2.0 khi residual đồng đều, > 2 khi một chiều lớn hơn
+    return loss.clamp(max=5.0)
 
 # def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
 #                           env_data: Optional[dict]) -> torch.Tensor:
@@ -1651,7 +1664,7 @@ def compute_total_loss(
         + weights.get("pinn",     0.5) * l_pinn    * NRM   # ← thêm * NRM
         + weights.get("spread",   0.8) * l_spread  * NRM
     ) / NRM
-    
+
     if torch.isnan(total) or torch.isinf(total):
         total = pred_abs.new_zeros(())
 
