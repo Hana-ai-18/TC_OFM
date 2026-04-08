@@ -1719,17 +1719,17 @@ class BestModelSaver:
 
 # ── GPH/UV checks (unchanged) ─────────────────────────────────────────────────
 
-def _check_gph500(bl, train_dataset):
-    env_data = bl[13]
-    if env_data is None or "gph500_mean" not in env_data:
-        print("  ⚠️  GPH500 key not found"); return
-    gph_val  = env_data["gph500_mean"]
-    gph_mean = gph_val.mean().item()
-    zero_pct = 100.0 * (gph_val == 0).sum().item() / max(gph_val.numel(), 1)
-    if 25.0 < gph_mean < 95.0:
-        print(f"  ✅ GPH500 OK (mean={gph_mean:.2f} dam, zero={zero_pct:.1f}%)")
-    else:
-        print(f"  ⚠️  GPH500 unexpected (mean={gph_mean:.4f}, zero={zero_pct:.1f}%)")
+# def _check_gph500(bl, train_dataset):
+#     env_data = bl[13]
+#     if env_data is None or "gph500_mean" not in env_data:
+#         print("  ⚠️  GPH500 key not found"); return
+#     gph_val  = env_data["gph500_mean"]
+#     gph_mean = gph_val.mean().item()
+#     zero_pct = 100.0 * (gph_val == 0).sum().item() / max(gph_val.numel(), 1)
+#     if 25.0 < gph_mean < 95.0:
+#         print(f"  ✅ GPH500 OK (mean={gph_mean:.2f} dam, zero={zero_pct:.1f}%)")
+#     else:
+#         print(f"  ⚠️  GPH500 unexpected (mean={gph_mean:.4f}, zero={zero_pct:.1f}%)")
 
 
 def _check_uv500(bl):
@@ -1746,6 +1746,39 @@ def _check_uv500(bl):
         else:
             print(f"  ✅ {key} OK: mean={mean_val:.4f}, std={std_val:.4f}")
 
+def _check_gph500(bl, train_dataset):
+    env_data = bl[13]
+    if env_data is None or "gph500_mean" not in env_data:
+        print("  ⚠️  GPH500 key not found"); return
+
+    gph_tensor = env_data["gph500_mean"]   # raw m²/s² từ loader
+    raw_mean = gph_tensor.mean().item()
+    raw_std  = gph_tensor.std().item()
+    raw_min  = gph_tensor.min().item()
+    raw_max  = gph_tensor.max().item()
+    zero_pct = 100.0 * (gph_tensor == 0).sum().item() / max(gph_tensor.numel(), 1)
+    has_3d_pct = 0.0
+    if "has_data3d" in env_data:
+        hd = env_data["has_data3d"]
+        has_3d_pct = 100.0 * hd.float().mean().item() if torch.is_tensor(hd) else 0.0
+
+    gph_m   = raw_mean / 9.80665        # → geopotential height (m)
+    gph_dam = gph_m / 10.0            # → dam
+
+    print(f"  GPH500 raw (từ loader, chưa normalize):")
+    print(f"    mean={raw_mean:.1f}  std={raw_std:.1f}")
+    print(f"    min={raw_min:.1f}    max={raw_max:.1f}")
+    print(f"    ÷9.8 → {gph_m:.1f} m  ({gph_dam:.1f} dam)  [WNP expected ~585-595 dam]")
+    print(f"    zero%={zero_pct:.1f}%   has_data3d%={has_3d_pct:.1f}%")
+
+    if zero_pct > 80.0:
+        print("  ⚠️  GPH500 zero >80% → Data3d miss hoàn toàn!")
+    elif raw_mean < 100.0:
+        print("  ⚠️  GPH500 raw quá nhỏ → sai channel index?")
+    elif not (55000 < raw_mean < 65000):
+        print(f"  ⚠️  GPH500 ngoài range expected [55000-65000] m²/s²")
+    else:
+        print(f"  ✅ GPH500 OK  raw≈{raw_mean:.0f} m²/s² → {gph_dam:.1f} dam")
 
 def _load_baseline_errors(path, name):
     if path is None:

@@ -1638,7 +1638,11 @@ def compute_total_loss(
                 all_trajs[:, n_sr:, :, :],   # chỉ steps 5-12
                 max_spread_km=150.0
             )
+        else:
+            # Fallback nếu traj quá ngắn (hiếm gặp)
+            l_spread = ensemble_spread_loss(all_trajs, max_spread_km=150.0)
 
+            
     # 6. Total  (short_range added externally in get_loss_breakdown)
     total = (
         weights.get("fm",       2.0) * l_fm

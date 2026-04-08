@@ -818,7 +818,7 @@ class VelocityField(nn.Module):
         self.env_enc = Env_net(obs_len=obs_len, d_model=32)
 
         # ctx_fc1 output = 512 = RAW_CTX_DIM
-        self.ctx_fc1  = nn.Linear(128 + 64 + 16, self.RAW_CTX_DIM)
+        self.ctx_fc1  = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
         self.ctx_drop = nn.Dropout(0.15)
         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
