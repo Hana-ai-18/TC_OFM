@@ -100,7 +100,8 @@ def data_loader(
         delim       = getattr(args, "delim",        " "),
         other_modal = getattr(args, "other_modal",  "gph"),
         test_year   = test_year,
-        type        = dset_type,
+        # type        = dset_type,
+        split=dset_type,
         is_test     = test,
     )
 

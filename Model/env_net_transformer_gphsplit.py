@@ -464,13 +464,19 @@ BOUNDARY_THRESHOLDS = [0.05, 0.15, 0.30]
 DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # ── Normalisation constants ───────────────────────────────────────────────────
-_GPH500_MEAN  = 33.64
-_GPH500_STD   =  7.08
-_GPH500C_MEAN = 32.84
-_GPH500C_STD  =  1.03
+# _GPH500_MEAN  = 33.64
+# _GPH500_STD   =  7.08
+# _GPH500C_MEAN = 32.84
+# _GPH500C_STD  =  1.03
 
-_GPH500_SENTINEL_LO = 25.0
-_GPH500_SENTINEL_HI = 95.0
+# _GPH500_SENTINEL_LO = 25.0
+# _GPH500_SENTINEL_HI = 95.0
+_GPH500_MEAN  = 5900.0   # meters (thay vì 33.64 dam)
+_GPH500_STD   =  200.0   # meters
+_GPH500C_MEAN = 5900.0
+_GPH500C_STD  =  200.0
+_GPH500_SENTINEL_LO = 4000.0   # meters (thay vì 25 dam)
+_GPH500_SENTINEL_HI = 7000.0   # meters (thay vì 95 dam)
 
 # FIX-ENV-20A/B: u/v500 raw normalization constant (m/s)
 _UV500_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
@@ -600,27 +606,40 @@ def intensity_class_onehot(wind_ms: float) -> list[int]:
 
 #     return 0.0
 
+# def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
+#     """
+#     FIX-ENV-22: Đọc u/v500 từ .npy (đã normalized [-1,1] bởi /30.0).
+#     Trả về 0.0 nếu missing hoặc has_data3d=False.
+#     Clip [-1, 1] để đảm bảo không có outlier.
+#     """
+#     if not isinstance(env_npy, dict):
+#         return 0.0
+#     # has_data3d=False → tất cả u/v = 0.0 (fallback trong builder)
+#     if not env_npy.get("has_data3d", True):
+#         return 0.0
+#     raw = env_npy.get(key, None)
+#     if raw is None:
+#         return 0.0
+#     try:
+#         v = float(raw)
+#     except (TypeError, ValueError):
+#         return 0.0
+#     # Trong .npy: đã clip(-1,1) — giá trị hợp lệ trong [-1,1]
+#     # Nếu = 0.0 → Data3d miss cho timestep này (builder fallback)
+#     return float(np.clip(v, -1.0, 1.0))
+
 def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
-    """
-    FIX-ENV-22: Đọc u/v500 từ .npy (đã normalized [-1,1] bởi /30.0).
-    Trả về 0.0 nếu missing hoặc has_data3d=False.
-    Clip [-1, 1] để đảm bảo không có outlier.
-    """
-    if not isinstance(env_npy, dict):
-        return 0.0
-    # has_data3d=False → tất cả u/v = 0.0 (fallback trong builder)
-    if not env_npy.get("has_data3d", True):
-        return 0.0
+    if not isinstance(env_npy, dict): return 0.0
+    if not env_npy.get("has_data3d", True): return 0.0
     raw = env_npy.get(key, None)
-    if raw is None:
-        return 0.0
+    if raw is None: return 0.0
     try:
         v = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    # Trong .npy: đã clip(-1,1) — giá trị hợp lệ trong [-1,1]
-    # Nếu = 0.0 → Data3d miss cho timestep này (builder fallback)
-    return float(np.clip(v, -1.0, 1.0))
+    # FIX: raw là m/s (~±30), cần /30 rồi clip
+    return float(np.clip(v / _UV500_NORM, -1.0, 1.0))
+    # _UV500_NORM = 30.0 đã có sẵn trong file
 
 def _read_uv500_from_csv(raw_val, norm: float = _UV500_NORM) -> float:
     """
@@ -660,7 +679,12 @@ def build_env_features_one_step(
 
     feat: dict = {}
 
-    feat["wind"]            = [wind_ms / _WIND_NORM_DENOM]
+    # feat["wind"]            = [wind_ms / _WIND_NORM_DENOM]
+    if isinstance(env_npy, dict) and "wind" in env_npy:
+        feat["wind"] = [float(env_npy["wind"])]   # wnd_norm gốc, nhất quán Data1d
+    else:
+        feat["wind"] = [(wind_norm * 25.0 + 40.0) * 0.5144 / _WIND_NORM_DENOM]
+
     feat["intensity_class"] = intensity_class_onehot(wind_ms)
 
     mv = 0.0

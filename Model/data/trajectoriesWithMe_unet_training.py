@@ -2588,12 +2588,14 @@ class TrajectoryDataset(Dataset):
 
                     if has_old_gph:
                         # .npy cũ với "_n" suffix: đã normalized bởi (gph-5900)/200
+                        # remapped["gph500_already_normed"] = True
                         remapped["gph500_already_normed"] = True
                     elif "gph500_mean" in remapped and not has_old_n_suffix:
                         # FIX-DATA-29: .npy mới (build_env_data_scs_v10):
                         # gph500_mean = (gph-5900)/200, u500_mean = clip(u/30,-1,1)
                         # Đây đều là đã normalized
-                        remapped["gph500_already_normed"] = True
+                        # remapped["gph500_already_normed"] = True\
+                        remapped["gph500_already_normed"] = False
 
                     return env_data_processing(remapped)
                 except Exception as e:

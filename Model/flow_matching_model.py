@@ -654,100 +654,113 @@ class ShortRangeHead(nn.Module):
     N_STEPS   = 4        # 6h, 12h, 18h, 24h
     MAX_DELTA = 0.48     # normalised units ≈ 576 km / 6h
 
-    def __init__(self, raw_ctx_dim: int = 512, obs_len: int = 8):
+    def __init__(self, raw_ctx_dim=512, obs_len=8):
         super().__init__()
         self.obs_len = obs_len
 
-        # ── Motion prior encoder ──────────────────────────────────────────
-        # Last 3 observed velocities (6 values) → 128-d feature
+        # Motion prior: dùng tất cả obs velocities, không chỉ 3 bước cuối
         self.vel_enc = nn.Sequential(
-            nn.Linear(6, 128),
+            nn.Linear(obs_len * 2, 256),   # FIX: toàn bộ obs_len velocities
             nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 128),
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
             nn.GELU(),
         )
 
-        # ── Context projection ────────────────────────────────────────────
         self.ctx_proj = nn.Sequential(
             nn.Linear(raw_ctx_dim, 256),
             nn.GELU(),
             nn.LayerNorm(256),
-            nn.Dropout(0.08),
+            nn.Dropout(0.05),   # FIX: giảm dropout 0.08→0.05
         )
 
-        # ── GRU cell: autoregressive step prediction ──────────────────────
-        # input_size  = ctx(256) + vel(128) + cur_pos(2) = 386
-        # hidden_size = 256
+        # FIX: GRU hidden = ctx+vel kết hợp ngay từ đầu
+        # input = ctx(256) + vel(128) + cur_pos(2) = 386
         self.gru_cell = nn.GRUCell(input_size=386, hidden_size=256)
 
-        # ── Output head ───────────────────────────────────────────────────
-        self.out_head = nn.Sequential(
-            nn.Linear(256, 64),
-            nn.GELU(),
-            nn.Linear(64, 2),
+        # FIX: thêm residual connection từ motion prior
+        self.motion_gate = nn.Sequential(
+            nn.Linear(128 + 256, 1),
+            nn.Sigmoid(),
         )
 
-        # ── Learnable per-step scale (small residual refinement) ──────────
-        self.step_scale = nn.Parameter(torch.ones(self.N_STEPS) * 0.3)
+        self.out_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.GELU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 2),
+        )
 
+        # Per-step scale được học, khởi tạo nhỏ để ổn định
+        self.step_scale = nn.Parameter(torch.ones(self.N_STEPS) * 0.2)
         self._init_weights()
 
     def _init_weights(self):
-        """Small init so early predictions follow observed velocity."""
         with torch.no_grad():
             for m in self.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.5)
+                    nn.init.xavier_uniform_(m.weight, gain=0.3)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
 
-    def forward(
-        self,
-        raw_ctx:  torch.Tensor,  # [B, raw_ctx_dim]  pre-projection context
-        obs_traj: torch.Tensor,  # [T_obs, B, 2]     normalised positions
-    ) -> torch.Tensor:
-        """
-        Returns predicted positions [4, B, 2] (normalised, absolute).
-        """
-        B = raw_ctx.shape[0]
+    def forward(self, raw_ctx, obs_traj):
+        # obs_traj: [T_obs, B, 2]
+        B        = raw_ctx.shape[0]
+        T_obs    = obs_traj.shape[0]
 
-        # ── Motion prior from last 3 velocity steps ───────────────────────
-        if obs_traj.shape[0] >= 4:
-            v1 = obs_traj[-1] - obs_traj[-2]   # [B, 2]
-            v2 = obs_traj[-2] - obs_traj[-3]   # [B, 2]
-            v3 = obs_traj[-3] - obs_traj[-4]   # [B, 2]
+        # FIX: encode toàn bộ velocity sequence
+        if T_obs >= 2:
+            vels = obs_traj[1:] - obs_traj[:-1]   # [T_obs-1, B, 2]
         else:
-            # Fallback for very short obs
-            v1 = obs_traj[-1] - obs_traj[0]
-            v2 = v3 = torch.zeros_like(v1)
+            vels = torch.zeros(1, B, 2, device=raw_ctx.device)
 
-        vel_feat = self.vel_enc(
-            torch.cat([v1, v2, v3], dim=-1)
-        )  # [B, 128]
+        # Pad hoặc crop về obs_len velocity steps
+        target_v = self.obs_len  # số velocity steps cần
+        if vels.shape[0] < target_v:
+            pad = torch.zeros(target_v - vels.shape[0], B, 2,
+                              device=raw_ctx.device)
+            vels = torch.cat([pad, vels], dim=0)
+        else:
+            vels = vels[-target_v:]   # lấy target_v bước cuối
+
+        vel_input = vels.permute(1, 0, 2).reshape(B, -1)  # [B, obs_len*2]
+        vel_feat  = self.vel_enc(vel_input)                 # [B, 128]
 
         ctx_feat = self.ctx_proj(raw_ctx)  # [B, 256]
 
-        # ── GRU autoregressive loop ───────────────────────────────────────
-        hx      = ctx_feat                  # initial hidden = projected context
-        cur_pos = obs_traj[-1].clone()      # [B, 2]
-        preds   = []
+        # FIX: hx được khởi tạo từ ctx thay vì chính ctx
+        # để GRU có không gian học riêng
+        hx      = ctx_feat
+        cur_pos = obs_traj[-1].clone()   # [B, 2]
 
+        # Last observed velocity làm prior bước đầu
+        last_vel = vels[-1].clone()      # [B, 2]
+
+        preds = []
         for i in range(self.N_STEPS):
-            inp = torch.cat([ctx_feat, vel_feat, cur_pos], dim=-1)  # [B, 386]
-            hx  = self.gru_cell(inp, hx)                             # [B, 256]
+            inp = torch.cat([ctx_feat, vel_feat, cur_pos], dim=-1)  # [B,386]
+            hx  = self.gru_cell(inp, hx)                             # [B,256]
 
-            raw_delta = self.out_head(hx)                            # [B, 2]
-            # Scale and clamp: physics speed constraint
-            scale_i   = torch.sigmoid(self.step_scale[i]) * self.MAX_DELTA
-            delta     = (raw_delta * scale_i).clamp(
-                -self.MAX_DELTA, self.MAX_DELTA
-            )
+            # FIX: motion gate — blend giữa GRU output và motion prior
+            gate = self.motion_gate(
+                torch.cat([vel_feat, hx], dim=-1)
+            )  # [B,1]  — giai đoạn đầu training gate≈1 → theo motion prior
 
+            raw_delta   = self.out_head(hx)                     # [B,2]
+            # Motion prior: tiếp tục với velocity cuối (decay theo step)
+            prior_delta = last_vel * (0.9 ** i)                 # [B,2]
+
+            # Blend: gate=1 → dùng motion prior hoàn toàn (đầu training)
+            #        gate=0 → dùng GRU output hoàn toàn (sau khi học)
+            scale_i = torch.sigmoid(self.step_scale[i]) * self.MAX_DELTA
+            blended = gate * prior_delta + (1 - gate) * raw_delta * scale_i
+
+            delta   = blended.clamp(-self.MAX_DELTA, self.MAX_DELTA)
             cur_pos = cur_pos + delta
+            last_vel = delta   # update velocity prior
             preds.append(cur_pos)
 
-        return torch.stack(preds, dim=0)  # [4, B, 2]
+        return torch.stack(preds, dim=0)   # [4, B, 2]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -779,7 +792,7 @@ class VelocityField(nn.Module):
         self.spatial_enc = FNO3DEncoder(
             in_channel   = unet_in_ch,
             out_channel  = 1,
-            d_model      = 64,
+            d_model      = 32,
             n_layers     = 4,
             modes_t      = 4,
             modes_h      = 4,
@@ -802,7 +815,7 @@ class VelocityField(nn.Module):
             d_state     = 16,
         )
 
-        self.env_enc = Env_net(obs_len=obs_len, d_model=64)
+        self.env_enc = Env_net(obs_len=obs_len, d_model=32)
 
         # ctx_fc1 output = 512 = RAW_CTX_DIM
         self.ctx_fc1  = nn.Linear(128 + 64 + 16, self.RAW_CTX_DIM)
@@ -845,27 +858,81 @@ class VelocityField(nn.Module):
         emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
         return F.pad(emb, (0, dim % 2))
 
-    def _context(self, batch_list: List) -> torch.Tensor:
-        """Returns raw_ctx [B, RAW_CTX_DIM] (before dropout/projection)."""
-        obs_traj  = batch_list[0]
-        obs_Me    = batch_list[7]
-        image_obs = batch_list[11]
+    # def _context(self, batch_list: List) -> torch.Tensor:
+    #     """Returns raw_ctx [B, RAW_CTX_DIM] (before dropout/projection)."""
+    #     obs_traj  = batch_list[0]
+    #     obs_Me    = batch_list[7]
+    #     image_obs = batch_list[11]
+    #     env_data  = batch_list[13]
+
+    #     if image_obs.dim() == 4:
+    #         image_obs = image_obs.unsqueeze(1)
+
+    #     expected_ch = self.spatial_enc.in_channel
+    #     if image_obs.shape[1] == 1 and expected_ch != 1:
+    #         image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
+
+    #     e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
+    #     T_obs = obs_traj.shape[0]
+
+    #     e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
+    #     e_3d_s = e_3d_s.permute(0, 2, 1)
+    #     e_3d_s = self.bottleneck_proj(e_3d_s)
+
+    #     T_bot = e_3d_s.shape[1]
+    #     if T_bot != T_obs:
+    #         e_3d_s = F.interpolate(
+    #             e_3d_s.permute(0, 2, 1), size=T_obs,
+    #             mode="linear", align_corners=False,
+    #         ).permute(0, 2, 1)
+
+    #     # f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))
+    #     # f_spatial     = self.decoder_proj(f_spatial_raw)
+
+    #     # FIX: pool H,W, giữ T, rồi flatten
+    #     # f_spatial_raw = e_3d_dec.squeeze(1)          # [B,T,1,1] → [B,T]  (squeeze C và H,W)
+    #     # f_spatial_raw = f_spatial_raw.mean(dim=1)    # [B] — hoặc giữ T nếu muốn
+    #     # Hoặc đơn giản hơn: mean chỉ spatial
+    #     f_spatial_raw = e_3d_dec.mean(dim=(3,4))     # [B,1,T] → squeeze → [B,T]
+    #     f_spatial     = self.decoder_proj(f_spatial_raw.squeeze(1))  # cần Linear(T,16)
+
+    #     obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
+    #     h_t    = self.enc_1d(obs_in, e_3d_s)
+
+    #     e_env, _, _ = self.env_enc(env_data, image_obs)
+
+    #     raw = torch.cat([h_t, e_env, f_spatial], dim=-1)
+    #     raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))  # [B, RAW_CTX_DIM]
+    #     return raw                                      # raw_ctx
+
+    # ── _context(): fix f_spatial ──────────────────────────────────────────────
+    def _context(self, batch_list):
+        obs_traj  = batch_list[0]   # [T_obs, B, 2]
+        obs_Me    = batch_list[7]   # [T_obs, B, 2]
+        image_obs = batch_list[11]  # [B, 13, T, 81, 81]  từ seq_collate
         env_data  = batch_list[13]
 
+        # image_obs đã được permute đúng bởi seq_collate → [B,13,T,H,W]
+        # Chỉ cần guard cho trường hợp dim==4 (không có T)
         if image_obs.dim() == 4:
-            image_obs = image_obs.unsqueeze(1)
+            image_obs = image_obs.unsqueeze(2)  # thêm T dim, không phải C
 
         expected_ch = self.spatial_enc.in_channel
         if image_obs.shape[1] == 1 and expected_ch != 1:
             image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
 
         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
+        # e_3d_bot: [B,128,T,4,4]   e_3d_dec: [B,1,T,1,1]
+
         T_obs = obs_traj.shape[0]
 
-        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
-        e_3d_s = e_3d_s.permute(0, 2, 1)
-        e_3d_s = self.bottleneck_proj(e_3d_s)
+        # Bottleneck: pool spatial → [B,128,T] → permute → [B,T,128]
+        e_3d_s = self.bottleneck_pool(e_3d_bot)   # [B,128,T,1,1]
+        e_3d_s = e_3d_s.squeeze(-1).squeeze(-1)   # [B,128,T]
+        e_3d_s = e_3d_s.permute(0, 2, 1)          # [B,T,128]
+        e_3d_s = self.bottleneck_proj(e_3d_s)     # [B,T,128]
 
+        # T alignment
         T_bot = e_3d_s.shape[1]
         if T_bot != T_obs:
             e_3d_s = F.interpolate(
@@ -873,17 +940,27 @@ class VelocityField(nn.Module):
                 mode="linear", align_corners=False,
             ).permute(0, 2, 1)
 
-        f_spatial_raw = e_3d_dec.mean(dim=(2, 3, 4))
-        f_spatial     = self.decoder_proj(f_spatial_raw)
+        # FIX Bug G: f_spatial giữ lại temporal info
+        # e_3d_dec: [B,1,T,1,1] → mean(H,W) → [B,1,T] → mean(T) → [B,1]
+        # Thay bằng: pool T về 1 bằng weighted mean (cuối quan trọng hơn)
+        e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)  # [B,T]
+        # Exponential weighting: bước cuối obs quan trọng nhất
+        t_weights = torch.softmax(
+            torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
+                        device=e_3d_dec_t.device) * 0.5,
+            dim=0
+        )  # [T]
+        f_spatial_scalar = (e_3d_dec_t * t_weights.unsqueeze(0)).sum(1, keepdim=True)  # [B,1]
+        f_spatial = self.decoder_proj(f_spatial_scalar)  # [B,16]
 
-        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
-        h_t    = self.enc_1d(obs_in, e_3d_s)
+        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)  # [B,T,4]
+        h_t    = self.enc_1d(obs_in, e_3d_s)   # [B,128]
 
-        e_env, _, _ = self.env_enc(env_data, image_obs)
+        e_env, _, _ = self.env_enc(env_data, image_obs)  # [B,64]
 
-        raw = torch.cat([h_t, e_env, f_spatial], dim=-1)
-        raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))  # [B, RAW_CTX_DIM]
-        return raw                                      # raw_ctx
+        raw = torch.cat([h_t, e_env, f_spatial], dim=-1)  # [B,208]
+        raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))       # [B,512]
+        return raw
 
     def _apply_ctx_head(self, raw: torch.Tensor,
                         noise_scale: float = 0.0) -> torch.Tensor:
@@ -1130,41 +1207,96 @@ class TCFlowMatching(nn.Module):
 
     # ── sample() ─────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
-    def sample(
-        self,
-        batch_list:  List,
-        num_ensemble: int = 50,
-        ddim_steps:   int = 20,
-        predict_csv:  Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        FIX-M24: pred_mean[:4] ← ShortRangeHead (deterministic, low-error).
-                 pred_mean[4:] ← FM ensemble mean.
+    # @torch.no_grad()
+    # def sample(
+    #     self,
+    #     batch_list:  List,
+    #     num_ensemble: int = 50,
+    #     ddim_steps:   int = 20,
+    #     predict_csv:  Optional[str] = None,
+    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     """
+    #     FIX-M24: pred_mean[:4] ← ShortRangeHead (deterministic, low-error).
+    #              pred_mean[4:] ← FM ensemble mean.
 
-        Returns:
-            pred_mean : [T, B, 2]
-            me_mean   : [T, B, 2]
-            all_trajs : [S, T, B, 2]
-        """
-        obs_t = batch_list[0]          # [T_obs, B, 2]
-        lp    = obs_t[-1]              # [B, 2]
-        lm    = batch_list[7][-1]      # [B, 2]
-        B     = lp.shape[0]
+    #     Returns:
+    #         pred_mean : [T, B, 2]
+    #         me_mean   : [T, B, 2]
+    #         all_trajs : [S, T, B, 2]
+    #     """
+    #     obs_t = batch_list[0]          # [T_obs, B, 2]
+    #     lp    = obs_t[-1]              # [B, 2]
+    #     lm    = batch_list[7][-1]      # [B, 2]
+    #     B     = lp.shape[0]
+    #     device = lp.device
+    #     T      = self.pred_len
+    #     dt     = 1.0 / max(ddim_steps, 1)
+
+    #     raw_ctx = self.net._context(batch_list)
+
+    #     # ── Short-range deterministic (steps 1-4) ─────────────────────────
+    #     n_sr     = ShortRangeHead.N_STEPS      # 4
+    #     sr_pred  = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2]
+
+    #     # ── FM ensemble (all 12 steps, for steps 5-12) ───────────────────
+    #     traj_s: List[torch.Tensor] = []
+    #     me_s:   List[torch.Tensor] = []
+
+    #     for k in range(num_ensemble):
+    #         x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+
+    #         for step in range(ddim_steps):
+    #             t_b = torch.full((B,), step * dt, device=device)
+    #             ns  = self.ctx_noise_scale if step == 0 else 0.0
+    #             vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
+    #             x_t = x_t + dt * vel
+
+    #         x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
+    #         x_t = x_t.clamp(-3.0, 3.0)
+
+    #         tr, me = self._to_abs(x_t, lp, lm)
+    #         traj_s.append(tr)
+    #         me_s.append(me)
+
+    #     all_trajs = torch.stack(traj_s)    # [S, T, B, 2]
+    #     all_me    = torch.stack(me_s)
+
+    #     # ── FIX-M24: Blend short-range into pred_mean ─────────────────────
+    #     fm_mean  = all_trajs.mean(0)       # [T, B, 2]
+    #     pred_mean = fm_mean.clone()
+    #     pred_mean[:n_sr] = sr_pred         # Override steps 1-4
+
+    #     # # Also override all_trajs first 4 steps with deterministic prediction
+    #     # # (reduces spurious spread for 12h/24h in CRPS)
+    #     # all_trajs[:, :n_sr, :, :] = sr_pred.unsqueeze(0).expand(
+    #     #     num_ensemble, -1, -1, -1
+    #     # )
+
+    #     me_mean = all_me.mean(0)
+
+    #     if predict_csv:
+    #         self._write_predict_csv(predict_csv, pred_mean, all_trajs)
+
+    #     return pred_mean, me_mean, all_trajs
+
+    @torch.no_grad()
+    def sample(self, batch_list, num_ensemble=50, ddim_steps=20, predict_csv=None):
+        obs_t  = batch_list[0]
+        lp     = obs_t[-1]
+        lm     = batch_list[7][-1]
+        B      = lp.shape[0]
         device = lp.device
         T      = self.pred_len
         dt     = 1.0 / max(ddim_steps, 1)
 
         raw_ctx = self.net._context(batch_list)
+        n_sr    = ShortRangeHead.N_STEPS
 
-        # ── Short-range deterministic (steps 1-4) ─────────────────────────
-        n_sr     = ShortRangeHead.N_STEPS      # 4
-        sr_pred  = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2]
+        # Short-range deterministic
+        sr_pred = self.net.forward_short_range(obs_t, raw_ctx)   # [4, B, 2]
 
-        # ── FM ensemble (all 12 steps, for steps 5-12) ───────────────────
-        traj_s: List[torch.Tensor] = []
-        me_s:   List[torch.Tensor] = []
-
+        # FM ensemble — giữ nguyên, KHÔNG override
+        traj_s, me_s = [], []
         for k in range(num_ensemble):
             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
@@ -1181,19 +1313,15 @@ class TCFlowMatching(nn.Module):
             traj_s.append(tr)
             me_s.append(me)
 
-        all_trajs = torch.stack(traj_s)    # [S, T, B, 2]
+        all_trajs = torch.stack(traj_s)   # [S, T, B, 2] — KHÔNG override steps 1-4
         all_me    = torch.stack(me_s)
 
-        # ── FIX-M24: Blend short-range into pred_mean ─────────────────────
-        fm_mean  = all_trajs.mean(0)       # [T, B, 2]
+        # FIX: pred_mean blend đúng cách
+        # Steps 1-4: ShortRangeHead (deterministic, low-error)
+        # Steps 5-12: FM ensemble mean
+        fm_mean   = all_trajs.mean(0)    # [T, B, 2]
         pred_mean = fm_mean.clone()
-        pred_mean[:n_sr] = sr_pred         # Override steps 1-4
-
-        # Also override all_trajs first 4 steps with deterministic prediction
-        # (reduces spurious spread for 12h/24h in CRPS)
-        all_trajs[:, :n_sr, :, :] = sr_pred.unsqueeze(0).expand(
-            num_ensemble, -1, -1, -1
-        )
+        pred_mean[:n_sr] = sr_pred       # override pred_mean, KHÔNG override all_trajs
 
         me_mean = all_me.mean(0)
 

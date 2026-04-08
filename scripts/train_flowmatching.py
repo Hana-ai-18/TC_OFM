@@ -1297,15 +1297,30 @@ def unfreeze_all(model: TCFlowMatching) -> None:
 
 # ── Weight schedules ──────────────────────────────────────────────────────────
 
-def get_short_range_weight(epoch: int) -> float:
-    """FIX-T24-C: short_range weight schedule."""
-    if epoch < 30:
+# def get_short_range_weight(epoch: int) -> float:
+#     """FIX-T24-C: short_range weight schedule."""
+#     if epoch < 30:
+#         return 8.0
+#     elif epoch < 60:
+#         return 5.0
+#     else:
+#         return 3.0
+def get_short_range_weight(epoch):
+    # FIX-T24-C giữ nguyên nhưng tăng mạnh hơn ở phase 1
+    if epoch < 15:
+        return 12.0   # ép ShortRangeHead học rất mạnh giai đoạn đầu
+    elif epoch < 30:
         return 8.0
     elif epoch < 60:
         return 5.0
     else:
         return 3.0
 
+def get_fm_weight(epoch):
+    """FIX MỚI: FM loss nhỏ ở phase 1 để không cản ShortRangeHead."""
+    if epoch < 30:
+        return 0.5   # giảm FM weight trong phase 1
+    return 2.0       # về bình thường ở phase 2
 
 def get_spread_weight(epoch: int) -> float:
     """FIX-T24-D: higher spread penalty in first 30 epochs."""
@@ -1314,13 +1329,25 @@ def get_spread_weight(epoch: int) -> float:
     return 0.8
 
 
-def get_pinn_weight(epoch: int, warmup_epochs: int = 80,
-                    w_start: float = 0.001, w_end: float = 0.05) -> float:
-    """FIX-T24-E: longer PINN warmup (80 epochs)."""
-    if epoch >= warmup_epochs:
-        return w_end
-    return w_start + (epoch / max(warmup_epochs - 1, 1)) * (w_end - w_start)
+# def get_pinn_weight(epoch: int, warmup_epochs: int = 80,
+#                     w_start: float = 0.001, w_end: float = 0.05) -> float:
+#     """FIX-T24-E: longer PINN warmup (80 epochs)."""
+#     if epoch >= warmup_epochs:
+#         return w_end
+#     return w_start + (epoch / max(warmup_epochs - 1, 1)) * (w_end - w_start)
 
+def get_pinn_weight(epoch, warmup_epochs=80,
+                    w_start=0.001, w_end=0.05):
+    # FIX: tăng nhanh hơn trong phase 2 (sau ep 30)
+    if epoch < 30:
+        # Phase 1: PINN rất nhỏ, focus ShortRangeHead
+        return w_start
+    elif epoch < warmup_epochs:
+        # Phase 2: tăng tuyến tính từ 0.005 → w_end
+        t = (epoch - 30) / max(warmup_epochs - 30, 1)
+        return 0.005 + t * (w_end - 0.005)
+    return w_end
+    
 
 def get_velocity_weight(epoch, warmup_epochs=20, w_start=0.5, w_end=1.5):
     if epoch >= warmup_epochs:
@@ -1964,6 +1991,7 @@ def main(args):
 
         step_alpha    = get_step_weight_alpha(epoch, args.step_weight_decay_epochs)
         epoch_weights = copy.copy(_BASE_WEIGHTS)
+        epoch_weights["fm"]          = get_fm_weight(epoch)
         epoch_weights["short_range"] = get_short_range_weight(epoch)
         epoch_weights["spread"]      = get_spread_weight(epoch)
         epoch_weights["pinn"]        = get_pinn_weight(

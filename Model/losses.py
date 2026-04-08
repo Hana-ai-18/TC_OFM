@@ -747,8 +747,13 @@ DT_6H        = 6 * 3600
 DEG_TO_KM    = 111.0
 STEP_KM      = 113.0
 
-_UV500_SCALE = 30.0          # normalized [-1,1] → m/s
-
+# Các hằng số cho PINN mới của bạn
+_UV500_NORM      = 30.0    # m/s → đã normalize [-1,1] trong env
+_GPH500_MEAN_M   = 5870.0  # meters (sau fix Bug C)
+_GPH500_STD_M    = 80.0
+_STEERING_MIN_MS = 3.0     # m/s — threshold có steering flow thực sự
+_GPH_GRAD_SCALE  = 200.0   # meters — scale GPH gradient
+_PINN_SCALE      = 1e-2  # Scale để residual không bị quá nhỏ
 # ── Weights (v25) ─────────────────────────────────────────────────────────────
 WEIGHTS: Dict[str, float] = dict(
     fm          = 2.0,
@@ -1102,6 +1107,63 @@ def _soft_clamp_loss(loss: torch.Tensor, max_val: float = 20.0) -> torch.Tensor:
     """FIX-L44: tanh soft-clamp. Gradient always > 0."""
     return max_val * torch.tanh(loss / max_val)
 
+def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
+                  T_tgt: int, B: int,
+                  device: torch.device) -> torch.Tensor:
+    """
+    Lấy u hoặc v 500hPa theo thứ tự ưu tiên: center > mean > zeros.
+    env_data[key] shape: [B, T_obs, 1] (từ seq_collate).
+    Output: [T_tgt, B] đơn vị m/s.
+    """
+    def _extract(key):
+        x = env_data.get(key, None)
+        if x is None or not torch.is_tensor(x):
+            return None
+        x = x.to(device).float()
+        # [B, T_obs, 1] → [B, T_obs]
+        if x.dim() == 3:
+            x = x[..., 0]
+        elif x.dim() == 1:
+            x = x.unsqueeze(0).expand(B, -1)
+        # x: [B, T_obs] → transpose → [T_obs, B]
+        x = x.permute(1, 0)   # [T_obs, B]
+        T_obs = x.shape[0]
+        if T_obs >= T_tgt:
+            return x[:T_tgt] * _UV500_NORM
+        # pad bằng climatology (0 m/s) thay vì repeat cuối
+        pad = torch.zeros(T_tgt - T_obs, B, device=device)
+        return torch.cat([x * _UV500_NORM, pad], dim=0)
+
+    # Ưu tiên center (flow tại tâm TC chính xác hơn)
+    val = _extract(key_center)
+    if val is not None:
+        return val
+    val = _extract(key_mean)
+    if val is not None:
+        return val
+    return torch.zeros(T_tgt, B, device=device)
+
+
+def _get_gph500_norm(env_data: dict, key: str,
+                     T_tgt: int, B: int,
+                     device: torch.device) -> torch.Tensor:
+    """
+    Lấy GPH500 đã z-score (sau fix Bug C: mean=5870, std=80).
+    Output: [T_tgt, B] normalized.
+    """
+    x = env_data.get(key, None)
+    if x is None or not torch.is_tensor(x):
+        return torch.zeros(T_tgt, B, device=device)
+    x = x.to(device).float()
+    if x.dim() == 3:
+        x = x[..., 0]
+    x = x.permute(1, 0)   # [T_obs, B]
+    T_obs = x.shape[0]
+    if T_obs >= T_tgt:
+        return x[:T_tgt]
+    pad = torch.zeros(T_tgt - T_obs, B, device=device)
+    return torch.cat([x, pad], dim=0)
+
 
 def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     """
@@ -1149,8 +1211,91 @@ def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     return _soft_clamp_loss(loss, max_val=20.0)
 
 
+# def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
+#                           env_data: Optional[dict]) -> torch.Tensor:
+#     if env_data is None:
+#         return pred_abs_deg.new_zeros(())
+
+#     T, B, _ = pred_abs_deg.shape
+#     if T < 2:
+#         return pred_abs_deg.new_zeros(())
+
+#     DT      = DT_6H
+#     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
+#     lat_rad = torch.deg2rad(pred_abs_deg[:-1, :, 1])
+#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+
+#     u_tc = dlat[:, :, 0] * cos_lat * 111000.0 / DT
+#     v_tc = dlat[:, :, 1] * 111000.0 / DT
+
+#     u500_raw = env_data.get("u500_mean", None)
+#     v500_raw = env_data.get("v500_mean", None)
+
+#     if u500_raw is None or v500_raw is None:
+#         speed = torch.sqrt(u_tc ** 2 + v_tc ** 2)
+#         return F.relu(speed - 30.0).pow(2).mean() * 0.01
+
+#     def _align(x: torch.Tensor) -> torch.Tensor:
+#         if not torch.is_tensor(x):
+#             return pred_abs_deg.new_zeros(T - 1, B)
+#         x = x.to(pred_abs_deg.device)
+#         if x.dim() == 3:
+#             x_sq  = x[:, :, 0]
+#             T_env = x_sq.shape[1]
+#             T_tgt = T - 1
+#             if T_env >= T_tgt:
+#                 return x_sq[:, :T_tgt].permute(1, 0)
+#             pad = x_sq[:, -1:].expand(-1, T_tgt - T_env)
+#             return torch.cat([x_sq, pad], dim=1).permute(1, 0)
+#         elif x.dim() == 2:
+#             if x.shape == (B, T - 1):
+#                 return x.permute(1, 0)
+#             elif x.shape[0] == T - 1:
+#                 return x[:, :B] if x.shape[1] >= B else x.expand(-1, B)
+#         return pred_abs_deg.new_zeros(T - 1, B)
+
+#     u500 = _align(u500_raw) * _UV500_SCALE
+#     v500 = _align(v500_raw) * _UV500_SCALE
+
+#     uv_magnitude = torch.sqrt(u500 ** 2 + v500 ** 2)
+#     has_steering  = (uv_magnitude > 0.5).float()
+
+#     env_dir  = torch.stack([u500, v500], dim=-1)
+#     tc_dir   = torch.stack([u_tc, v_tc],  dim=-1)
+#     env_norm = env_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
+#     tc_norm  = tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
+#     cos_sim  = ((env_dir / env_norm) * (tc_dir / tc_norm)).sum(-1)
+#     misalign = F.relu(-0.5 - cos_sim).pow(2)
+
+#     return (misalign * has_steering).mean() * 0.05
+
+
+
+# def pinn_bve_loss(pred_abs_deg: torch.Tensor,
+#                   batch_list,
+#                   env_data: Optional[dict] = None) -> torch.Tensor:
+#     T = pred_abs_deg.shape[0]
+#     if T < 3:
+#         return pred_abs_deg.new_zeros(())
+
+#     l_sw    = pinn_shallow_water(pred_abs_deg)
+#     l_steer = pinn_rankine_steering(pred_abs_deg, env_data)
+#     l_speed = pinn_speed_constraint(pred_abs_deg)
+
+#     total = l_sw + 0.5 * l_steer + 0.1 * l_speed
+#     return _soft_clamp_loss(total, max_val=20.0)
+# losses.py — thay toàn bộ phần PINN
+
+
+
+
 def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
                           env_data: Optional[dict]) -> torch.Tensor:
+    """
+    FIX: Dùng u/v500_center (ưu tiên) + mean làm steering vector.
+    FIX: has_steering threshold 0.5 → 3.0 m/s.
+    FIX: Padding bằng zeros (climatology) thay vì repeat obs cuối.
+    """
     if env_data is None:
         return pred_abs_deg.new_zeros(())
 
@@ -1158,54 +1303,134 @@ def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
     if T < 2:
         return pred_abs_deg.new_zeros(())
 
+    device  = pred_abs_deg.device
+    T_tgt   = T - 1
     DT      = DT_6H
+
     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
     lat_rad = torch.deg2rad(pred_abs_deg[:-1, :, 1])
     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
 
-    u_tc = dlat[:, :, 0] * cos_lat * 111000.0 / DT
-    v_tc = dlat[:, :, 1] * 111000.0 / DT
+    u_tc = dlat[:, :, 0] * cos_lat * 111000.0 / DT   # [T-1, B] m/s
+    v_tc = dlat[:, :, 1] * 111000.0 / DT              # [T-1, B] m/s
 
-    u500_raw = env_data.get("u500_mean", None)
-    v500_raw = env_data.get("v500_mean", None)
+    # FIX: center > mean, cả hai nếu có
+    u500 = _get_uv500_ms(env_data, "u500_mean", "u500_center",
+                         T_tgt, B, device)   # [T-1, B] m/s
+    v500 = _get_uv500_ms(env_data, "v500_mean", "v500_center",
+                         T_tgt, B, device)
 
-    if u500_raw is None or v500_raw is None:
-        speed = torch.sqrt(u_tc ** 2 + v_tc ** 2)
-        return F.relu(speed - 30.0).pow(2).mean() * 0.01
-
-    def _align(x: torch.Tensor) -> torch.Tensor:
-        if not torch.is_tensor(x):
-            return pred_abs_deg.new_zeros(T - 1, B)
-        x = x.to(pred_abs_deg.device)
-        if x.dim() == 3:
-            x_sq  = x[:, :, 0]
-            T_env = x_sq.shape[1]
-            T_tgt = T - 1
-            if T_env >= T_tgt:
-                return x_sq[:, :T_tgt].permute(1, 0)
-            pad = x_sq[:, -1:].expand(-1, T_tgt - T_env)
-            return torch.cat([x_sq, pad], dim=1).permute(1, 0)
-        elif x.dim() == 2:
-            if x.shape == (B, T - 1):
-                return x.permute(1, 0)
-            elif x.shape[0] == T - 1:
-                return x[:, :B] if x.shape[1] >= B else x.expand(-1, B)
-        return pred_abs_deg.new_zeros(T - 1, B)
-
-    u500 = _align(u500_raw) * _UV500_SCALE
-    v500 = _align(v500_raw) * _UV500_SCALE
-
-    uv_magnitude = torch.sqrt(u500 ** 2 + v500 ** 2)
-    has_steering  = (uv_magnitude > 0.5).float()
+    uv_mag       = torch.sqrt(u500**2 + v500**2)
+    # FIX: threshold 3.0 m/s thay vì 0.5
+    has_steering = (uv_mag > _STEERING_MIN_MS).float()
 
     env_dir  = torch.stack([u500, v500], dim=-1)
-    tc_dir   = torch.stack([u_tc, v_tc],  dim=-1)
-    env_norm = env_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
+    tc_dir   = torch.stack([u_tc,  v_tc], dim=-1)
+    env_norm = env_dir.norm(dim=-1, keepdim=True).clamp(min=1.0)
     tc_norm  = tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
     cos_sim  = ((env_dir / env_norm) * (tc_dir / tc_norm)).sum(-1)
-    misalign = F.relu(-0.5 - cos_sim).pow(2)
 
+    # Penalise chỉ khi hướng ngược (cos < -0.5) VÀ có steering thực sự
+    misalign = F.relu(-0.5 - cos_sim).pow(2)
     return (misalign * has_steering).mean() * 0.05
+
+
+def pinn_gph500_gradient(pred_abs_deg: torch.Tensor,
+                         env_data: Optional[dict]) -> torch.Tensor:
+    """
+    MỚI: GPH500 gradient loss.
+
+    Vật lý: TC di chuyển dọc theo đường đẳng áp (isobar) của GPH500.
+    - gph500_center < gph500_mean → TC ở rãnh thấp → xu hướng poleward
+    - gph500_center > gph500_mean → TC ở gờ cao    → xu hướng equatorward
+
+    Loss: nếu GPH gradient chỉ hướng poleward nhưng TC đi equatorward
+    (hoặc ngược lại) → penalise.
+
+    gph500_mean/center đã z-score: (raw_m - 5870) / 80.
+    Gradient = center - mean → đơn vị normalized.
+    """
+    if env_data is None:
+        return pred_abs_deg.new_zeros(())
+    T, B, _ = pred_abs_deg.shape
+    if T < 2:
+        return pred_abs_deg.new_zeros(())
+
+    device = pred_abs_deg.device
+    T_tgt  = T - 1
+
+    gph_mean   = _get_gph500_norm(env_data, "gph500_mean",
+                                  T_tgt, B, device)    # [T-1, B]
+    gph_center = _get_gph500_norm(env_data, "gph500_center",
+                                  T_tgt, B, device)    # [T-1, B]
+
+    # gradient: center - mean (normalized units)
+    # âm → TC ở vùng thấp hơn xung quanh → ridge ở phía bắc → đẩy TC về nam?
+    # dương → TC ở vùng cao hơn xung quanh → trough ở phía bắc → đẩy TC về bắc
+    gph_grad = gph_center - gph_mean   # [T-1, B]
+
+    # TC lat tendency
+    dlat   = pred_abs_deg[1:, :, 1] - pred_abs_deg[:-1, :, 1]  # [T-1, B] degrees
+    # Chuẩn hóa lat tendency
+    dlat_n = dlat / (dlat.abs().clamp(min=1e-4))  # sign only: +1 hay -1
+
+    # Khi gph_grad < -0.1 (rãnh sâu phía bắc) → TC nên đi poleward (dlat > 0)
+    # Khi gph_grad > +0.1 (ridge phía bắc)    → TC nên đi equatorward (dlat < 0)
+    # Expected sign of dlat = sign of -gph_grad (rough heuristic)
+    expected_sign = -torch.sign(gph_grad)
+    has_gradient  = (gph_grad.abs() > 0.1).float()  # chỉ penalise khi gradient rõ
+
+    # Penalise khi sign ngược
+    wrong_dir = F.relu(-(dlat_n * expected_sign)).pow(2)
+    return (wrong_dir * has_gradient).mean() * 0.02
+
+
+def pinn_steering_speed_consistency(pred_abs_deg: torch.Tensor,
+                                    env_data: Optional[dict]) -> torch.Tensor:
+    """
+    MỚI: TC speed phải gần với steering flow speed.
+
+    Vật lý: TC thường di chuyển với tốc độ ≈ 0.5–0.8 × |steering flow|.
+    Nếu TC di chuyển quá nhanh hoặc quá chậm so với steering → bất thường.
+
+    Dùng cả u500_mean và u500_center để ước lượng steering magnitude.
+    """
+    if env_data is None:
+        return pred_abs_deg.new_zeros(())
+    T, B, _ = pred_abs_deg.shape
+    if T < 2:
+        return pred_abs_deg.new_zeros(())
+
+    device = pred_abs_deg.device
+    T_tgt  = T - 1
+    DT     = DT_6H
+
+    dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
+    lat_rad = torch.deg2rad(pred_abs_deg[:-1, :, 1])
+    cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+    dx_km   = dlat[:, :, 0] * cos_lat * 111.0
+    dy_km   = dlat[:, :, 1] * 111.0
+    tc_speed_ms = torch.sqrt(dx_km**2 + dy_km**2) * 1000.0 / DT  # m/s
+
+    # Dùng mean của center và mean để ước lượng steering magnitude
+    u_c = _get_uv500_ms(env_data, "u500_mean", "u500_center", T_tgt, B, device)
+    v_c = _get_uv500_ms(env_data, "v500_mean", "v500_center", T_tgt, B, device)
+    u_m = _get_uv500_ms(env_data, "u500_mean", "u500_mean",   T_tgt, B, device)
+    v_m = _get_uv500_ms(env_data, "v500_mean", "v500_mean",   T_tgt, B, device)
+
+    steering_mag = (torch.sqrt(u_c**2 + v_c**2) +
+                    torch.sqrt(u_m**2 + v_m**2)) / 2.0   # m/s
+
+    has_steering = (steering_mag > _STEERING_MIN_MS).float()
+
+    # TC speed ≈ 0.5–1.0 × steering (empirical for WP TCs)
+    lo = steering_mag * 0.3
+    hi = steering_mag * 1.5
+    too_slow = F.relu(lo - tc_speed_ms)
+    too_fast = F.relu(tc_speed_ms - hi)
+
+    penalty = (too_slow.pow(2) + too_fast.pow(2)) / (_UV500_NORM**2)
+    return (penalty * has_steering).mean() * 0.03
 
 
 def pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
@@ -1219,19 +1444,46 @@ def pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
     speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
     return F.relu(speed - 600.0).pow(2).mean()
 
-
 def pinn_bve_loss(pred_abs_deg: torch.Tensor,
                   batch_list,
                   env_data: Optional[dict] = None) -> torch.Tensor:
+    """
+    FIX: Tận dụng đầy đủ 6 Data3d features:
+      u500_mean, u500_center → steering direction + speed consistency
+      v500_mean, v500_center → steering direction + speed consistency
+      gph500_mean, gph500_center → GPH gradient → lat tendency constraint
+
+    Breakdown:
+      l_sw    : shallow water equation residual (trajectory only)
+      l_steer : steering direction alignment (u/v center+mean)
+      l_speed : TC absolute speed cap (trajectory only)
+      l_gph   : GPH gradient → lat tendency (gph center vs mean)
+      l_spdcons: TC speed vs steering flow magnitude
+    """
     T = pred_abs_deg.shape[0]
     if T < 3:
         return pred_abs_deg.new_zeros(())
 
-    l_sw    = pinn_shallow_water(pred_abs_deg)
-    l_steer = pinn_rankine_steering(pred_abs_deg, env_data)
-    l_speed = pinn_speed_constraint(pred_abs_deg)
+    # env_data fallback
+    _env = env_data
+    if _env is None and batch_list is not None:
+        try:
+            _env = batch_list[13]
+        except (IndexError, TypeError):
+            _env = None
 
-    total = l_sw + 0.5 * l_steer + 0.1 * l_speed
+    l_sw      = pinn_shallow_water(pred_abs_deg)
+    l_steer   = pinn_rankine_steering(pred_abs_deg, _env)
+    l_speed   = pinn_speed_constraint(pred_abs_deg)
+    l_gph     = pinn_gph500_gradient(pred_abs_deg, _env)
+    l_spdcons = pinn_steering_speed_consistency(pred_abs_deg, _env)
+
+    total = (l_sw
+             + 0.5  * l_steer
+             + 0.1  * l_speed
+             + 0.3  * l_gph        # MỚI: GPH gradient
+             + 0.4  * l_spdcons)   # MỚI: speed vs steering
+
     return _soft_clamp_loss(total, max_val=20.0)
 
 
@@ -1369,9 +1621,23 @@ def compute_total_loss(
     l_pinn = pinn_bve_loss(pred_abs, batch_list, env_data=_env)
 
     # 5. Spread penalty  (FIX-L52)
+    # l_spread = pred_abs.new_zeros(())
+    # if all_trajs is not None and all_trajs.shape[0] >= 2:
+    #     l_spread = ensemble_spread_loss(all_trajs, max_spread_km=150.0)
+
+    # FIX: spread loss chỉ tính trên FM ensemble thật (không có sr_pred override)
+    # all_trajs trong get_loss_breakdown là FM samples trước khi blend
+    # → spread_loss phản ánh đúng ensemble diversity
     l_spread = pred_abs.new_zeros(())
     if all_trajs is not None and all_trajs.shape[0] >= 2:
-        l_spread = ensemble_spread_loss(all_trajs, max_spread_km=150.0)
+        # Chỉ tính spread cho steps 5-12 (FM range)
+        # Steps 1-4 do ShortRangeHead handle riêng
+        n_sr = 4
+        if all_trajs.shape[1] > n_sr:
+            l_spread = ensemble_spread_loss(
+                all_trajs[:, n_sr:, :, :],   # chỉ steps 5-12
+                max_spread_km=150.0
+            )
 
     # 6. Total  (short_range added externally in get_loss_breakdown)
     total = (
