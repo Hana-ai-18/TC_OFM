@@ -2082,35 +2082,24 @@ def main(args):
             bl = move(list(batch), device)
 
             if epoch == 0 and i == 0:
-                # Check env directory
+                # Đúng attribute name
                 try:
-                    env_dir = train_dataset.env_dir
+                    env_dir = train_dataset.env_path
                 except AttributeError:
                     try:
-                        env_dir = train_dataset.dataset.env_dir
+                        env_dir = train_dataset.dataset.env_path
                     except AttributeError:
                         env_dir = "UNKNOWN"
-                print(f"  Env dir: {env_dir}")
-
-                # Check 1 file .npy mẫu trực tiếp từ disk
-                import glob
-                npy_files = glob.glob(f"{env_dir}/**/*.npy", recursive=True)
-                print(f"  Số .npy files tìm thấy: {len(npy_files)}")
-                if npy_files:
-                    sample = np.load(npy_files[0], allow_pickle=True).item()
-                    print(f"  Sample .npy keys    : {list(sample.keys())}")
-                    print(f"  Sample has_data3d   : {sample.get('has_data3d')}")
-                    print(f"  Sample gph500_mean  : {sample.get('gph500_mean')}")
-                    print(f"  Sample u500_mean    : {sample.get('u500_mean')}")
-                    print(f"  Sample v500_mean    : {sample.get('v500_mean')}")
-
-                # Check tensor trong batch (sau collate)
+                print(f"  Env path     : {env_dir}")
+                print(f"  Env exists   : {os.path.exists(env_dir) if env_dir != 'UNKNOWN' else 'N/A'}")
+                print(f"  Root path    : {getattr(train_dataset, 'root_path', 'N/A')}")
+                        # Check tensor trong batch (sau collate)
                 _check_gph500(bl, train_dataset)
                 _check_uv500(bl)
 
             with autocast(device_type="cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl, step_weight_alpha=step_alpha)
-                
+
             loss_to_bp = bd["total"] / max(args.grad_accum, 1)
             scaler.scale(loss_to_bp).backward()
 

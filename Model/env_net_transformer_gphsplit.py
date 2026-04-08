@@ -464,19 +464,13 @@ BOUNDARY_THRESHOLDS = [0.05, 0.15, 0.30]
 DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # ── Normalisation constants ───────────────────────────────────────────────────
-# _GPH500_MEAN  = 33.64
-# _GPH500_STD   =  7.08
-# _GPH500C_MEAN = 32.84
-# _GPH500C_STD  =  1.03
-
-# _GPH500_SENTINEL_LO = 25.0
-# _GPH500_SENTINEL_HI = 95.0
-_GPH500_MEAN  = 5900.0   # meters (thay vì 33.64 dam)
-_GPH500_STD   =  200.0   # meters
-_GPH500C_MEAN = 5900.0
-_GPH500C_STD  =  200.0
-_GPH500_SENTINEL_LO = 4000.0   # meters (thay vì 25 dam)
-_GPH500_SENTINEL_HI = 7000.0   # meters (thay vì 95 dam)
+# ── GPH500 ──────────────────────────────────────────────────────
+_GPH500_MEAN      = 5880.0   # geopotential height (m), WNP ~588 dam
+_GPH500_STD       =  150.0   # std thực tế
+_GPH500C_MEAN     = 5880.0
+_GPH500C_STD      =  150.0
+_GPH500_VALID_MIN =  4000.0  # m
+_GPH500_VALID_MAX =  7000.0  # m
 
 # FIX-ENV-20A/B: u/v500 raw normalization constant (m/s)
 _UV500_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
@@ -726,79 +720,8 @@ def build_env_features_one_step(
     else:
         v = [-1] * 4
     feat["history_inte_change24"] = v
-
-    # # ── GPH500 ─────────────────────────────────────────────────────────────────
-    # already_normed_gph = isinstance(env_npy, dict) and env_npy.get("gph500_already_normed", False)
-    # for k, mean_val, std_val in [
-    #     ("gph500_mean",   _GPH500_MEAN,  _GPH500_STD),
-    #     ("gph500_center", _GPH500C_MEAN, _GPH500C_STD),
-    # ]:
-    #     val = 0.0
-    #     if isinstance(env_npy, dict) and k in env_npy:
-    #         raw = env_npy[k]
-    #         try:
-    #             raw = float(raw)
-    #         except (TypeError, ValueError):
-    #             raw = None
-
-    #         if raw is None or math.isnan(raw):
-    #             val = 0.0
-    #         elif already_normed_gph:
-    #             val = float(np.clip(raw, -3.0, 3.0))
-    #         elif raw < 100.0 or raw > 70000.0:
-    #             # sentinel: missing hoặc rác
-    #             val = 0.0
-    #         else:
-    #             # raw từ v12 là m²/s² (geopotential)
-    #             # → ÷9.8 ra geopotential height (m)
-    #             gph_m = raw / 9.8
-    #             val   = (gph_m - mean_val) / (std_val + 1e-8)
-    #             val   = float(np.clip(val, -3.0, 3.0))
-
-    #     feat[k] = [val]
-
-    #   # ── U500 / V500 (FIX-ENV-22) ───────────────────────────────────────────────
-    # # Source priority:
-    # #   1. .npy: key "u500_mean" đã trong [-1,1]  (build_env_data_scs_v10)
-    # #   2. CSV:  key "u500_raw_mean" (raw m²/s²)  → normalize /30
-    # #   3. 0.0 fallback
- 
-    # for feat_key, npy_key, csv_raw_keys in [
-    # ("u500_mean",   "u500_mean",   ["u500_raw_mean",   "d3d_u500_mean_raw"]),
-    # ("u500_center", "u500_center", ["u500_raw_center", "d3d_u500_center_raw"]),
-    # ("v500_mean",   "v500_mean",   ["v500_raw_mean",   "d3d_v500_mean_raw"]),
-    # ("v500_center", "v500_center", ["v500_raw_center", "d3d_v500_center_raw"]),
-    # ]:
-    #     val = 0.0
-    #     if isinstance(env_npy, dict):
-    #         if npy_key in env_npy:
-    #             try:
-    #                 candidate_f = float(env_npy[npy_key])
-    #                 has_3d          = env_npy.get("has_data3d", True)
-    #                 already_normed_uv = env_npy.get("uv500_already_normed", False)
-
-    #                 if not has_3d or candidate_f == 0.0:
-    #                     val = 0.0
-    #                 elif already_normed_uv:
-    #                     # .npy cũ đã normed → dùng trực tiếp
-    #                     val = float(np.clip(candidate_f, -1.0, 1.0))
-    #                 else:
-    #                     # v12: raw m/s → chia _UV500_NORM
-    #                     val = float(np.clip(candidate_f / _UV500_NORM, -1.0, 1.0))
-    #             except (TypeError, ValueError):
-    #                 val = 0.0
-
-    #         # Fallback CSV raw keys
-    #         if val == 0.0:
-    #             for rk in csv_raw_keys:
-    #                 if rk in env_npy:
-    #                     val = _read_uv500_from_csv(env_npy[rk])
-    #                     if val != 0.0:
-    #                         break
-
-    #     feat[feat_key] = [val]
     
-    # ── GPH500 ──────────────────────────────────────────────────────
+    # Trong build_env_features_one_step:
     for k, mean_val, std_val in [
         ("gph500_mean",   _GPH500_MEAN,  _GPH500_STD),
         ("gph500_center", _GPH500C_MEAN, _GPH500C_STD),
@@ -806,42 +729,16 @@ def build_env_features_one_step(
         val = 0.0
         if isinstance(env_npy, dict) and k in env_npy:
             has_3d = env_npy.get("has_data3d", False)
-            if not has_3d:
-                val = 0.0
-            else:
-                raw = env_npy[k]
+            if has_3d:
                 try:
-                    raw = float(raw)
+                    raw = float(env_npy[k])
+                    if _GPH500_VALID_MIN <= raw <= _GPH500_VALID_MAX:
+                        # raw đã là geopotential height (m), không cần ÷9.8
+                        val = (raw - mean_val) / (std_val + 1e-8)
+                        val = float(np.clip(val, -3.0, 3.0))
                 except (TypeError, ValueError):
-                    raw = None
-
-                if raw is None or math.isnan(raw) or raw < 100.0 or raw > 70000.0:
                     val = 0.0
-                else:
-                    # raw là geopotential m²/s² → ÷9.8 → geopotential height m
-                    gph_m = raw / 9.8
-                    val   = (gph_m - mean_val) / (std_val + 1e-8)
-                    val   = float(np.clip(val, -3.0, 3.0))
         feat[k] = [val]
-
-    # ── U500 / V500 ──────────────────────────────────────────────────
-    for feat_key, npy_key in [
-        ("u500_mean",   "u500_mean"),
-        ("u500_center", "u500_center"),
-        ("v500_mean",   "v500_mean"),
-        ("v500_center", "v500_center"),
-    ]:
-        val = 0.0
-        if isinstance(env_npy, dict):
-            has_3d = env_npy.get("has_data3d", False)
-            if has_3d and npy_key in env_npy:
-                try:
-                    raw = float(env_npy[npy_key])
-                    # raw là m/s → ÷30 → [-1, 1]
-                    val = float(np.clip(raw / _UV500_NORM, -1.0, 1.0))
-                except (TypeError, ValueError):
-                    val = 0.0
-        feat[feat_key] = [val]
     return feat
 
 
