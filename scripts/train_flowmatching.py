@@ -3339,13 +3339,24 @@ def main(args):
             except Exception as e:
                 print(f"  ⚠  full_eval failed ep {epoch}: {e}")
 
-        if (epoch + 1) % args.save_interval == 0:
-            torch.save({"epoch": epoch, "model_state_dict": model.state_dict()},
-                       os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"))
-
-        if saver.early_stop:
-            print(f"  Early stopping @ epoch {epoch}")
-            break
+        # if (epoch + 1) % args.save_interval == 0:
+        #     torch.save({"epoch": epoch, "model_state_dict": model.state_dict()},
+        #                os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"))
+        # Cuối mỗi epoch (thay save_interval)
+        # Bằng đoạn này — lưu TẤT CẢ mọi epoch:
+        torch.save(
+            {
+                "epoch"            : epoch,
+                "model_state_dict" : model.state_dict(),
+                "optimizer_state"  : optimizer.state_dict(),
+                "train_loss"       : avg_t,
+                "val_loss"         : last_val_loss,
+                "sr_ade_12h"       : m_fast.get("sr_ade_12h", float("nan")),
+                "blend_ade"        : m_fast.get("ADE", float("nan")),
+                "spread_72h"       : m_fast.get("spread_72h_km", 0.0),
+            },
+            os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"),
+        )
 
         if epoch % 5 == 4:
             avg_ep    = sum(epoch_times) / len(epoch_times)
