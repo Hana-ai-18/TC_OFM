@@ -2507,6 +2507,13 @@ def freeze_backbone(model):
     
     if n_frozen_params < 2_000_000:
         print("  ⚠️  WARNING: Expected >2M frozen params for backbone+ctx!")
+
+
+def unfreeze_all(model):
+    """Phase 2: unfreeze all parameters."""
+    for param in model.parameters():
+        param.requires_grad_(True)
+    print(f"  [Phase-2] Unfrozen all params")
 # ── Weight schedules ──────────────────────────────────────────────────────────
 
 def get_short_range_weight(epoch: int) -> float:

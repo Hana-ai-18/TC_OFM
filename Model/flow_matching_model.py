@@ -1837,8 +1837,10 @@ class TCFlowMatching(nn.Module):
         sigma_min:            float = 0.02,
         n_train_ens:          int   = 4,
         unet_in_ch:           int   = 13,
-        ctx_noise_scale:      float = 0.002,
-        initial_sample_sigma: float = 0.03,
+        # ctx_noise_scale:      float = 0.002,
+        # initial_sample_sigma: float = 0.03,
+        ctx_noise_scale:      float = 0.01,
+        initial_sample_sigma: float = 0.15,
         **kwargs,
     ):
         super().__init__()
@@ -2049,13 +2051,25 @@ class TCFlowMatching(nn.Module):
         traj_s: List[torch.Tensor] = []
         me_s:   List[torch.Tensor] = []
 
+        # for k in range(num_ensemble):
+        #     x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+
+        #     for step in range(ddim_steps):
+        #         t_b = torch.full((B,), step * dt, device=device)
+        #         ns  = self.ctx_noise_scale if step == 0 else 0.0
+        #         vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
+        #         x_t = x_t + dt * vel
         for k in range(num_ensemble):
             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
+            # Mỗi member dùng ctx với noise riêng → diversity đến từ ctx uncertainty
+            ctx_k = self.net._apply_ctx_head(
+                raw_ctx, noise_scale=self.ctx_noise_scale * 5.0  # tăng 5× khi sampling
+            )
+
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
-                ns  = self.ctx_noise_scale if step == 0 else 0.0
-                vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
+                vel = self.net._decode(x_t, t_b, ctx_k)
                 x_t = x_t + dt * vel
 
             x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
