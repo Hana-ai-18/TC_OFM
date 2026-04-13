@@ -772,6 +772,17 @@ def build_env_features_one_step(
                     val = 0.0
         feat[feat_key] = [val]
     # ── U500 / V500 ──────────────────────────────────────────────
+    # Thêm tạm vào đầu phần u/v500 trong build_env_features_one_step:
+    if not hasattr(build_env_features_one_step, '_uv_debug_done'):
+        build_env_features_one_step._uv_debug_done = True
+        print(f"\n[UV DEBUG] env_npy type={type(env_npy)}")
+        if isinstance(env_npy, dict):
+            print(f"[UV DEBUG] has_data3d={env_npy.get('has_data3d')}")
+            print(f"[UV DEBUG] u500_mean raw={env_npy.get('u500_mean')}  type={type(env_npy.get('u500_mean'))}")
+            print(f"[UV DEBUG] v500_mean raw={env_npy.get('v500_mean')}  type={type(env_npy.get('v500_mean'))}")
+            print(f"[UV DEBUG] all keys={list(env_npy.keys())}")
+        else:
+            print(f"[UV DEBUG] env_npy={env_npy}")
     for feat_key, npy_key in [
         ("u500_mean",   "u500_mean"),
         ("u500_center", "u500_center"),

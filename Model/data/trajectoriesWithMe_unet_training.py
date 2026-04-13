@@ -2604,6 +2604,23 @@ class TrajectoryDataset(Dataset):
             for p in candidates:
                 try:
                     raw = np.load(p, allow_pickle=True).item()
+                    # Thêm vào _load_env_npy, ngay sau raw = np.load(p, allow_pickle=True).item():
+                    if not hasattr(self, '_gph_unit_debug'):
+                        self._gph_unit_debug = True
+                        gph_val = raw.get('gph500_mean', 'MISSING')
+                        print(f"\n[GPH UNIT DEBUG]")
+                        print(f"  gph500_mean = {gph_val}")
+                        print(f"  Nếu đơn vị m²/s²: expect ~5500-6000")
+                        print(f"  Nếu đơn vị dam:    expect ~550-600")  
+                        print(f"  Nếu đơn vị z-score: expect ~-3 to 3")
+                        print(f"  Actual = {gph_val} → unit là ???")
+                        # Check tất cả numeric values
+                        for k, v in raw.items():
+                            try:
+                                fv = float(v)
+                                print(f"  {k} = {fv:.4f}")
+                            except:
+                                pass
                     # Trong _load_env_npy, sau dòng raw = np.load(p, allow_pickle=True).item():
                     if not hasattr(self, '_gph_debug_done'):
                         self._gph_debug_done = True
@@ -2640,19 +2657,23 @@ class TrajectoryDataset(Dataset):
 
                     
                     result = env_data_processing(remapped)
-                    # if not hasattr(self, '_debug_printed'):
-                    #     self._debug_printed = True
-                    #     print(f"\n  [DEBUG _load_env_npy] file={p}")
-                    #     print(f"  raw keys     : {list(raw.keys())}")
-                    #     print(f"  raw has_data3d : {raw.get('has_data3d')}")
-                    #     print(f"  raw u500_mean  : {raw.get('u500_mean')}")
-                    #     print(f"  remapped has_data3d : {remapped.get('has_data3d')}")
-                    #     print(f"  remapped u500_mean  : {remapped.get('u500_mean')}")
-                    #     print(f"  result has_data3d   : {result.get('has_data3d')}")
-                    #     print(f"  result u500_mean    : {result.get('u500_mean')}")
-                    #     print()
-
+                    # Trong _load_env_npy, sau dòng result = env_data_processing(remapped):
+                    if not hasattr(self, '_gph_load_debug2'):
+                        self._gph_load_debug2 = True
+                        print(f"\n[GPH LOAD DEBUG]")
+                        print(f"  remapped gph500_mean      = {remapped.get('gph500_mean')}")
+                        print(f"  remapped already_normed   = {remapped.get('gph500_already_normed')}")
+                        print(f"  result gph500_mean        = {result.get('gph500_mean')}")
+                        print(f"  result has_data3d         = {result.get('has_data3d')}")
+                   # Sau dòng: result = env_data_processing(remapped)
+                    if not hasattr(self, '_uv_load_debug'):
+                        self._uv_load_debug = True
+                        print(f"\n[LOAD DEBUG] u500_mean in result: {'u500_mean' in result}")
+                        print(f"[LOAD DEBUG] u500_mean value: {result.get('u500_mean', 'MISSING')}")
+                        print(f"[LOAD DEBUG] has_data3d: {result.get('has_data3d')}")
+                        print(f"[LOAD DEBUG] result keys: {list(result.keys())}")
                     return result
+                    
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
 
