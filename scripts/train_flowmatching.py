@@ -3314,7 +3314,7 @@ def main(args):
                       f"  sr={sr_loss:.4f}"
                       f"  bridge={bridge:.4f}"
                       f"  pinn={bd.get('pinn',0):.4f}"
-                      f"  spread={bd.get('spread',0):.3f}"
+                      f"  spread={bd.get('spread',0):.6f}"
                       f"  sr_w={epoch_weights['short_range']:.1f}"
                       f"  br_w={epoch_weights['bridge']:.1f}"
                       f"  alpha={step_alpha:.2f}"
