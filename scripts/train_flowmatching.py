@@ -2441,25 +2441,51 @@ def get_phase(epoch: int, phase2_start: int = 30) -> int:
     return 1 if epoch < phase2_start else 2
 
 
+# def freeze_backbone(model: TCFlowMatching) -> None:
+#     """
+#     FIX-T-C: Freeze backbone + ctx_fc1 + ctx_ln trong phase 1.
+#     raw_ctx từ frozen encoder chất lượng kém → ctx_fc1 cũng freeze
+#     để ShortRangeHead không học trên nhiễu.
+#     """
+#     frozen_keys = ["spatial_enc", "enc_1d", "env_enc",
+#                    "ctx_fc1", "ctx_ln"]   # FIX-T-C: thêm ctx_fc1, ctx_ln
+#     for name, param in model.named_parameters():
+#         if any(k in name for k in frozen_keys):
+#             param.requires_grad_(False)
+#     n_frozen = sum(not p.requires_grad for p in model.parameters())
+#     print(f"  [Phase-1] Frozen {n_frozen:,} params (backbone + ctx_fc1)")
+
+
+# def unfreeze_all(model: TCFlowMatching) -> None:
+#     for param in model.parameters():
+#         param.requires_grad_(True)
+#     print(f"  [Phase-2] Unfrozen all params")
+
+# Trong freeze_backbone — thêm cả prefix _orig_mod:
 def freeze_backbone(model: TCFlowMatching) -> None:
-    """
-    FIX-T-C: Freeze backbone + ctx_fc1 + ctx_ln trong phase 1.
-    raw_ctx từ frozen encoder chất lượng kém → ctx_fc1 cũng freeze
-    để ShortRangeHead không học trên nhiễu.
-    """
-    frozen_keys = ["spatial_enc", "enc_1d", "env_enc",
-                   "ctx_fc1", "ctx_ln"]   # FIX-T-C: thêm ctx_fc1, ctx_ln
+    frozen_keys = [
+        "spatial_enc", "enc_1d", "env_enc", "ctx_fc1", "ctx_ln",
+        # Sau torch.compile tên có thể có prefix:
+        "_orig_mod.net.spatial_enc", "_orig_mod.net.enc_1d",
+        "_orig_mod.net.env_enc",     "_orig_mod.net.ctx_fc1",
+        "_orig_mod.net.ctx_ln",
+        # Hoặc prefix net.:
+        "net.spatial_enc", "net.enc_1d", "net.env_enc",
+        "net.ctx_fc1",     "net.ctx_ln",
+    ]
+    n_frozen = 0
     for name, param in model.named_parameters():
         if any(k in name for k in frozen_keys):
             param.requires_grad_(False)
-    n_frozen = sum(not p.requires_grad for p in model.parameters())
-    print(f"  [Phase-1] Frozen {n_frozen:,} params (backbone + ctx_fc1)")
-
-
-def unfreeze_all(model: TCFlowMatching) -> None:
-    for param in model.parameters():
-        param.requires_grad_(True)
-    print(f"  [Phase-2] Unfrozen all params")
+            n_frozen += param.numel()
+    n_tensors = sum(not p.requires_grad for p in model.parameters())
+    print(f"  [Phase-1] Frozen {n_tensors} tensors / {n_frozen:,} params")
+    # Sanity check
+    if n_frozen < 1_000_000:
+        print(f"  ⚠️  WARNING: chỉ frozen {n_frozen:,} params — kiểm tra tên lại!")
+        print("  Tên params thực tế (10 đầu):")
+        for name, _ in list(model.named_parameters())[:10]:
+            print(f"    {name}")
 
 
 # ── Weight schedules ──────────────────────────────────────────────────────────

@@ -2570,6 +2570,13 @@ class TrajectoryDataset(Dataset):
             for p in candidates:
                 try:
                     raw = np.load(p, allow_pickle=True).item()
+                    # Trong _load_env_npy, sau dòng raw = np.load(p, allow_pickle=True).item():
+                    if not hasattr(self, '_gph_debug_done'):
+                        self._gph_debug_done = True
+                        print(f"\n  [GPH DEBUG] file={p}")
+                        print(f"  raw gph500_mean = {raw.get('gph500_mean')}")
+                        print(f"  raw has_data3d  = {raw.get('has_data3d')}")
+                        print(f"  raw keys = {[k for k in raw.keys() if 'gph' in k.lower()]}")
                     if not isinstance(raw, dict):
                         continue
 
