@@ -2344,6 +2344,10 @@ def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
 def _get_gph500_norm(env_data: dict, key: str,
                      T_tgt: int, B: int, device: torch.device) -> torch.Tensor:
     x = env_data.get(key, None)
+     # --- THÊM DÒNG NÀY ĐỂ DEBUG ---
+    if key == "gph500_mean" and x is not None:
+        print(f"DEBUG GPH: key={key}, shape={x.shape}, sum={x.sum().item()}, max={x.max().item()}")
+    # ------------------------------
     if x is None or not torch.is_tensor(x):
         return torch.zeros(T_tgt, B, device=device)
     x = x.to(device).float()
