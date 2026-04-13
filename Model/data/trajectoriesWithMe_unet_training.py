@@ -2069,13 +2069,13 @@ def env_data_processing(env_dict: dict) -> dict:
             val = cleaned[sst_key]
             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
                 cleaned[sst_key] = _SST_FILL_K
-    if not already_normed:
-        for gph_key in ("gph500_mean", "gph500_center"):
-            if gph_key in cleaned:
-                val = cleaned[gph_key]
-                if val is not None and isinstance(val, (int, float)):
-                    if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
-                        cleaned[gph_key] = None
+    # if not already_normed:
+    #     for gph_key in ("gph500_mean", "gph500_center"):
+    #         if gph_key in cleaned:
+    #             val = cleaned[gph_key]
+    #             if val is not None and isinstance(val, (int, float)):
+    #                 if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
+    #                     cleaned[gph_key] = None
     return cleaned
 
 

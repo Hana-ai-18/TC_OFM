@@ -2833,14 +2833,20 @@ def compute_total_loss(
         l_spread = ensemble_spread_loss(trajs_fm, max_spread_km=150.0)
 
     # 6. Bridge loss (FIX-L-H)
+    # l_bridge = pred_abs.new_zeros(())
+    # if sr_pred is not None and pred_samples is not None:
+    #     fm_mean = pred_samples.mean(0)   # [T, B, 2]  (FM ensemble mean, normalized)
+    #     # Chuyển FM mean sang degree
+    #     fm_mean_deg = _norm_to_deg(fm_mean)
+    #     sr_pred_deg = _norm_to_deg(sr_pred)   # [4, B, 2] degrees
+    #     l_bridge = bridge_loss(sr_pred_deg, fm_mean_deg)
+
+    # SỬA: bỏ _norm_to_deg khi gọi bridge_loss
     l_bridge = pred_abs.new_zeros(())
     if sr_pred is not None and pred_samples is not None:
-        fm_mean = pred_samples.mean(0)   # [T, B, 2]  (FM ensemble mean, normalized)
-        # Chuyển FM mean sang degree
-        fm_mean_deg = _norm_to_deg(fm_mean)
-        sr_pred_deg = _norm_to_deg(sr_pred)   # [4, B, 2] degrees
-        l_bridge = bridge_loss(sr_pred_deg, fm_mean_deg)
-
+        fm_mean = pred_samples.mean(0)   # [T, B, 2] normalized
+        # KHÔNG decode ở đây — bridge_loss tự decode bên trong
+        l_bridge = bridge_loss(sr_pred, fm_mean)
     # 7. Total
     # FIX-L-A: pinn KHÔNG nhân NRM — l_pinn đã có AdaptClamp(max=20)
     # Các loss directional nhân NRM để đưa về cùng thang với l_fm (km)

@@ -3101,18 +3101,32 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  params  : {n_params:,}")
 
+    # try:
+    #     model = torch.compile(model, mode="reduce-overhead")
+    #     print("  torch.compile: enabled")
+    # except Exception:
+    #     pass
+
+    # # # Phase 1: freeze backbone + ctx_fc1 (FIX-T-C)
+    # # freeze_backbone(model)
+    # optimizer = optim.AdamW(
+    #     filter(lambda p: p.requires_grad, model.parameters()),
+    #     lr=args.phase1_lr, weight_decay=args.weight_decay,
+    # )
+    # FIX: freeze TRƯỚC compile
+    freeze_backbone(model)
+    optimizer = optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.phase1_lr, weight_decay=args.weight_decay,
+    )
+
+    # compile SAU freeze
     try:
         model = torch.compile(model, mode="reduce-overhead")
         print("  torch.compile: enabled")
     except Exception:
         pass
 
-    # Phase 1: freeze backbone + ctx_fc1 (FIX-T-C)
-    freeze_backbone(model)
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.phase1_lr, weight_decay=args.weight_decay,
-    )
     steps_per_epoch = math.ceil(len(train_loader) / max(args.grad_accum, 1))
     total_steps     = steps_per_epoch * args.num_epochs
     warmup          = steps_per_epoch * args.warmup_epochs
