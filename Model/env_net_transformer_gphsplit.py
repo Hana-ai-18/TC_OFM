@@ -626,18 +626,31 @@ def intensity_class_onehot(wind_ms: float) -> list[int]:
 #     # Nếu = 0.0 → Data3d miss cho timestep này (builder fallback)
 #     return float(np.clip(v, -1.0, 1.0))
 
-def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
-    if not isinstance(env_npy, dict): return 0.0
-    if not env_npy.get("has_data3d", True): return 0.0
-    raw = env_npy.get(key, None)
+# def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
+#     if not isinstance(env_npy, dict): return 0.0
+#     if not env_npy.get("has_data3d", True): return 0.0
+#     raw = env_npy.get(key, None)
+#     if raw is None: return 0.0
+#     try:
+#         v = float(raw)
+#     except (TypeError, ValueError):
+#         return 0.0
+#     # FIX: raw là m/s (~±30), cần /30 rồi clip
+#     return float(np.clip(v / _UV500_NORM, -1.0, 1.0))
+#     # _UV500_NORM = 30.0 đã có sẵn trong file
+
+def _read_uv500_from_npy(env_data: dict, key: str) -> float:
+    if not isinstance(env_data, dict): return 0.0
+    if not env_data.get("has_data3d", True): return 0.0
+    raw = env_data.get(key, None)
     if raw is None: return 0.0
     try:
         v = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    # FIX: raw là m/s (~±30), cần /30 rồi clip
-    return float(np.clip(v / _UV500_NORM, -1.0, 1.0))
-    # _UV500_NORM = 30.0 đã có sẵn trong file
+    # Giá trị đã là z-score từ _normalize_data3d (mean≈0, std≈1)
+    # Chỉ clip để loại outlier, KHÔNG chia thêm
+    return float(np.clip(v, -3.0, 3.0))
 
 def _read_uv500_from_csv(raw_val, norm: float = _UV500_NORM) -> float:
     """
@@ -772,7 +785,8 @@ def build_env_features_one_step(
                 try:
                     raw = float(env_npy[npy_key])
                     # raw là m/s từ build_env_data_scs_v12 → ÷30 → [-1,1]
-                    val = float(np.clip(raw / _UV500_NORM, -1.0, 1.0))
+                    # val = float(np.clip(raw / _UV500_NORM, -1.0, 1.0))
+                    val = float(np.clip(raw, -3.0, 3.0))
                 except (TypeError, ValueError):
                     val = 0.0
         feat[feat_key] = [val]

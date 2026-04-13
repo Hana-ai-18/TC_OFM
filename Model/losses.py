@@ -2377,19 +2377,35 @@ def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
 #         return x[:T_tgt]
 #     pad = torch.zeros(T_tgt - T_obs, B, device=device)
 #     return torch.cat([x, pad], dim=0)
-def _get_gph500_norm(env_data, key, T_tgt, B, device):
+# def _get_gph500_norm(env_data, key, T_tgt, B, device):
+#     x = env_data.get(key, None)
+#     if x is None or not torch.is_tensor(x): return torch.zeros(T_tgt, B, device=device)
+#     x = x.to(device).float()
+#     if x.dim() == 3: x = x[..., 0]
+#     x = x.permute(1, 0)
+#     # FIX: data đã normalized từ build_env_features (~[-3,3]) → KHÔNG normalize lại
+#     # Bỏ check > 100 vì dam values (~32) sẽ bị nhầm là "đã normalized"
+#     # Chỉ clip để safety
+#     x = x.clamp(-3.0, 3.0)
+#     T_obs = x.shape[0]
+#     if T_obs >= T_tgt: return x[:T_tgt]
+#     return torch.cat([x, torch.zeros(T_tgt - T_obs, B, device=device)], 0)
+def _get_gph500_norm(env_data: dict, key: str,
+                     T_tgt: int, B: int, device) -> torch.Tensor:
     x = env_data.get(key, None)
-    if x is None or not torch.is_tensor(x): return torch.zeros(T_tgt, B, device=device)
+    if x is None or not torch.is_tensor(x):
+        return torch.zeros(T_tgt, B, device=device)
     x = x.to(device).float()
-    if x.dim() == 3: x = x[..., 0]
+    if x.dim() == 3:
+        x = x[..., 0]
     x = x.permute(1, 0)
-    # FIX: data đã normalized từ build_env_features (~[-3,3]) → KHÔNG normalize lại
-    # Bỏ check > 100 vì dam values (~32) sẽ bị nhầm là "đã normalized"
-    # Chỉ clip để safety
+    # Không normalize lại — đã được normalize trong build_env_features_one_step
     x = x.clamp(-3.0, 3.0)
     T_obs = x.shape[0]
-    if T_obs >= T_tgt: return x[:T_tgt]
-    return torch.cat([x, torch.zeros(T_tgt - T_obs, B, device=device)], 0)
+    if T_obs >= T_tgt:
+        return x[:T_tgt]
+    pad = torch.zeros(T_tgt - T_obs, B, device=device)
+    return torch.cat([x, pad], dim=0)
 
 def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     """BVE: bảo toàn độ xoáy tuyệt đối (Eq.55)."""
