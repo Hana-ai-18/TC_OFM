@@ -2051,26 +2051,27 @@ class TCFlowMatching(nn.Module):
         traj_s: List[torch.Tensor] = []
         me_s:   List[torch.Tensor] = []
 
-        # for k in range(num_ensemble):
-        #     x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
-
-        #     for step in range(ddim_steps):
-        #         t_b = torch.full((B,), step * dt, device=device)
-        #         ns  = self.ctx_noise_scale if step == 0 else 0.0
-        #         vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
-        #         x_t = x_t + dt * vel
         for k in range(num_ensemble):
             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
 
-            # Mỗi member dùng ctx với noise riêng → diversity đến từ ctx uncertainty
-            ctx_k = self.net._apply_ctx_head(
-                raw_ctx, noise_scale=self.ctx_noise_scale * 5.0  # tăng 5× khi sampling
-            )
-
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
-                vel = self.net._decode(x_t, t_b, ctx_k)
+                # ns  = self.ctx_noise_scale if step == 0 else 0.0
+                ns = self.ctx_noise_scale * 10.0 if step == 0 else 0.0
+                vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx, noise_scale=ns)
                 x_t = x_t + dt * vel
+        # for k in range(num_ensemble):
+        #     x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+
+        #     # Mỗi member dùng ctx với noise riêng → diversity đến từ ctx uncertainty
+        #     ctx_k = self.net._apply_ctx_head(
+        #         raw_ctx, noise_scale=self.ctx_noise_scale * 5.0  # tăng 5× khi sampling
+        #     )
+
+        #     for step in range(ddim_steps):
+        #         t_b = torch.full((B,), step * dt, device=device)
+        #         vel = self.net._decode(x_t, t_b, ctx_k)
+        #         x_t = x_t + dt * vel
 
             x_t = self._physics_correct(x_t, lp, lm, n_steps=5, lr=0.002)
             x_t = x_t.clamp(-3.0, 3.0)
