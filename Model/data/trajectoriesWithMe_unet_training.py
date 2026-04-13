@@ -2129,6 +2129,31 @@ def seq_collate(data):
         }
         all_keys -= _skip_keys
 
+        # for key in all_keys:
+        #     vals = []
+        #     for d in env_data_raw:
+        #         if isinstance(d, dict) and key in d:
+        #             v = d[key]
+        #             v = torch.tensor(v, dtype=torch.float) if not torch.is_tensor(v) else v.float()
+        #             vals.append(v)
+        #         else:
+        #             ref = next((d[key] for d in valid_envs if key in d), None)
+        #             if ref is not None:
+        #                 rt = torch.tensor(ref, dtype=torch.float) if not torch.is_tensor(ref) else ref.float()
+        #                 vals.append(torch.zeros_like(rt))
+        #             else:
+        #                 vals.append(torch.zeros(1))
+        #     try:
+        #         env_out[key] = torch.stack(vals, dim=0)
+        #     except Exception:
+        #         try:
+        #             mx     = max(v.numel() for v in vals)
+        #             padded = [F.pad(v.flatten(), (0, mx - v.numel())) for v in vals]
+        #             env_out[key] = torch.stack(padded, dim=0)
+        #         except Exception:
+        #             pass
+        # Trong seq_collate, phần xử lý env_out, thay đoạn try/except stack:
+
         for key in all_keys:
             vals = []
             for d in env_data_raw:
@@ -2146,13 +2171,22 @@ def seq_collate(data):
             try:
                 env_out[key] = torch.stack(vals, dim=0)
             except Exception:
+                # FIX: thay vì pad về cùng size (có thể broadcast sai),
+                # normalize tất cả về shape [dim] trước khi stack
                 try:
-                    mx     = max(v.numel() for v in vals)
-                    padded = [F.pad(v.flatten(), (0, mx - v.numel())) for v in vals]
-                    env_out[key] = torch.stack(padded, dim=0)
+                    # Tìm expected dim từ ENV_FEATURE_DIMS
+                    from Model.env_net_transformer_gphsplit import ENV_FEATURE_DIMS
+                    expected_dim = ENV_FEATURE_DIMS.get(key, 1)
+                    normed = []
+                    for v in vals:
+                        v_flat = v.flatten()
+                        if v_flat.numel() >= expected_dim:
+                            normed.append(v_flat[:expected_dim])
+                        else:
+                            normed.append(F.pad(v_flat, (0, expected_dim - v_flat.numel())))
+                    env_out[key] = torch.stack(normed, dim=0)  # [B, dim]
                 except Exception:
                     pass
-
     return (
         obs_traj_out, pred_traj_out, obs_rel_out, pred_rel_out,
         nlp_out, mask_out, seq_start_end,

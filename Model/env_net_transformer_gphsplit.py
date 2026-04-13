@@ -465,10 +465,16 @@ DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # ── Normalisation constants ───────────────────────────────────────────────────
 # ── GPH500 ──────────────────────────────────────────────────────
-_GPH500_MEAN_M  = 5880.0
-_GPH500_STD_M   =  150.0
-_GPH500_MIN_M   = 4000.0   # sentinel lo
-_GPH500_MAX_M   = 7000.0   # sentinel hi
+# _GPH500_MEAN_M  = 5880.0
+# _GPH500_STD_M   =  150.0
+# _GPH500_MIN_M   = 4000.0   # sentinel lo
+# _GPH500_MAX_M   = 7000.0   # sentinel hi
+# Đổi constants về đơn vị dam (decameters), vì .npy lưu dam
+_GPH500_MIN_DAM = 400.0   # ~4000m / 10
+_GPH500_MAX_DAM = 700.0   # ~7000m / 10
+_GPH500_MEAN_DAM = 587.0  # ~5870m / 10
+_GPH500_STD_DAM  = 8.0    # ~80m / 10
+
 
 # FIX-ENV-20A/B: u/v500 raw normalization constant (m/s)
 _UV500_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
@@ -720,25 +726,38 @@ def build_env_features_one_step(
     feat["history_inte_change24"] = v
     
     # Trong build_env_features_one_step:
-    for feat_key, npy_key in [
-        ("gph500_mean",   "gph500_mean"),
-        ("gph500_center", "gph500_center"),
-    ]:
+    # for feat_key, npy_key in [
+    #     ("gph500_mean",   "gph500_mean"),
+    #     ("gph500_center", "gph500_center"),
+    # ]:
+    #     val = 0.0
+    #     if isinstance(env_npy, dict):
+    #         has_3d = env_npy.get("has_data3d", False)
+    #         if has_3d and npy_key in env_npy:
+    #             try:
+    #                 raw = float(env_npy[npy_key])
+    #                 if _GPH500_MIN_M <= raw <= _GPH500_MAX_M:
+    #                     # raw là geopotential height (m) → normalize trực tiếp
+    #                     val = (raw - _GPH500_MEAN_M) / (_GPH500_STD_M + 1e-8)
+    #                     val = float(np.clip(val, -3.0, 3.0))
+    #                 # else: ngoài range → val = 0.0 (missing/sentinel)
+    #             except (TypeError, ValueError):
+    #                 val = 0.0
+    #     feat[feat_key] = [val]
+    for feat_key, npy_key in [("gph500_mean", "gph500_mean"), ("gph500_center", "gph500_center")]:
         val = 0.0
         if isinstance(env_npy, dict):
             has_3d = env_npy.get("has_data3d", False)
             if has_3d and npy_key in env_npy:
                 try:
                     raw = float(env_npy[npy_key])
-                    if _GPH500_MIN_M <= raw <= _GPH500_MAX_M:
-                        # raw là geopotential height (m) → normalize trực tiếp
-                        val = (raw - _GPH500_MEAN_M) / (_GPH500_STD_M + 1e-8)
+                    if _GPH500_MIN_DAM <= raw <= _GPH500_MAX_DAM:
+                        val = (raw - _GPH500_MEAN_DAM) / (_GPH500_STD_DAM + 1e-8)
                         val = float(np.clip(val, -3.0, 3.0))
-                    # else: ngoài range → val = 0.0 (missing/sentinel)
+                    # else: missing/sentinel → val = 0.0
                 except (TypeError, ValueError):
                     val = 0.0
         feat[feat_key] = [val]
-    
     # ── U500 / V500 ──────────────────────────────────────────────
     for feat_key, npy_key in [
         ("u500_mean",   "u500_mean"),

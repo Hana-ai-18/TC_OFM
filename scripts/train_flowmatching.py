@@ -2461,33 +2461,52 @@ def get_phase(epoch: int, phase2_start: int = 30) -> int:
 #         param.requires_grad_(True)
 #     print(f"  [Phase-2] Unfrozen all params")
 
-# Trong freeze_backbone — thêm cả prefix _orig_mod:
-def freeze_backbone(model: TCFlowMatching) -> None:
-    frozen_keys = [
-        "spatial_enc", "enc_1d", "env_enc", "ctx_fc1", "ctx_ln",
-        # Sau torch.compile tên có thể có prefix:
-        "_orig_mod.net.spatial_enc", "_orig_mod.net.enc_1d",
-        "_orig_mod.net.env_enc",     "_orig_mod.net.ctx_fc1",
-        "_orig_mod.net.ctx_ln",
-        # Hoặc prefix net.:
-        "net.spatial_enc", "net.enc_1d", "net.env_enc",
-        "net.ctx_fc1",     "net.ctx_ln",
-    ]
-    n_frozen = 0
+# # Trong freeze_backbone — thêm cả prefix _orig_mod:
+# def freeze_backbone(model: TCFlowMatching) -> None:
+#     frozen_keys = [
+#         "spatial_enc", "enc_1d", "env_enc", "ctx_fc1", "ctx_ln",
+#         # Sau torch.compile tên có thể có prefix:
+#         "_orig_mod.net.spatial_enc", "_orig_mod.net.enc_1d",
+#         "_orig_mod.net.env_enc",     "_orig_mod.net.ctx_fc1",
+#         "_orig_mod.net.ctx_ln",
+#         # Hoặc prefix net.:
+#         "net.spatial_enc", "net.enc_1d", "net.env_enc",
+#         "net.ctx_fc1",     "net.ctx_ln",
+#     ]
+#     n_frozen = 0
+#     for name, param in model.named_parameters():
+#         if any(k in name for k in frozen_keys):
+#             param.requires_grad_(False)
+#             n_frozen += param.numel()
+#     n_tensors = sum(not p.requires_grad for p in model.parameters())
+#     print(f"  [Phase-1] Frozen {n_tensors} tensors / {n_frozen:,} params")
+#     # Sanity check
+#     if n_frozen < 1_000_000:
+#         print(f"  ⚠️  WARNING: chỉ frozen {n_frozen:,} params — kiểm tra tên lại!")
+#         print("  Tên params thực tế (10 đầu):")
+#         for name, _ in list(model.named_parameters())[:10]:
+#             print(f"    {name}")
+
+def freeze_backbone(model):
+    frozen_keys = ["spatial_enc", "enc_1d", "env_enc", "ctx_fc1", "ctx_ln",
+                   "net.spatial_enc", "net.enc_1d", "net.env_enc", "net.ctx_fc1", "net.ctx_ln"]
+    n_frozen_params = 0
     for name, param in model.named_parameters():
         if any(k in name for k in frozen_keys):
             param.requires_grad_(False)
-            n_frozen += param.numel()
-    n_tensors = sum(not p.requires_grad for p in model.parameters())
-    print(f"  [Phase-1] Frozen {n_tensors} tensors / {n_frozen:,} params")
-    # Sanity check
-    if n_frozen < 1_000_000:
-        print(f"  ⚠️  WARNING: chỉ frozen {n_frozen:,} params — kiểm tra tên lại!")
-        print("  Tên params thực tế (10 đầu):")
-        for name, _ in list(model.named_parameters())[:10]:
-            print(f"    {name}")
-
-
+            n_frozen_params += param.numel()
+    
+    # Debug: list frozen modules
+    frozen_modules = set()
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            top = name.split('.')[0] if '.' in name else name
+            frozen_modules.add(top)
+    print(f"  [Phase-1] Frozen {n_frozen_params:,} / {sum(p.numel() for p in model.parameters()):,} params")
+    print(f"  Frozen modules: {sorted(frozen_modules)}")
+    
+    if n_frozen_params < 2_000_000:
+        print("  ⚠️  WARNING: Expected >2M frozen params for backbone+ctx!")
 # ── Weight schedules ──────────────────────────────────────────────────────────
 
 def get_short_range_weight(epoch: int) -> float:
@@ -2947,6 +2966,20 @@ def _check_gph500(bl, train_dataset):
             print(f"  ⚠️  {key}: mean={mn:.3f} ngoài range [{lo},{hi}]")
 
 
+# def _check_uv500(bl):
+#     env_data = bl[13]
+#     if env_data is None: return
+#     for key in ("u500_mean", "v500_mean"):
+#         if key not in env_data:
+#             print(f"  ⚠️  {key} MISSING"); continue
+#         v    = env_data[key]
+#         mn   = v.mean().item()
+#         std  = v.std().item()
+#         zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
+#         if zero > 80.0:
+#             print(f"  ⚠️  {key}: zero={zero:.1f}% → u/v500 missing!")
+#         else:
+#             print(f"  ✅ {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
 def _check_uv500(bl):
     env_data = bl[13]
     if env_data is None: return
@@ -2954,14 +2987,13 @@ def _check_uv500(bl):
         if key not in env_data:
             print(f"  ⚠️  {key} MISSING"); continue
         v    = env_data[key]
+        print(f"  {key} raw tensor shape: {v.shape}")  # THÊM DÒNG NÀY
         mn   = v.mean().item()
         std  = v.std().item()
-        zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
-        if zero > 80.0:
-            print(f"  ⚠️  {key}: zero={zero:.1f}% → u/v500 missing!")
-        else:
-            print(f"  ✅ {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
-
+        # In thêm vài giá trị cụ thể để xem variation
+        flat = v.flatten()
+        print(f"  first 8 vals: {flat[:8].tolist()}")   # THÊM DÒNG NÀY
+        print(f"  mean={mn:.4f} std={std:.4f}")
 
 def _load_baseline_errors(path, name):
     if path is None:
