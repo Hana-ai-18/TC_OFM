@@ -465,16 +465,10 @@ DELTA_VEL_BINS      = [-20.0, -5.0, 5.0, 20.0]
 
 # ── Normalisation constants ───────────────────────────────────────────────────
 # ── GPH500 ──────────────────────────────────────────────────────
-# _GPH500_MEAN_M  = 5880.0
-# _GPH500_STD_M   =  150.0
-# _GPH500_MIN_M   = 4000.0   # sentinel lo
-# _GPH500_MAX_M   = 7000.0   # sentinel hi
-# Đổi constants về đơn vị dam (decameters), vì .npy lưu dam
-_GPH500_MIN_DAM = 400.0   # ~4000m / 10
-_GPH500_MAX_DAM = 700.0   # ~7000m / 10
-_GPH500_MEAN_DAM = 587.0  # ~5870m / 10
-_GPH500_STD_DAM  = 8.0    # ~80m / 10
-
+_GPH500_MEAN_M  = 5880.0
+_GPH500_STD_M   =  150.0
+_GPH500_MIN_M   = 4000.0   # sentinel lo
+_GPH500_MAX_M   = 7000.0   # sentinel hi
 
 # FIX-ENV-20A/B: u/v500 raw normalization constant (m/s)
 _UV500_NORM = 30.0   # clip raw u/v500 (m/s) to [-30,30] → [-1,1]
@@ -626,31 +620,18 @@ def intensity_class_onehot(wind_ms: float) -> list[int]:
 #     # Nếu = 0.0 → Data3d miss cho timestep này (builder fallback)
 #     return float(np.clip(v, -1.0, 1.0))
 
-# def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
-#     if not isinstance(env_npy, dict): return 0.0
-#     if not env_npy.get("has_data3d", True): return 0.0
-#     raw = env_npy.get(key, None)
-#     if raw is None: return 0.0
-#     try:
-#         v = float(raw)
-#     except (TypeError, ValueError):
-#         return 0.0
-#     # FIX: raw là m/s (~±30), cần /30 rồi clip
-#     return float(np.clip(v / _UV500_NORM, -1.0, 1.0))
-#     # _UV500_NORM = 30.0 đã có sẵn trong file
-
-def _read_uv500_from_npy(env_data: dict, key: str) -> float:
-    if not isinstance(env_data, dict): return 0.0
-    if not env_data.get("has_data3d", True): return 0.0
-    raw = env_data.get(key, None)
+def _read_uv500_from_npy(env_npy: dict, key: str) -> float:
+    if not isinstance(env_npy, dict): return 0.0
+    if not env_npy.get("has_data3d", True): return 0.0
+    raw = env_npy.get(key, None)
     if raw is None: return 0.0
     try:
         v = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    # Giá trị đã là z-score từ _normalize_data3d (mean≈0, std≈1)
-    # Chỉ clip để loại outlier, KHÔNG chia thêm
-    return float(np.clip(v, -3.0, 3.0))
+    # FIX: raw là m/s (~±30), cần /30 rồi clip
+    return float(np.clip(v / _UV500_NORM, -1.0, 1.0))
+    # _UV500_NORM = 30.0 đã có sẵn trong file
 
 def _read_uv500_from_csv(raw_val, norm: float = _UV500_NORM) -> float:
     """
@@ -739,50 +720,26 @@ def build_env_features_one_step(
     feat["history_inte_change24"] = v
     
     # Trong build_env_features_one_step:
-    # for feat_key, npy_key in [
-    #     ("gph500_mean",   "gph500_mean"),
-    #     ("gph500_center", "gph500_center"),
-    # ]:
-    #     val = 0.0
-    #     if isinstance(env_npy, dict):
-    #         has_3d = env_npy.get("has_data3d", False)
-    #         if has_3d and npy_key in env_npy:
-    #             try:
-    #                 raw = float(env_npy[npy_key])
-    #                 if _GPH500_MIN_M <= raw <= _GPH500_MAX_M:
-    #                     # raw là geopotential height (m) → normalize trực tiếp
-    #                     val = (raw - _GPH500_MEAN_M) / (_GPH500_STD_M + 1e-8)
-    #                     val = float(np.clip(val, -3.0, 3.0))
-    #                 # else: ngoài range → val = 0.0 (missing/sentinel)
-    #             except (TypeError, ValueError):
-    #                 val = 0.0
-    #     feat[feat_key] = [val]
-    for feat_key, npy_key in [("gph500_mean", "gph500_mean"), ("gph500_center", "gph500_center")]:
+    for feat_key, npy_key in [
+        ("gph500_mean",   "gph500_mean"),
+        ("gph500_center", "gph500_center"),
+    ]:
         val = 0.0
         if isinstance(env_npy, dict):
             has_3d = env_npy.get("has_data3d", False)
             if has_3d and npy_key in env_npy:
                 try:
                     raw = float(env_npy[npy_key])
-                    if _GPH500_MIN_DAM <= raw <= _GPH500_MAX_DAM:
-                        val = (raw - _GPH500_MEAN_DAM) / (_GPH500_STD_DAM + 1e-8)
+                    if _GPH500_MIN_M <= raw <= _GPH500_MAX_M:
+                        # raw là geopotential height (m) → normalize trực tiếp
+                        val = (raw - _GPH500_MEAN_M) / (_GPH500_STD_M + 1e-8)
                         val = float(np.clip(val, -3.0, 3.0))
-                    # else: missing/sentinel → val = 0.0
+                    # else: ngoài range → val = 0.0 (missing/sentinel)
                 except (TypeError, ValueError):
                     val = 0.0
         feat[feat_key] = [val]
+    
     # ── U500 / V500 ──────────────────────────────────────────────
-    # Thêm tạm vào đầu phần u/v500 trong build_env_features_one_step:
-    if not hasattr(build_env_features_one_step, '_uv_debug_done'):
-        build_env_features_one_step._uv_debug_done = True
-        print(f"\n[UV DEBUG] env_npy type={type(env_npy)}")
-        if isinstance(env_npy, dict):
-            print(f"[UV DEBUG] has_data3d={env_npy.get('has_data3d')}")
-            print(f"[UV DEBUG] u500_mean raw={env_npy.get('u500_mean')}  type={type(env_npy.get('u500_mean'))}")
-            print(f"[UV DEBUG] v500_mean raw={env_npy.get('v500_mean')}  type={type(env_npy.get('v500_mean'))}")
-            print(f"[UV DEBUG] all keys={list(env_npy.keys())}")
-        else:
-            print(f"[UV DEBUG] env_npy={env_npy}")
     for feat_key, npy_key in [
         ("u500_mean",   "u500_mean"),
         ("u500_center", "u500_center"),
@@ -796,8 +753,7 @@ def build_env_features_one_step(
                 try:
                     raw = float(env_npy[npy_key])
                     # raw là m/s từ build_env_data_scs_v12 → ÷30 → [-1,1]
-                    # val = float(np.clip(raw / _UV500_NORM, -1.0, 1.0))
-                    val = float(np.clip(raw, -3.0, 3.0))
+                    val = float(np.clip(raw / _UV500_NORM, -1.0, 1.0))
                 except (TypeError, ValueError):
                     val = 0.0
         feat[feat_key] = [val]

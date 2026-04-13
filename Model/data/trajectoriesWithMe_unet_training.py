@@ -2069,13 +2069,13 @@ def env_data_processing(env_dict: dict) -> dict:
             val = cleaned[sst_key]
             if val is None or val == 0 or (isinstance(val, float) and val < _SST_VALID_MIN):
                 cleaned[sst_key] = _SST_FILL_K
-    # if not already_normed:
-    #     for gph_key in ("gph500_mean", "gph500_center"):
-    #         if gph_key in cleaned:
-    #             val = cleaned[gph_key]
-    #             if val is not None and isinstance(val, (int, float)):
-    #                 if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
-    #                     cleaned[gph_key] = None
+    if not already_normed:
+        for gph_key in ("gph500_mean", "gph500_center"):
+            if gph_key in cleaned:
+                val = cleaned[gph_key]
+                if val is not None and isinstance(val, (int, float)):
+                    if val < _DATA3D_GPH_VALID_MIN or val > _DATA3D_GPH_VALID_MAX:
+                        cleaned[gph_key] = None
     return cleaned
 
 
@@ -2129,31 +2129,6 @@ def seq_collate(data):
         }
         all_keys -= _skip_keys
 
-        # for key in all_keys:
-        #     vals = []
-        #     for d in env_data_raw:
-        #         if isinstance(d, dict) and key in d:
-        #             v = d[key]
-        #             v = torch.tensor(v, dtype=torch.float) if not torch.is_tensor(v) else v.float()
-        #             vals.append(v)
-        #         else:
-        #             ref = next((d[key] for d in valid_envs if key in d), None)
-        #             if ref is not None:
-        #                 rt = torch.tensor(ref, dtype=torch.float) if not torch.is_tensor(ref) else ref.float()
-        #                 vals.append(torch.zeros_like(rt))
-        #             else:
-        #                 vals.append(torch.zeros(1))
-        #     try:
-        #         env_out[key] = torch.stack(vals, dim=0)
-        #     except Exception:
-        #         try:
-        #             mx     = max(v.numel() for v in vals)
-        #             padded = [F.pad(v.flatten(), (0, mx - v.numel())) for v in vals]
-        #             env_out[key] = torch.stack(padded, dim=0)
-        #         except Exception:
-        #             pass
-        # Trong seq_collate, phần xử lý env_out, thay đoạn try/except stack:
-
         for key in all_keys:
             vals = []
             for d in env_data_raw:
@@ -2171,22 +2146,13 @@ def seq_collate(data):
             try:
                 env_out[key] = torch.stack(vals, dim=0)
             except Exception:
-                # FIX: thay vì pad về cùng size (có thể broadcast sai),
-                # normalize tất cả về shape [dim] trước khi stack
                 try:
-                    # Tìm expected dim từ ENV_FEATURE_DIMS
-                    from Model.env_net_transformer_gphsplit import ENV_FEATURE_DIMS
-                    expected_dim = ENV_FEATURE_DIMS.get(key, 1)
-                    normed = []
-                    for v in vals:
-                        v_flat = v.flatten()
-                        if v_flat.numel() >= expected_dim:
-                            normed.append(v_flat[:expected_dim])
-                        else:
-                            normed.append(F.pad(v_flat, (0, expected_dim - v_flat.numel())))
-                    env_out[key] = torch.stack(normed, dim=0)  # [B, dim]
+                    mx     = max(v.numel() for v in vals)
+                    padded = [F.pad(v.flatten(), (0, mx - v.numel())) for v in vals]
+                    env_out[key] = torch.stack(padded, dim=0)
                 except Exception:
                     pass
+
     return (
         obs_traj_out, pred_traj_out, obs_rel_out, pred_rel_out,
         nlp_out, mask_out, seq_start_end,
@@ -2604,30 +2570,6 @@ class TrajectoryDataset(Dataset):
             for p in candidates:
                 try:
                     raw = np.load(p, allow_pickle=True).item()
-                    # Thêm vào _load_env_npy, ngay sau raw = np.load(p, allow_pickle=True).item():
-                    if not hasattr(self, '_gph_unit_debug'):
-                        self._gph_unit_debug = True
-                        gph_val = raw.get('gph500_mean', 'MISSING')
-                        print(f"\n[GPH UNIT DEBUG]")
-                        print(f"  gph500_mean = {gph_val}")
-                        print(f"  Nếu đơn vị m²/s²: expect ~5500-6000")
-                        print(f"  Nếu đơn vị dam:    expect ~550-600")  
-                        print(f"  Nếu đơn vị z-score: expect ~-3 to 3")
-                        print(f"  Actual = {gph_val} → unit là ???")
-                        # Check tất cả numeric values
-                        for k, v in raw.items():
-                            try:
-                                fv = float(v)
-                                print(f"  {k} = {fv:.4f}")
-                            except:
-                                pass
-                    # Trong _load_env_npy, sau dòng raw = np.load(p, allow_pickle=True).item():
-                    if not hasattr(self, '_gph_debug_done'):
-                        self._gph_debug_done = True
-                        print(f"\n  [GPH DEBUG] file={p}")
-                        print(f"  raw gph500_mean = {raw.get('gph500_mean')}")
-                        print(f"  raw has_data3d  = {raw.get('has_data3d')}")
-                        print(f"  raw keys = {[k for k in raw.keys() if 'gph' in k.lower()]}")
                     if not isinstance(raw, dict):
                         continue
 
@@ -2657,23 +2599,19 @@ class TrajectoryDataset(Dataset):
 
                     
                     result = env_data_processing(remapped)
-                    # Trong _load_env_npy, sau dòng result = env_data_processing(remapped):
-                    if not hasattr(self, '_gph_load_debug2'):
-                        self._gph_load_debug2 = True
-                        print(f"\n[GPH LOAD DEBUG]")
-                        print(f"  remapped gph500_mean      = {remapped.get('gph500_mean')}")
-                        print(f"  remapped already_normed   = {remapped.get('gph500_already_normed')}")
-                        print(f"  result gph500_mean        = {result.get('gph500_mean')}")
-                        print(f"  result has_data3d         = {result.get('has_data3d')}")
-                   # Sau dòng: result = env_data_processing(remapped)
-                    if not hasattr(self, '_uv_load_debug'):
-                        self._uv_load_debug = True
-                        print(f"\n[LOAD DEBUG] u500_mean in result: {'u500_mean' in result}")
-                        print(f"[LOAD DEBUG] u500_mean value: {result.get('u500_mean', 'MISSING')}")
-                        print(f"[LOAD DEBUG] has_data3d: {result.get('has_data3d')}")
-                        print(f"[LOAD DEBUG] result keys: {list(result.keys())}")
+                    # if not hasattr(self, '_debug_printed'):
+                    #     self._debug_printed = True
+                    #     print(f"\n  [DEBUG _load_env_npy] file={p}")
+                    #     print(f"  raw keys     : {list(raw.keys())}")
+                    #     print(f"  raw has_data3d : {raw.get('has_data3d')}")
+                    #     print(f"  raw u500_mean  : {raw.get('u500_mean')}")
+                    #     print(f"  remapped has_data3d : {remapped.get('has_data3d')}")
+                    #     print(f"  remapped u500_mean  : {remapped.get('u500_mean')}")
+                    #     print(f"  result has_data3d   : {result.get('has_data3d')}")
+                    #     print(f"  result u500_mean    : {result.get('u500_mean')}")
+                    #     print()
+
                     return result
-                    
                 except Exception as e:
                     logger.debug(f"env npy load error {p}: {e}")
 

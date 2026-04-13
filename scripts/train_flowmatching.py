@@ -2966,20 +2966,6 @@ def _check_gph500(bl, train_dataset):
             print(f"  ⚠️  {key}: mean={mn:.3f} ngoài range [{lo},{hi}]")
 
 
-# def _check_uv500(bl):
-#     env_data = bl[13]
-#     if env_data is None: return
-#     for key in ("u500_mean", "v500_mean"):
-#         if key not in env_data:
-#             print(f"  ⚠️  {key} MISSING"); continue
-#         v    = env_data[key]
-#         mn   = v.mean().item()
-#         std  = v.std().item()
-#         zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
-#         if zero > 80.0:
-#             print(f"  ⚠️  {key}: zero={zero:.1f}% → u/v500 missing!")
-#         else:
-#             print(f"  ✅ {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
 def _check_uv500(bl):
     env_data = bl[13]
     if env_data is None: return
@@ -2987,13 +2973,14 @@ def _check_uv500(bl):
         if key not in env_data:
             print(f"  ⚠️  {key} MISSING"); continue
         v    = env_data[key]
-        print(f"  {key} raw tensor shape: {v.shape}")  # THÊM DÒNG NÀY
         mn   = v.mean().item()
         std  = v.std().item()
-        # In thêm vài giá trị cụ thể để xem variation
-        flat = v.flatten()
-        print(f"  first 8 vals: {flat[:8].tolist()}")   # THÊM DÒNG NÀY
-        print(f"  mean={mn:.4f} std={std:.4f}")
+        zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
+        if zero > 80.0:
+            print(f"  ⚠️  {key}: zero={zero:.1f}% → u/v500 missing!")
+        else:
+            print(f"  ✅ {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
+
 
 def _load_baseline_errors(path, name):
     if path is None:
