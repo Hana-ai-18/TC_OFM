@@ -2091,8 +2091,13 @@ class TCFlowMatching(nn.Module):
         # Blend: step 1-4 từ SR, 5-12 từ FM mean
         fm_mean   = all_trajs.mean(0)      # [T, B, 2]
         pred_mean = fm_mean.clone()
-        pred_mean[:n_sr] = sr_pred         # override pred_mean, giữ all_trajs nguyên
+        # pred_mean[:n_sr] = sr_pred         # override pred_mean, giữ all_trajs nguyên
 
+        # Dùng:
+        alpha = torch.linspace(0.0, 1.0, n_sr, device=device).view(n_sr, 1, 1)
+        pred_mean[:n_sr] = (1 - alpha) * sr_pred + alpha * fm_mean[:n_sr]
+        
+        # step 1: 100% SR, step 4: 50% SR + 50% FM → smooth transition
         me_mean = all_me.mean(0)
 
         if predict_csv:
