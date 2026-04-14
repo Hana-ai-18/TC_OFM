@@ -2397,8 +2397,9 @@ def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
     # Scale = 0.1 m/s²: typical TC → residual ~1e-3 → loss ~1e-4 (không penalize)
     # Bad traj → residual ~0.1 → loss ~1.0 (penalize mạnh)
     scale = 0.1
-    loss = ((res_u_corrected / scale).pow(2).mean()
-          + (res_v / scale).pow(2).mean())
+    # loss = ((res_u_corrected / scale).pow(2).mean()
+    #       + (res_v / scale).pow(2).mean())
+    loss = ((res_u_corrected / scale).pow(2) + (res_v / scale).pow(2)) 
     return loss
 
 
@@ -2438,8 +2439,8 @@ def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
     # Sigmoid soft weighting (Eq.59): penalize liên tục thay vì ngưỡng cứng
     steer_w  = torch.sigmoid(uv_mag - 1.0)   # ≈0.27 tại 0 m/s, ≈0.5 tại 1 m/s
     misalign = F.relu(-0.5 - cos_sim).pow(2)
-    return (misalign * steer_w * has_steering).mean() * 0.05
-
+    # return (misalign * steer_w * has_steering).mean() * 0.05
+    return (misalign * steer_w * has_steering) * 0.05 # Trả về [T-1, B]
 
 def pinn_gph500_gradient(pred_abs_deg: torch.Tensor,
                          env_data: Optional[dict]) -> torch.Tensor:
@@ -2480,8 +2481,8 @@ def pinn_gph500_gradient(pred_abs_deg: torch.Tensor,
     s_correct = torch.sign(dlat) * torch.sign(gph_diff)
     wrong_dir = F.relu(-s_correct)   # dương khi sai hướng
 
-    return (wrong_dir.pow(2) * has_gradient).mean() * 0.02
-
+    # return (wrong_dir.pow(2) * has_gradient).mean() * 0.02
+    return (wrong_dir.pow(2) * has_gradient) * 0.02 # Trả về [T-1, B]
 
 def pinn_steering_speed_consistency(pred_abs_deg: torch.Tensor,
                                     env_data: Optional[dict]) -> torch.Tensor:
@@ -2521,8 +2522,8 @@ def pinn_steering_speed_consistency(pred_abs_deg: torch.Tensor,
     too_fast = F.relu(tc_speed_ms - hi)
 
     penalty = (too_slow.pow(2) + too_fast.pow(2)) / steer_var
-    return (penalty * has_steering).mean() * 0.03
-
+    # return (penalty * has_steering).mean() * 0.03
+    return (penalty * has_steering) * 0.03 # Trả về [T-1, B]
 
 def pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
     if pred_deg.shape[0] < 2:
@@ -2533,8 +2534,8 @@ def pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
     dx_km   = dt_deg[:, :, 0] * cos_lat * DEG_TO_KM
     dy_km   = dt_deg[:, :, 1] * DEG_TO_KM
     speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
-    return F.relu(speed - 600.0).pow(2).mean()
-
+    # return F.relu(speed - 600.0).pow(2).mean()
+    return F.relu(speed - 600.0).pow(2) # Trả về [T-1, B]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FIX-L-D: Pressure-Wind Balance Loss (Eq.62-63)
@@ -2581,131 +2582,184 @@ def pinn_pressure_wind_loss(
 
     # Normalize bằng 5 hPa (500 Pa) như Eq.63
     residual = (dp - dp_pred) / 500.0
-    return residual.pow(2).mean()
-
+    # return residual.pow(2).mean()
+    return residual.pow(2) # Trả về [T, B]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  FIX-L-C + FIX-L-E + FIX-L-F: PINN tổng hợp
 # ══════════════════════════════════════════════════════════════════════════════
 
+# def pinn_bve_loss(
+#     pred_abs_deg: torch.Tensor,
+#     batch_list,
+#     env_data:    Optional[dict] = None,
+#     epoch:       int = 0,
+#     gt_abs_deg:  Optional[torch.Tensor] = None,  # FIX-L-C: cho adaptive weighting
+#     vmax_pred:   Optional[torch.Tensor] = None,   # FIX-L-D: pressure-wind
+#     pmin_pred:   Optional[torch.Tensor] = None,
+#     r34_km:      Optional[torch.Tensor] = None,
+# ) -> torch.Tensor:
+#     """
+#     PINN tổng hợp (Eq.64/101) với đầy đủ 5 ràng buộc + PWR.
+
+#     Cải tiến so với v25:
+#       - AdaptClamp thay vì tanh cố định (FIX-L-B)
+#       - Adaptive BVE weighting theo track error (FIX-L-C)
+#       - Frequency compensation f_lazy (FIX-L-E)
+#       - Spatial boundary weighting w_bnd (FIX-L-F)
+#       - L_PWR pressure-wind balance (FIX-L-D)
+#     """
+#     T = pred_abs_deg.shape[0]
+#     if T < 3:
+#         return pred_abs_deg.new_zeros(())
+
+#     _env = env_data
+#     if _env is None and batch_list is not None:
+#         try:
+#             _env = batch_list[13]
+#         except (IndexError, TypeError):
+#             _env = None
+
+#     # FIX-L-E: Frequency compensation (Eq.100)
+#     if epoch < 30:
+#         f_lazy = 0.20
+#     elif epoch < 50:
+#         f_lazy = 0.50
+#     else:
+#         f_lazy = 1.00
+
+#     # FIX-L-C: Adaptive BVE weighting (Eq.99)
+#     if gt_abs_deg is not None and gt_abs_deg.shape == pred_abs_deg.shape:
+#         with torch.no_grad():
+#             d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)   # [T, B]
+#             # w_BVE,k = σ(1 - d/200km)
+#             w_bve_per_step = torch.sigmoid(1.0 - d_track / 200.0)  # [T, B] ∈ (0,1)
+#             w_bve = w_bve_per_step.mean()   # scalar
+#     else:
+#         w_bve = pred_abs_deg.new_tensor(1.0)
+
+#     # FIX-L-F: Spatial boundary weighting (Eq.63a-b)
+#     w_bnd = _boundary_weights(pred_abs_deg).mean()   # scalar ≈ 1 at center, ≈ 0 at edge
+
+#     # # Individual PINN components
+#     # l_sw      = pinn_shallow_water(pred_abs_deg)
+#     # l_steer   = pinn_rankine_steering(pred_abs_deg, _env)
+#     # l_speed   = pinn_speed_constraint(pred_abs_deg)
+#     # l_gph     = pinn_gph500_gradient(pred_abs_deg, _env)
+#     # l_spdcons = pinn_steering_speed_consistency(pred_abs_deg, _env)
+#     # l_pwr     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch)
+
+#     # # Tổng hợp (Eq.101) — hệ số từ doc
+#     # total = (
+#     #     w_bve * l_sw          # BVE với adaptive weighting
+#     #     + 0.5  * l_steer
+#     #     + 0.1  * l_speed
+#     #     + 0.3  * l_gph
+#     #     + 0.4  * l_spdcons
+#     #     + 0.6  * l_pwr        # PWR với cao nhất (doc: ưu tiên intensity)
+#     # )
+
+#     # # FIX-L-B: AdaptClamp thay vì tanh cố định
+#     # total_clamped = adapt_clamp(total, epoch, max_val=20.0)
+
+#     # # FIX-L-E + FIX-L-F: áp dụng frequency compensation và boundary weight
+#     # return total_clamped * w_bnd * f_lazy
+#      # 1. Định nghĩa Trọng số thời gian cho PINN (Key để giảm 72h)
+#     # Tăng dần từ 0.5 (ở 6h) lên 4.0 (ở 72h)
+#     pinn_step_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
+    
+#     # 2. Tính toán các thành phần (Giả sử các hàm này trả về tensor [T_i, B])
+#     # Nếu hàm của bạn đang trả về scalar, hãy sửa chúng để KHÔNG gọi .mean() ở cuối
+#     l_sw_map      = pinn_shallow_water(pred_abs_deg)          # [T-2, B]
+#     l_steer_map   = pinn_rankine_steering(pred_abs_deg, _env) # [T-1, B]
+#     l_speed_map   = pinn_speed_constraint(pred_abs_deg)       # [T-1, B]
+#     l_gph_map     = pinn_gph500_gradient(pred_abs_deg, _env)  # [T-1, B]
+#     l_spdcons_map = pinn_steering_speed_consistency(pred_abs_deg, _env)   # [T-1, B]
+#     l_pwr_map     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch) # [T, B]
+
+#     # 3. Tính Adaptive Weighting (FIX-L-C) nhưng giữ nguyên theo step
+#     if gt_abs_deg is not None:
+#         with torch.no_grad():
+#             d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)
+#             w_bve_step = torch.sigmoid(1.0 - d_track / 200.0) # [T, B]
+#     else:
+#         w_bve_step = torch.ones(T, B, device=pred_abs_deg.device)
+
+#     # 4. Tổng hợp loss theo từng bước thời gian (Pointwise Total)
+#     # Ta lấy phần đuôi của pinn_step_w để khớp với số lượng step của từng loại loss
+#     def apply_w(l_map, weight_scalar):
+#         t_size = l_map.shape[0]
+#         # Nhân trọng số thành phần * trọng số thời gian * adaptive weight
+#         return weight_scalar * l_map * pinn_step_w[-t_size:, None] * w_bve_step[-t_size:]
+
+#     total_pointwise = (
+#         apply_w(l_sw_map, 1.0)           # Trọng số gốc 1.0
+#         + apply_w(l_steer_map, 0.5)
+#         + apply_w(l_speed_map, 0.1)
+#         + apply_w(l_gph_map, 0.3)
+#         + apply_w(l_spdcons_map, 0.4)
+#         + apply_w(l_pwr_map, 0.6)
+#     )
+
+#     # 5. Lấy trung bình toàn bộ
+#     total = total_pointwise.mean()
+
+#     # FIX-L-B: AdaptClamp
+#     total_clamped = adapt_clamp(total, epoch, max_val=20.0)
+
+#     return total_clamped * w_bnd * f_lazy
 def pinn_bve_loss(
     pred_abs_deg: torch.Tensor,
     batch_list,
     env_data:    Optional[dict] = None,
     epoch:       int = 0,
-    gt_abs_deg:  Optional[torch.Tensor] = None,  # FIX-L-C: cho adaptive weighting
-    vmax_pred:   Optional[torch.Tensor] = None,   # FIX-L-D: pressure-wind
+    gt_abs_deg:  Optional[torch.Tensor] = None,
+    vmax_pred:   Optional[torch.Tensor] = None,
     pmin_pred:   Optional[torch.Tensor] = None,
     r34_km:      Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """
-    PINN tổng hợp (Eq.64/101) với đầy đủ 5 ràng buộc + PWR.
-
-    Cải tiến so với v25:
-      - AdaptClamp thay vì tanh cố định (FIX-L-B)
-      - Adaptive BVE weighting theo track error (FIX-L-C)
-      - Frequency compensation f_lazy (FIX-L-E)
-      - Spatial boundary weighting w_bnd (FIX-L-F)
-      - L_PWR pressure-wind balance (FIX-L-D)
-    """
     T = pred_abs_deg.shape[0]
-    if T < 3:
-        return pred_abs_deg.new_zeros(())
+    if T < 3: return pred_abs_deg.new_zeros(())
 
     _env = env_data
     if _env is None and batch_list is not None:
-        try:
-            _env = batch_list[13]
-        except (IndexError, TypeError):
-            _env = None
+        try: _env = batch_list[13]
+        except: _env = None
 
-    # FIX-L-E: Frequency compensation (Eq.100)
-    if epoch < 30:
-        f_lazy = 0.20
-    elif epoch < 50:
-        f_lazy = 0.50
-    else:
-        f_lazy = 1.00
+    # 1. Trọng số thời gian tăng mạnh ở 72h
+    pinn_time_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
 
-    # FIX-L-C: Adaptive BVE weighting (Eq.99)
-    if gt_abs_deg is not None and gt_abs_deg.shape == pred_abs_deg.shape:
-        with torch.no_grad():
-            d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)   # [T, B]
-            # w_BVE,k = σ(1 - d/200km)
-            w_bve_per_step = torch.sigmoid(1.0 - d_track / 200.0)  # [T, B] ∈ (0,1)
-            w_bve = w_bve_per_step.mean()   # scalar
-    else:
-        w_bve = pred_abs_deg.new_tensor(1.0)
-
-    # FIX-L-F: Spatial boundary weighting (Eq.63a-b)
-    w_bnd = _boundary_weights(pred_abs_deg).mean()   # scalar ≈ 1 at center, ≈ 0 at edge
-
-    # # Individual PINN components
-    # l_sw      = pinn_shallow_water(pred_abs_deg)
-    # l_steer   = pinn_rankine_steering(pred_abs_deg, _env)
-    # l_speed   = pinn_speed_constraint(pred_abs_deg)
-    # l_gph     = pinn_gph500_gradient(pred_abs_deg, _env)
-    # l_spdcons = pinn_steering_speed_consistency(pred_abs_deg, _env)
-    # l_pwr     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch)
-
-    # # Tổng hợp (Eq.101) — hệ số từ doc
-    # total = (
-    #     w_bve * l_sw          # BVE với adaptive weighting
-    #     + 0.5  * l_steer
-    #     + 0.1  * l_speed
-    #     + 0.3  * l_gph
-    #     + 0.4  * l_spdcons
-    #     + 0.6  * l_pwr        # PWR với cao nhất (doc: ưu tiên intensity)
-    # )
-
-    # # FIX-L-B: AdaptClamp thay vì tanh cố định
-    # total_clamped = adapt_clamp(total, epoch, max_val=20.0)
-
-    # # FIX-L-E + FIX-L-F: áp dụng frequency compensation và boundary weight
-    # return total_clamped * w_bnd * f_lazy
-     # 1. Định nghĩa Trọng số thời gian cho PINN (Key để giảm 72h)
-    # Tăng dần từ 0.5 (ở 6h) lên 4.0 (ở 72h)
-    pinn_step_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
-    
-    # 2. Tính toán các thành phần (Giả sử các hàm này trả về tensor [T_i, B])
-    # Nếu hàm của bạn đang trả về scalar, hãy sửa chúng để KHÔNG gọi .mean() ở cuối
-    l_sw_map      = pinn_shallow_water(pred_abs_deg)          # [T-2, B]
-    l_steer_map   = pinn_rankine_steering(pred_abs_deg, _env) # [T-1, B]
-    l_speed_map   = pinn_speed_constraint(pred_abs_deg)       # [T-1, B]
-    l_gph_map     = pinn_gph500_gradient(pred_abs_deg, _env)  # [T-1, B]
-    l_spdcons_map = pinn_steering_speed_consistency(pred_abs_deg, _env)   # [T-1, B]
-    l_pwr_map     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch) # [T, B]
-
-    # 3. Tính Adaptive Weighting (FIX-L-C) nhưng giữ nguyên theo step
+    # 2. Adaptive weighting (FIX-L-C) - giữ nguyên chiều [T, B]
     if gt_abs_deg is not None:
         with torch.no_grad():
             d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)
             w_bve_step = torch.sigmoid(1.0 - d_track / 200.0) # [T, B]
     else:
-        w_bve_step = torch.ones(T, B, device=pred_abs_deg.device)
+        w_bve_step = torch.ones(T, pred_abs_deg.shape[1], device=pred_abs_deg.device)
 
-    # 4. Tổng hợp loss theo từng bước thời gian (Pointwise Total)
-    # Ta lấy phần đuôi của pinn_step_w để khớp với số lượng step của từng loại loss
+    # 3. Hàm hỗ trợ nhân trọng số
     def apply_w(l_map, weight_scalar):
-        t_size = l_map.shape[0]
-        # Nhân trọng số thành phần * trọng số thời gian * adaptive weight
-        return weight_scalar * l_map * pinn_step_w[-t_size:, None] * w_bve_step[-t_size:]
+        t_size = l_map.shape[0] # Giờ l_map đã có chiều [T_i, B]
+        # Nhân: (loss từng bước) * (weight thành phần) * (weight thời gian) * (adaptive weight)
+        return weight_scalar * l_map * pinn_time_w[-t_size:, None] * w_bve_step[-t_size:]
 
-    total_pointwise = (
-        apply_w(l_sw_map, 1.0)           # Trọng số gốc 1.0
-        + apply_w(l_steer_map, 0.5)
-        + apply_w(l_speed_map, 0.1)
-        + apply_w(l_gph_map, 0.3)
-        + apply_w(l_spdcons_map, 0.4)
-        + apply_w(l_pwr_map, 0.6)
-    )
+    # 4. Tính toán các thành phần (lúc này các hàm đã trả về Tensor)
+    l_sw      = apply_w(pinn_shallow_water(pred_abs_deg), 1.0)
+    l_steer   = apply_w(pinn_rankine_steering(pred_abs_deg, _env), 0.5)
+    l_speed   = apply_w(pinn_speed_constraint(pred_abs_deg), 0.1)
+    l_gph     = apply_w(pinn_gph500_gradient(pred_abs_deg, _env), 0.3)
+    l_spdcons = apply_w(pinn_steering_speed_consistency(pred_abs_deg, _env), 0.4)
+    l_pwr     = apply_w(pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch), 0.6)
 
-    # 5. Lấy trung bình toàn bộ
-    total = total_pointwise.mean()
+    # 5. Tổng hợp và trung bình
+    total = (l_sw.mean() + l_steer.mean() + l_speed.mean() + 
+             l_gph.mean() + l_spdcons.mean() + l_pwr.mean())
 
-    # FIX-L-B: AdaptClamp
+    # Các phần f_lazy, w_bnd và AdaptClamp giữ nguyên
+    w_bnd = _boundary_weights(pred_abs_deg).mean()
+    f_lazy = 0.2 if epoch < 30 else (0.5 if epoch < 50 else 1.0)
+    
     total_clamped = adapt_clamp(total, epoch, max_val=20.0)
-
     return total_clamped * w_bnd * f_lazy
 
 
