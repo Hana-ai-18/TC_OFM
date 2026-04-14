@@ -2231,7 +2231,13 @@ def fm_afcrps_loss(
     M, T, B, _ = pred_samples.shape
 
     # Time weights
-    base_w = torch.linspace(0.5, 1.5, T, device=pred_samples.device)
+    # base_w = torch.linspace(0.5, 1.5, T, device=pred_samples.device)
+    # losses.py — fm_afcrps_loss, thay base_w
+    base_w = torch.zeros(T, device=pred_samples.device)
+    for i in range(T):
+        if i >= 8:    base_w[i] = 3.0   # 54h-72h
+        elif i >= 4:  base_w[i] = 1.5   # 30h-48h
+        else:         base_w[i] = 0.5   # 6h-24h (SR lo)
     if step_weight_alpha > 0.0:
         early_w = torch.exp(
             -torch.arange(T, dtype=torch.float, device=pred_samples.device) * 0.5
