@@ -2738,11 +2738,20 @@ def pinn_bve_loss(
         w_bve_step = torch.ones(T, pred_abs_deg.shape[1], device=pred_abs_deg.device)
 
     # 3. Hàm hỗ trợ nhân trọng số
+    # def apply_w(l_map, weight_scalar):
+    #     t_size = l_map.shape[0] # Giờ l_map đã có chiều [T_i, B]
+    #     # Nhân: (loss từng bước) * (weight thành phần) * (weight thời gian) * (adaptive weight)
+    #     return weight_scalar * l_map * pinn_time_w[-t_size:, None] * w_bve_step[-t_size:]
     def apply_w(l_map, weight_scalar):
-        t_size = l_map.shape[0] # Giờ l_map đã có chiều [T_i, B]
-        # Nhân: (loss từng bước) * (weight thành phần) * (weight thời gian) * (adaptive weight)
-        return weight_scalar * l_map * pinn_time_w[-t_size:, None] * w_bve_step[-t_size:]
-
+        # Kiểm tra nếu l_map là scalar (đề phòng chưa sửa hết các hàm con)
+        if l_map.dim() == 0: 
+            return l_map * weight_scalar
+            
+        t_size = l_map.shape[0] 
+        # Nhân trọng số thành phần * trọng số thời gian (pinn_time_w)
+        w_final = weight_scalar * pinn_time_w[-t_size:, None] 
+        return (l_map * w_final).mean() # Chỉ .mean() tại đây
+    
     # 4. Tính toán các thành phần (lúc này các hàm đã trả về Tensor)
     l_sw      = apply_w(pinn_shallow_water(pred_abs_deg), 1.0)
     l_steer   = apply_w(pinn_rankine_steering(pred_abs_deg, _env), 0.5)
