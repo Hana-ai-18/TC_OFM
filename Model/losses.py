@@ -3022,29 +3022,26 @@ def compute_total_loss(
                                 gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
                                 pmin_pred=pmin_pred, r34_km=r34_km)
 
-    if pred_samples is not None and epoch >= 30: 
+    if pred_samples is not None and epoch >= 15: 
         M = pred_samples.shape[0]
-        idxs = torch.randperm(M)[:2] # Chọn 2 hạt ngẫu nhiên
+        idxs = torch.randperm(M)[:2]
         
         l_pinn_samples = []
-        l_smooth_samples = [] # NEW
-        l_accel_samples = []  # NEW
+        l_smooth_samples = []
+        l_accel_samples = []
         
         for idx in idxs:
             sample_deg = _norm_to_deg(pred_samples[idx])
-            
-            # PINN cho từng hạt
             l_p_sample = pinn_bve_loss(sample_deg, batch_list, env_data=_env, epoch=epoch,
                                        gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
                                        pmin_pred=pmin_pred, r34_km=r34_km)
             l_pinn_samples.append(l_p_sample)
-            
-            # Smoothness cho từng hạt (Ép các hạt không được đi ziczac)
             l_smooth_samples.append(smooth_loss(sample_deg))
             l_accel_samples.append(acceleration_loss(sample_deg))
         
-        # Cập nhật PINN final
         l_pinn = 0.4 * l_pinn_mean + 0.6 * torch.stack(l_pinn_samples).mean()
+    else:                          # ← THÊM DÒNG NÀY
+        l_pinn = l_pinn_mean       # ← THÊM DÒNG NÀY
         
         # Cập nhật Smoothness & Accel final (Blended 50/50)
         # Việc ép smoothness lên từng hạt giúp giảm hiện tượng ziczac ở ensemble, cải thiện spread
@@ -3053,7 +3050,7 @@ def compute_total_loss(
     if all_trajs is not None and all_trajs.shape[0] >= 2:
         n_sr = 4
         trajs_fm = all_trajs[:, n_sr:] if all_trajs.shape[1] > n_sr else all_trajs
-        l_spread = ensemble_spread_loss(trajs_fm, max_spread_km=150.0)
+        l_spread = ensemble_spread_loss(trajs_fm)
 
     # 6. Bridge loss (FIX-L-H)
     # l_bridge = pred_abs.new_zeros(())
