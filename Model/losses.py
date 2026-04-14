@@ -2640,28 +2640,72 @@ def pinn_bve_loss(
     # FIX-L-F: Spatial boundary weighting (Eq.63a-b)
     w_bnd = _boundary_weights(pred_abs_deg).mean()   # scalar ≈ 1 at center, ≈ 0 at edge
 
-    # Individual PINN components
-    l_sw      = pinn_shallow_water(pred_abs_deg)
-    l_steer   = pinn_rankine_steering(pred_abs_deg, _env)
-    l_speed   = pinn_speed_constraint(pred_abs_deg)
-    l_gph     = pinn_gph500_gradient(pred_abs_deg, _env)
-    l_spdcons = pinn_steering_speed_consistency(pred_abs_deg, _env)
-    l_pwr     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch)
+    # # Individual PINN components
+    # l_sw      = pinn_shallow_water(pred_abs_deg)
+    # l_steer   = pinn_rankine_steering(pred_abs_deg, _env)
+    # l_speed   = pinn_speed_constraint(pred_abs_deg)
+    # l_gph     = pinn_gph500_gradient(pred_abs_deg, _env)
+    # l_spdcons = pinn_steering_speed_consistency(pred_abs_deg, _env)
+    # l_pwr     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch)
 
-    # Tổng hợp (Eq.101) — hệ số từ doc
-    total = (
-        w_bve * l_sw          # BVE với adaptive weighting
-        + 0.5  * l_steer
-        + 0.1  * l_speed
-        + 0.3  * l_gph
-        + 0.4  * l_spdcons
-        + 0.6  * l_pwr        # PWR với cao nhất (doc: ưu tiên intensity)
+    # # Tổng hợp (Eq.101) — hệ số từ doc
+    # total = (
+    #     w_bve * l_sw          # BVE với adaptive weighting
+    #     + 0.5  * l_steer
+    #     + 0.1  * l_speed
+    #     + 0.3  * l_gph
+    #     + 0.4  * l_spdcons
+    #     + 0.6  * l_pwr        # PWR với cao nhất (doc: ưu tiên intensity)
+    # )
+
+    # # FIX-L-B: AdaptClamp thay vì tanh cố định
+    # total_clamped = adapt_clamp(total, epoch, max_val=20.0)
+
+    # # FIX-L-E + FIX-L-F: áp dụng frequency compensation và boundary weight
+    # return total_clamped * w_bnd * f_lazy
+     # 1. Định nghĩa Trọng số thời gian cho PINN (Key để giảm 72h)
+    # Tăng dần từ 0.5 (ở 6h) lên 4.0 (ở 72h)
+    pinn_step_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
+    
+    # 2. Tính toán các thành phần (Giả sử các hàm này trả về tensor [T_i, B])
+    # Nếu hàm của bạn đang trả về scalar, hãy sửa chúng để KHÔNG gọi .mean() ở cuối
+    l_sw_map      = pinn_shallow_water(pred_abs_deg)          # [T-2, B]
+    l_steer_map   = pinn_rankine_steering(pred_abs_deg, _env) # [T-1, B]
+    l_speed_map   = pinn_speed_constraint(pred_abs_deg)       # [T-1, B]
+    l_gph_map     = pinn_gph500_gradient(pred_abs_deg, _env)  # [T-1, B]
+    l_spdcons_map = pinn_steering_speed_consistency(pred_abs_deg, _env)   # [T-1, B]
+    l_pwr_map     = pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch) # [T, B]
+
+    # 3. Tính Adaptive Weighting (FIX-L-C) nhưng giữ nguyên theo step
+    if gt_abs_deg is not None:
+        with torch.no_grad():
+            d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)
+            w_bve_step = torch.sigmoid(1.0 - d_track / 200.0) # [T, B]
+    else:
+        w_bve_step = torch.ones(T, B, device=pred_abs_deg.device)
+
+    # 4. Tổng hợp loss theo từng bước thời gian (Pointwise Total)
+    # Ta lấy phần đuôi của pinn_step_w để khớp với số lượng step của từng loại loss
+    def apply_w(l_map, weight_scalar):
+        t_size = l_map.shape[0]
+        # Nhân trọng số thành phần * trọng số thời gian * adaptive weight
+        return weight_scalar * l_map * pinn_step_w[-t_size:, None] * w_bve_step[-t_size:]
+
+    total_pointwise = (
+        apply_w(l_sw_map, 1.0)           # Trọng số gốc 1.0
+        + apply_w(l_steer_map, 0.5)
+        + apply_w(l_speed_map, 0.1)
+        + apply_w(l_gph_map, 0.3)
+        + apply_w(l_spdcons_map, 0.4)
+        + apply_w(l_pwr_map, 0.6)
     )
 
-    # FIX-L-B: AdaptClamp thay vì tanh cố định
+    # 5. Lấy trung bình toàn bộ
+    total = total_pointwise.mean()
+
+    # FIX-L-B: AdaptClamp
     total_clamped = adapt_clamp(total, epoch, max_val=20.0)
 
-    # FIX-L-E + FIX-L-F: áp dụng frequency compensation và boundary weight
     return total_clamped * w_bnd * f_lazy
 
 
@@ -2794,6 +2838,23 @@ def compute_total_loss(
     l_jerk      = jerk_loss(pred_abs)
 
     # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
+    # _env = env_data
+    # if _env is None and batch_list is not None:
+    #     try:
+    #         _env = batch_list[13]
+    #     except (IndexError, TypeError):
+    #         _env = None
+
+    # l_pinn = pinn_bve_loss(
+    #     pred_abs, batch_list, env_data=_env,
+    #     epoch=epoch,
+    #     gt_abs_deg=gt_abs_deg,
+    #     vmax_pred=vmax_pred,
+    #     pmin_pred=pmin_pred,
+    #     r34_km=r34_km,
+    # )
+
+    # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
     _env = env_data
     if _env is None and batch_list is not None:
         try:
@@ -2801,15 +2862,46 @@ def compute_total_loss(
         except (IndexError, TypeError):
             _env = None
 
-    l_pinn = pinn_bve_loss(
-        pred_abs, batch_list, env_data=_env,
+    # Tính PINN cho Mean (định hướng quỹ đạo trung tâm)
+    l_pinn_mean = pinn_bve_loss(
+        pred_abs_deg=pred_abs, 
+        batch_list=batch_list, 
+        env_data=_env,
         epoch=epoch,
         gt_abs_deg=gt_abs_deg,
         vmax_pred=vmax_pred,
         pmin_pred=pmin_pred,
-        r34_km=r34_km,
+        r34_km=r34_km
     )
 
+    # Stochastic PINN: Ép vật lý lên từng hạt ensemble ở Phase 2
+    if pred_samples is not None and epoch >= 30: 
+        M = pred_samples.shape[0]
+        # Chọn ngẫu nhiên 2 hạt để tính PINN (tiết kiệm memory)
+        idxs = torch.randperm(M)[:2]
+        
+        l_pinn_samples = []
+        for idx in idxs:
+            # Decode sample từ normalized sang degrees
+            sample_deg = _norm_to_deg(pred_samples[idx])
+            
+            l_p_sample = pinn_bve_loss(
+                pred_abs_deg=sample_deg, 
+                batch_list=batch_list, 
+                env_data=_env,
+                epoch=epoch,
+                gt_abs_deg=gt_abs_deg, # Các hạt đều phải hướng về GT chung
+                vmax_pred=vmax_pred,
+                pmin_pred=pmin_pred,
+                r34_km=r34_km
+            )
+            l_pinn_samples.append(l_p_sample)
+        
+        # Kết hợp: 40% Mean + 60% Samples
+        l_pinn = 0.4 * l_pinn_mean + 0.6 * torch.stack(l_pinn_samples).mean()
+    else:
+        l_pinn = l_pinn_mean
+        
     # 5. Spread penalty (chỉ FM steps 5-12)
     l_spread = pred_abs.new_zeros(())
     if all_trajs is not None and all_trajs.shape[0] >= 2:
