@@ -2752,31 +2752,64 @@ def fm_physics_consistency_loss(
 #  Ensemble spread
 # ══════════════════════════════════════════════════════════════════════════════
 
-def ensemble_spread_loss(all_trajs: torch.Tensor,
-                         max_spread_km: float = 150.0) -> torch.Tensor:
+# def ensemble_spread_loss(all_trajs: torch.Tensor,
+#                          max_spread_km: float = 150.0) -> torch.Tensor:
+#     if all_trajs.shape[0] < 2:
+#         return all_trajs.new_zeros(())
+
+#     S, T, B, _ = all_trajs.shape
+
+#     step_weights = torch.exp(
+#         -torch.arange(T, dtype=torch.float, device=all_trajs.device)
+#         * (math.log(4.0) / max(T - 1, 1))
+#     ) * 2.0
+
+#     total_loss = all_trajs.new_zeros(())
+#     for t in range(T):
+#         step_trajs = all_trajs[:, t, :, :2]
+#         std_lon    = step_trajs[:, :, 0].std(0)
+#         std_lat    = step_trajs[:, :, 1].std(0)
+#         spread_km  = torch.sqrt(std_lon ** 2 + std_lat ** 2) * 500.0
+#         excess     = F.relu(spread_km - max_spread_km)
+#         total_loss = total_loss + step_weights[t] * (
+#             excess / max_spread_km
+#         ).pow(2).mean()
+
+#     return total_loss / T
+def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
     if all_trajs.shape[0] < 2:
         return all_trajs.new_zeros(())
 
     S, T, B, _ = all_trajs.shape
+    device = all_trajs.device
 
-    step_weights = torch.exp(
-        -torch.arange(T, dtype=torch.float, device=all_trajs.device)
-        * (math.log(4.0) / max(T - 1, 1))
-    ) * 2.0
+    # 1. ĐẢO NGƯỢC TRỌNG SỐ: Tăng dần từ 6h đến 72h
+    # Step 1 (6h) weight = 0.8, Step 12 (72h) weight = 4.0
+    # Điều này bắt mô hình phải ưu tiên siết spread ở horizon xa
+    step_weights = torch.linspace(0.8, 4.0, T, device=device)
+
+    # 2. NGƯỠNG ĐỘNG (Dynamic Threshold): 
+    # 6h không nên spread quá 60km, 72h không nên spread quá 180km
+    # Ép một ngưỡng cứng 150km ở 72h là rất khó, nên dùng 170-180km là hợp lý
+    max_spreads = torch.linspace(60.0, 180.0, T, device=device)
 
     total_loss = all_trajs.new_zeros(())
     for t in range(T):
         step_trajs = all_trajs[:, t, :, :2]
         std_lon    = step_trajs[:, :, 0].std(0)
         std_lat    = step_trajs[:, :, 1].std(0)
-        spread_km  = torch.sqrt(std_lon ** 2 + std_lat ** 2) * 500.0
-        excess     = F.relu(spread_km - max_spread_km)
-        total_loss = total_loss + step_weights[t] * (
-            excess / max_spread_km
-        ).pow(2).mean()
+        spread_km  = torch.sqrt(std_lon ** 2 + std_lat ** 2) * 500.0 # [B]
+        
+        # 3. PHẠT BÌNH PHƯƠNG MẠNH
+        # Nếu spread vượt ngưỡng động tại thời điểm t
+        excess = F.relu(spread_km - max_spreads[t])
+        
+        # Dùng hằng số chia nhỏ hơn (ví dụ 40.0) để gradient dốc hơn
+        loss = (excess / 40.0).pow(2) 
+        
+        total_loss = total_loss + step_weights[t] * loss.mean()
 
     return total_loss / T
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main loss
@@ -2826,7 +2859,85 @@ def compute_total_loss(
     else:
         l_fm = _haversine_deg(pred_abs, gt).mean()
 
-    # 3. Directional losses
+    # # 3. Directional losses
+    # l_vel       = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
+    # l_disp      = (disp_loss_per_sample(pred_abs, gt)     * sample_w).mean()
+    # l_step      = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
+    # l_heading   = heading_loss(pred_abs, gt)
+    # l_recurv    = recurvature_loss(pred_abs, gt)
+    # l_dir_final = overall_dir_loss(pred_abs, gt, ref)
+    # l_smooth    = smooth_loss(pred_abs)
+    # l_accel     = acceleration_loss(pred_abs)
+    # l_jerk      = jerk_loss(pred_abs)
+
+    # # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
+    # # _env = env_data
+    # # if _env is None and batch_list is not None:
+    # #     try:
+    # #         _env = batch_list[13]
+    # #     except (IndexError, TypeError):
+    # #         _env = None
+
+    # # l_pinn = pinn_bve_loss(
+    # #     pred_abs, batch_list, env_data=_env,
+    # #     epoch=epoch,
+    # #     gt_abs_deg=gt_abs_deg,
+    # #     vmax_pred=vmax_pred,
+    # #     pmin_pred=pmin_pred,
+    # #     r34_km=r34_km,
+    # # )
+
+    # # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
+    # _env = env_data
+    # if _env is None and batch_list is not None:
+    #     try:
+    #         _env = batch_list[13]
+    #     except (IndexError, TypeError):
+    #         _env = None
+
+    # # Tính PINN cho Mean (định hướng quỹ đạo trung tâm)
+    # l_pinn_mean = pinn_bve_loss(
+    #     pred_abs_deg=pred_abs, 
+    #     batch_list=batch_list, 
+    #     env_data=_env,
+    #     epoch=epoch,
+    #     gt_abs_deg=gt_abs_deg,
+    #     vmax_pred=vmax_pred,
+    #     pmin_pred=pmin_pred,
+    #     r34_km=r34_km
+    # )
+
+    # # Stochastic PINN: Ép vật lý lên từng hạt ensemble ở Phase 2
+    # if pred_samples is not None and epoch >= 30: 
+    #     M = pred_samples.shape[0]
+    #     # Chọn ngẫu nhiên 2 hạt để tính PINN (tiết kiệm memory)
+    #     idxs = torch.randperm(M)[:2]
+        
+    #     l_pinn_samples = []
+    #     for idx in idxs:
+    #         # Decode sample từ normalized sang degrees
+    #         sample_deg = _norm_to_deg(pred_samples[idx])
+            
+    #         l_p_sample = pinn_bve_loss(
+    #             pred_abs_deg=sample_deg, 
+    #             batch_list=batch_list, 
+    #             env_data=_env,
+    #             epoch=epoch,
+    #             gt_abs_deg=gt_abs_deg, # Các hạt đều phải hướng về GT chung
+    #             vmax_pred=vmax_pred,
+    #             pmin_pred=pmin_pred,
+    #             r34_km=r34_km
+    #         )
+    #         l_pinn_samples.append(l_p_sample)
+        
+    #     # Kết hợp: 40% Mean + 60% Samples
+    #     l_pinn = 0.4 * l_pinn_mean + 0.6 * torch.stack(l_pinn_samples).mean()
+    # else:
+    #     l_pinn = l_pinn_mean
+        
+    # ... (đoạn tính l_fm và directional losses cơ bản ở trên giữ nguyên)
+
+    # 3. Directional losses (Tính trên Mean trước)
     l_vel       = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
     l_disp      = (disp_loss_per_sample(pred_abs, gt)     * sample_w).mean()
     l_step      = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
@@ -2837,71 +2948,43 @@ def compute_total_loss(
     l_accel     = acceleration_loss(pred_abs)
     l_jerk      = jerk_loss(pred_abs)
 
-    # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
-    # _env = env_data
-    # if _env is None and batch_list is not None:
-    #     try:
-    #         _env = batch_list[13]
-    #     except (IndexError, TypeError):
-    #         _env = None
-
-    # l_pinn = pinn_bve_loss(
-    #     pred_abs, batch_list, env_data=_env,
-    #     epoch=epoch,
-    #     gt_abs_deg=gt_abs_deg,
-    #     vmax_pred=vmax_pred,
-    #     pmin_pred=pmin_pred,
-    #     r34_km=r34_km,
-    # )
-
-    # 4. PINN (FIX-L-A: KHÔNG nhân NRM ở đây; FIX-L-C/D/E/F: pass extra args)
+    # 4. PINN & Stochastic Physics (Tích hợp Smoothness vào đây)
     _env = env_data
     if _env is None and batch_list is not None:
-        try:
-            _env = batch_list[13]
-        except (IndexError, TypeError):
-            _env = None
+        try: _env = batch_list[13]
+        except (IndexError, TypeError): _env = None
 
-    # Tính PINN cho Mean (định hướng quỹ đạo trung tâm)
-    l_pinn_mean = pinn_bve_loss(
-        pred_abs_deg=pred_abs, 
-        batch_list=batch_list, 
-        env_data=_env,
-        epoch=epoch,
-        gt_abs_deg=gt_abs_deg,
-        vmax_pred=vmax_pred,
-        pmin_pred=pmin_pred,
-        r34_km=r34_km
-    )
+    # PINN trên Mean
+    l_pinn_mean = pinn_bve_loss(pred_abs, batch_list, env_data=_env, epoch=epoch,
+                                gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
+                                pmin_pred=pmin_pred, r34_km=r34_km)
 
-    # Stochastic PINN: Ép vật lý lên từng hạt ensemble ở Phase 2
     if pred_samples is not None and epoch >= 30: 
         M = pred_samples.shape[0]
-        # Chọn ngẫu nhiên 2 hạt để tính PINN (tiết kiệm memory)
-        idxs = torch.randperm(M)[:2]
+        idxs = torch.randperm(M)[:2] # Chọn 2 hạt ngẫu nhiên
         
         l_pinn_samples = []
+        l_smooth_samples = [] # NEW
+        l_accel_samples = []  # NEW
+        
         for idx in idxs:
-            # Decode sample từ normalized sang degrees
             sample_deg = _norm_to_deg(pred_samples[idx])
             
-            l_p_sample = pinn_bve_loss(
-                pred_abs_deg=sample_deg, 
-                batch_list=batch_list, 
-                env_data=_env,
-                epoch=epoch,
-                gt_abs_deg=gt_abs_deg, # Các hạt đều phải hướng về GT chung
-                vmax_pred=vmax_pred,
-                pmin_pred=pmin_pred,
-                r34_km=r34_km
-            )
+            # PINN cho từng hạt
+            l_p_sample = pinn_bve_loss(sample_deg, batch_list, env_data=_env, epoch=epoch,
+                                       gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
+                                       pmin_pred=pmin_pred, r34_km=r34_km)
             l_pinn_samples.append(l_p_sample)
+            
+            # Smoothness cho từng hạt (Ép các hạt không được đi ziczac)
+            l_smooth_samples.append(smooth_loss(sample_deg))
+            l_accel_samples.append(acceleration_loss(sample_deg))
         
-        # Kết hợp: 40% Mean + 60% Samples
+        # Cập nhật PINN final
         l_pinn = 0.4 * l_pinn_mean + 0.6 * torch.stack(l_pinn_samples).mean()
-    else:
-        l_pinn = l_pinn_mean
         
+        # Cập nhật Smoothness & Accel final (Blended 50/50)
+        # Việc ép smoothness lên từng hạt giúp giảm hiện tượng ziczac ở ensemble, cải thiện spread
     # 5. Spread penalty (chỉ FM steps 5-12)
     l_spread = pred_abs.new_zeros(())
     if all_trajs is not None and all_trajs.shape[0] >= 2:

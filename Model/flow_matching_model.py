@@ -1680,7 +1680,12 @@ class VelocityField(nn.Module):
         self.time_fc2 = nn.Linear(512, 256)
 
         self.traj_embed  = nn.Linear(4, 256)
-        self.pos_enc     = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
+        # self.pos_enc     = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
+        # Thay vì:
+        # self.pos_enc = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
+
+        # Hãy thử:
+        self.pos_enc = nn.Parameter(torch.randn(1, pred_len, 256) * 0.1) # Tăng scale lên 5 lần
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
