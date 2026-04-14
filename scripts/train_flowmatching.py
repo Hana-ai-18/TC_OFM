@@ -2531,14 +2531,18 @@ def get_short_range_weight(epoch: int) -> float:
         return 1.5    # FIX-T-D: 3.0 → 1.5
 
 
-def get_bridge_weight(epoch: int) -> float:
-    """
-    FIX-T-E: Bridge loss từ epoch 10.
-    ep 0-9:  0.0 (SR và FM chưa đủ ổn định để enforce nhất quán)
-    ep 10+:  0.5
-    """
-    return 0.0 if epoch < 10 else 0.5
+# def get_bridge_weight(epoch: int) -> float:
+#     """
+#     FIX-T-E: Bridge loss từ epoch 10.
+#     ep 0-9:  0.0 (SR và FM chưa đủ ổn định để enforce nhất quán)
+#     ep 10+:  0.5
+#     """
+#     return 0.0 if epoch < 10 else 0.5
 
+def get_bridge_weight(epoch: int) -> float:
+    if epoch < 10: return 0.0
+    if epoch < 40: return 0.5
+    return 1.5  # Tăng mạnh weight ở cuối để ép FM phải bám sát SR Head tại mốc 24h
 
 def get_fm_weight(epoch: int) -> float:
     if epoch < 30:
