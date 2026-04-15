@@ -2734,7 +2734,7 @@ class TCFlowMatching(nn.Module):
 
         # ── FM prediction (step 5-12) conditioned on SR endpoint ──
         # FM uses sr_pred[3] as starting point
-        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred.detach())  # [B, 256]
+        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
         
         # FM ground truth: relative to SR step 4 position
         fm_ref_pos = sr_pred[3].detach()  # [B, 2] - SR step 4 position (normalised)
@@ -2784,6 +2784,10 @@ class TCFlowMatching(nn.Module):
         # ── Build full trajectory (SR + FM) ──
         full_pred_norm = torch.cat([sr_pred, fm_pred_abs_norm], dim=0)  # [12, B, 2]
         
+         # --- THÊM MSE TỌA ĐỘ VÀO ĐÂY ---
+        # Đây là "vũ khí" giúp LSTM thắng bạn, giờ chúng ta trang bị nó cho FM
+        l_mse_coord = F.mse_loss(full_pred_norm, traj_gt)
+        
         # Convert to degrees
         full_pred_deg = _denorm_to_deg(full_pred_norm)
         fm_pred_deg   = _denorm_to_deg(fm_pred_abs_norm)
@@ -2808,6 +2812,11 @@ class TCFlowMatching(nn.Module):
             sr_pred            = sr_pred,
             fm_pred_abs        = fm_pred_deg,
         )
+
+        # Cập nhật MSE vào breakdown
+        mse_w = WEIGHTS.get("mse", 4.0) # Trọng số cao để đấu với LSTM
+        breakdown["total"] = breakdown["total"] + mse_w * l_mse_coord
+        breakdown["mse"] = l_mse_coord.item()
 
         # Add FM physics
         fm_phys_w = WEIGHTS.get("fm_physics", 0.3)
