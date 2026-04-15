@@ -5142,7 +5142,7 @@ WEIGHTS: Dict[str, float] = dict(
     recurv      = 1.0,
     continuity  = 0.2,      # Giảm cực thấp, chỉ để nối mượt
     # BỎ HOÀN TOÀN: pinn, jerk, disp, dir, step, spread, accel, smooth, continuity
-    mse         = 4.0,      # MỚI: Neo tọa độ tuyệt đối (Trọng số cao nhất)
+    mse_hav         = 3.0,      # MỚI: Neo tọa độ tuyệt đối (Trọng số cao nhất)
 )
 
 RECURV_ANGLE_THR = 45.0
@@ -5150,12 +5150,51 @@ RECURV_WEIGHT    = 2.5
 
 _SR_N_STEPS  = 4
 _SR_WEIGHTS  = [1.5, 3.0, 2.0, 2.5]  # 6h, 12h(focus), 18h, 24h(important)
+MSE_STEP_WEIGHTS = [1.0, 3.0, 1.5, 2.5, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 2.0]
 _HUBER_DELTA = 50.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Haversine utilities
 # ══════════════════════════════════════════════════════════════════════════════
+def mse_haversine_perstep(
+    pred_norm: "torch.Tensor",
+    gt_norm:   "torch.Tensor",
+    step_weights: list = None,
+) -> "torch.Tensor":
+    """
+    MSE per-step dùng haversine — vũ khí chính để cạnh tranh LSTM.
+    
+    LSTM dùng MSE(lon, lat) → bị artifact vì cos(lat) không đều.
+    Hàm này dùng haversine distance thật sự → physically correct.
+    Step weighting nhấn mạnh 12h và 24h.
+    
+    Args:
+        pred_norm: [T, B, 2] normalised
+        gt_norm:   [T, B, 2] normalised
+    Returns:
+        scalar loss
+    """
+    import torch
+    import torch.nn.functional as F
+ 
+    if step_weights is None:
+        step_weights = MSE_STEP_WEIGHTS
+ 
+    T = min(pred_norm.shape[0], gt_norm.shape[0])
+    pred_deg = _norm_to_deg(pred_norm[:T])
+    gt_deg   = _norm_to_deg(gt_norm[:T])
+ 
+    dist_km = _haversine_deg(pred_deg, gt_deg)   # [T, B]
+ 
+    w = pred_norm.new_tensor(step_weights[:T])
+    w = w / w.sum() * T
+ 
+    # Weighted squared haversine
+    loss = (dist_km.pow(2) * w.unsqueeze(1)).mean()
+ 
+    # Normalize: 200km scale → gradient ~1.0
+    return loss / (200.0 ** 2)
 
 def _haversine(p1: torch.Tensor, p2: torch.Tensor,
                unit_01deg: bool = True) -> torch.Tensor:
@@ -5966,164 +6005,90 @@ def fm_physics_consistency_loss(
     direction_loss = F.relu(-cos_align) * penalise_mask
     return direction_loss.mean() * 0.5
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Main loss - HIERARCHICAL VERSION
-# ══════════════════════════════════════════════════════════════════════════════
-
 def compute_total_loss(
-    pred_abs,          # [T, B, 2] degrees - FULL trajectory (SR+FM concatenated)
+    pred_abs,          # [T, B, 2] degrees - FULL 12 steps
     gt,                # [T, B, 2] degrees
     ref,               # [B, 2] degrees
     batch_list,
-    pred_samples       = None,   # [S, T_fm, B, 2] normalised - FM samples (step 5-12)
-    gt_norm            = None,   # [T, B, 2] normalised
-    weights            = WEIGHTS,
-    intensity_w: Optional[torch.Tensor] = None,
-    env_data:    Optional[dict]         = None,
-    step_weight_alpha: float = 0.0,
-    all_trajs:   Optional[torch.Tensor] = None,  # [S, T_fm, B, 2] FM ensemble
-    epoch:       int = 0,
-    gt_abs_deg:  Optional[torch.Tensor] = None,
-    vmax_pred:   Optional[torch.Tensor] = None,
-    pmin_pred:   Optional[torch.Tensor] = None,
-    r34_km:      Optional[torch.Tensor] = None,
-    sr_pred:     Optional[torch.Tensor] = None,   # [4, B, 2] normalised
-    fm_pred_abs: Optional[torch.Tensor] = None,   # [T_fm, B, 2] degrees - FM mean
-) -> Dict:
-    # NRM = 35.0
-
-    # recurv_w = _recurvature_weights(gt, w_recurv=2.5)
-    # sample_w = recurv_w * (intensity_w.to(gt.device) if intensity_w is not None
-    #                        else 1.0)
-    # sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
-
-    # # ── FM AFCRPS (step 5-12 only, hoặc full nếu không có SR) ──
-    # if pred_samples is not None:
-    #     target = gt_norm if gt_norm is not None else gt
-    #     unit   = gt_norm is not None
-    #     l_fm = fm_afcrps_loss(
-    #         pred_samples, target,
-    #         unit_01deg=unit,
-    #         intensity_w=sample_w,
-    #         step_weight_alpha=step_weight_alpha,
-    #         w_es=0.3,
-    #         fm_start_step=0,  # pred_samples đã được slice sẵn
-    #     )
-    # else:
-    #     l_fm = _haversine_deg(pred_abs, gt).mean()
-
-    # # ── Directional losses (trên FULL trajectory SR+FM) ──
-    # l_vel       = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
-    # l_disp      = (disp_loss_per_sample(pred_abs, gt)     * sample_w).mean()
-    # l_step      = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
-    # l_heading   = heading_loss(pred_abs, gt)
-    # l_recurv    = recurvature_loss(pred_abs, gt)
-    # l_dir_final = overall_dir_loss(pred_abs, gt, ref)
-    # l_smooth    = smooth_loss(pred_abs)
-    # l_accel     = acceleration_loss(pred_abs)
-    # l_jerk      = jerk_loss(pred_abs)
-
-    # # ── PINN (trên full trajectory) ──
-    # _env = env_data
-    # if _env is None and batch_list is not None:
-    #     try:
-    #         _env = batch_list[13]
-    #     except (IndexError, TypeError):
-    #         _env = None
-
-    # l_pinn = pinn_bve_loss(
-    #     pred_abs, batch_list, env_data=_env, epoch=epoch,
-    #     gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
-    #     pmin_pred=pmin_pred, r34_km=r34_km
-    # )
-
-    # # ── Spread (FM zone only) ──
-    # l_spread = pred_abs.new_zeros(())
-    # if all_trajs is not None and all_trajs.shape[0] >= 2:
-    #     l_spread = ensemble_spread_loss(all_trajs)
-
-    # # ── Continuity (SR→FM handoff) ──
-    # l_cont = pred_abs.new_zeros(())
-    # if sr_pred is not None and fm_pred_abs is not None:
-    #     l_cont = continuity_loss(sr_pred, fm_pred_abs, gt)
-
-    # # ── Total ──
-    # total = (
-    #     weights.get("fm",         2.0) * l_fm
-    #     + weights.get("velocity",   0.8) * l_vel     * NRM
-    #     + weights.get("disp",       0.5) * l_disp    * NRM
-    #     + weights.get("step",       0.5) * l_step    * NRM
-    #     + weights.get("heading",    2.0) * l_heading * NRM
-    #     + weights.get("recurv",     1.5) * l_recurv  * NRM
-    #     + weights.get("dir",        1.0) * l_dir_final * NRM
-    #     + weights.get("smooth",     0.5) * l_smooth  * NRM
-    #     + weights.get("accel",      0.8) * l_accel   * NRM
-    #     + weights.get("jerk",       0.3) * l_jerk    * NRM
-    #     + weights.get("pinn",       0.3) * l_pinn
-    #     + weights.get("spread",     0.5) * l_spread  * NRM
-    #     + weights.get("continuity", 2.0) * l_cont    * NRM
-    # ) / NRM
-
-    # if torch.isnan(total) or torch.isinf(total):
-    #     total = pred_abs.new_zeros(())
-
-    # return dict(
-    #     total        = total,
-    #     fm           = l_fm.item(),
-    #     velocity     = l_vel.item()     * NRM,
-    #     step         = l_step.item(),
-    #     disp         = l_disp.item()    * NRM,
-    #     heading      = l_heading.item(),
-    #     recurv       = l_recurv.item(),
-    #     smooth       = l_smooth.item()  * NRM,
-    #     accel        = l_accel.item()   * NRM,
-    #     jerk         = l_jerk.item()    * NRM,
-    #     pinn         = l_pinn.item(),
-    #     spread       = l_spread.item()  * NRM,
-    #     continuity   = l_cont.item()    * NRM,
-    #     recurv_ratio = (_recurvature_weights(gt) > 1.0).float().mean().item(),
-    # )
+    pred_samples       = None,   # [S, T, B, 2] normalised
+    gt_norm            = None,   # [T, B, 2] normalised (FULL, không phải FM zone)
+    weights            = None,
+    intensity_w        = None,
+    step_weight_alpha  = 0.0,
+    all_trajs          = None,
+    epoch              = 0,
+    gt_abs_deg         = None,
+    sr_pred            = None,
+    fm_pred_abs        = None,
+    **kwargs,          # ignore các params cũ
+) -> dict:
+    """
+    Loss v31 — đơn giản, mạnh, cạnh tranh được LSTM.
+    
+    Không dùng: PINN, continuity, spread, jerk, disp, dir, accel, smooth
+    Dùng: FM AFCRPS + MSE haversine per-step + SR + velocity + heading
+    """
+    import torch
+    import torch.nn.functional as F
+ 
+    if weights is None:
+        weights = WEIGHTS
+ 
     NRM = 35.0
-
-    sample_w = _recurvature_weights(gt) * (
+ 
+    # Sample weights (recurvature + intensity)
+    recurv_w = _recurvature_weights(gt, w_recurv=2.0)
+    sample_w = recurv_w * (
         intensity_w.to(gt.device) if intensity_w is not None else 1.0)
     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
-
-    # FM AFCRPS — loss chính, không suppress
-    if pred_samples is not None:
-        target = gt_norm if gt_norm is not None else gt
+ 
+    # ── FM AFCRPS ────────────────────────────────────────────────────
+    if pred_samples is not None and gt_norm is not None:
         l_fm = fm_afcrps_loss(
-            pred_samples, target,
-            unit_01deg=(gt_norm is not None),
+            pred_samples, gt_norm,
+            unit_01deg=True,
             intensity_w=sample_w,
             step_weight_alpha=step_weight_alpha,
+            w_es=0.2,
         )
+    elif pred_samples is not None:
+        l_fm = _haversine_deg(pred_abs, gt).mean()
     else:
         l_fm = _haversine_deg(pred_abs, gt).mean()
-
-    l_mse_coord = F.mse_loss(pred_abs / 10.0, gt / 10.0) # Scale về đơn vị nhỏ
-    # Chỉ giữ velocity + heading (directional consistency)
+ 
+    # ── MSE Haversine per-step (KEY loss) ────────────────────────────
+    # Tính trên pred_abs (degrees) vs gt (degrees)
+    dist_km = _haversine_deg(pred_abs, gt)  # [T, B]
+    T = dist_km.shape[0]
+    sw = pred_abs.new_tensor(MSE_STEP_WEIGHTS[:T])
+    sw = sw / sw.sum() * T
+    l_mse_hav = (dist_km.pow(2) * sw.unsqueeze(1)).mean() / (200.0 ** 2)
+ 
+    # ── Directional ──────────────────────────────────────────────────
     l_vel     = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
     l_heading = heading_loss(pred_abs, gt)
     l_recurv  = recurvature_loss(pred_abs, gt)
-
+ 
+    # ── Total ─────────────────────────────────────────────────────────
     total = (
-        weights.get("fm",         2.5) * l_fm
-        + weights.get("velocity",   0.8) * l_vel * NRM
-        + weights.get("heading",    1.5) * l_heading * NRM
-        + weights.get("recurv",     1.0) * l_recurv * NRM
-        + weights.get("mse", 2.0) * l_mse_coord * NRM  # MSE làm mỏ neo
+        weights.get("fm",          2.0) * l_fm
+        + weights.get("mse_hav",   3.0) * l_mse_hav
+        + weights.get("velocity",  0.5) * l_vel     * NRM
+        + weights.get("heading",   1.0) * l_heading * NRM
+        + weights.get("recurv",    0.5) * l_recurv  * NRM
     ) / NRM
-
+ 
     if torch.isnan(total) or torch.isinf(total):
         total = pred_abs.new_zeros(())
-
+ 
     return dict(
-        total=total, fm=l_fm.item(),
-        velocity=l_vel.item()*NRM, heading=l_heading.item(),
-        recurv=l_recurv.item(),mse=l_mse_coord.item(),
+        total       = total,
+        fm          = l_fm.item(),
+        mse_hav     = l_mse_hav.item(),
+        velocity    = l_vel.item() * NRM,
+        heading     = l_heading.item(),
+        recurv      = l_recurv.item(),
+        # zeros để backward compat
         step=0.0, disp=0.0, smooth=0.0, accel=0.0, jerk=0.0, pinn=0.0,
         spread=0.0, continuity=0.0, recurv_ratio=0.0,
-        
     )

@@ -2425,7 +2425,8 @@ class VelocityField(nn.Module):
         )
 
         self.traj_embed  = nn.Linear(4, 256)
-        self.pos_enc     = nn.Parameter(torch.randn(1, fm_pred_len, 256) * 0.05)
+        # self.pos_enc     = nn.Parameter(torch.randn(1, fm_pred_len, 256) * 0.05)
+        self.pos_enc = nn.Parameter(torch.randn(1, pred_len, 256) * 0.05)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
@@ -2694,6 +2695,36 @@ class TCFlowMatching(nn.Module):
         return self.get_loss_breakdown(
             batch_list, step_weight_alpha, epoch)["total"]
 
+    # def get_loss_breakdown(
+    #     self,
+    #     batch_list: List,
+    #     step_weight_alpha: float = 0.0,
+    #     epoch: int = 0,
+    # ) -> Dict:
+    #     """
+    #     HIERARCHICAL loss computation:
+    #     1. Compute SR pred (step 1-4) 
+    #     2. Compute FM pred (step 5-12) conditioned on SR step 4
+    #     3. Concatenate → full trajectory
+    #     4. Compute losses on appropriate zones
+    #     """
+    #     batch_list = self._lon_flip_aug(batch_list, p=0.3)
+
+    #     traj_gt = batch_list[1]    # [T, B, 2] normalised
+    #     Me_gt   = batch_list[8]
+    #     obs_t   = batch_list[0]    # [T_obs, B, 2] normalised
+    #     obs_Me  = batch_list[7]
+
+    #     try:
+    #         env_data = batch_list[13]
+    #     except (IndexError, TypeError):
+    #         env_data = None
+
+    #     lp, lm = obs_t[-1], obs_Me[-1]
+        
+    #     # ── Compute raw_ctx once ──
+    #     raw_ctx     = self.net._context(batch_list)
+    #     intensity_w = self._intensity_weights(obs_Me)
     def get_loss_breakdown(
         self,
         batch_list: List,
@@ -2701,40 +2732,39 @@ class TCFlowMatching(nn.Module):
         epoch: int = 0,
     ) -> Dict:
         """
-        HIERARCHICAL loss computation:
-        1. Compute SR pred (step 1-4) 
-        2. Compute FM pred (step 5-12) conditioned on SR step 4
-        3. Concatenate → full trajectory
-        4. Compute losses on appropriate zones
+        v31: FM predict full 12 steps từ lp.
+        KEY FIX: không dùng sr_pred[3] làm FM reference → fix 72h stuck 500km.
         """
         batch_list = self._lon_flip_aug(batch_list, p=0.3)
-
-        traj_gt = batch_list[1]    # [T, B, 2] normalised
+ 
+        traj_gt = batch_list[1]    # [12, B, 2] normalised
         Me_gt   = batch_list[8]
-        obs_t   = batch_list[0]    # [T_obs, B, 2] normalised
+        obs_t   = batch_list[0]
         obs_Me  = batch_list[7]
-
+ 
         try:
             env_data = batch_list[13]
         except (IndexError, TypeError):
             env_data = None
-
+ 
         lp, lm = obs_t[-1], obs_Me[-1]
-        
-        # ── Compute raw_ctx once ──
+ 
         raw_ctx     = self.net._context(batch_list)
         intensity_w = self._intensity_weights(obs_Me)
-
         # ── SR prediction (step 1-4) ──
-        n_sr = ShortRangeHead.N_STEPS
-        sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
-        
-        # SR loss
-        l_sr = short_range_regression_loss(sr_pred, traj_gt[:n_sr], lp)
+        # n_sr = ShortRangeHead.N_STEPS
+        # sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
+        n_sr    = ShortRangeHead.N_STEPS
+        sr_pred = self.net.forward_short_range(obs_t, raw_ctx)
+        l_sr    = short_range_regression_loss(sr_pred, traj_gt[:n_sr], lp)
+
+        # # SR loss
+        # l_sr = short_range_regression_loss(sr_pred, traj_gt[:n_sr], lp)
 
         # ── FM prediction (step 5-12) conditioned on SR endpoint ──
         # FM uses sr_pred[3] as starting point
-        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
+        # sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
+        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred.detach())
         
         # FM ground truth: relative to SR step 4 position
         fm_ref_pos = sr_pred[3].detach()  # [B, 2] - SR step 4 position (normalised)
@@ -2750,89 +2780,185 @@ class TCFlowMatching(nn.Module):
                 fm_physics=0.0, recurv_ratio=0.0,
             )
 
-        # FM input: relative to SR step 4
-        x1_fm = self._to_rel(fm_gt, fm_Me_gt, fm_ref_pos, lm)  # [B, T_fm, 4]
+        # # FM input: relative to SR step 4
+        # x1_fm = self._to_rel(fm_gt, fm_Me_gt, fm_ref_pos, lm)  # [B, T_fm, 4]
         
-        # CFM forward
-        x_t, t, te, denom, _ = self._cfm_noisy(x1_fm)
+        # # CFM forward
+        # x_t, t, te, denom, _ = self._cfm_noisy(x1_fm)
+        # pred_vel = self.net.forward_with_ctx(
+        #     x_t, t, raw_ctx, noise_scale=0.0,
+        #     sr_anchor_emb=sr_anchor_emb
+        # )
+
+        # # FM ensemble for AFCRPS
+        # fm_samples: List[torch.Tensor] = []
+        # for _ in range(self.n_train_ens):
+        #     xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1_fm)
+        #     pv_s = self.net.forward_with_ctx(
+        #         xt_s, ts, raw_ctx, noise_scale=0.0,
+        #         sr_anchor_emb=sr_anchor_emb
+        #     )
+        #     x1_s = xt_s + dens_s * pv_s
+        #     pa_s, _ = self._to_abs(x1_s, fm_ref_pos, lm)
+        #     fm_samples.append(pa_s)
+        # fm_pred_samples = torch.stack(fm_samples)  # [S, T_fm, B, 2] normalised
+
+        # # FM physics consistency
+        # l_fm_physics = fm_physics_consistency_loss(
+        #     fm_pred_samples, gt_norm=fm_gt, last_pos=fm_ref_pos)
+
+        # # FM mean prediction (normalised)
+        # x1_pred = x_t + denom * pred_vel
+        # fm_pred_abs_norm, _ = self._to_abs(x1_pred, fm_ref_pos, lm)  # [T_fm, B, 2]
+
+        # # ── Build full trajectory (SR + FM) ──
+        # full_pred_norm = torch.cat([sr_pred, fm_pred_abs_norm], dim=0)  # [12, B, 2]
+        
+        #  # --- THÊM MSE TỌA ĐỘ VÀO ĐÂY ---
+        # # Đây là "vũ khí" giúp LSTM thắng bạn, giờ chúng ta trang bị nó cho FM
+        # l_mse_coord = F.mse_loss(full_pred_norm, traj_gt)
+        
+        # # Convert to degrees
+        # full_pred_deg = _denorm_to_deg(full_pred_norm)
+        # fm_pred_deg   = _denorm_to_deg(fm_pred_abs_norm)
+        # traj_gt_deg   = _denorm_to_deg(traj_gt)
+        # ref_deg       = _denorm_to_deg(lp)
+
+        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)  # [B, 12, 4] rel to lp
+ 
+        x_t, t, te, denom, _ = self._cfm_noisy(x1)
         pred_vel = self.net.forward_with_ctx(
             x_t, t, raw_ctx, noise_scale=0.0,
-            sr_anchor_emb=sr_anchor_emb
-        )
-
-        # FM ensemble for AFCRPS
+            sr_anchor_emb=sr_anchor_emb)
+ 
+        # FM ensemble
         fm_samples: List[torch.Tensor] = []
         for _ in range(self.n_train_ens):
-            xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1_fm)
+            xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
             pv_s = self.net.forward_with_ctx(
                 xt_s, ts, raw_ctx, noise_scale=0.0,
-                sr_anchor_emb=sr_anchor_emb
-            )
+                sr_anchor_emb=sr_anchor_emb)
             x1_s = xt_s + dens_s * pv_s
-            pa_s, _ = self._to_abs(x1_s, fm_ref_pos, lm)
+            pa_s, _ = self._to_abs(x1_s, lp, lm)
             fm_samples.append(pa_s)
-        fm_pred_samples = torch.stack(fm_samples)  # [S, T_fm, B, 2] normalised
-
-        # FM physics consistency
-        l_fm_physics = fm_physics_consistency_loss(
-            fm_pred_samples, gt_norm=fm_gt, last_pos=fm_ref_pos)
-
-        # FM mean prediction (normalised)
+        pred_samples = torch.stack(fm_samples)   # [S, 12, B, 2] normalised
+ 
+        # FM mean
         x1_pred = x_t + denom * pred_vel
-        fm_pred_abs_norm, _ = self._to_abs(x1_pred, fm_ref_pos, lm)  # [T_fm, B, 2]
+        pred_abs, _ = self._to_abs(x1_pred, lp, lm)   # [12, B, 2] normalised
+ 
+        # Convert to degrees for directional losses
+        pred_abs_deg = _denorm_to_deg(pred_abs)
+        traj_gt_deg  = _denorm_to_deg(traj_gt)
+        ref_deg      = _denorm_to_deg(lp)
 
-        # ── Build full trajectory (SR + FM) ──
-        full_pred_norm = torch.cat([sr_pred, fm_pred_abs_norm], dim=0)  # [12, B, 2]
-        
-         # --- THÊM MSE TỌA ĐỘ VÀO ĐÂY ---
-        # Đây là "vũ khí" giúp LSTM thắng bạn, giờ chúng ta trang bị nó cho FM
-        l_mse_coord = F.mse_loss(full_pred_norm, traj_gt)
-        
-        # Convert to degrees
-        full_pred_deg = _denorm_to_deg(full_pred_norm)
-        fm_pred_deg   = _denorm_to_deg(fm_pred_abs_norm)
-        traj_gt_deg   = _denorm_to_deg(traj_gt)
-        ref_deg       = _denorm_to_deg(lp)
-
-        # ── Compute total loss ──
+        from Model.losses import compute_total_loss, WEIGHTS
         breakdown = compute_total_loss(
-            pred_abs           = full_pred_deg,
+            pred_abs           = pred_abs_deg,
             gt                 = traj_gt_deg,
             ref                = ref_deg,
             batch_list         = batch_list,
-            pred_samples       = fm_pred_samples,   # FM zone only
-            gt_norm            = fm_gt,              # FM zone GT
+            pred_samples       = pred_samples,
+            gt_norm            = traj_gt,       # FULL 12 steps
             weights            = WEIGHTS,
             intensity_w        = intensity_w,
-            env_data           = env_data,
             step_weight_alpha  = step_weight_alpha,
-            all_trajs          = fm_pred_samples,    # FM zone ensemble
             epoch              = epoch,
-            gt_abs_deg         = traj_gt_deg,
             sr_pred            = sr_pred,
-            fm_pred_abs        = fm_pred_deg,
         )
-
-        # Cập nhật MSE vào breakdown
-        mse_w = WEIGHTS.get("mse", 4.0) # Trọng số cao để đấu với LSTM
-        breakdown["total"] = breakdown["total"] + mse_w * l_mse_coord
-        breakdown["mse"] = l_mse_coord.item()
-
-        # Add FM physics
-        fm_phys_w = WEIGHTS.get("fm_physics", 0.3)
-        breakdown["total"]      = breakdown["total"] + fm_phys_w * l_fm_physics
-        breakdown["fm_physics"] = l_fm_physics.item()
-
+ 
         # Add SR loss
-        sr_w = WEIGHTS.get("short_range", 3.0)
+        sr_w = WEIGHTS.get("short_range", 5.0)
         breakdown["total"]       = breakdown["total"] + sr_w * l_sr
         breakdown["short_range"] = l_sr.item()
-
+ 
         return breakdown
 
     # ── sample() ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
+    # def sample(
+    #     self,
+    #     batch_list:   List,
+    #     num_ensemble: int = 50,
+    #     ddim_steps:   int = 20,
+    #     predict_csv:  Optional[str] = None,
+    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    #     """
+    #     HIERARCHICAL sampling:
+    #     1. SR predicts step 1-4
+    #     2. FM predicts step 5-12 starting from SR step 4
+    #     3. Concatenate → full 12-step trajectory
+        
+    #     Returns:
+    #         pred_mean : [T=12, B, 2] normalised
+    #         me_mean   : [T=12, B, 2]
+    #         all_trajs : [S, T=12, B, 2] full ensemble
+    #     """
+    #     obs_t  = batch_list[0]
+    #     lp     = obs_t[-1]
+    #     lm     = batch_list[7][-1]
+    #     B      = lp.shape[0]
+    #     device = lp.device
+    #     T_fm   = self.fm_pred_len  # 8
+    #     dt     = 1.0 / max(ddim_steps, 1)
+
+    #     raw_ctx = self.net._context(batch_list)
+
+    #     # ── Step 1: SR prediction ──
+    #     sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
+        
+    #     # SR anchor for FM
+    #     sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
+    #     fm_ref_pos = sr_pred[3]  # FM starts from SR step 4
+
+    #     # ── Step 2: FM ensemble from SR endpoint ──
+    #     fm_traj_s: List[torch.Tensor] = []
+    #     fm_me_s:   List[torch.Tensor] = []
+
+    #     for k in range(num_ensemble):
+    #         x_t = torch.randn(B, T_fm, 4, device=device) * self.initial_sample_sigma
+
+    #         for step in range(ddim_steps):
+    #             t_b = torch.full((B,), step * dt, device=device)
+    #             # ns  = self.ctx_noise_scale if step == 0 else 0.0  # ★ NO *10
+    #             ns = self.ctx_noise_scale if step < 3 else 0.0
+
+    #             vel = self.net.forward_with_ctx(
+    #                 x_t, t_b, raw_ctx, noise_scale=ns,
+    #                 sr_anchor_emb=sr_anchor_emb
+    #             )
+    #             x_t = x_t + dt * vel
+
+    #         x_t = self._physics_correct(x_t, fm_ref_pos, lm, n_steps=5, lr=0.002)
+    #         x_t = x_t.clamp(-3.0, 3.0)
+
+    #         tr, me = self._to_abs(x_t, fm_ref_pos, lm)  # [T_fm, B, 2]
+    #         fm_traj_s.append(tr)
+    #         fm_me_s.append(me)
+
+    #     fm_all_trajs = torch.stack(fm_traj_s)  # [S, T_fm, B, 2]
+    #     fm_all_me    = torch.stack(fm_me_s)
+
+    #     fm_mean = fm_all_trajs.mean(0)  # [T_fm, B, 2]
+    #     fm_me_mean = fm_all_me.mean(0)
+
+    #     # ── Step 3: Concatenate SR + FM ──
+    #     # SR step 1-4 + FM step 5-12 = full 12 steps
+    #     pred_mean = torch.cat([sr_pred, fm_mean], dim=0)  # [12, B, 2]
+        
+    #     # Me: SR doesn't predict Me, use FM Me with padding
+    #     sr_me = torch.zeros(N_SR_STEPS, B, 2, device=device)
+    #     me_mean = torch.cat([sr_me, fm_me_mean], dim=0)
+
+    #     # Full ensemble: SR (repeated) + FM ensemble
+    #     sr_expanded = sr_pred.unsqueeze(0).expand(num_ensemble, -1, -1, -1)  # [S, 4, B, 2]
+    #     all_trajs = torch.cat([sr_expanded, fm_all_trajs], dim=1)  # [S, 12, B, 2]
+
+    #     if predict_csv:
+    #         self._write_predict_csv(predict_csv, pred_mean, all_trajs)
+
+    #     return pred_mean, me_mean, all_trajs
     def sample(
         self,
         batch_list:   List,
@@ -2841,79 +2967,56 @@ class TCFlowMatching(nn.Module):
         predict_csv:  Optional[str] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        HIERARCHICAL sampling:
-        1. SR predicts step 1-4
-        2. FM predicts step 5-12 starting from SR step 4
-        3. Concatenate → full 12-step trajectory
-        
-        Returns:
-            pred_mean : [T=12, B, 2] normalised
-            me_mean   : [T=12, B, 2]
-            all_trajs : [S, T=12, B, 2] full ensemble
+        v31: FM từ lp (consistent với training).
+        SR override step 1-4 trong pred_mean.
         """
         obs_t  = batch_list[0]
         lp     = obs_t[-1]
         lm     = batch_list[7][-1]
         B      = lp.shape[0]
         device = lp.device
-        T_fm   = self.fm_pred_len  # 8
+        T      = self.pred_len    # 12
         dt     = 1.0 / max(ddim_steps, 1)
-
+ 
         raw_ctx = self.net._context(batch_list)
-
-        # ── Step 1: SR prediction ──
-        sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
-        
-        # SR anchor for FM
-        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
-        fm_ref_pos = sr_pred[3]  # FM starts from SR step 4
-
-        # ── Step 2: FM ensemble from SR endpoint ──
-        fm_traj_s: List[torch.Tensor] = []
-        fm_me_s:   List[torch.Tensor] = []
-
+ 
+        # SR step 1-4
+        sr_pred = self.net.forward_short_range(obs_t, raw_ctx)
+        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)
+ 
+        # FM ensemble từ lp (KHÔNG phải từ sr_pred[3])
+        traj_s, me_s = [], []
         for k in range(num_ensemble):
-            x_t = torch.randn(B, T_fm, 4, device=device) * self.initial_sample_sigma
-
+            x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+ 
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
-                # ns  = self.ctx_noise_scale if step == 0 else 0.0  # ★ NO *10
-                ns = self.ctx_noise_scale if step < 3 else 0.0
-
+                ns  = self.ctx_noise_scale if step < 3 else 0.0
                 vel = self.net.forward_with_ctx(
-                    x_t, t_b, raw_ctx, noise_scale=ns,
-                    sr_anchor_emb=sr_anchor_emb
-                )
+                    x_t, t_b, raw_ctx,
+                    noise_scale=ns, sr_anchor_emb=sr_anchor_emb)
                 x_t = x_t + dt * vel
-
-            x_t = self._physics_correct(x_t, fm_ref_pos, lm, n_steps=5, lr=0.002)
+ 
+            x_t = self._physics_correct(x_t, lp, lm, n_steps=3, lr=0.001)
             x_t = x_t.clamp(-3.0, 3.0)
-
-            tr, me = self._to_abs(x_t, fm_ref_pos, lm)  # [T_fm, B, 2]
-            fm_traj_s.append(tr)
-            fm_me_s.append(me)
-
-        fm_all_trajs = torch.stack(fm_traj_s)  # [S, T_fm, B, 2]
-        fm_all_me    = torch.stack(fm_me_s)
-
-        fm_mean = fm_all_trajs.mean(0)  # [T_fm, B, 2]
-        fm_me_mean = fm_all_me.mean(0)
-
-        # ── Step 3: Concatenate SR + FM ──
-        # SR step 1-4 + FM step 5-12 = full 12 steps
-        pred_mean = torch.cat([sr_pred, fm_mean], dim=0)  # [12, B, 2]
-        
-        # Me: SR doesn't predict Me, use FM Me with padding
-        sr_me = torch.zeros(N_SR_STEPS, B, 2, device=device)
-        me_mean = torch.cat([sr_me, fm_me_mean], dim=0)
-
-        # Full ensemble: SR (repeated) + FM ensemble
-        sr_expanded = sr_pred.unsqueeze(0).expand(num_ensemble, -1, -1, -1)  # [S, 4, B, 2]
-        all_trajs = torch.cat([sr_expanded, fm_all_trajs], dim=1)  # [S, 12, B, 2]
-
+ 
+            tr, me = self._to_abs(x_t, lp, lm)
+            traj_s.append(tr)
+            me_s.append(me)
+ 
+        all_trajs = torch.stack(traj_s)    # [S, 12, B, 2]
+        all_me    = torch.stack(me_s)
+ 
+        fm_mean = all_trajs.mean(0)        # [12, B, 2]
+        me_mean = all_me.mean(0)
+ 
+        # Blend: SR step 1-4, FM step 5-12
+        pred_mean = fm_mean.clone()
+        pred_mean[:ShortRangeHead.N_STEPS] = sr_pred
+ 
         if predict_csv:
             self._write_predict_csv(predict_csv, pred_mean, all_trajs)
-
+ 
         return pred_mean, me_mean, all_trajs
 
     # ── Physics correction ────────────────────────────────────────────────────
