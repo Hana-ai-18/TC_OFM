@@ -2868,7 +2868,9 @@ class TCFlowMatching(nn.Module):
 
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
-                ns  = self.ctx_noise_scale if step == 0 else 0.0  # ★ NO *10
+                # ns  = self.ctx_noise_scale if step == 0 else 0.0  # ★ NO *10
+                ns = self.ctx_noise_scale if step < 3 else 0.0
+
                 vel = self.net.forward_with_ctx(
                     x_t, t_b, raw_ctx, noise_scale=ns,
                     sr_anchor_emb=sr_anchor_emb

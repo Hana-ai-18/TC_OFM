@@ -4029,8 +4029,8 @@ def get_args():
     p.add_argument("--num_workers",     default=2,          type=int)
 
     p.add_argument("--sigma_min",            default=0.02,   type=float)
-    p.add_argument("--ctx_noise_scale",      default=0.002,  type=float)
-    p.add_argument("--initial_sample_sigma", default=0.03,   type=float)
+    p.add_argument("--ctx_noise_scale",      default=0.01,  type=float)
+    p.add_argument("--initial_sample_sigma", default=0.05,   type=float)
 
     p.add_argument("--ode_steps_train", default=20,  type=int)
     p.add_argument("--ode_steps_val",   default=30,  type=int)
@@ -4249,7 +4249,7 @@ def main(args):
                 scaler.update()
                 scheduler.step()          # ← 2. scheduler sau  (HOÁN ĐỔI VỊ TRÍ)
                 optimizer.zero_grad()
-                
+
             sum_loss += bd["total"].item()
 
             if i % 20 == 0:
