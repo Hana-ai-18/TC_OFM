@@ -5415,9 +5415,10 @@ def continuity_loss(
     else:
         l_accel = sr_pred.new_zeros(())
     
-    # return 0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel
-        result = 0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel
-    return result.clamp(max=50.0)   # ← THÊM DÒNG NÀY: tránh spike 19,945
+    # # return 0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel
+    #     result = 0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel
+    # return result.clamp(max=50.0)   # ← THÊM DÒNG NÀY: tránh spike 19,945
+    return (0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel).clamp(max=50.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
