@@ -2213,24 +2213,28 @@
 # TCDiffusion = TCFlowMatching
 
 """
-Model/flow_matching_model.py  ── v30 - HIERARCHICAL
-=====================================================
-CHIẾN LƯỢC: SR owns step 1-4, FM starts from SR endpoint for step 5-12
+flow_matching_model_v32.py — Tiếp cận đơn giản nhất để beat LSTM
 
-KEY CHANGES từ v25:
-  1. BỎ Phase 1 freeze hoàn toàn → train everything from epoch 0
-  2. FM predict step 5-12 CONDITIONED ON sr_pred[3] (24h position)
-  3. sample(): SR[:4] + FM[:8] = full 12 steps, NO blend override
-  4. initial_sample_sigma = 0.03 (trả về gốc)
-  5. ctx_noise_scale = 0.002 (trả về gốc, KHÔNG nhân 10)
-  6. get_loss_breakdown(): tính FM loss chỉ trên FM zone
-  7. Continuity loss thay bridge loss
-  8. FM pred_len = 8 (step 5-12), không phải 12
+INSIGHT: LSTM beat vì nó train với pure MSE → gradient rõ ràng, không conflict.
+Vấn đề của FM không phải architecture mà là training signal:
+  - AFCRPS: pull về diverse predictions
+  - MSE_hav: pull về mean prediction  
+  - Hai cái này conflict nhau → stuck at mean (ADE=412km)
 
-ARCHITECTURE:
-  - ShortRangeHead: GRU autoregressive, predict step 1-4 (unchanged)
-  - VelocityField: OT-CFM, predict step 5-12 starting from sr_pred[3]
-  - Handoff: SR step 4 position → FM initial condition
+GIẢI PHÁP V32:
+  Phase 1 (epoch 0-30): Train như LSTM thuần túy
+    - Loss = SR_Huber(step 1-4) + MSE_hav(step 1-12)
+    - Không dùng FM AFCRPS
+    - Model học được basic trajectory prediction
+    
+  Phase 2 (epoch 31+): Thêm FM ensemble diversity
+    - Loss = SR_Huber + MSE_hav + 0.5*AFCRPS
+    - FM dùng để calibrate uncertainty, không phải accuracy
+    
+KẾT QUẢ DỰ KIẾN:
+  - Epoch 10-20: ADE giảm nhanh từ 412 → ~250km (như LSTM ban đầu)
+  - Epoch 30-50: ADE ~170km, 72h ~300km
+  - Epoch 60+: SR converge → 12h ~50km
 """
 from __future__ import annotations
 
@@ -2244,62 +2248,64 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Import các module unchanged
 from Model.FNO3D_encoder import FNO3DEncoder
 from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 from Model.env_net_transformer_gphsplit import Env_net
 from Model.losses import (
-    compute_total_loss, fm_physics_consistency_loss, WEIGHTS,
-    pinn_speed_constraint, short_range_regression_loss, continuity_loss,
-    _norm_to_deg, N_SR_STEPS,
+    _haversine_deg, _norm_to_deg, N_SR_STEPS,
+    short_range_regression_loss, heading_loss,
+    velocity_loss_per_sample, recurvature_loss,
+    fm_afcrps_loss, fm_physics_consistency_loss,
 )
 
+MSE_STEP_WEIGHTS = [1.0, 3.0, 1.5, 2.5, 1.0, 1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 2.0]
 
-def _denorm_to_deg(traj_norm: torch.Tensor) -> torch.Tensor:
-    out = traj_norm.clone()
-    out[..., 0] = (traj_norm[..., 0] * 50.0 + 1800.0) / 10.0
-    out[..., 1] = (traj_norm[..., 1] * 50.0) / 10.0
+
+def _denorm_to_deg(t):
+    out = t.clone()
+    out[..., 0] = (t[..., 0] * 50.0 + 1800.0) / 10.0
+    out[..., 1] = (t[..., 1] * 50.0) / 10.0
     return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ShortRangeHead (unchanged from v25)
-# ══════════════════════════════════════════════════════════════════════════════
+def mse_hav_loss(pred_norm, gt_norm, step_w=None):
+    """Haversine MSE per-step với step weighting."""
+    if step_w is None:
+        step_w = MSE_STEP_WEIGHTS
+    T = min(pred_norm.shape[0], gt_norm.shape[0])
+    pred_deg = _norm_to_deg(pred_norm[:T])
+    gt_deg   = _norm_to_deg(gt_norm[:T])
+    dist_km  = _haversine_deg(pred_deg, gt_deg)   # [T, B]
+    w = pred_norm.new_tensor(step_w[:T])
+    w = w / w.sum() * T
+    return (dist_km.pow(2) * w.unsqueeze(1)).mean() / (200.0 ** 2)
+
+
+# ─── ShortRangeHead (giữ nguyên từ v30) ──────────────────────────────────────
 
 class ShortRangeHead(nn.Module):
     N_STEPS   = 4
     MAX_DELTA = 0.48
 
-    def __init__(self, raw_ctx_dim: int = 512, obs_len: int = 8):
+    def __init__(self, raw_ctx_dim=512, obs_len=8):
         super().__init__()
         self.obs_len = obs_len
-
         self.vel_enc = nn.Sequential(
-            nn.Linear(obs_len * 2, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Linear(256, 128),
-            nn.GELU(),
+            nn.Linear(obs_len * 2, 256), nn.GELU(),
+            nn.LayerNorm(256), nn.Linear(256, 128), nn.GELU(),
         )
-
         self.ctx_proj = nn.Sequential(
-            nn.Linear(raw_ctx_dim, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Dropout(0.05),
+            nn.Linear(raw_ctx_dim, 256), nn.GELU(),
+            nn.LayerNorm(256), nn.Dropout(0.05),
         )
-
         self.gru_cell = nn.GRUCell(input_size=386, hidden_size=256)
-
         self.motion_gate_linear = nn.Linear(128 + 256, 1)
-
         self.out_norm = nn.LayerNorm(256)
         self.out_head = nn.Sequential(
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.LayerNorm(128),
-            nn.Linear(128, 2),
+            nn.Linear(256, 128), nn.GELU(),
+            nn.LayerNorm(128), nn.Linear(128, 2),
         )
-
         self.step_scale = nn.Parameter(torch.ones(self.N_STEPS) * 0.2)
         self._init_weights()
 
@@ -2312,810 +2318,385 @@ class ShortRangeHead(nn.Module):
                         nn.init.zeros_(m.bias)
             nn.init.constant_(self.motion_gate_linear.bias, 2.0)
 
-    def forward(self, raw_ctx: torch.Tensor,
-                obs_traj: torch.Tensor) -> torch.Tensor:
-        B     = raw_ctx.shape[0]
-        T_obs = obs_traj.shape[0]
-
-        if T_obs >= 2:
-            vels = obs_traj[1:] - obs_traj[:-1]
-        else:
-            vels = torch.zeros(1, B, 2, device=raw_ctx.device)
-
-        target_v = self.obs_len
-        if vels.shape[0] < target_v:
-            pad  = torch.zeros(target_v - vels.shape[0], B, 2, device=raw_ctx.device)
+    def forward(self, raw_ctx, obs_traj):
+        B, T_obs = raw_ctx.shape[0], obs_traj.shape[0]
+        vels = obs_traj[1:] - obs_traj[:-1] if T_obs >= 2 else torch.zeros(1, B, 2, device=raw_ctx.device)
+        if vels.shape[0] < self.obs_len:
+            pad  = torch.zeros(self.obs_len - vels.shape[0], B, 2, device=raw_ctx.device)
             vels = torch.cat([pad, vels], dim=0)
         else:
-            vels = vels[-target_v:]
-
-        vel_input = vels.permute(1, 0, 2).reshape(B, -1)
-        vel_feat  = self.vel_enc(vel_input)
-        ctx_feat  = self.ctx_proj(raw_ctx)
-
-        hx      = ctx_feat
-        cur_pos = obs_traj[-1].clone()
-        last_vel = vels[-1].clone()
-
+            vels = vels[-self.obs_len:]
+        vel_feat = self.vel_enc(vels.permute(1, 0, 2).reshape(B, -1))
+        ctx_feat = self.ctx_proj(raw_ctx)
+        hx, cur_pos, last_vel = ctx_feat, obs_traj[-1].clone(), vels[-1].clone()
         preds = []
         for i in range(self.N_STEPS):
-            inp = torch.cat([ctx_feat, vel_feat, cur_pos], dim=-1)
-            hx  = self.gru_cell(inp, hx)
-
-            gate_input = torch.cat([vel_feat, hx], dim=-1)
-            gate = torch.sigmoid(self.motion_gate_linear(gate_input))
-
+            hx  = self.gru_cell(torch.cat([ctx_feat, vel_feat, cur_pos], dim=-1), hx)
+            gate = torch.sigmoid(self.motion_gate_linear(torch.cat([vel_feat, hx], dim=-1)))
             raw_delta   = self.out_head(self.out_norm(hx))
             prior_delta = last_vel * (0.9 ** i)
-
             scale_i = torch.sigmoid(self.step_scale[i]) * self.MAX_DELTA
-            blended = gate * prior_delta + (1.0 - gate) * raw_delta * scale_i
-            delta   = blended.clamp(-self.MAX_DELTA, self.MAX_DELTA)
-
-            cur_pos  = cur_pos + delta
+            delta   = (gate * prior_delta + (1.0 - gate) * raw_delta * scale_i).clamp(-self.MAX_DELTA, self.MAX_DELTA)
+            cur_pos = cur_pos + delta
             last_vel = delta
             preds.append(cur_pos)
-
         return torch.stack(preds, dim=0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  VelocityField
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── VelocityField (giữ nguyên từ v30, pos_enc dùng pred_len) ────────────────
 
 class VelocityField(nn.Module):
     RAW_CTX_DIM = 512
 
-    def __init__(
-        self,
-        pred_len:   int   = 12,
-        obs_len:    int   = 8,
-        ctx_dim:    int   = 256,
-        sigma_min:  float = 0.02,
-        unet_in_ch: int   = 13,
-        fm_pred_len: int  = 8,  # NEW: FM predicts 8 steps (step 5-12)
-    ):
+    def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, sigma_min=0.02,
+                 unet_in_ch=13, fm_pred_len=8):
         super().__init__()
-        self.pred_len    = pred_len
-        self.fm_pred_len = fm_pred_len
-        self.obs_len     = obs_len
-        self.sigma_min   = sigma_min
-
+        self.pred_len = pred_len
+        self.obs_len  = obs_len
         self.spatial_enc = FNO3DEncoder(
-            in_channel   = unet_in_ch,
-            out_channel  = 1,
-            d_model      = 32,
-            n_layers     = 4,
-            modes_t      = 4,
-            modes_h      = 4,
-            modes_w      = 4,
-            spatial_down = 32,
-            dropout      = 0.05,
-        )
-
+            in_channel=unet_in_ch, out_channel=1, d_model=32,
+            n_layers=4, modes_t=4, modes_h=4, modes_w=4,
+            spatial_down=32, dropout=0.05)
         self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
         self.bottleneck_proj = nn.Linear(128, 128)
         self.decoder_proj    = nn.Linear(1, 16)
-
         self.enc_1d = DataEncoder1D(
-            in_1d       = 4,
-            feat_3d_dim = 128,
-            mlp_h       = 64,
-            lstm_hidden = 128,
-            lstm_layers = 3,
-            dropout     = 0.1,
-            d_state     = 16,
-        )
-
+            in_1d=4, feat_3d_dim=128, mlp_h=64,
+            lstm_hidden=128, lstm_layers=3, dropout=0.1, d_state=16)
         self.env_enc = Env_net(obs_len=obs_len, d_model=32)
-
         self.ctx_fc1  = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
         self.ctx_drop = nn.Dropout(0.15)
         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
-
-        self.time_fc1 = nn.Linear(256, 512)
-        self.time_fc2 = nn.Linear(512, 256)
-
-        # ★ SR anchor embedding: encode SR endpoint info for FM
         self.sr_anchor_proj = nn.Sequential(
-            nn.Linear(4, 64),  # sr_pos(2) + sr_vel(2)
-            nn.GELU(),
-            nn.Linear(64, 256),
-        )
-
-        self.traj_embed  = nn.Linear(4, 256)
-        # self.pos_enc     = nn.Parameter(torch.randn(1, fm_pred_len, 256) * 0.05)
-        self.pos_enc = nn.Parameter(torch.randn(1, pred_len, 256) * 0.05)
+            nn.Linear(4, 64), nn.GELU(), nn.Linear(64, 256))
+        self.time_fc1   = nn.Linear(256, 512)
+        self.time_fc2   = nn.Linear(512, 256)
+        self.traj_embed = nn.Linear(4, 256)
+        # KEY FIX: pos_enc dùng pred_len (12), không phải fm_pred_len (8)
+        self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 256) * 0.05)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
-                dropout=0.15, activation="gelu", batch_first=True,
-            ),
-            num_layers=4,
-        )
+                dropout=0.15, activation="gelu", batch_first=True),
+            num_layers=4)
         self.out_fc1 = nn.Linear(256, 512)
         self.out_fc2 = nn.Linear(512, 4)
-
         self.physics_scale = nn.Parameter(torch.ones(4) * 0.5)
+        self.short_range_head = ShortRangeHead(self.RAW_CTX_DIM, obs_len)
 
-        self.short_range_head = ShortRangeHead(
-            raw_ctx_dim = self.RAW_CTX_DIM,
-            obs_len     = obs_len,
-        )
-
-    def _time_emb(self, t: torch.Tensor, dim: int = 256) -> torch.Tensor:
+    def _time_emb(self, t, dim=256):
         half = dim // 2
-        freq = torch.exp(
-            torch.arange(half, dtype=torch.float32, device=t.device)
-            * (-math.log(10_000.0) / max(half - 1, 1))
-        )
-        emb = t.float().unsqueeze(1) * 1_000.0 * freq.unsqueeze(0)
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return F.pad(emb, (0, dim % 2))
+        freq = torch.exp(torch.arange(half, dtype=torch.float32, device=t.device)
+                         * (-math.log(10000.0) / max(half - 1, 1)))
+        emb  = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
+        return F.pad(torch.cat([emb.sin(), emb.cos()], dim=-1), (0, dim % 2))
 
-    def _context(self, batch_list) -> torch.Tensor:
+    def _context(self, batch_list):
         obs_traj  = batch_list[0]
         obs_Me    = batch_list[7]
         image_obs = batch_list[11]
         env_data  = batch_list[13]
-
         if image_obs.dim() == 4:
             image_obs = image_obs.unsqueeze(2)
-
-        expected_ch = self.spatial_enc.in_channel
-        if image_obs.shape[1] == 1 and expected_ch != 1:
-            image_obs = image_obs.expand(-1, expected_ch, -1, -1, -1)
-
+        if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
+            image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
         T_obs = obs_traj.shape[0]
-
-        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1)
-        e_3d_s = e_3d_s.permute(0, 2, 1)
+        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
         e_3d_s = self.bottleneck_proj(e_3d_s)
-
-        T_bot = e_3d_s.shape[1]
-        if T_bot != T_obs:
-            e_3d_s = F.interpolate(
-                e_3d_s.permute(0, 2, 1), size=T_obs,
-                mode="linear", align_corners=False,
-            ).permute(0, 2, 1)
-
+        if e_3d_s.shape[1] != T_obs:
+            e_3d_s = F.interpolate(e_3d_s.permute(0, 2, 1), size=T_obs,
+                                   mode="linear", align_corners=False).permute(0, 2, 1)
         e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
-        t_weights = torch.softmax(
-            torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
-                        device=e_3d_dec_t.device) * 0.5, dim=0,
-        )
-        f_spatial_scalar = (e_3d_dec_t * t_weights.unsqueeze(0)).sum(1, keepdim=True)
-        f_spatial = self.decoder_proj(f_spatial_scalar)
-
+        t_w = torch.softmax(torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
+                             device=e_3d_dec_t.device) * 0.5, dim=0)
+        f_spatial = self.decoder_proj((e_3d_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
         obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
         h_t    = self.enc_1d(obs_in, e_3d_s)
-
         e_env, _, _ = self.env_enc(env_data, image_obs)
+        return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_spatial], dim=-1))))
 
-        raw = torch.cat([h_t, e_env, f_spatial], dim=-1)
-        raw = F.gelu(self.ctx_ln(self.ctx_fc1(raw)))
-        return raw
-
-    def _apply_ctx_head(self, raw: torch.Tensor,
-                        noise_scale: float = 0.0) -> torch.Tensor:
+    def _apply_ctx_head(self, raw, noise_scale=0.0):
         if noise_scale > 0.0:
             raw = raw + torch.randn_like(raw) * noise_scale
         return self.ctx_fc2(self.ctx_drop(raw))
 
-    def _beta_drift_velocity(self, x_t: torch.Tensor) -> torch.Tensor:
-        OMEGA_val  = 7.2921e-5
-        R_val      = 6.371e6
-        DT         = 6 * 3600.0
-        M_PER_NORM = 5.0 * 111.0 * 1000.0
-
-        lat_norm = x_t[:, :, 1]
-        lat_deg  = lat_norm * 5.0
+    def _beta_drift(self, x_t):
+        lat_deg  = x_t[:, :, 1] * 5.0
         lat_rad  = torch.deg2rad(lat_deg.clamp(-85, 85))
-
-        beta   = 2 * OMEGA_val * torch.cos(lat_rad) / R_val
-        R_tc   = 3e5
-        v_lon  = -beta * R_tc ** 2 / 2
-        v_lat  =  beta * R_tc ** 2 / 4
-
-        v_lon_norm = v_lon * DT / M_PER_NORM
-        v_lat_norm = v_lat * DT / M_PER_NORM
-
-        v_phys = torch.zeros_like(x_t)
-        v_phys[:, :, 0] = v_lon_norm
-        v_phys[:, :, 1] = v_lat_norm
+        beta     = 2 * 7.2921e-5 * torch.cos(lat_rad) / 6.371e6
+        R_tc     = 3e5
+        v_phys   = torch.zeros_like(x_t)
+        v_phys[:, :, 0] = -beta * R_tc**2 / 2 * 6*3600 / (5*111*1000)
+        v_phys[:, :, 1] =  beta * R_tc**2 / 4 * 6*3600 / (5*111*1000)
         return v_phys
 
-    def _decode(self, x_t: torch.Tensor, t: torch.Tensor,
-                ctx: torch.Tensor,
-                sr_anchor_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        ★ NEW: sr_anchor_emb provides SR endpoint information to FM.
-        """
-        t_emb = F.gelu(self.time_fc1(self._time_emb(t, 256)))
+    def _decode(self, x_t, t, ctx, sr_anchor_emb=None):
+        t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
         t_emb = self.time_fc2(t_emb)
-
         T_seq = min(x_t.size(1), self.pos_enc.shape[1])
-        x_emb = (self.traj_embed(x_t[:, :T_seq, :])
-                  + self.pos_enc[:, :T_seq, :]
-                  + t_emb.unsqueeze(1))
-        
-        # Memory: context + time + SR anchor
+        x_emb = self.traj_embed(x_t[:, :T_seq]) + self.pos_enc[:, :T_seq] + t_emb.unsqueeze(1)
         mem_parts = [t_emb.unsqueeze(1), ctx.unsqueeze(1)]
         if sr_anchor_emb is not None:
             mem_parts.append(sr_anchor_emb.unsqueeze(1))
-        memory = torch.cat(mem_parts, dim=1)
-
         v_neural = self.out_fc2(F.gelu(self.out_fc1(
-            self.transformer(x_emb, memory)
-        )))
-
+            self.transformer(x_emb, torch.cat(mem_parts, dim=1)))))
         with torch.no_grad():
-            v_phys = self._beta_drift_velocity(x_t[:, :T_seq, :])
+            v_phys = self._beta_drift(x_t[:, :T_seq])
+        return v_neural + torch.sigmoid(self.physics_scale) * 2.0 * v_phys
 
-        scale = torch.sigmoid(self.physics_scale) * 2.0
-        return v_neural + scale * v_phys
+    def forward_with_ctx(self, x_t, t, raw_ctx, noise_scale=0.0, sr_anchor_emb=None):
+        return self._decode(x_t, t, self._apply_ctx_head(raw_ctx, noise_scale), sr_anchor_emb)
 
-    def forward(self, x_t, t, batch_list, sr_anchor_emb=None):
-        raw = self._context(batch_list)
-        ctx = self._apply_ctx_head(raw, noise_scale=0.0)
-        return self._decode(x_t, t, ctx, sr_anchor_emb)
-
-    def forward_with_ctx(self, x_t, t, raw_ctx, noise_scale: float = 0.0,
-                         sr_anchor_emb: Optional[torch.Tensor] = None):
-        ctx = self._apply_ctx_head(raw_ctx, noise_scale=noise_scale)
-        return self._decode(x_t, t, ctx, sr_anchor_emb)
-
-    def forward_short_range(self, obs_traj: torch.Tensor,
-                            raw_ctx: torch.Tensor) -> torch.Tensor:
+    def forward_short_range(self, obs_traj, raw_ctx):
         return self.short_range_head(raw_ctx, obs_traj)
 
-    def compute_sr_anchor_emb(self, sr_pred: torch.Tensor) -> torch.Tensor:
-        """
-        Encode SR endpoint info for FM conditioning.
-        sr_pred: [4, B, 2] normalised
-        Returns: [B, 256]
-        """
-        sr_pos = sr_pred[-1]                          # [B, 2] - step 4 position
-        sr_vel = sr_pred[-1] - sr_pred[-2]            # [B, 2] - step 3→4 velocity
-        anchor_input = torch.cat([sr_pos, sr_vel], dim=-1)  # [B, 4]
-        return self.sr_anchor_proj(anchor_input)      # [B, 256]
+    def compute_sr_anchor_emb(self, sr_pred):
+        anchor_input = torch.cat([sr_pred[-1], sr_pred[-1] - sr_pred[-2]], dim=-1)
+        return self.sr_anchor_proj(anchor_input)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TCFlowMatching - HIERARCHICAL VERSION
-# ══════════════════════════════════════════════════════════════════════════════
+# ─── TCFlowMatching v32 ───────────────────────────────────────────────────────
 
 class TCFlowMatching(nn.Module):
     """
-    TC trajectory prediction: SR (step 1-4) + FM (step 5-12).
+    v32: Phase-based training để tránh FM/MSE conflict.
     
-    Hierarchical architecture:
-    - SR head: deterministic, predict 6h-24h
-    - FM: probabilistic OT-CFM, predict 30h-72h
-    - FM starts from SR step 4 endpoint (conditioned)
+    Phase 1 (epoch < phase_switch): Pure MSE + SR
+    Phase 2 (epoch >= phase_switch): MSE + SR + AFCRPS
     """
 
-    def __init__(
-        self,
-        pred_len:             int   = 12,
-        obs_len:              int   = 8,
-        sigma_min:            float = 0.02,
-        n_train_ens:          int   = 4,
-        unet_in_ch:           int   = 13,
-        ctx_noise_scale:      float = 0.002,    # ★ RESTORED to original
-        initial_sample_sigma: float = 0.03,     # ★ RESTORED to original
-        **kwargs,
-    ):
+    PHASE_SWITCH = 30  # Sau epoch này mới thêm AFCRPS
+
+    def __init__(self, pred_len=12, obs_len=8, sigma_min=0.02,
+                 n_train_ens=4, unet_in_ch=13,
+                 ctx_noise_scale=0.002, initial_sample_sigma=0.03, **kwargs):
         super().__init__()
         self.pred_len             = pred_len
-        self.fm_pred_len          = pred_len - N_SR_STEPS  # 8
+        self.fm_pred_len          = pred_len - N_SR_STEPS
         self.obs_len              = obs_len
         self.sigma_min            = sigma_min
         self.n_train_ens          = n_train_ens
-        self.active_pred_len      = pred_len
         self.ctx_noise_scale      = ctx_noise_scale
         self.initial_sample_sigma = initial_sample_sigma
+        self.active_pred_len      = pred_len
+        self.net = VelocityField(pred_len=pred_len, obs_len=obs_len,
+                                  sigma_min=sigma_min, unet_in_ch=unet_in_ch,
+                                  fm_pred_len=self.fm_pred_len)
 
-        self.net = VelocityField(
-            pred_len    = pred_len,
-            obs_len     = obs_len,
-            sigma_min   = sigma_min,
-            unet_in_ch  = unet_in_ch,
-            fm_pred_len = self.fm_pred_len,
-        )
-
-    def set_curriculum_len(self, active_len: int) -> None:
-        pass
-
-    # ── Static helpers ────────────────────────────────────────────────────────
+    def set_curriculum_len(self, *a, **kw): pass
 
     @staticmethod
-    def _to_rel(traj_gt, Me_gt, last_pos, last_Me):
-        return torch.cat(
-            [traj_gt - last_pos.unsqueeze(0),
-             Me_gt   - last_Me.unsqueeze(0)],
-            dim=-1,
-        ).permute(1, 0, 2)
+    def _to_rel(traj, Me, lp, lm):
+        return torch.cat([traj - lp.unsqueeze(0),
+                           Me   - lm.unsqueeze(0)], dim=-1).permute(1, 0, 2)
 
     @staticmethod
-    def _to_abs(rel, last_pos, last_Me):
+    def _to_abs(rel, lp, lm):
         d = rel.permute(1, 0, 2)
-        return (
-            last_pos.unsqueeze(0) + d[:, :, :2],
-            last_Me.unsqueeze(0)  + d[:, :, 2:],
-        )
-
-    @staticmethod
-    def _to_rel_from_pos(traj_abs, ref_pos, ref_Me):
-        """Convert absolute normalised positions to relative."""
-        rel_pos = traj_abs - ref_pos.unsqueeze(0)
-        rel_Me = torch.zeros_like(rel_pos)  # placeholder
-        return torch.cat([rel_pos, rel_Me], dim=-1).permute(1, 0, 2)
+        return lp.unsqueeze(0) + d[:, :, :2], lm.unsqueeze(0) + d[:, :, 2:]
 
     def _cfm_noisy(self, x1):
         B, device = x1.shape[0], x1.device
-        sm  = self.sigma_min
-        x0  = torch.randn_like(x1) * sm
-        t   = torch.rand(B, device=device)
-        te  = t.view(B, 1, 1)
+        sm = self.sigma_min
+        x0 = torch.randn_like(x1) * sm
+        t  = torch.rand(B, device=device)
+        te = t.view(B, 1, 1)
         x_t = te * x1 + (1.0 - te * (1.0 - sm)) * x0
-        denom      = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
-        target_vel = (x1 - (1.0 - sm) * x_t) / denom
-        return x_t, t, te, denom, target_vel
+        denom = (1.0 - (1.0 - sm) * te).clamp(min=1e-5)
+        return x_t, t, te, denom
 
     @staticmethod
-    def _intensity_weights(obs_Me: torch.Tensor) -> torch.Tensor:
-        wind_norm = obs_Me[-1, :, 1].detach()
-        w = torch.where(wind_norm < 0.1, torch.full_like(wind_norm, 0.5),
-            torch.where(wind_norm < 0.3, torch.full_like(wind_norm, 0.8),
-            torch.where(wind_norm < 0.6, torch.full_like(wind_norm, 1.0),
-                        torch.full_like(wind_norm, 1.5))))
+    def _intensity_weights(obs_Me):
+        w = obs_Me[-1, :, 1].detach()
+        w = torch.where(w < 0.1, torch.full_like(w, 0.5),
+            torch.where(w < 0.3, torch.full_like(w, 0.8),
+            torch.where(w < 0.6, torch.full_like(w, 1.0),
+                        torch.full_like(w, 1.5))))
         return w / w.mean().clamp(min=1e-6)
 
     @staticmethod
-    def _lon_flip_aug(batch_list: List, p: float = 0.3) -> List:
+    def _lon_flip_aug(batch_list, p=0.3):
         if torch.rand(1).item() > p:
             return batch_list
         aug = list(batch_list)
         for idx in [0, 1, 2, 3]:
-            t = aug[idx]
-            if torch.is_tensor(t) and t.shape[-1] >= 1:
-                t = t.clone()
+            if torch.is_tensor(aug[idx]) and aug[idx].shape[-1] >= 1:
+                t = aug[idx].clone()
                 t[..., 0] = -t[..., 0]
                 aug[idx] = t
         return aug
 
-    # ── Loss ──────────────────────────────────────────────────────────────────
+    def get_loss(self, batch_list, step_weight_alpha=0.0, epoch=0):
+        return self.get_loss_breakdown(batch_list, step_weight_alpha, epoch)["total"]
 
-    def get_loss(self, batch_list: List,
-                 step_weight_alpha: float = 0.0,
-                 epoch: int = 0) -> torch.Tensor:
-        return self.get_loss_breakdown(
-            batch_list, step_weight_alpha, epoch)["total"]
-
-    # def get_loss_breakdown(
-    #     self,
-    #     batch_list: List,
-    #     step_weight_alpha: float = 0.0,
-    #     epoch: int = 0,
-    # ) -> Dict:
-    #     """
-    #     HIERARCHICAL loss computation:
-    #     1. Compute SR pred (step 1-4) 
-    #     2. Compute FM pred (step 5-12) conditioned on SR step 4
-    #     3. Concatenate → full trajectory
-    #     4. Compute losses on appropriate zones
-    #     """
-    #     batch_list = self._lon_flip_aug(batch_list, p=0.3)
-
-    #     traj_gt = batch_list[1]    # [T, B, 2] normalised
-    #     Me_gt   = batch_list[8]
-    #     obs_t   = batch_list[0]    # [T_obs, B, 2] normalised
-    #     obs_Me  = batch_list[7]
-
-    #     try:
-    #         env_data = batch_list[13]
-    #     except (IndexError, TypeError):
-    #         env_data = None
-
-    #     lp, lm = obs_t[-1], obs_Me[-1]
-        
-    #     # ── Compute raw_ctx once ──
-    #     raw_ctx     = self.net._context(batch_list)
-    #     intensity_w = self._intensity_weights(obs_Me)
-    def get_loss_breakdown(
-        self,
-        batch_list: List,
-        step_weight_alpha: float = 0.0,
-        epoch: int = 0,
-    ) -> Dict:
+    def get_loss_breakdown(self, batch_list, step_weight_alpha=0.0, epoch=0):
         """
-        v31: FM predict full 12 steps từ lp.
-        KEY FIX: không dùng sr_pred[3] làm FM reference → fix 72h stuck 500km.
+        Phase 1 (epoch < 30): SR_Huber + MSE_hav — học như LSTM
+        Phase 2 (epoch >= 30): SR_Huber + MSE_hav + AFCRPS — thêm probabilistic
         """
-        batch_list = self._lon_flip_aug(batch_list, p=0.3)
- 
-        traj_gt = batch_list[1]    # [12, B, 2] normalised
+        batch_list = self._lon_flip_aug(batch_list)
+
+        traj_gt = batch_list[1]
         Me_gt   = batch_list[8]
         obs_t   = batch_list[0]
         obs_Me  = batch_list[7]
- 
-        try:
-            env_data = batch_list[13]
-        except (IndexError, TypeError):
-            env_data = None
- 
-        lp, lm = obs_t[-1], obs_Me[-1]
- 
+        lp, lm  = obs_t[-1], obs_Me[-1]
+
         raw_ctx     = self.net._context(batch_list)
         intensity_w = self._intensity_weights(obs_Me)
-        # ── SR prediction (step 1-4) ──
-        # n_sr = ShortRangeHead.N_STEPS
-        # sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
+
+        # ── SR (step 1-4) ──────────────────────────────────────────────
         n_sr    = ShortRangeHead.N_STEPS
         sr_pred = self.net.forward_short_range(obs_t, raw_ctx)
         l_sr    = short_range_regression_loss(sr_pred, traj_gt[:n_sr], lp)
 
-        # # SR loss
-        # l_sr = short_range_regression_loss(sr_pred, traj_gt[:n_sr], lp)
+        # ── FM: full 12 steps từ lp ────────────────────────────────────
+        sr_anchor = self.net.compute_sr_anchor_emb(sr_pred.detach())
+        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)
+        x_t, t, te, denom = self._cfm_noisy(x1)
+        pred_vel = self.net.forward_with_ctx(x_t, t, raw_ctx, sr_anchor_emb=sr_anchor)
+        x1_pred  = x_t + denom * pred_vel
+        pred_abs, _ = self._to_abs(x1_pred, lp, lm)   # [12, B, 2] normalised
 
-        # ── FM prediction (step 5-12) conditioned on SR endpoint ──
-        # FM uses sr_pred[3] as starting point
-        # sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
-        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred.detach())
-        
-        # FM ground truth: relative to SR step 4 position
-        fm_ref_pos = sr_pred[3].detach()  # [B, 2] - SR step 4 position (normalised)
-        fm_gt = traj_gt[n_sr:]            # [T_fm, B, 2] normalised (step 5-12)
-        fm_Me_gt = Me_gt[n_sr:]
-        
-        if fm_gt.shape[0] == 0:
-            # Not enough GT steps
-            return dict(
-                total=l_sr, fm=0.0, velocity=0.0, step=0.0, disp=0.0,
-                heading=0.0, recurv=0.0, smooth=0.0, accel=0.0, jerk=0.0,
-                pinn=0.0, spread=0.0, continuity=0.0, short_range=l_sr.item(),
-                fm_physics=0.0, recurv_ratio=0.0,
+        # ── MSE haversine per-step ─────────────────────────────────────
+        # Đây là loss chính trong Phase 1 — giống LSTM nhưng physically correct
+        l_mse = mse_hav_loss(pred_abs, traj_gt)
+
+        # ── Directional ────────────────────────────────────────────────
+        pred_deg = _denorm_to_deg(pred_abs)
+        gt_deg   = _denorm_to_deg(traj_gt)
+        l_vel    = velocity_loss_per_sample(pred_deg, gt_deg).mean()
+        l_head   = heading_loss(pred_deg, gt_deg)
+
+        # ── Total (Phase 1) ────────────────────────────────────────────
+        NRM   = 35.0
+        total = (
+            5.0  * l_sr
+            + 4.0  * l_mse          # HIGH weight như LSTM
+            + 0.5  * l_vel  * NRM
+            + 0.8  * l_head * NRM
+        ) / NRM
+
+        bd = dict(
+            total=total, short_range=l_sr.item(), mse_hav=l_mse.item(),
+            velocity=l_vel.item()*NRM, heading=l_head.item(),
+            fm=0.0, step=0.0, disp=0.0, cont=0.0, pinn=0.0,
+            spread=0.0, continuity=0.0, recurv_ratio=0.0,
+        )
+
+        # ── Phase 2: Thêm AFCRPS (epoch >= PHASE_SWITCH) ───────────────
+        if epoch >= self.PHASE_SWITCH:
+            samples = []
+            for _ in range(self.n_train_ens):
+                xt_s, ts, _, dens_s = self._cfm_noisy(x1)
+                pv_s = self.net.forward_with_ctx(xt_s, ts, raw_ctx, sr_anchor_emb=sr_anchor)
+                pa_s, _ = self._to_abs(xt_s + dens_s * pv_s, lp, lm)
+                samples.append(pa_s)
+            pred_samples = torch.stack(samples)   # [S, 12, B, 2]
+
+            l_fm = fm_afcrps_loss(
+                pred_samples, traj_gt,
+                unit_01deg=True,
+                intensity_w=intensity_w,
+                w_es=0.2,
             )
 
-        # # FM input: relative to SR step 4
-        # x1_fm = self._to_rel(fm_gt, fm_Me_gt, fm_ref_pos, lm)  # [B, T_fm, 4]
-        
-        # # CFM forward
-        # x_t, t, te, denom, _ = self._cfm_noisy(x1_fm)
-        # pred_vel = self.net.forward_with_ctx(
-        #     x_t, t, raw_ctx, noise_scale=0.0,
-        #     sr_anchor_emb=sr_anchor_emb
-        # )
+            # Weight AFCRPS nhỏ hơn MSE để không dominate
+            fm_w = min(1.0, (epoch - self.PHASE_SWITCH) / 20.0)  # ramp up 0→1
+            bd["total"] = total + fm_w * 1.5 * l_fm / NRM
+            bd["fm"]    = l_fm.item()
 
-        # # FM ensemble for AFCRPS
-        # fm_samples: List[torch.Tensor] = []
-        # for _ in range(self.n_train_ens):
-        #     xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1_fm)
-        #     pv_s = self.net.forward_with_ctx(
-        #         xt_s, ts, raw_ctx, noise_scale=0.0,
-        #         sr_anchor_emb=sr_anchor_emb
-        #     )
-        #     x1_s = xt_s + dens_s * pv_s
-        #     pa_s, _ = self._to_abs(x1_s, fm_ref_pos, lm)
-        #     fm_samples.append(pa_s)
-        # fm_pred_samples = torch.stack(fm_samples)  # [S, T_fm, B, 2] normalised
+        if torch.isnan(bd["total"]) or torch.isinf(bd["total"]):
+            bd["total"] = lp.new_zeros(())
 
-        # # FM physics consistency
-        # l_fm_physics = fm_physics_consistency_loss(
-        #     fm_pred_samples, gt_norm=fm_gt, last_pos=fm_ref_pos)
-
-        # # FM mean prediction (normalised)
-        # x1_pred = x_t + denom * pred_vel
-        # fm_pred_abs_norm, _ = self._to_abs(x1_pred, fm_ref_pos, lm)  # [T_fm, B, 2]
-
-        # # ── Build full trajectory (SR + FM) ──
-        # full_pred_norm = torch.cat([sr_pred, fm_pred_abs_norm], dim=0)  # [12, B, 2]
-        
-        #  # --- THÊM MSE TỌA ĐỘ VÀO ĐÂY ---
-        # # Đây là "vũ khí" giúp LSTM thắng bạn, giờ chúng ta trang bị nó cho FM
-        # l_mse_coord = F.mse_loss(full_pred_norm, traj_gt)
-        
-        # # Convert to degrees
-        # full_pred_deg = _denorm_to_deg(full_pred_norm)
-        # fm_pred_deg   = _denorm_to_deg(fm_pred_abs_norm)
-        # traj_gt_deg   = _denorm_to_deg(traj_gt)
-        # ref_deg       = _denorm_to_deg(lp)
-
-        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)  # [B, 12, 4] rel to lp
- 
-        x_t, t, te, denom, _ = self._cfm_noisy(x1)
-        pred_vel = self.net.forward_with_ctx(
-            x_t, t, raw_ctx, noise_scale=0.0,
-            sr_anchor_emb=sr_anchor_emb)
- 
-        # FM ensemble
-        fm_samples: List[torch.Tensor] = []
-        for _ in range(self.n_train_ens):
-            xt_s, ts, _, dens_s, _ = self._cfm_noisy(x1)
-            pv_s = self.net.forward_with_ctx(
-                xt_s, ts, raw_ctx, noise_scale=0.0,
-                sr_anchor_emb=sr_anchor_emb)
-            x1_s = xt_s + dens_s * pv_s
-            pa_s, _ = self._to_abs(x1_s, lp, lm)
-            fm_samples.append(pa_s)
-        pred_samples = torch.stack(fm_samples)   # [S, 12, B, 2] normalised
- 
-        # FM mean
-        x1_pred = x_t + denom * pred_vel
-        pred_abs, _ = self._to_abs(x1_pred, lp, lm)   # [12, B, 2] normalised
- 
-        # Convert to degrees for directional losses
-        pred_abs_deg = _denorm_to_deg(pred_abs)
-        traj_gt_deg  = _denorm_to_deg(traj_gt)
-        ref_deg      = _denorm_to_deg(lp)
-
-        from Model.losses import compute_total_loss, WEIGHTS
-        breakdown = compute_total_loss(
-            pred_abs           = pred_abs_deg,
-            gt                 = traj_gt_deg,
-            ref                = ref_deg,
-            batch_list         = batch_list,
-            pred_samples       = pred_samples,
-            gt_norm            = traj_gt,       # FULL 12 steps
-            weights            = WEIGHTS,
-            intensity_w        = intensity_w,
-            step_weight_alpha  = step_weight_alpha,
-            epoch              = epoch,
-            sr_pred            = sr_pred,
-        )
- 
-        # Add SR loss
-        sr_w = WEIGHTS.get("short_range", 5.0)
-        breakdown["total"]       = breakdown["total"] + sr_w * l_sr
-        breakdown["short_range"] = l_sr.item()
- 
-        return breakdown
-
-    # ── sample() ─────────────────────────────────────────────────────────────
+        return bd
 
     @torch.no_grad()
-    # def sample(
-    #     self,
-    #     batch_list:   List,
-    #     num_ensemble: int = 50,
-    #     ddim_steps:   int = 20,
-    #     predict_csv:  Optional[str] = None,
-    # ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    #     """
-    #     HIERARCHICAL sampling:
-    #     1. SR predicts step 1-4
-    #     2. FM predicts step 5-12 starting from SR step 4
-    #     3. Concatenate → full 12-step trajectory
-        
-    #     Returns:
-    #         pred_mean : [T=12, B, 2] normalised
-    #         me_mean   : [T=12, B, 2]
-    #         all_trajs : [S, T=12, B, 2] full ensemble
-    #     """
-    #     obs_t  = batch_list[0]
-    #     lp     = obs_t[-1]
-    #     lm     = batch_list[7][-1]
-    #     B      = lp.shape[0]
-    #     device = lp.device
-    #     T_fm   = self.fm_pred_len  # 8
-    #     dt     = 1.0 / max(ddim_steps, 1)
-
-    #     raw_ctx = self.net._context(batch_list)
-
-    #     # ── Step 1: SR prediction ──
-    #     sr_pred = self.net.forward_short_range(obs_t, raw_ctx)  # [4, B, 2] normalised
-        
-    #     # SR anchor for FM
-    #     sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)  # [B, 256]
-    #     fm_ref_pos = sr_pred[3]  # FM starts from SR step 4
-
-    #     # ── Step 2: FM ensemble from SR endpoint ──
-    #     fm_traj_s: List[torch.Tensor] = []
-    #     fm_me_s:   List[torch.Tensor] = []
-
-    #     for k in range(num_ensemble):
-    #         x_t = torch.randn(B, T_fm, 4, device=device) * self.initial_sample_sigma
-
-    #         for step in range(ddim_steps):
-    #             t_b = torch.full((B,), step * dt, device=device)
-    #             # ns  = self.ctx_noise_scale if step == 0 else 0.0  # ★ NO *10
-    #             ns = self.ctx_noise_scale if step < 3 else 0.0
-
-    #             vel = self.net.forward_with_ctx(
-    #                 x_t, t_b, raw_ctx, noise_scale=ns,
-    #                 sr_anchor_emb=sr_anchor_emb
-    #             )
-    #             x_t = x_t + dt * vel
-
-    #         x_t = self._physics_correct(x_t, fm_ref_pos, lm, n_steps=5, lr=0.002)
-    #         x_t = x_t.clamp(-3.0, 3.0)
-
-    #         tr, me = self._to_abs(x_t, fm_ref_pos, lm)  # [T_fm, B, 2]
-    #         fm_traj_s.append(tr)
-    #         fm_me_s.append(me)
-
-    #     fm_all_trajs = torch.stack(fm_traj_s)  # [S, T_fm, B, 2]
-    #     fm_all_me    = torch.stack(fm_me_s)
-
-    #     fm_mean = fm_all_trajs.mean(0)  # [T_fm, B, 2]
-    #     fm_me_mean = fm_all_me.mean(0)
-
-    #     # ── Step 3: Concatenate SR + FM ──
-    #     # SR step 1-4 + FM step 5-12 = full 12 steps
-    #     pred_mean = torch.cat([sr_pred, fm_mean], dim=0)  # [12, B, 2]
-        
-    #     # Me: SR doesn't predict Me, use FM Me with padding
-    #     sr_me = torch.zeros(N_SR_STEPS, B, 2, device=device)
-    #     me_mean = torch.cat([sr_me, fm_me_mean], dim=0)
-
-    #     # Full ensemble: SR (repeated) + FM ensemble
-    #     sr_expanded = sr_pred.unsqueeze(0).expand(num_ensemble, -1, -1, -1)  # [S, 4, B, 2]
-    #     all_trajs = torch.cat([sr_expanded, fm_all_trajs], dim=1)  # [S, 12, B, 2]
-
-    #     if predict_csv:
-    #         self._write_predict_csv(predict_csv, pred_mean, all_trajs)
-
-    #     return pred_mean, me_mean, all_trajs
-    def sample(
-        self,
-        batch_list:   List,
-        num_ensemble: int = 50,
-        ddim_steps:   int = 20,
-        predict_csv:  Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        v31: FM từ lp (consistent với training).
-        SR override step 1-4 trong pred_mean.
-        """
+    def sample(self, batch_list, num_ensemble=50, ddim_steps=20, predict_csv=None):
         obs_t  = batch_list[0]
         lp     = obs_t[-1]
         lm     = batch_list[7][-1]
         B      = lp.shape[0]
         device = lp.device
-        T      = self.pred_len    # 12
+        T      = self.pred_len
         dt     = 1.0 / max(ddim_steps, 1)
- 
+
         raw_ctx = self.net._context(batch_list)
- 
-        # SR step 1-4
         sr_pred = self.net.forward_short_range(obs_t, raw_ctx)
-        sr_anchor_emb = self.net.compute_sr_anchor_emb(sr_pred)
- 
-        # FM ensemble từ lp (KHÔNG phải từ sr_pred[3])
+        sr_anchor = self.net.compute_sr_anchor_emb(sr_pred)
+
         traj_s, me_s = [], []
-        for k in range(num_ensemble):
+        for _ in range(num_ensemble):
             x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
- 
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 ns  = self.ctx_noise_scale if step < 3 else 0.0
-                vel = self.net.forward_with_ctx(
-                    x_t, t_b, raw_ctx,
-                    noise_scale=ns, sr_anchor_emb=sr_anchor_emb)
+                vel = self.net.forward_with_ctx(x_t, t_b, raw_ctx,
+                                                 noise_scale=ns, sr_anchor_emb=sr_anchor)
                 x_t = x_t + dt * vel
- 
-            x_t = self._physics_correct(x_t, lp, lm, n_steps=3, lr=0.001)
+            x_t = self._physics_correct(x_t, lp, lm)
             x_t = x_t.clamp(-3.0, 3.0)
- 
             tr, me = self._to_abs(x_t, lp, lm)
             traj_s.append(tr)
             me_s.append(me)
- 
-        all_trajs = torch.stack(traj_s)    # [S, 12, B, 2]
-        all_me    = torch.stack(me_s)
- 
-        fm_mean = all_trajs.mean(0)        # [12, B, 2]
-        me_mean = all_me.mean(0)
- 
-        # Blend: SR step 1-4, FM step 5-12
+
+        all_trajs = torch.stack(traj_s)
+        fm_mean   = all_trajs.mean(0)
         pred_mean = fm_mean.clone()
-        pred_mean[:ShortRangeHead.N_STEPS] = sr_pred
- 
+        pred_mean[:ShortRangeHead.N_STEPS] = sr_pred   # SR override step 1-4
+
         if predict_csv:
             self._write_predict_csv(predict_csv, pred_mean, all_trajs)
- 
-        return pred_mean, me_mean, all_trajs
+        return pred_mean, torch.stack(me_s).mean(0), all_trajs
 
-    # ── Physics correction ────────────────────────────────────────────────────
-
-    def _physics_correct(
-        self,
-        x_pred:   torch.Tensor,
-        last_pos: torch.Tensor,
-        last_Me:  torch.Tensor,
-        n_steps:  int   = 5,
-        lr:       float = 0.002,
-    ) -> torch.Tensor:
+    def _physics_correct(self, x_pred, last_pos, last_Me, n_steps=3, lr=0.001):
         with torch.enable_grad():
             x = x_pred.detach().requires_grad_(True)
-            optimizer = torch.optim.Adam([x], lr=lr, betas=(0.9, 0.99))
-
+            opt = torch.optim.Adam([x], lr=lr, betas=(0.9, 0.99))
             for _ in range(n_steps):
-                optimizer.zero_grad()
+                opt.zero_grad()
                 pred_abs, _ = self._to_abs(x, last_pos, last_Me)
-                pred_deg    = _denorm_to_deg(pred_abs)
-
-                l_speed = self._pinn_speed_constraint(pred_deg)
-                l_accel = self._pinn_beta_plane_simplified(pred_deg)
-
-                physics_loss = l_speed + 0.3 * l_accel
-                physics_loss.backward()
-
-                torch.nn.utils.clip_grad_norm_([x], max_norm=0.05)
-                optimizer.step()
-
+                pred_deg = _denorm_to_deg(pred_abs)
+                dt_deg  = pred_deg[1:] - pred_deg[:-1]
+                lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
+                cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+                speed   = torch.sqrt((dt_deg[:, :, 0] * cos_lat * 111.0).pow(2)
+                                      + (dt_deg[:, :, 1] * 111.0).pow(2))
+                loss = F.relu(speed - 600.0).pow(2).mean()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_([x], 0.05)
+                opt.step()
         return x.detach()
 
     @staticmethod
-    def _pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
-        if pred_deg.shape[0] < 2:
-            return pred_deg.new_zeros(())
-        dt_deg  = pred_deg[1:] - pred_deg[:-1]
-        lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
-        cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-        dx_km   = dt_deg[:, :, 0] * cos_lat * 111.0
-        dy_km   = dt_deg[:, :, 1] * 111.0
-        speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
-        return F.relu(speed - 600.0).pow(2).mean()
-
-    @staticmethod
-    def _pinn_beta_plane_simplified(pred_deg: torch.Tensor) -> torch.Tensor:
-        if pred_deg.shape[0] < 3:
-            return pred_deg.new_zeros(())
-        v = pred_deg[1:] - pred_deg[:-1]
-        a = v[1:] - v[:-1]
-        lat_rad = torch.deg2rad(pred_deg[1:-1, :, 1])
-        cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
-        a_lon_km = a[:, :, 0] * cos_lat * 111.0
-        a_lat_km = a[:, :, 1] * 111.0
-        max_accel = 50.0
-        violation = F.relu(torch.sqrt(a_lon_km**2 + a_lat_km**2) - max_accel)
-        return violation.pow(2).mean() * 0.1
-
-    @staticmethod
-    def _write_predict_csv(csv_path: str, traj_mean: torch.Tensor,
-                           all_trajs: torch.Tensor) -> None:
+    def _write_predict_csv(csv_path, traj_mean, all_trajs):
         import numpy as np
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-        ts      = datetime.now().strftime("%Y%m%d_%H%M%S")
         T, B, _ = traj_mean.shape
-        S       = all_trajs.shape[0]
-
         mean_lon = ((traj_mean[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
         mean_lat = ((traj_mean[..., 1] * 50.0) / 10.0).cpu().numpy()
         all_lon  = ((all_trajs[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
         all_lat  = ((all_trajs[..., 1] * 50.0) / 10.0).cpu().numpy()
-
         fields   = ["timestamp", "batch_idx", "step_idx", "lead_h",
-                    "lon_mean_deg", "lat_mean_deg",
-                    "lon_std_deg", "lat_std_deg", "ens_spread_km"]
+                    "lon_mean_deg", "lat_mean_deg", "lon_std_deg", "lat_std_deg", "ens_spread_km"]
         write_hdr = not os.path.exists(csv_path)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         with open(csv_path, "a", newline="") as fh:
             w = csv.DictWriter(fh, fieldnames=fields)
-            if write_hdr:
-                w.writeheader()
+            if write_hdr: w.writeheader()
             for b in range(B):
                 for k in range(T):
                     dlat   = all_lat[:, k, b] - mean_lat[k, b]
-                    dlon   = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(
-                        math.radians(mean_lat[k, b]))
+                    dlon   = (all_lon[:, k, b] - mean_lon[k, b]) * math.cos(math.radians(mean_lat[k, b]))
                     spread = float(((dlat**2 + dlon**2)**0.5).mean() * 111.0)
-                    w.writerow(dict(
-                        timestamp     = ts,
-                        batch_idx     = b,
-                        step_idx      = k,
-                        lead_h        = (k + 1) * 6,
-                        lon_mean_deg  = f"{mean_lon[k,b]:.4f}",
-                        lat_mean_deg  = f"{mean_lat[k,b]:.4f}",
-                        lon_std_deg   = f"{all_lon[:,k,b].std():.4f}",
-                        lat_std_deg   = f"{all_lat[:,k,b].std():.4f}",
-                        ens_spread_km = f"{spread:.2f}",
-                    ))
-        print(f"  Predictions → {csv_path}  (B={B}, T={T}, S={S})")
+                    w.writerow({"timestamp": ts, "batch_idx": b, "step_idx": k,
+                                "lead_h": (k+1)*6, "lon_mean_deg": f"{mean_lon[k,b]:.4f}",
+                                "lat_mean_deg": f"{mean_lat[k,b]:.4f}",
+                                "lon_std_deg": f"{all_lon[:,k,b].std():.4f}",
+                                "lat_std_deg": f"{all_lat[:,k,b].std():.4f}",
+                                "ens_spread_km": f"{spread:.2f}"})
 
 
-# Backward-compat alias
 TCDiffusion = TCFlowMatching
