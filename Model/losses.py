@@ -4071,22 +4071,1012 @@
 #         recurv_ratio=(_recurvature_weights(gt) > 1.0).float().mean().item(),
 #     )
 
+# """
+# Model/losses.py  ── v28 - BALANCED
+# ===================================
+# MỤC TIÊU: 12h < 50km, 24h < 100km, 72h < 300km
+
+# NGUYÊN TẮC CÂN BẰNG:
+#   1. KHÔNG thay đổi SR loss - giữ 12h/24h tốt
+#   2. Tăng FM time weights cho 48h-72h NHƯNG không quá mạnh
+#   3. Bridge loss ĐƠN GIẢN - chỉ enforce position, không velocity phức tạp
+#   4. Spread loss RELAX hơn để FM có thể explore
+
+# KEY CHANGES từ v26:
+#   - FM time weights: 0.5→3.0 (linear) → 0.5→4.0 (quadratic focus 72h)
+#   - Bridge: weight 0.5, chỉ position matching, normalize /150km
+#   - Spread: relax threshold 60→200km (cho FM explore)
+#   - PINN: giữ nguyên, không thay đổi
+# """
+# from __future__ import annotations
+
+# import math
+# from typing import Dict, Optional, Tuple
+
+# import torch
+# import torch.nn.functional as F
+
+# __all__ = [
+#     "WEIGHTS", "compute_total_loss", "fm_afcrps_loss",
+#     "fm_physics_consistency_loss", "pinn_bve_loss",
+#     "recurvature_loss", "velocity_loss_per_sample",
+#     "short_range_regression_loss", "bridge_loss",
+#     "adapt_clamp", "pinn_pressure_wind_loss",
+# ]
+
+# # ── Constants ─────────────────────────────────────────────────────────────────
+# OMEGA        = 7.2921e-5
+# R_EARTH      = 6.371e6
+# DT_6H        = 6 * 3600
+# DEG_TO_KM    = 111.0
+# STEP_KM      = 113.0
+# P_ENV        = 1013.0
+# RHO_AIR      = 1.15
+
+# _ERA5_LAT_MIN =   0.0
+# _ERA5_LAT_MAX =  40.0
+# _ERA5_LON_MIN = 100.0
+# _ERA5_LON_MAX = 160.0
+
+# _UV500_NORM      = 30.0
+# _GPH500_MEAN_M   = 5870.0
+# _GPH500_STD_M    = 80.0
+# _STEERING_MIN_MS = 3.0
+# _PINN_SCALE      = 1e-2
+
+# # ── Weights (GIỮ NGUYÊN từ v26 - đã hoạt động) ────────────────────────────────
+# WEIGHTS: Dict[str, float] = dict(
+#     fm          = 2.0,      # GIỮ NGUYÊN
+#     velocity    = 0.8,      # GIỮ NGUYÊN
+#     heading     = 2.0,
+#     recurv      = 1.5,
+#     step        = 0.5,
+#     disp        = 0.5,
+#     dir         = 1.0,
+#     smooth      = 0.5,
+#     accel       = 0.8,
+#     jerk        = 0.3,
+#     pinn        = 0.5,      # GIỮ NGUYÊN
+#     fm_physics  = 0.3,
+#     spread      = 0.5,      # GIẢM từ 0.8 - cho FM explore
+#     short_range = 5.0,      # GIỮ NGUYÊN - quan trọng cho 12h/24h
+#     bridge      = 0.5,      # GIỮ NGUYÊN weight, sửa function
+# )
+
+# RECURV_ANGLE_THR = 45.0
+# RECURV_WEIGHT    = 2.5
+
+# _SR_N_STEPS  = 4
+# _SR_WEIGHTS  = [2.0, 4.0, 2.0, 2.0]  # Focus vào 12h (step 2)
+# _HUBER_DELTA = 50.0
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Haversine utilities (GIỮ NGUYÊN)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def _haversine(p1: torch.Tensor, p2: torch.Tensor,
+#                unit_01deg: bool = True) -> torch.Tensor:
+#     if unit_01deg:
+#         lon1 = (p1[..., 0] * 50.0 + 1800.0) / 10.0
+#         lat1 = (p1[..., 1] * 50.0) / 10.0
+#         lon2 = (p2[..., 0] * 50.0 + 1800.0) / 10.0
+#         lat2 = (p2[..., 1] * 50.0) / 10.0
+#     else:
+#         lon1, lat1 = p1[..., 0], p1[..., 1]
+#         lon2, lat2 = p2[..., 0], p2[..., 1]
+
+#     lat1r = torch.deg2rad(lat1); lat2r = torch.deg2rad(lat2)
+#     dlon  = torch.deg2rad(lon2 - lon1)
+#     dlat  = torch.deg2rad(lat2 - lat1)
+#     a = (torch.sin(dlat / 2).pow(2)
+#          + torch.cos(lat1r) * torch.cos(lat2r) * torch.sin(dlon / 2).pow(2))
+#     a = a.clamp(1e-12, 1.0 - 1e-12)
+#     return 2.0 * 6371.0 * torch.asin(a.sqrt())
+
+
+# def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+#     return _haversine(p1, p2, unit_01deg=False)
+
+
+# def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
+#     out = arr.clone()
+#     out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
+#     out[..., 1] = (arr[..., 1] * 50.0) / 10.0
+#     return out
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  AdaptClamp (GIỮ NGUYÊN)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def adapt_clamp(x: torch.Tensor, epoch: int, max_val: float = 20.0) -> torch.Tensor:
+#     delta = max_val
+
+#     def huber_clamp(v: torch.Tensor) -> torch.Tensor:
+#         return torch.where(
+#             v <= delta,
+#             v.pow(2) / (2.0 * delta),
+#             v - delta / 2.0,
+#         )
+
+#     def tanh_clamp(v: torch.Tensor) -> torch.Tensor:
+#         return delta * torch.tanh(v / delta)
+
+#     if epoch < 10:
+#         return huber_clamp(x)
+#     elif epoch < 20:
+#         beta = (epoch - 10) / 10.0
+#         return (1.0 - beta) * huber_clamp(x) + beta * tanh_clamp(x)
+#     else:
+#         return tanh_clamp(x)
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ★ KEY CHANGE: FM AFCRPS với Time Weights CÂN BẰNG
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def fm_afcrps_loss(
+#     pred_samples:      torch.Tensor,
+#     gt:                torch.Tensor,
+#     unit_01deg:        bool  = True,
+#     intensity_w:       Optional[torch.Tensor] = None,
+#     step_weight_alpha: float = 0.0,
+#     w_es:              float = 0.3,
+# ) -> torch.Tensor:
+#     """
+#     ★ KEY CHANGE: Time weights CÂN BẰNG
+    
+#     Mục tiêu:
+#     - Giữ 12h/24h accuracy (SR handle) → weight thấp cho step 1-4
+#     - Tăng 72h accuracy (FM handle) → weight cao cho step 9-12
+    
+#     NHƯNG không quá aggressive để tránh destabilize training
+    
+#     Weight scheme (12 steps = 72h):
+#         Step 1-4 (6h-24h):  0.5, 0.5, 0.7, 0.7   (SR handles)
+#         Step 5-8 (30h-48h): 1.0, 1.3, 1.6, 2.0   (transition)
+#         Step 9-12 (54h-72h): 2.5, 3.0, 3.5, 4.0  (FM critical)
+    
+#     So với v26 (0.5 → 3.0 linear), đây tăng 72h weight lên 4.0
+#     nhưng không quá mạnh như v27 (8.5)
+#     """
+#     M, T, B, _ = pred_samples.shape
+#     device = pred_samples.device
+
+#     # ★ Time weights quadratic focus on 72h
+#     base_w = torch.zeros(T, device=device)
+#     for i in range(T):
+#         if i < 4:       # 6h-24h: SR handles
+#             base_w[i] = 0.5 + (i % 2) * 0.2  # [0.5, 0.7, 0.5, 0.7]
+#         elif i < 8:     # 30h-48h: transition
+#             base_w[i] = 1.0 + (i - 4) * 0.35  # [1.0, 1.35, 1.7, 2.05]
+#         else:           # 54h-72h: FM critical
+#             base_w[i] = 2.5 + (i - 8) * 0.5   # [2.5, 3.0, 3.5, 4.0]
+
+#     if step_weight_alpha > 0.0:
+#         early_w = torch.exp(
+#             -torch.arange(T, dtype=torch.float, device=device) * 0.5
+#         )
+#         early_w = early_w / early_w.mean()
+#         time_w = (1.0 - step_weight_alpha) * base_w + step_weight_alpha * early_w
+#     else:
+#         time_w = base_w
+
+#     if M == 1:
+#         dist = _haversine(pred_samples[0], gt, unit_01deg)
+#         loss_per_b = (dist * time_w.unsqueeze(1)).mean(0)
+#         es_term = pred_samples.new_zeros(())
+#     else:
+#         # Accuracy: E[d(X^m, Y)]
+#         d_to_gt = _haversine(
+#             pred_samples,
+#             gt.unsqueeze(0).expand_as(pred_samples),
+#             unit_01deg,
+#         )
+#         d_to_gt_w    = d_to_gt * time_w.unsqueeze(0).unsqueeze(2)
+#         e_sy         = d_to_gt_w.mean(1).mean(0)
+
+#         # Sharpness: E[d(X^m, X^m')]
+#         ps_i = pred_samples.unsqueeze(1)
+#         ps_j = pred_samples.unsqueeze(0)
+#         d_pair = _haversine(
+#             ps_i.expand(M, M, T, B, 2).reshape(M * M, T, B, 2),
+#             ps_j.expand(M, M, T, B, 2).reshape(M * M, T, B, 2),
+#             unit_01deg,
+#         ).reshape(M, M, T, B)
+
+#         diag_mask = torch.eye(M, device=device, dtype=torch.bool)
+#         diag_mask = diag_mask.view(M, M, 1, 1).expand_as(d_pair)
+#         d_pair = d_pair.masked_fill(diag_mask, 0.0)
+
+#         d_pair_w    = d_pair * time_w.unsqueeze(0).unsqueeze(0).unsqueeze(3)
+#         e_ssp       = d_pair_w.mean(2).sum(0).sum(0) / (M * (M - 1))
+
+#         loss_per_b = e_sy - 0.5 * e_ssp
+
+#         # Energy Score term
+#         if w_es > 0.0 and M > 1:
+#             ps_flat  = pred_samples.reshape(M, T * B, 2)
+#             gt_flat  = gt.reshape(T * B, 2)
+#             mean_pred = ps_flat.mean(0)
+
+#             es_acc = (mean_pred - gt_flat).pow(2).sum(-1).sqrt().mean()
+
+#             ps_i_f = ps_flat.unsqueeze(1)
+#             ps_j_f = ps_flat.unsqueeze(0)
+#             d_pair_f = (ps_i_f - ps_j_f).pow(2).sum(-1).sqrt()
+#             diag_f = torch.eye(M, device=device, dtype=torch.bool)
+#             diag_f = diag_f.view(M, M, 1).expand_as(d_pair_f)
+#             d_pair_f = d_pair_f.masked_fill(diag_f, 0.0)
+#             es_sharp = (M - 1) / M * d_pair_f.sum(0).sum(0).mean() / (M * (M - 1))
+
+#             es_term = es_acc - es_sharp
+#         else:
+#             es_term = pred_samples.new_zeros(())
+
+#     if intensity_w is not None:
+#         w = intensity_w.to(loss_per_b.device)
+#         crps_loss = (loss_per_b * w).mean()
+#     else:
+#         crps_loss = loss_per_b.mean()
+
+#     return crps_loss + w_es * es_term
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Short-range Loss (GIỮ NGUYÊN - quan trọng cho 12h/24h)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def short_range_regression_loss(
+#     pred_sr:  torch.Tensor,
+#     gt_sr:    torch.Tensor,
+#     last_pos: torch.Tensor,
+# ) -> torch.Tensor:
+#     n_steps = min(pred_sr.shape[0], gt_sr.shape[0], _SR_N_STEPS)
+#     if n_steps == 0:
+#         return pred_sr.new_zeros(())
+
+#     pred_deg = _norm_to_deg(pred_sr[:n_steps])
+#     gt_deg   = _norm_to_deg(gt_sr[:n_steps])
+
+#     dist_km = _haversine_deg(pred_deg, gt_deg)
+
+#     huber = torch.where(
+#         dist_km < _HUBER_DELTA,
+#         0.5 * dist_km.pow(2) / _HUBER_DELTA,
+#         dist_km - 0.5 * _HUBER_DELTA,
+#     )
+
+#     w = pred_sr.new_tensor(_SR_WEIGHTS[:n_steps])
+#     w = w / w.sum()
+#     return (huber * w.view(-1, 1)).mean()
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ★ KEY CHANGE: Bridge Loss ĐƠN GIẢN HƠN
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def bridge_loss(
+#     sr_pred:  torch.Tensor,
+#     fm_mean:  torch.Tensor,
+# ) -> torch.Tensor:
+#     """
+#     ★ SIMPLIFIED Bridge Loss
+    
+#     Vấn đề v27: bridge loss quá phức tạp (250-1000+) destabilize training
+    
+#     Solution: Chỉ enforce position matching ở step 4
+#     - Normalize bằng 150km (không phải 50km hay 100km)
+#     - Không thêm velocity matching (gây instability)
+    
+#     Mục tiêu: SR step 4 ≈ FM step 4 (cách nhau < 100km)
+#     """
+#     if sr_pred.shape[0] < 4 or fm_mean.shape[0] < 5:
+#         return sr_pred.new_zeros(())
+
+#     # Position match at step 4 (24h)
+#     pos_sr4 = _norm_to_deg(sr_pred[3])
+#     pos_fm4 = _norm_to_deg(fm_mean[3])
+
+#     dist_pos = _haversine_deg(pos_sr4, pos_fm4)
+    
+#     # Normalize by 150km - typical TC movement in 6h
+#     # Nếu SR và FM cách nhau < 150km → loss < 1
+#     l_pos = (dist_pos / 150.0).pow(2).mean()
+
+#     return l_pos
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ★ KEY CHANGE: Spread Loss RELAX hơn
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
+#     """
+#     ★ RELAXED Spread Loss
+    
+#     Vấn đề: Spread quá strict → FM không explore được → 72h bad
+    
+#     Solution: Relax threshold để FM có thể explore
+#     - 6h:  max 60km spread (was 40km)
+#     - 72h: max 200km spread (was 120km)
+    
+#     Đây là trade-off: spread cao hơn nhưng 72h accuracy tốt hơn
+#     """
+#     if all_trajs.shape[0] < 2:
+#         return all_trajs.new_zeros(())
+
+#     S, T, B, _ = all_trajs.shape
+#     device = all_trajs.device
+
+#     # RELAXED thresholds
+#     max_spreads = torch.linspace(60.0, 200.0, T, device=device)
+    
+#     # Weight nhẹ hơn ở early steps
+#     step_weights = torch.linspace(0.5, 2.0, T, device=device)
+
+#     total_loss = all_trajs.new_zeros(())
+#     for t in range(T):
+#         step_trajs = all_trajs[:, t, :, :2]
+#         std_lon    = step_trajs[:, :, 0].std(0)
+#         std_lat    = step_trajs[:, :, 1].std(0)
+#         spread_km  = torch.sqrt(std_lon ** 2 + std_lat ** 2) * 500.0
+
+#         excess = F.relu(spread_km - max_spreads[t])
+        
+#         # Gentler penalty
+#         loss = (excess / 50.0).pow(2)
+
+#         total_loss = total_loss + step_weights[t] * loss.mean()
+
+#     return total_loss / T
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Helper functions (GIỮ NGUYÊN)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def _boundary_weights(traj_deg: torch.Tensor) -> torch.Tensor:
+#     lon = traj_deg[..., 0]
+#     lat = traj_deg[..., 1]
+
+#     d_lat_lo = (lat - _ERA5_LAT_MIN) / 5.0
+#     d_lat_hi = (_ERA5_LAT_MAX - lat) / 5.0
+#     d_lon_lo = (lon - _ERA5_LON_MIN) / 5.0
+#     d_lon_hi = (_ERA5_LON_MAX - lon) / 5.0
+
+#     d_bnd = torch.stack([d_lat_lo, d_lat_hi, d_lon_lo, d_lon_hi], dim=-1).min(dim=-1).values
+#     return torch.sigmoid(d_bnd - 0.5)
+
+
+# def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
+#     dt      = traj_deg[1:] - traj_deg[:-1]
+#     lat_mid = (traj_deg[:-1, :, 1] + traj_deg[1:, :, 1]) * 0.5
+#     cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+#     dt_km   = dt.clone()
+#     dt_km[..., 0] = dt[..., 0] * cos_lat * DEG_TO_KM
+#     dt_km[..., 1] = dt[..., 1] * DEG_TO_KM
+#     return dt_km
+
+
+# def _total_rotation_angle_batch(gt: torch.Tensor) -> torch.Tensor:
+#     T, B, _ = gt.shape
+#     if T < 3:
+#         return gt.new_zeros(B)
+#     lats_rad = torch.deg2rad(gt[:, :, 1])
+#     cos_lat  = torch.cos(lats_rad[:-1])
+#     dlat = gt[1:, :, 1] - gt[:-1, :, 1]
+#     dlon = (gt[1:, :, 0] - gt[:-1, :, 0]) * cos_lat
+#     v    = torch.stack([dlon, dlat], dim=-1)
+#     v1   = v[:-1]; v2 = v[1:]
+#     n1   = v1.norm(dim=-1).clamp(min=1e-8)
+#     n2   = v2.norm(dim=-1).clamp(min=1e-8)
+#     cos_a = (v1 * v2).sum(-1) / (n1 * n2)
+#     return torch.rad2deg(torch.acos(cos_a.clamp(-1.0, 1.0))).sum(0)
+
+
+# def _recurvature_weights(gt: torch.Tensor,
+#                          thr: float = RECURV_ANGLE_THR,
+#                          w_recurv: float = RECURV_WEIGHT) -> torch.Tensor:
+#     rot = _total_rotation_angle_batch(gt)
+#     return torch.where(rot >= thr,
+#                        torch.full_like(rot, w_recurv),
+#                        torch.ones_like(rot))
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Directional losses (GIỮ NGUYÊN)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def velocity_loss_per_sample(pred: torch.Tensor,
+#                              gt: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(pred.shape[1])
+#     v_pred_km = _step_displacements_km(pred)
+#     v_gt_km   = _step_displacements_km(gt)
+#     s_pred    = v_pred_km.norm(dim=-1)
+#     s_gt      = v_gt_km.norm(dim=-1)
+#     l_speed   = (s_pred - s_gt).pow(2).mean(0)
+#     gn        = v_gt_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     gt_unit   = v_gt_km / gn
+#     ate       = ((v_pred_km - v_gt_km) * gt_unit).sum(-1)
+#     l_ate     = ate.pow(2).mean(0)
+#     pn        = v_pred_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     cos_sim   = ((v_pred_km / pn) * gt_unit).sum(-1)
+#     l_dir     = F.relu(-cos_sim).pow(2).mean(0) * STEP_KM ** 2
+#     return (l_speed + 0.5 * l_ate + 0.3 * l_dir) / (STEP_KM ** 2)
+
+
+# def disp_loss_per_sample(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(pred.shape[1])
+#     pd = _step_displacements_km(pred).norm(dim=-1).mean(0)
+#     gd = _step_displacements_km(gt).norm(dim=-1).mean(0)
+#     return (pd - gd).pow(2) / (STEP_KM ** 2)
+
+
+# def step_dir_loss_per_sample(pred: torch.Tensor,
+#                               gt: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(pred.shape[1])
+#     v_pred_km = _step_displacements_km(pred)
+#     v_gt_km   = _step_displacements_km(gt)
+#     pn = v_pred_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     gn = v_gt_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     cos_sim = ((v_pred_km / pn) * (v_gt_km / gn)).sum(-1)
+#     return (1.0 - cos_sim).mean(0)
+
+
+# def heading_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 2:
+#         return pred.new_zeros(())
+#     pv = _step_displacements_km(pred)
+#     gv = _step_displacements_km(gt)
+#     pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     wrong_dir      = F.relu(-((pv / pn) * (gv / gn)).sum(-1))
+#     wrong_dir_loss = (wrong_dir ** 2).mean()
+
+#     if pred.shape[0] >= 3:
+#         def _curv(v):
+#             cross = v[1:, :, 0] * v[:-1, :, 1] - v[1:, :, 1] * v[:-1, :, 0]
+#             n1    = v[1:].norm(dim=-1).clamp(min=1e-4)
+#             n2    = v[:-1].norm(dim=-1).clamp(min=1e-4)
+#             return (cross / (n1 * n2)).clamp(-10.0, 10.0)
+#         curv_mse = F.mse_loss(_curv(pv), _curv(gv))
+#     else:
+#         curv_mse = pred.new_zeros(())
+#     return wrong_dir_loss + curv_mse
+
+
+# def smooth_loss(pred: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 3:
+#         return pred.new_zeros(())
+#     v_km = _step_displacements_km(pred)
+#     if v_km.shape[0] < 2:
+#         return pred.new_zeros(())
+#     accel_km = v_km[1:] - v_km[:-1]
+#     return accel_km.pow(2).mean() / (STEP_KM ** 2)
+
+
+# def acceleration_loss(pred: torch.Tensor) -> torch.Tensor:
+#     return smooth_loss(pred)
+
+
+# def jerk_loss(pred: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 4:
+#         return pred.new_zeros(())
+#     v_km = _step_displacements_km(pred)
+#     if v_km.shape[0] < 3:
+#         return pred.new_zeros(())
+#     a_km = v_km[1:] - v_km[:-1]
+#     j_km = a_km[1:] - a_km[:-1]
+#     return j_km.pow(2).mean() / (STEP_KM ** 2)
+
+
+# def overall_dir_loss(pred: torch.Tensor, gt: torch.Tensor,
+#                      ref: torch.Tensor) -> torch.Tensor:
+#     p_d = pred[-1] - ref
+#     g_d = gt[-1]   - ref
+#     lat_ref = ref[:, 1]
+#     cos_lat = torch.cos(torch.deg2rad(lat_ref)).clamp(min=1e-4)
+#     p_d_km  = p_d.clone(); p_d_km[:, 0] *= cos_lat * DEG_TO_KM; p_d_km[:, 1] *= DEG_TO_KM
+#     g_d_km  = g_d.clone(); g_d_km[:, 0] *= cos_lat * DEG_TO_KM; g_d_km[:, 1] *= DEG_TO_KM
+#     pn = p_d_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     gn = g_d_km.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+#     return (1.0 - ((p_d_km / pn) * (g_d_km / gn)).sum(-1)).mean()
+
+
+# def recurvature_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+#     if pred.shape[0] < 3:
+#         return pred.new_zeros(())
+#     pred_v   = pred[1:] - pred[:-1]
+#     gt_v     = gt[1:]   - gt[:-1]
+#     gt_cross = (gt_v[:-1, :, 0] * gt_v[1:, :, 1]
+#               - gt_v[:-1, :, 1] * gt_v[1:, :, 0])
+#     if gt_cross.shape[0] < 2:
+#         return pred.new_zeros(())
+#     sign_change = (gt_cross[:-1] * gt_cross[1:]) < 0
+#     if not sign_change.any():
+#         return pred.new_zeros(())
+#     pred_v_mid = pred_v[1:-1]
+#     gt_v_mid   = gt_v[1:-1]
+#     if pred_v_mid.shape[0] > sign_change.shape[0]:
+#         pred_v_mid = pred_v_mid[:sign_change.shape[0]]
+#         gt_v_mid   = gt_v_mid[:sign_change.shape[0]]
+#     pn      = pred_v_mid.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     gn      = gt_v_mid.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     cos_sim  = ((pred_v_mid / pn) * (gt_v_mid / gn)).sum(-1)
+#     dir_loss = (1.0 - cos_sim)
+#     mask     = sign_change.float()
+#     if mask.sum() < 1:
+#         return pred.new_zeros(())
+#     return (dir_loss * mask).sum() / mask.sum().clamp(min=1)
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  PINN Components (GIỮ NGUYÊN từ v26)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
+#                   T_tgt: int, B: int, device: torch.device) -> torch.Tensor:
+#     def _extract(key):
+#         x = env_data.get(key, None)
+#         if x is None or not torch.is_tensor(x):
+#             return None
+#         x = x.to(device).float()
+#         if x.dim() == 3:
+#             x = x[..., 0]
+#         elif x.dim() == 1:
+#             x = x.unsqueeze(0).expand(B, -1)
+#         x = x.permute(1, 0)
+#         T_obs = x.shape[0]
+#         if T_obs >= T_tgt:
+#             return x[:T_tgt] * _UV500_NORM
+#         pad = torch.zeros(T_tgt - T_obs, B, device=device)
+#         return torch.cat([x * _UV500_NORM, pad], dim=0)
+
+#     val = _extract(key_center)
+#     if val is not None:
+#         return val
+#     val = _extract(key_mean)
+#     if val is not None:
+#         return val
+#     return torch.zeros(T_tgt, B, device=device)
+
+
+# def _get_gph500_norm(env_data: dict, key: str,
+#                      T_tgt: int, B: int, device: torch.device) -> torch.Tensor:
+#     x = env_data.get(key, None)
+    
+#     if x is None or not torch.is_tensor(x):
+#         return torch.zeros(T_tgt, B, device=device)
+#     x = x.to(device).float()
+#     if x.dim() == 3:
+#         x = x[..., 0]
+#     x = x.permute(1, 0)
+#     T_obs = x.shape[0]
+#     if T_obs >= T_tgt:
+#         return x[:T_tgt]
+#     pad = torch.zeros(T_tgt - T_obs, B, device=device)
+#     return torch.cat([x, pad], dim=0)
+
+
+# def pinn_shallow_water(pred_abs_deg: torch.Tensor) -> torch.Tensor:
+#     T, B, _ = pred_abs_deg.shape
+#     if T < 3:
+#         return pred_abs_deg.new_zeros(())
+
+#     DT      = DT_6H
+#     lat_rad = torch.deg2rad(pred_abs_deg[:, :, 1])
+#     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
+#     cos_lat = torch.cos(lat_rad[:-1]).clamp(min=1e-4)
+
+#     u = dlat[:, :, 0] * cos_lat * 111000.0 / DT
+#     v = dlat[:, :, 1] * 111000.0 / DT
+
+#     if u.shape[0] < 2:
+#         return pred_abs_deg.new_zeros(())
+
+#     du = (u[1:] - u[:-1]) / DT
+#     dv = (v[1:] - v[:-1]) / DT
+
+#     f    = 2 * OMEGA * torch.sin(lat_rad[1:-1])
+#     beta = 2 * OMEGA * torch.cos(lat_rad[1:-1]) / R_EARTH
+
+#     res_u = du - f * v[1:]
+#     res_v = dv + f * u[1:]
+
+#     R_tc            = 3e5
+#     v_beta_x        = -beta * R_tc ** 2 / 2
+#     res_u_corrected = res_u - v_beta_x
+
+#     scale = 0.1
+#     loss = ((res_u_corrected / scale).pow(2) + (res_v / scale).pow(2))
+#     return loss
+
+
+# def pinn_rankine_steering(pred_abs_deg: torch.Tensor,
+#                           env_data: Optional[dict]) -> torch.Tensor:
+#     if env_data is None:
+#         return pred_abs_deg.new_zeros(())
+
+#     T, B, _ = pred_abs_deg.shape
+#     if T < 2:
+#         return pred_abs_deg.new_zeros(())
+
+#     device  = pred_abs_deg.device
+#     T_tgt   = T - 1
+#     DT      = DT_6H
+
+#     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
+#     lat_rad = torch.deg2rad(pred_abs_deg[:-1, :, 1])
+#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+
+#     u_tc = dlat[:, :, 0] * cos_lat * 111000.0 / DT
+#     v_tc = dlat[:, :, 1] * 111000.0 / DT
+
+#     u500 = _get_uv500_ms(env_data, "u500_mean", "u500_center", T_tgt, B, device)
+#     v500 = _get_uv500_ms(env_data, "v500_mean", "v500_center", T_tgt, B, device)
+
+#     uv_mag       = torch.sqrt(u500**2 + v500**2)
+#     has_steering = (uv_mag > _STEERING_MIN_MS).float()
+
+#     env_dir  = torch.stack([u500, v500], dim=-1)
+#     tc_dir   = torch.stack([u_tc, v_tc], dim=-1)
+#     env_norm = env_dir.norm(dim=-1, keepdim=True).clamp(min=1.0)
+#     tc_norm  = tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
+#     cos_sim  = ((env_dir / env_norm) * (tc_dir / tc_norm)).sum(-1)
+
+#     steer_w  = torch.sigmoid(uv_mag - 1.0)
+#     misalign = F.relu(-0.5 - cos_sim).pow(2)
+#     return (misalign * steer_w * has_steering) * 0.05
+
+
+# def pinn_gph500_gradient(pred_abs_deg: torch.Tensor,
+#                          env_data: Optional[dict]) -> torch.Tensor:
+#     if env_data is None:
+#         return pred_abs_deg.new_zeros(())
+#     T, B, _ = pred_abs_deg.shape
+#     if T < 2:
+#         return pred_abs_deg.new_zeros(())
+
+#     device = pred_abs_deg.device
+#     T_tgt  = T - 1
+
+#     gph_mean   = _get_gph500_norm(env_data, "gph500_mean",   T_tgt, B, device)
+#     gph_center = _get_gph500_norm(env_data, "gph500_center", T_tgt, B, device)
+
+#     gph_diff = gph_center - gph_mean
+
+#     dlat = pred_abs_deg[1:, :, 1] - pred_abs_deg[:-1, :, 1]
+
+#     has_gradient = (gph_diff.abs() > 0.1).float()
+
+#     s_correct = torch.sign(dlat) * torch.sign(gph_diff)
+#     wrong_dir = F.relu(-s_correct)
+
+#     return (wrong_dir.pow(2) * has_gradient) * 0.02
+
+
+# def pinn_steering_speed_consistency(pred_abs_deg: torch.Tensor,
+#                                     env_data: Optional[dict]) -> torch.Tensor:
+#     if env_data is None:
+#         return pred_abs_deg.new_zeros(())
+#     T, B, _ = pred_abs_deg.shape
+#     if T < 2:
+#         return pred_abs_deg.new_zeros(())
+
+#     device = pred_abs_deg.device
+#     T_tgt  = T - 1
+#     DT     = DT_6H
+
+#     dlat    = pred_abs_deg[1:] - pred_abs_deg[:-1]
+#     lat_rad = torch.deg2rad(pred_abs_deg[:-1, :, 1])
+#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+#     dx_km   = dlat[:, :, 0] * cos_lat * 111.0
+#     dy_km   = dlat[:, :, 1] * 111.0
+#     tc_speed_ms = torch.sqrt(dx_km**2 + dy_km**2) * 1000.0 / DT
+
+#     u_c = _get_uv500_ms(env_data, "u500_mean", "u500_center", T_tgt, B, device)
+#     v_c = _get_uv500_ms(env_data, "v500_mean", "v500_center", T_tgt, B, device)
+#     u_m = _get_uv500_ms(env_data, "u500_mean", "u500_mean",   T_tgt, B, device)
+#     v_m = _get_uv500_ms(env_data, "v500_mean", "v500_mean",   T_tgt, B, device)
+
+#     steering_mag = (torch.sqrt(u_c**2 + v_c**2) +
+#                     torch.sqrt(u_m**2 + v_m**2)) / 2.0
+
+#     steer_var = (steering_mag**2).mean().clamp(min=1.0)
+
+#     has_steering = (steering_mag > _STEERING_MIN_MS).float()
+#     lo = steering_mag * 0.3
+#     hi = steering_mag * 1.5
+#     too_slow = F.relu(lo - tc_speed_ms)
+#     too_fast = F.relu(tc_speed_ms - hi)
+
+#     penalty = (too_slow.pow(2) + too_fast.pow(2)) / steer_var
+#     return (penalty * has_steering) * 0.03
+
+
+# def pinn_speed_constraint(pred_deg: torch.Tensor) -> torch.Tensor:
+#     if pred_deg.shape[0] < 2:
+#         return pred_deg.new_zeros(())
+#     dt_deg  = pred_deg[1:] - pred_deg[:-1]
+#     lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
+#     cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+#     dx_km   = dt_deg[:, :, 0] * cos_lat * DEG_TO_KM
+#     dy_km   = dt_deg[:, :, 1] * DEG_TO_KM
+#     speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2)
+#     return F.relu(speed - 600.0).pow(2)
+
+
+# def pinn_pressure_wind_loss(
+#     pred_abs_deg: torch.Tensor,
+#     vmax_pred:    Optional[torch.Tensor],
+#     pmin_pred:    Optional[torch.Tensor],
+#     r34_km:       Optional[torch.Tensor] = None,
+#     epoch:        int = 0,
+# ) -> torch.Tensor:
+#     if epoch < 30:
+#         return pred_abs_deg.new_zeros(())
+#     if vmax_pred is None or pmin_pred is None:
+#         return pred_abs_deg.new_zeros(())
+
+#     T, B, _ = pred_abs_deg.shape
+#     if vmax_pred.shape[0] != T or pmin_pred.shape[0] != T:
+#         return pred_abs_deg.new_zeros(())
+
+#     lat_rad = torch.deg2rad(pred_abs_deg[:, :, 1])
+#     f_k     = 2 * OMEGA * torch.sin(lat_rad).abs().clamp(min=1e-6)
+
+#     if r34_km is not None:
+#         R_tc = (2.0 * r34_km * 1000.0).clamp(min=1e5, max=8e5)
+#     else:
+#         R_tc = 3e5 + 1e3 * F.relu(vmax_pred - 30.0)
+
+#     V  = vmax_pred.clamp(min=1.0)
+#     dp = (P_ENV - pmin_pred) * 100.0
+
+#     dp_pred = RHO_AIR * (V.pow(2) / 2.0 + f_k * R_tc * V / 2.0)
+
+#     residual = (dp - dp_pred) / 500.0
+#     return residual.pow(2)
+
+
+# def pinn_bve_loss(
+#     pred_abs_deg: torch.Tensor,
+#     batch_list,
+#     env_data:    Optional[dict] = None,
+#     epoch:       int = 0,
+#     gt_abs_deg:  Optional[torch.Tensor] = None,
+#     vmax_pred:   Optional[torch.Tensor] = None,
+#     pmin_pred:   Optional[torch.Tensor] = None,
+#     r34_km:      Optional[torch.Tensor] = None,
+# ) -> torch.Tensor:
+#     T = pred_abs_deg.shape[0]
+#     if T < 3:
+#         return pred_abs_deg.new_zeros(())
+
+#     _env = env_data
+#     if _env is None and batch_list is not None:
+#         try:
+#             _env = batch_list[13]
+#         except:
+#             _env = None
+
+#     pinn_time_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
+
+#     if gt_abs_deg is not None:
+#         with torch.no_grad():
+#             d_track = _haversine_deg(pred_abs_deg, gt_abs_deg)
+#             w_bve_step = torch.sigmoid(1.0 - d_track / 200.0)
+#     else:
+#         w_bve_step = torch.ones(T, pred_abs_deg.shape[1], device=pred_abs_deg.device)
+
+#     def apply_w(l_map, weight_scalar):
+#         if l_map.dim() == 0:
+#             return l_map * weight_scalar
+#         t_size = l_map.shape[0]
+#         w_final = weight_scalar * pinn_time_w[-t_size:, None]
+#         return (l_map * w_final).mean()
+
+#     l_sw      = apply_w(pinn_shallow_water(pred_abs_deg), 1.0)
+#     l_steer   = apply_w(pinn_rankine_steering(pred_abs_deg, _env), 0.5)
+#     l_speed   = apply_w(pinn_speed_constraint(pred_abs_deg), 0.1)
+#     l_gph     = apply_w(pinn_gph500_gradient(pred_abs_deg, _env), 0.3)
+#     l_spdcons = apply_w(pinn_steering_speed_consistency(pred_abs_deg, _env), 0.4)
+#     l_pwr     = apply_w(pinn_pressure_wind_loss(pred_abs_deg, vmax_pred, pmin_pred, r34_km, epoch), 0.6)
+
+#     total = (l_sw.mean() + l_steer.mean() + l_speed.mean() +
+#              l_gph.mean() + l_spdcons.mean() + l_pwr.mean())
+
+#     w_bnd = _boundary_weights(pred_abs_deg).mean()
+#     f_lazy = 0.2 if epoch < 30 else (0.5 if epoch < 50 else 1.0)
+
+#     total_clamped = adapt_clamp(total, epoch, max_val=20.0)
+#     return total_clamped * w_bnd * f_lazy
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Physics consistency (GIỮ NGUYÊN)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def fm_physics_consistency_loss(
+#     pred_samples: torch.Tensor,
+#     gt_norm:      torch.Tensor,
+#     last_pos:     torch.Tensor,
+# ) -> torch.Tensor:
+#     S, T, B = pred_samples.shape[:3]
+
+#     last_lon = (last_pos[:, 0] * 50.0 + 1800.0) / 10.0
+#     last_lat = (last_pos[:, 1] * 50.0) / 10.0
+#     lat_rad  = torch.deg2rad(last_lat)
+#     beta     = 2 * OMEGA * torch.cos(lat_rad) / R_EARTH
+#     R_tc     = 3e5
+
+#     v_beta_lon = -beta * R_tc ** 2 / 2
+#     v_beta_lat =  beta * R_tc ** 2 / 4
+
+#     beta_dir      = torch.stack([v_beta_lon, v_beta_lat], dim=-1)
+#     beta_norm     = beta_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     beta_dir_unit = beta_dir / beta_norm
+
+#     pos_step1 = pred_samples[:, 0, :, :2]
+#     dir_step1 = pos_step1 - last_pos.unsqueeze(0)
+#     dir_norm  = dir_step1.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     dir_unit  = dir_step1 / dir_norm
+#     mean_dir  = dir_unit.mean(0)
+#     mean_norm = mean_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+#     mean_dir_unit = mean_dir / mean_norm
+
+#     cos_align     = (mean_dir_unit * beta_dir_unit).sum(-1)
+#     beta_strength = beta_norm.squeeze(-1)
+#     penalise_mask = (beta_strength > 1.0).float()
+#     direction_loss = F.relu(-cos_align) * penalise_mask
+#     return direction_loss.mean() * 0.5
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Main loss (GIỮ NGUYÊN structure, chỉ sửa bridge và spread calls)
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def compute_total_loss(
+#     pred_abs,
+#     gt,
+#     ref,
+#     batch_list,
+#     pred_samples       = None,
+#     gt_norm            = None,
+#     weights            = WEIGHTS,
+#     intensity_w: Optional[torch.Tensor] = None,
+#     env_data:    Optional[dict]         = None,
+#     step_weight_alpha: float = 0.0,
+#     all_trajs:   Optional[torch.Tensor] = None,
+#     epoch:       int = 0,
+#     gt_abs_deg:  Optional[torch.Tensor] = None,
+#     vmax_pred:   Optional[torch.Tensor] = None,
+#     pmin_pred:   Optional[torch.Tensor] = None,
+#     r34_km:      Optional[torch.Tensor] = None,
+#     sr_pred:     Optional[torch.Tensor] = None,
+# ) -> Dict:
+#     NRM = 35.0
+
+#     recurv_w = _recurvature_weights(gt, w_recurv=2.5)
+#     sample_w = recurv_w * (intensity_w.to(gt.device) if intensity_w is not None
+#                            else 1.0)
+#     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
+
+#     # FM AFCRPS - với time weights mới
+#     if pred_samples is not None:
+#         target = gt_norm if gt_norm is not None else gt
+#         unit   = gt_norm is not None
+#         l_fm = fm_afcrps_loss(
+#             pred_samples, target,
+#             unit_01deg=unit,
+#             intensity_w=sample_w,
+#             step_weight_alpha=step_weight_alpha,
+#             w_es=0.3,
+#         )
+#     else:
+#         l_fm = _haversine_deg(pred_abs, gt).mean()
+
+#     # Directional losses (GIỮ NGUYÊN)
+#     l_vel       = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
+#     l_disp      = (disp_loss_per_sample(pred_abs, gt)     * sample_w).mean()
+#     l_step      = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
+#     l_heading   = heading_loss(pred_abs, gt)
+#     l_recurv    = recurvature_loss(pred_abs, gt)
+#     l_dir_final = overall_dir_loss(pred_abs, gt, ref)
+#     l_smooth    = smooth_loss(pred_abs)
+#     l_accel     = acceleration_loss(pred_abs)
+#     l_jerk      = jerk_loss(pred_abs)
+
+#     # PINN (GIỮ NGUYÊN)
+#     _env = env_data
+#     if _env is None and batch_list is not None:
+#         try:
+#             _env = batch_list[13]
+#         except (IndexError, TypeError):
+#             _env = None
+
+#     l_pinn = pinn_bve_loss(
+#         pred_abs, batch_list, env_data=_env, epoch=epoch,
+#         gt_abs_deg=gt_abs_deg, vmax_pred=vmax_pred,
+#         pmin_pred=pmin_pred, r34_km=r34_km
+#     )
+
+#     # Spread (RELAXED)
+#     l_spread = pred_abs.new_zeros(())
+#     if all_trajs is not None and all_trajs.shape[0] >= 2:
+#         n_sr = 4
+#         trajs_fm = all_trajs[:, n_sr:] if all_trajs.shape[1] > n_sr else all_trajs
+#         l_spread = ensemble_spread_loss(trajs_fm)
+
+#     # Bridge (SIMPLIFIED)
+#     l_bridge = pred_abs.new_zeros(())
+#     if sr_pred is not None and pred_samples is not None:
+#         fm_mean = pred_samples.mean(0)
+#         l_bridge = bridge_loss(sr_pred, fm_mean)
+
+#     # Total (GIỮ NGUYÊN structure)
+#     total = (
+#         weights.get("fm",       2.0) * l_fm
+#         + weights.get("velocity", 0.8) * l_vel     * NRM
+#         + weights.get("disp",     0.5) * l_disp    * NRM
+#         + weights.get("step",     0.5) * l_step    * NRM
+#         + weights.get("heading",  2.0) * l_heading * NRM
+#         + weights.get("recurv",   1.5) * l_recurv  * NRM
+#         + weights.get("dir",      1.0) * l_dir_final * NRM
+#         + weights.get("smooth",   0.5) * l_smooth  * NRM
+#         + weights.get("accel",    0.8) * l_accel   * NRM
+#         + weights.get("jerk",     0.3) * l_jerk    * NRM
+#         + weights.get("pinn",     0.5) * l_pinn
+#         + weights.get("spread",   0.5) * l_spread  * NRM
+#         + weights.get("bridge",   0.5) * l_bridge  * NRM
+#     ) / NRM
+
+#     if torch.isnan(total) or torch.isinf(total):
+#         total = pred_abs.new_zeros(())
+
+#     return dict(
+#         total        = total,
+#         fm           = l_fm.item(),
+#         velocity     = l_vel.item()     * NRM,
+#         step         = l_step.item(),
+#         disp         = l_disp.item()    * NRM,
+#         heading      = l_heading.item(),
+#         recurv       = l_recurv.item(),
+#         smooth       = l_smooth.item()  * NRM,
+#         accel        = l_accel.item()   * NRM,
+#         jerk         = l_jerk.item()    * NRM,
+#         pinn         = l_pinn.item(),
+#         spread       = l_spread.item()  * NRM,
+#         bridge       = l_bridge.item()  * NRM,
+#         recurv_ratio = (_recurvature_weights(gt) > 1.0).float().mean().item(),
+#     )
 """
-Model/losses.py  ── v28 - BALANCED
-===================================
-MỤC TIÊU: 12h < 50km, 24h < 100km, 72h < 300km
+Model/losses.py  ── v30 - HIERARCHICAL
+========================================
+MỤC TIÊU: 12h < 50km, 24h < 100km, 48h < 200km, 72h < 300km
 
-NGUYÊN TẮC CÂN BẰNG:
-  1. KHÔNG thay đổi SR loss - giữ 12h/24h tốt
-  2. Tăng FM time weights cho 48h-72h NHƯNG không quá mạnh
-  3. Bridge loss ĐƠN GIẢN - chỉ enforce position, không velocity phức tạp
-  4. Spread loss RELAX hơn để FM có thể explore
+CHIẾN LƯỢC MỚI:
+  - SR owns step 1-4 (6h-24h) hoàn toàn
+  - FM starts from SR endpoint, predicts step 5-12 (30h-72h)
+  - KHÔNG CÒN CONFLICT giữa SR và FM
+  - Bridge loss → Continuity loss (velocity matching tại handoff)
+  - FM time weights ĐỒNG ĐỀU (không suppress short-range)
+  - PINN nhẹ nhàng, không dominant
+  - Spread loss tuned cho FM-only steps (5-12)
 
-KEY CHANGES từ v26:
-  - FM time weights: 0.5→3.0 (linear) → 0.5→4.0 (quadratic focus 72h)
-  - Bridge: weight 0.5, chỉ position matching, normalize /150km
-  - Spread: relax threshold 60→200km (cho FM explore)
-  - PINN: giữ nguyên, không thay đổi
+KEY CHANGES từ v28:
+  - FM AFCRPS: chỉ tính trên step 5-12 (FM zone)
+  - SR loss: tính trên step 1-4 (SR zone) 
+  - Continuity loss: SR step4 → FM step5 smooth transition
+  - Bỏ bridge loss cũ (position matching không đủ)
+  - FM time weights: flat 1.0→2.0 (không suppress step nào)
+  - PINN: giảm weight, chỉ apply trên FM zone
+  - Spread: chỉ apply trên FM zone
 """
 from __future__ import annotations
 
@@ -4100,7 +5090,7 @@ __all__ = [
     "WEIGHTS", "compute_total_loss", "fm_afcrps_loss",
     "fm_physics_consistency_loss", "pinn_bve_loss",
     "recurvature_loss", "velocity_loss_per_sample",
-    "short_range_regression_loss", "bridge_loss",
+    "short_range_regression_loss", "continuity_loss",
     "adapt_clamp", "pinn_pressure_wind_loss",
 ]
 
@@ -4124,10 +5114,12 @@ _GPH500_STD_M    = 80.0
 _STEERING_MIN_MS = 3.0
 _PINN_SCALE      = 1e-2
 
-# ── Weights (GIỮ NGUYÊN từ v26 - đã hoạt động) ────────────────────────────────
+N_SR_STEPS = 4  # SR owns step 1-4
+
+# ── Weights ─────────────────────────────────────────────────────────────────
 WEIGHTS: Dict[str, float] = dict(
-    fm          = 2.0,      # GIỮ NGUYÊN
-    velocity    = 0.8,      # GIỮ NGUYÊN
+    fm          = 2.0,      # FM AFCRPS (step 5-12 only)
+    velocity    = 0.8,
     heading     = 2.0,
     recurv      = 1.5,
     step        = 0.5,
@@ -4136,23 +5128,23 @@ WEIGHTS: Dict[str, float] = dict(
     smooth      = 0.5,
     accel       = 0.8,
     jerk        = 0.3,
-    pinn        = 0.5,      # GIỮ NGUYÊN
+    pinn        = 0.3,      # Giảm từ 0.5 - PINN không dominant
     fm_physics  = 0.3,
-    spread      = 0.5,      # GIẢM từ 0.8 - cho FM explore
-    short_range = 5.0,      # GIỮ NGUYÊN - quan trọng cho 12h/24h
-    bridge      = 0.5,      # GIỮ NGUYÊN weight, sửa function
+    spread      = 0.5,
+    short_range = 3.0,      # SR loss (step 1-4)
+    continuity  = 2.0,      # NEW: SR→FM handoff smoothness
 )
 
 RECURV_ANGLE_THR = 45.0
 RECURV_WEIGHT    = 2.5
 
 _SR_N_STEPS  = 4
-_SR_WEIGHTS  = [2.0, 4.0, 2.0, 2.0]  # Focus vào 12h (step 2)
+_SR_WEIGHTS  = [1.5, 3.0, 2.0, 2.5]  # 6h, 12h(focus), 18h, 24h(important)
 _HUBER_DELTA = 50.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Haversine utilities (GIỮ NGUYÊN)
+#  Haversine utilities
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _haversine(p1: torch.Tensor, p2: torch.Tensor,
@@ -4187,7 +5179,7 @@ def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AdaptClamp (GIỮ NGUYÊN)
+#  AdaptClamp
 # ══════════════════════════════════════════════════════════════════════════════
 
 def adapt_clamp(x: torch.Tensor, epoch: int, max_val: float = 20.0) -> torch.Tensor:
@@ -4213,7 +5205,7 @@ def adapt_clamp(x: torch.Tensor, epoch: int, max_val: float = 20.0) -> torch.Ten
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ★ KEY CHANGE: FM AFCRPS với Time Weights CÂN BẰNG
+#  ★ FM AFCRPS - cho FM zone (step 5-12) HOẶC full (step 1-12)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fm_afcrps_loss(
@@ -4223,40 +5215,35 @@ def fm_afcrps_loss(
     intensity_w:       Optional[torch.Tensor] = None,
     step_weight_alpha: float = 0.0,
     w_es:              float = 0.3,
+    fm_start_step:     int   = 0,
 ) -> torch.Tensor:
     """
-    ★ KEY CHANGE: Time weights CÂN BẰNG
+    FM AFCRPS loss.
     
-    Mục tiêu:
-    - Giữ 12h/24h accuracy (SR handle) → weight thấp cho step 1-4
-    - Tăng 72h accuracy (FM handle) → weight cao cho step 9-12
+    fm_start_step: nếu > 0, chỉ tính loss từ step này trở đi
+                   (step 4 = bắt đầu FM zone trong hierarchical mode)
     
-    NHƯNG không quá aggressive để tránh destabilize training
-    
-    Weight scheme (12 steps = 72h):
-        Step 1-4 (6h-24h):  0.5, 0.5, 0.7, 0.7   (SR handles)
-        Step 5-8 (30h-48h): 1.0, 1.3, 1.6, 2.0   (transition)
-        Step 9-12 (54h-72h): 2.5, 3.0, 3.5, 4.0  (FM critical)
-    
-    So với v26 (0.5 → 3.0 linear), đây tăng 72h weight lên 4.0
-    nhưng không quá mạnh như v27 (8.5)
+    Time weights ĐỒNG ĐỀU: 1.0 → 2.5 (gentle ramp)
+    Không suppress step nào → FM learns accurate ở ALL steps
     """
     M, T, B, _ = pred_samples.shape
     device = pred_samples.device
 
-    # ★ Time weights quadratic focus on 72h
-    base_w = torch.zeros(T, device=device)
-    for i in range(T):
-        if i < 4:       # 6h-24h: SR handles
-            base_w[i] = 0.5 + (i % 2) * 0.2  # [0.5, 0.7, 0.5, 0.7]
-        elif i < 8:     # 30h-48h: transition
-            base_w[i] = 1.0 + (i - 4) * 0.35  # [1.0, 1.35, 1.7, 2.05]
-        else:           # 54h-72h: FM critical
-            base_w[i] = 2.5 + (i - 8) * 0.5   # [2.5, 3.0, 3.5, 4.0]
+    # Slice to FM zone if needed
+    if fm_start_step > 0 and T > fm_start_step:
+        pred_samples = pred_samples[:, fm_start_step:]
+        gt = gt[fm_start_step:]
+        M, T, B, _ = pred_samples.shape
+
+    if T == 0:
+        return pred_samples.new_zeros(())
+
+    # Time weights: gentle ramp, no step suppressed
+    base_w = torch.linspace(1.0, 2.5, T, device=device)
 
     if step_weight_alpha > 0.0:
         early_w = torch.exp(
-            -torch.arange(T, dtype=torch.float, device=device) * 0.5
+            -torch.arange(T, dtype=torch.float, device=device) * 0.3
         )
         early_w = early_w / early_w.mean()
         time_w = (1.0 - step_weight_alpha) * base_w + step_weight_alpha * early_w
@@ -4325,7 +5312,7 @@ def fm_afcrps_loss(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Short-range Loss (GIỮ NGUYÊN - quan trọng cho 12h/24h)
+#  Short-range Loss (step 1-4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def short_range_regression_loss(
@@ -4354,55 +5341,94 @@ def short_range_regression_loss(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ★ KEY CHANGE: Bridge Loss ĐƠN GIẢN HƠN
+#  ★ NEW: Continuity Loss (SR→FM handoff)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def bridge_loss(
-    sr_pred:  torch.Tensor,
-    fm_mean:  torch.Tensor,
+def continuity_loss(
+    sr_pred:     torch.Tensor,    # [4, B, 2] normalised
+    fm_pred_abs: torch.Tensor,    # [T_fm, B, 2] degrees (FM predictions step 5-12)
+    gt_abs:      torch.Tensor,    # [T_full, B, 2] degrees
 ) -> torch.Tensor:
     """
-    ★ SIMPLIFIED Bridge Loss
+    Continuity Loss: đảm bảo transition mượt từ SR step 4 → FM step 5.
     
-    Vấn đề v27: bridge loss quá phức tạp (250-1000+) destabilize training
+    3 components:
+    1. Position continuity: FM step 5 gần SR step 4 (khoảng cách hợp lý)
+    2. Velocity continuity: hướng đi FM step 5 consistent với SR step 3→4
+    3. Acceleration smoothness: không có "giật" tại handoff
     
-    Solution: Chỉ enforce position matching ở step 4
-    - Normalize bằng 150km (không phải 50km hay 100km)
-    - Không thêm velocity matching (gây instability)
-    
-    Mục tiêu: SR step 4 ≈ FM step 4 (cách nhau < 100km)
+    Tất cả normalize về km, weight hợp lý.
     """
-    if sr_pred.shape[0] < 4 or fm_mean.shape[0] < 5:
+    if sr_pred.shape[0] < 4 or fm_pred_abs.shape[0] < 2:
         return sr_pred.new_zeros(())
 
-    # Position match at step 4 (24h)
-    pos_sr4 = _norm_to_deg(sr_pred[3])
-    pos_fm4 = _norm_to_deg(fm_mean[3])
-
-    dist_pos = _haversine_deg(pos_sr4, pos_fm4)
+    # Convert SR to degrees
+    sr_deg = _norm_to_deg(sr_pred)  # [4, B, 2]
     
-    # Normalize by 150km - typical TC movement in 6h
-    # Nếu SR và FM cách nhau < 150km → loss < 1
-    l_pos = (dist_pos / 150.0).pow(2).mean()
-
-    return l_pos
+    # SR velocity at step 3→4 (last SR velocity)
+    sr_vel = sr_deg[3] - sr_deg[2]  # [B, 2] in degrees
+    
+    # FM velocity at step 4→5 (first FM velocity)
+    # fm_pred_abs[0] = step 5, sr_deg[3] = step 4
+    fm_vel = fm_pred_abs[0] - sr_deg[3]  # [B, 2] in degrees
+    
+    # 1. Position continuity: FM step 5 should be reachable from SR step 4
+    # Typical TC moves 50-200km in 6h, so gap should be < 300km
+    pos_dist = _haversine_deg(sr_deg[3:4], fm_pred_abs[0:1]).squeeze(0)  # [B]
+    l_pos = F.relu(pos_dist - 300.0).pow(2).mean() / (300.0 ** 2)
+    
+    # 2. Velocity continuity: direction should be similar
+    lat_mid = sr_deg[3, :, 1]
+    cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+    
+    sr_vel_km = sr_vel.clone()
+    sr_vel_km[:, 0] = sr_vel[:, 0] * cos_lat * DEG_TO_KM
+    sr_vel_km[:, 1] = sr_vel[:, 1] * DEG_TO_KM
+    
+    fm_vel_km = fm_vel.clone()
+    fm_vel_km[:, 0] = fm_vel[:, 0] * cos_lat * DEG_TO_KM
+    fm_vel_km[:, 1] = fm_vel[:, 1] * DEG_TO_KM
+    
+    sr_speed = sr_vel_km.norm(dim=-1).clamp(min=1e-4)
+    fm_speed = fm_vel_km.norm(dim=-1).clamp(min=1e-4)
+    
+    # Speed ratio: FM speed should be 0.5x-2.0x of SR speed
+    speed_ratio = fm_speed / sr_speed
+    l_speed = (F.relu(speed_ratio - 2.0).pow(2) + 
+               F.relu(0.5 - speed_ratio).pow(2)).mean()
+    
+    # Direction: cosine similarity
+    cos_sim = (sr_vel_km * fm_vel_km).sum(-1) / (sr_speed * fm_speed)
+    l_dir = F.relu(-cos_sim).pow(2).mean()  # Penalize opposite direction
+    
+    # 3. Acceleration smoothness at handoff
+    if fm_pred_abs.shape[0] >= 2:
+        fm_vel2 = fm_pred_abs[1] - fm_pred_abs[0]  # step 5→6 velocity
+        fm_vel2_km = fm_vel2.clone()
+        fm_vel2_km[:, 0] = fm_vel2[:, 0] * cos_lat * DEG_TO_KM
+        fm_vel2_km[:, 1] = fm_vel2[:, 1] * DEG_TO_KM
+        
+        # Acceleration at handoff vs acceleration in FM
+        accel_handoff = fm_vel_km - sr_vel_km
+        accel_fm = fm_vel2_km - fm_vel_km
+        l_accel = (accel_handoff - accel_fm).pow(2).mean() / (STEP_KM ** 2)
+    else:
+        l_accel = sr_pred.new_zeros(())
+    
+    return 0.5 * l_pos + 0.3 * l_dir + 0.1 * l_speed + 0.1 * l_accel
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ★ KEY CHANGE: Spread Loss RELAX hơn
+#  Spread Loss - FM zone only (step 5-12)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
     """
-    ★ RELAXED Spread Loss
+    Spread loss cho FM zone.
     
-    Vấn đề: Spread quá strict → FM không explore được → 72h bad
-    
-    Solution: Relax threshold để FM có thể explore
-    - 6h:  max 60km spread (was 40km)
-    - 72h: max 200km spread (was 120km)
-    
-    Đây là trade-off: spread cao hơn nhưng 72h accuracy tốt hơn
+    Thresholds hợp lý cho 30h-72h:
+    - 30h: max 80km spread
+    - 72h: max 250km spread
     """
     if all_trajs.shape[0] < 2:
         return all_trajs.new_zeros(())
@@ -4410,10 +5436,7 @@ def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
     S, T, B, _ = all_trajs.shape
     device = all_trajs.device
 
-    # RELAXED thresholds
-    max_spreads = torch.linspace(60.0, 200.0, T, device=device)
-    
-    # Weight nhẹ hơn ở early steps
+    max_spreads = torch.linspace(80.0, 250.0, T, device=device)
     step_weights = torch.linspace(0.5, 2.0, T, device=device)
 
     total_loss = all_trajs.new_zeros(())
@@ -4424,8 +5447,6 @@ def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
         spread_km  = torch.sqrt(std_lon ** 2 + std_lat ** 2) * 500.0
 
         excess = F.relu(spread_km - max_spreads[t])
-        
-        # Gentler penalty
         loss = (excess / 50.0).pow(2)
 
         total_loss = total_loss + step_weights[t] * loss.mean()
@@ -4434,7 +5455,7 @@ def ensemble_spread_loss(all_trajs: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Helper functions (GIỮ NGUYÊN)
+#  Helper functions
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _boundary_weights(traj_deg: torch.Tensor) -> torch.Tensor:
@@ -4486,7 +5507,7 @@ def _recurvature_weights(gt: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Directional losses (GIỮ NGUYÊN)
+#  Directional losses (apply trên FULL trajectory)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def velocity_loss_per_sample(pred: torch.Tensor,
@@ -4616,7 +5637,7 @@ def recurvature_loss(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PINN Components (GIỮ NGUYÊN từ v26)
+#  PINN Components
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
@@ -4649,7 +5670,6 @@ def _get_uv500_ms(env_data: dict, key_mean: str, key_center: str,
 def _get_gph500_norm(env_data: dict, key: str,
                      T_tgt: int, B: int, device: torch.device) -> torch.Tensor:
     x = env_data.get(key, None)
-    
     if x is None or not torch.is_tensor(x):
         return torch.zeros(T_tgt, B, device=device)
     x = x.to(device).float()
@@ -4749,11 +5769,8 @@ def pinn_gph500_gradient(pred_abs_deg: torch.Tensor,
     gph_center = _get_gph500_norm(env_data, "gph500_center", T_tgt, B, device)
 
     gph_diff = gph_center - gph_mean
-
     dlat = pred_abs_deg[1:, :, 1] - pred_abs_deg[:-1, :, 1]
-
     has_gradient = (gph_diff.abs() > 0.1).float()
-
     s_correct = torch.sign(dlat) * torch.sign(gph_diff)
     wrong_dir = F.relu(-s_correct)
 
@@ -4865,7 +5882,7 @@ def pinn_bve_loss(
         except:
             _env = None
 
-    pinn_time_w = torch.linspace(0.5, 4.0, T, device=pred_abs_deg.device)
+    pinn_time_w = torch.linspace(0.5, 3.0, T, device=pred_abs_deg.device)
 
     if gt_abs_deg is not None:
         with torch.no_grad():
@@ -4892,14 +5909,14 @@ def pinn_bve_loss(
              l_gph.mean() + l_spdcons.mean() + l_pwr.mean())
 
     w_bnd = _boundary_weights(pred_abs_deg).mean()
-    f_lazy = 0.2 if epoch < 30 else (0.5 if epoch < 50 else 1.0)
+    f_lazy = 0.2 if epoch < 20 else (0.5 if epoch < 40 else 1.0)
 
-    total_clamped = adapt_clamp(total, epoch, max_val=20.0)
+    total_clamped = adapt_clamp(total, epoch, max_val=15.0)
     return total_clamped * w_bnd * f_lazy
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Physics consistency (GIỮ NGUYÊN)
+#  Physics consistency
 # ══════════════════════════════════════════════════════════════════════════════
 
 def fm_physics_consistency_loss(
@@ -4938,27 +5955,28 @@ def fm_physics_consistency_loss(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Main loss (GIỮ NGUYÊN structure, chỉ sửa bridge và spread calls)
+#  Main loss - HIERARCHICAL VERSION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_total_loss(
-    pred_abs,
-    gt,
-    ref,
+    pred_abs,          # [T, B, 2] degrees - FULL trajectory (SR+FM concatenated)
+    gt,                # [T, B, 2] degrees
+    ref,               # [B, 2] degrees
     batch_list,
-    pred_samples       = None,
-    gt_norm            = None,
+    pred_samples       = None,   # [S, T_fm, B, 2] normalised - FM samples (step 5-12)
+    gt_norm            = None,   # [T, B, 2] normalised
     weights            = WEIGHTS,
     intensity_w: Optional[torch.Tensor] = None,
     env_data:    Optional[dict]         = None,
     step_weight_alpha: float = 0.0,
-    all_trajs:   Optional[torch.Tensor] = None,
+    all_trajs:   Optional[torch.Tensor] = None,  # [S, T_fm, B, 2] FM ensemble
     epoch:       int = 0,
     gt_abs_deg:  Optional[torch.Tensor] = None,
     vmax_pred:   Optional[torch.Tensor] = None,
     pmin_pred:   Optional[torch.Tensor] = None,
     r34_km:      Optional[torch.Tensor] = None,
-    sr_pred:     Optional[torch.Tensor] = None,
+    sr_pred:     Optional[torch.Tensor] = None,   # [4, B, 2] normalised
+    fm_pred_abs: Optional[torch.Tensor] = None,   # [T_fm, B, 2] degrees - FM mean
 ) -> Dict:
     NRM = 35.0
 
@@ -4967,7 +5985,7 @@ def compute_total_loss(
                            else 1.0)
     sample_w = sample_w / sample_w.mean().clamp(min=1e-6)
 
-    # FM AFCRPS - với time weights mới
+    # ── FM AFCRPS (step 5-12 only, hoặc full nếu không có SR) ──
     if pred_samples is not None:
         target = gt_norm if gt_norm is not None else gt
         unit   = gt_norm is not None
@@ -4977,11 +5995,12 @@ def compute_total_loss(
             intensity_w=sample_w,
             step_weight_alpha=step_weight_alpha,
             w_es=0.3,
+            fm_start_step=0,  # pred_samples đã được slice sẵn
         )
     else:
         l_fm = _haversine_deg(pred_abs, gt).mean()
 
-    # Directional losses (GIỮ NGUYÊN)
+    # ── Directional losses (trên FULL trajectory SR+FM) ──
     l_vel       = (velocity_loss_per_sample(pred_abs, gt) * sample_w).mean()
     l_disp      = (disp_loss_per_sample(pred_abs, gt)     * sample_w).mean()
     l_step      = (step_dir_loss_per_sample(pred_abs, gt) * sample_w).mean()
@@ -4992,7 +6011,7 @@ def compute_total_loss(
     l_accel     = acceleration_loss(pred_abs)
     l_jerk      = jerk_loss(pred_abs)
 
-    # PINN (GIỮ NGUYÊN)
+    # ── PINN (trên full trajectory) ──
     _env = env_data
     if _env is None and batch_list is not None:
         try:
@@ -5006,34 +6025,31 @@ def compute_total_loss(
         pmin_pred=pmin_pred, r34_km=r34_km
     )
 
-    # Spread (RELAXED)
+    # ── Spread (FM zone only) ──
     l_spread = pred_abs.new_zeros(())
     if all_trajs is not None and all_trajs.shape[0] >= 2:
-        n_sr = 4
-        trajs_fm = all_trajs[:, n_sr:] if all_trajs.shape[1] > n_sr else all_trajs
-        l_spread = ensemble_spread_loss(trajs_fm)
+        l_spread = ensemble_spread_loss(all_trajs)
 
-    # Bridge (SIMPLIFIED)
-    l_bridge = pred_abs.new_zeros(())
-    if sr_pred is not None and pred_samples is not None:
-        fm_mean = pred_samples.mean(0)
-        l_bridge = bridge_loss(sr_pred, fm_mean)
+    # ── Continuity (SR→FM handoff) ──
+    l_cont = pred_abs.new_zeros(())
+    if sr_pred is not None and fm_pred_abs is not None:
+        l_cont = continuity_loss(sr_pred, fm_pred_abs, gt)
 
-    # Total (GIỮ NGUYÊN structure)
+    # ── Total ──
     total = (
-        weights.get("fm",       2.0) * l_fm
-        + weights.get("velocity", 0.8) * l_vel     * NRM
-        + weights.get("disp",     0.5) * l_disp    * NRM
-        + weights.get("step",     0.5) * l_step    * NRM
-        + weights.get("heading",  2.0) * l_heading * NRM
-        + weights.get("recurv",   1.5) * l_recurv  * NRM
-        + weights.get("dir",      1.0) * l_dir_final * NRM
-        + weights.get("smooth",   0.5) * l_smooth  * NRM
-        + weights.get("accel",    0.8) * l_accel   * NRM
-        + weights.get("jerk",     0.3) * l_jerk    * NRM
-        + weights.get("pinn",     0.5) * l_pinn
-        + weights.get("spread",   0.5) * l_spread  * NRM
-        + weights.get("bridge",   0.5) * l_bridge  * NRM
+        weights.get("fm",         2.0) * l_fm
+        + weights.get("velocity",   0.8) * l_vel     * NRM
+        + weights.get("disp",       0.5) * l_disp    * NRM
+        + weights.get("step",       0.5) * l_step    * NRM
+        + weights.get("heading",    2.0) * l_heading * NRM
+        + weights.get("recurv",     1.5) * l_recurv  * NRM
+        + weights.get("dir",        1.0) * l_dir_final * NRM
+        + weights.get("smooth",     0.5) * l_smooth  * NRM
+        + weights.get("accel",      0.8) * l_accel   * NRM
+        + weights.get("jerk",       0.3) * l_jerk    * NRM
+        + weights.get("pinn",       0.3) * l_pinn
+        + weights.get("spread",     0.5) * l_spread  * NRM
+        + weights.get("continuity", 2.0) * l_cont    * NRM
     ) / NRM
 
     if torch.isnan(total) or torch.isinf(total):
@@ -5052,6 +6068,6 @@ def compute_total_loss(
         jerk         = l_jerk.item()    * NRM,
         pinn         = l_pinn.item(),
         spread       = l_spread.item()  * NRM,
-        bridge       = l_bridge.item()  * NRM,
+        continuity   = l_cont.item()    * NRM,
         recurv_ratio = (_recurvature_weights(gt) > 1.0).float().mean().item(),
     )
