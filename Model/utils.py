@@ -63,7 +63,14 @@ def dic2cuda(env_data, device=None):
 
 
 class EarlyStopping:
-    def __init__(self, patience=20, verbose=True, delta=0.0001):
+    def __init__(self, patience=20, verbose=True, delta=0):
+        """
+        Args:
+            patience (int): Số epoch tối đa chờ đợi sau lần cuối val_loss cải thiện.
+            verbose (bool): Nếu True, in ra thông báo mỗi khi lưu checkpoint.
+            delta (float): Độ lệch tối thiểu để tính là một sự cải thiện. 
+                           Mặc định = 0 để chấp nhận mọi sự sụt giảm.
+        """
         self.patience     = patience
         self.verbose      = verbose
         self.delta        = delta
@@ -73,10 +80,16 @@ class EarlyStopping:
         self.val_loss_min = np.inf
 
     def __call__(self, val_loss, model, path):
+        # Sử dụng score là giá trị âm của loss (loss càng nhỏ score càng cao)
         score = -val_loss
+
         if self.best_score is None:
             self.best_score = score
             self.save_checkpoint(val_loss, model, path)
+        
+        # FIX: Chỉ cần score lớn hơn best_score hiện tại (tức là val_loss nhỏ hơn)
+        # Cộng thêm self.delta nếu bạn muốn ép buộc phải giảm một khoảng đáng kể.
+        # Với delta=0, chỉ cần val_loss thấp hơn dù chỉ 0.000001 cũng sẽ Save.
         elif score < self.best_score + self.delta:
             self.counter += 1
             if self.verbose:
@@ -84,18 +97,25 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
+            # Trường hợp này là score >= self.best_score + self.delta (Cải thiện)
             self.best_score = score
             self.save_checkpoint(val_loss, model, path)
-            self.counter = 0
+            self.counter = 0 # Reset lại bộ đếm khi có cải thiện
 
     def save_checkpoint(self, val_loss, model, path):
         if self.verbose:
-            print(f'Val loss decreased ({self.val_loss_min:.6f} → {val_loss:.6f}). Saving...')
+            if self.val_loss_min == np.inf:
+                print(f'Initial validation loss: {val_loss:.6f}. Saving model...')
+            else:
+                print(f'Val loss decreased ({self.val_loss_min:.6f} → {val_loss:.6f}). Saving model...')
+        
         os.makedirs(path, exist_ok=True)
-        torch.save({'model_state_dict': model.state_dict(), 'val_loss': val_loss},
-                   os.path.join(path, 'best_model.pth'))
+        torch.save({
+            'model_state_dict': model.state_dict(), 
+            'val_loss': val_loss
+        }, os.path.join(path, 'best_model.pth'))
+        
         self.val_loss_min = val_loss
-
 
 def get_cosine_schedule_with_warmup(
     optimizer,
