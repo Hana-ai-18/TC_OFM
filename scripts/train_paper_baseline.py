@@ -244,7 +244,7 @@ def main(args):
         factor   = args.lr_factor,
         patience = args.lr_patience,
         min_lr   = args.lr_min,
-        verbose  = True,
+        # verbose  = True,
     )
 
     scaler = GradScaler("cuda", enabled=args.use_amp)
