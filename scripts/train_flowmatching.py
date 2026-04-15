@@ -4230,16 +4230,26 @@ def main(args):
             loss_to_bp = bd["total"] / max(args.grad_accum, 1)
             scaler.scale(loss_to_bp).backward()
 
+            # if ((i + 1) % args.grad_accum == 0
+            #         or (i + 1) == len(train_loader)):
+            #     scaler.unscale_(optimizer)
+            #     torch.nn.utils.clip_grad_norm_(
+            #         model.parameters(), current_clip)
+            #     scaler.step(optimizer)
+            #     scaler.update()
+            #     optimizer.zero_grad()
+            #     scheduler.step()
+
             if ((i + 1) % args.grad_accum == 0
                     or (i + 1) == len(train_loader)):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), current_clip)
-                scaler.step(optimizer)
+                scaler.step(optimizer)    # ← 1. optimizer trước
                 scaler.update()
+                scheduler.step()          # ← 2. scheduler sau  (HOÁN ĐỔI VỊ TRÍ)
                 optimizer.zero_grad()
-                scheduler.step()
-
+                
             sum_loss += bd["total"].item()
 
             if i % 20 == 0:
