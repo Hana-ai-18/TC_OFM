@@ -3082,23 +3082,36 @@ class TCFlowMatching(nn.Module):
         d = rel.permute(1, 0, 2)
         return lp.unsqueeze(0) + d[:, :, :2], lm.unsqueeze(0) + d[:, :, 2:]
 
-    def _cfm_noisy(self, x1, sigma_min=None):
-        """
-        Conditional FM noise process.
+    # def _cfm_noisy(self, x1, sigma_min=None):
+    #     """
+    #     Conditional FM noise process.
         
-        KEY: sigma_min controls stochasticity:
-        - sigma_min lớn (0.1-0.2) → gần deterministic → tốt cho MSE training
-        - sigma_min nhỏ (0.01-0.02) → stochastic → tốt cho ensemble diversity
-        """
+    #     KEY: sigma_min controls stochasticity:
+    #     - sigma_min lớn (0.1-0.2) → gần deterministic → tốt cho MSE training
+    #     - sigma_min nhỏ (0.01-0.02) → stochastic → tốt cho ensemble diversity
+    #     """
+    #     if sigma_min is None:
+    #         sigma_min = self.sigma_min
+    #     B, device = x1.shape[0], x1.device
+    #     x0 = torch.randn_like(x1) * sigma_min
+    #     t  = torch.rand(B, device=device)
+    #     te = t.view(B, 1, 1)
+    #     # x_t = te * x1 + (1.0 - te * (1.0 - sigma_min)) * x0
+    #     # denom = (1.0 - (1.0 - sigma_min) * te).clamp(min=1e-5)
+    #     x_t = te * x1 + (1.0 - te * (1.0 - sigma_min)) * x0
+    #     denom = (1.0 - (1.0 - sigma_min) * te).clamp(min=1e-5)
+    #     return x_t, t, te, denom
+
+    def _cfm_noisy(self, x1, sigma_min=None):
         if sigma_min is None:
             sigma_min = self.sigma_min
         B, device = x1.shape[0], x1.device
         x0 = torch.randn_like(x1) * sigma_min
         t  = torch.rand(B, device=device)
         te = t.view(B, 1, 1)
-        x_t = te * x1 + (1.0 - te * (1.0 - sigma_min)) * x0
-        denom = (1.0 - (1.0 - sigma_min) * te).clamp(min=1e-5)
-        return x_t, t, te, denom
+        x_t = (1.0 - te) * x0 + te * x1
+        u   = x1 - x0
+        return x_t, t, u  # 3 giá trị, không còn denom
 
     @staticmethod
     def _intensity_weights(obs_Me):
@@ -3126,116 +3139,219 @@ class TCFlowMatching(nn.Module):
     def get_loss(self, batch_list, step_weight_alpha=0.0, epoch=0):
         return self.get_loss_breakdown(batch_list, step_weight_alpha, epoch)["total"]
 
-    def get_loss_breakdown(self, batch_list, step_weight_alpha=0.0, epoch=0):
-        """
-        ═══════════════════════════════════════════════════════════════
-        CORE TRAINING LOGIC — MSE-focused, FM as architecture only
-        ═══════════════════════════════════════════════════════════════
+    # def get_loss_breakdown(self, batch_list, step_weight_alpha=0.0, epoch=0):
+    #     """
+    #     ═══════════════════════════════════════════════════════════════
+    #     CORE TRAINING LOGIC — MSE-focused, FM as architecture only
+    #     ═══════════════════════════════════════════════════════════════
         
-        Phase 1 (epoch < 15): Pure MSE, sigma_min = 0.15 (near-deterministic)
-          → FM gần như regression network
-          → Gradient rõ ràng, ADE giảm nhanh
+    #     Phase 1 (epoch < 15): Pure MSE, sigma_min = 0.15 (near-deterministic)
+    #       → FM gần như regression network
+    #       → Gradient rõ ràng, ADE giảm nhanh
           
-        Phase 2 (epoch 15-40): MSE + nhẹ velocity/heading, sigma_min = 0.08
-          → Refine trajectory shape
-          → Giảm directional errors
+    #     Phase 2 (epoch 15-40): MSE + nhẹ velocity/heading, sigma_min = 0.08
+    #       → Refine trajectory shape
+    #       → Giảm directional errors
           
-        Phase 3 (epoch 40+): MSE + velocity/heading, sigma_min = 0.03
-          → Fine-tune, cho phép ensemble diversity
-          → Maintain accuracy, add calibration
-        """
+    #     Phase 3 (epoch 40+): MSE + velocity/heading, sigma_min = 0.03
+    #       → Fine-tune, cho phép ensemble diversity
+    #       → Maintain accuracy, add calibration
+    #     """
+    #     batch_list = self._lon_flip_aug(batch_list)
+
+    #     traj_gt = batch_list[1]    # [T, B, 2] normalized
+    #     Me_gt   = batch_list[8]    # [T, B, 2] normalized  
+    #     obs_t   = batch_list[0]    # [T_obs, B, 2] normalized
+    #     obs_Me  = batch_list[7]    # [T_obs, B, 2] normalized
+    #     lp, lm  = obs_t[-1], obs_Me[-1]
+
+    #     # ── Sigma schedule ─────────────────────────────────────────────
+    #     # Ban đầu sigma lớn → FM gần deterministic → MSE hiệu quả
+    #     if epoch < 15:
+    #         current_sigma = 0.15
+    #     elif epoch < 40:
+    #         # Linear decay 0.15 → 0.03
+    #         t = (epoch - 15) / 25.0
+    #         current_sigma = 0.15 - t * (0.15 - 0.03)
+    #     else:
+    #         current_sigma = 0.03
+
+    #     # ── Encode context ─────────────────────────────────────────────
+    #     raw_ctx     = self.net._context(batch_list)
+    #     vel_obs_feat = self.net._get_vel_obs_feat(obs_t)
+
+    #     # ── FM forward: predict ALL 12 steps ───────────────────────────
+    #     x1 = self._to_rel(traj_gt, Me_gt, lp, lm)  # [B, T, 4]
+    #     # # x_t, t, te, denom = self._cfm_noisy(x1, sigma_min=current_sigma)
+    #     # x_t, t, u_target = self._cfm_noisy(x1, sigma_min=current_sigma)
+
+    #     # pred_vel = self.net.forward_with_ctx(
+    #     #     x_t, t, raw_ctx, vel_obs_feat=vel_obs_feat)
+    #     # x1_pred  = x_t + denom * pred_vel
+    #     # pred_abs, _ = self._to_abs(x1_pred, lp, lm)  # [12, B, 2] normalized
+
+    #     # # ── LOSS 1: MSE Haversine (CHÍNH) ──────────────────────────────
+    #     # l_mse = mse_hav_loss(pred_abs, traj_gt)
+    #     x_t, t, u_target = self._cfm_noisy(x1, sigma_min=current_sigma)
+    #     pred_vel = self.net.forward_with_ctx(x_t, t, raw_ctx, vel_obs_feat=vel_obs_feat)
+    #     l_mse = F.mse_loss(pred_vel, u_target)  # loss trên velocity, stable qua mọi epo
+
+    #     # ── LOSS 2: Velocity matching (nhẹ) ───────────────────────────
+    #     pred_deg = _denorm_to_deg(pred_abs)
+    #     gt_deg   = _denorm_to_deg(traj_gt)
+        
+    #     if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
+    #         T_min = min(pred_deg.shape[0], gt_deg.shape[0])
+    #         v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
+    #         v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
+    #         l_vel  = F.smooth_l1_loss(v_pred, v_gt)
+    #     else:
+    #         l_vel = pred_abs.new_zeros(())
+
+    #     # ── LOSS 3: Heading consistency (nhẹ) ─────────────────────────
+    #     if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
+    #         T_min = min(pred_deg.shape[0], gt_deg.shape[0])
+    #         v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
+    #         v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
+            
+    #         v_pred_n = v_pred.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    #         v_gt_n   = v_gt.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    #         cos_sim  = ((v_pred / v_pred_n) * (v_gt / v_gt_n)).sum(-1)
+    #         l_head   = F.relu(-cos_sim).pow(2).mean()  # penalize opposite direction
+    #     else:
+    #         l_head = pred_abs.new_zeros(())
+
+    #     # ── Total Loss ─────────────────────────────────────────────────
+    #     # Phase 1: pure MSE
+    #     # Phase 2+: MSE + small velocity + small heading
+    #     if epoch < 15:
+    #         w_vel  = 0.0
+    #         w_head = 0.0
+    #     elif epoch < 40:
+    #         t_phase = (epoch - 15) / 25.0
+    #         w_vel  = t_phase * 0.3
+    #         w_head = t_phase * 0.2
+    #     else:
+    #         w_vel  = 0.3
+    #         w_head = 0.2
+
+    #     total = l_mse + w_vel * l_vel + w_head * l_head
+
+    #     # ── Ensemble consistency (optional, epoch 40+) ─────────────────
+    #     # Train thêm 1 sample, penalize nếu quá khác nhau
+    #     l_ens_consist = pred_abs.new_zeros(())
+    #     if epoch >= 40 and self.n_train_ens >= 2:
+    #         x_t2, t2, te2, denom2 = self._cfm_noisy(x1, sigma_min=current_sigma)
+    #         pred_vel2 = self.net.forward_with_ctx(
+    #             x_t2, t2, raw_ctx, vel_obs_feat=vel_obs_feat)
+    #         x1_pred2 = x_t2 + denom2 * pred_vel2
+    #         pred_abs2, _ = self._to_abs(x1_pred2, lp, lm)
+            
+    #         # MSE of second sample → cũng phải gần gt
+    #         l_ens_consist = mse_hav_loss(pred_abs2, traj_gt)
+    #         total = total + 0.3 * l_ens_consist
+
+    #     if torch.isnan(total) or torch.isinf(total):
+    #         total = lp.new_zeros(())
+
+    #     return dict(
+    #         total=total,
+    #         mse_hav=l_mse.item(),
+    #         velocity=l_vel.item(),
+    #         heading=l_head.item(),
+    #         ens_consist=l_ens_consist.item(),
+    #         sigma=current_sigma,
+    #         # Backward compat
+    #         fm=0.0, short_range=0.0, cont=0.0, pinn=0.0,
+    #         spread=0.0, continuity=0.0, step=0.0, disp=0.0,
+    #         recurv_ratio=0.0,
+    #     )
+
+    def get_loss_breakdown(self, batch_list, step_weight_alpha=0.0, epoch=0):
         batch_list = self._lon_flip_aug(batch_list)
 
-        traj_gt = batch_list[1]    # [T, B, 2] normalized
-        Me_gt   = batch_list[8]    # [T, B, 2] normalized  
-        obs_t   = batch_list[0]    # [T_obs, B, 2] normalized
-        obs_Me  = batch_list[7]    # [T_obs, B, 2] normalized
+        traj_gt = batch_list[1]
+        Me_gt   = batch_list[8]
+        obs_t   = batch_list[0]
+        obs_Me  = batch_list[7]
         lp, lm  = obs_t[-1], obs_Me[-1]
 
-        # ── Sigma schedule ─────────────────────────────────────────────
-        # Ban đầu sigma lớn → FM gần deterministic → MSE hiệu quả
+        # ── Sigma schedule — đổi tên biến thành sigma_t tránh conflict với FM t ──
         if epoch < 15:
             current_sigma = 0.15
         elif epoch < 40:
-            # Linear decay 0.15 → 0.03
-            t = (epoch - 15) / 25.0
-            current_sigma = 0.15 - t * (0.15 - 0.03)
+            sigma_frac = (epoch - 15) / 25.0
+            current_sigma = 0.15 - sigma_frac * (0.15 - 0.03)
         else:
             current_sigma = 0.03
 
-        # ── Encode context ─────────────────────────────────────────────
-        raw_ctx     = self.net._context(batch_list)
+        # ── Encode context ────────────────────────────────────────────────
+        raw_ctx      = self.net._context(batch_list)
         vel_obs_feat = self.net._get_vel_obs_feat(obs_t)
 
-        # ── FM forward: predict ALL 12 steps ───────────────────────────
-        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)  # [B, T, 4]
-        x_t, t, te, denom = self._cfm_noisy(x1, sigma_min=current_sigma)
-        
+        # ── FM forward ────────────────────────────────────────────────────
+        x1_rel = self._to_rel(traj_gt, Me_gt, lp, lm)  # [B, T, 4]
+        x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
+
         pred_vel = self.net.forward_with_ctx(
-            x_t, t, raw_ctx, vel_obs_feat=vel_obs_feat)
-        x1_pred  = x_t + denom * pred_vel
-        pred_abs, _ = self._to_abs(x1_pred, lp, lm)  # [12, B, 2] normalized
+            x_t, fm_t, raw_ctx, vel_obs_feat=vel_obs_feat)
 
-        # ── LOSS 1: MSE Haversine (CHÍNH) ──────────────────────────────
-        l_mse = mse_hav_loss(pred_abs, traj_gt)
+        # ── LOSS 1: FM velocity MSE (chính) ──────────────────────────────
+        l_mse = F.mse_loss(pred_vel, u_target)
 
-        # ── LOSS 2: Velocity matching (nhẹ) ───────────────────────────
+        # ── Reconstruct pred_abs để tính velocity/heading loss ───────────
+        with torch.no_grad():
+            fm_te    = fm_t.view(x1_rel.shape[0], 1, 1)
+            x1_pred  = x_t + (1.0 - fm_te) * pred_vel  # FM chuẩn: x1 = x_t + (1-t)*v
+            pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+
         pred_deg = _denorm_to_deg(pred_abs)
         gt_deg   = _denorm_to_deg(traj_gt)
-        
+
+        # ── LOSS 2: Velocity matching ─────────────────────────────────────
         if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
-            T_min = min(pred_deg.shape[0], gt_deg.shape[0])
+            T_min  = min(pred_deg.shape[0], gt_deg.shape[0])
             v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
             v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
             l_vel  = F.smooth_l1_loss(v_pred, v_gt)
         else:
-            l_vel = pred_abs.new_zeros(())
+            l_vel = x_t.new_zeros(())
 
-        # ── LOSS 3: Heading consistency (nhẹ) ─────────────────────────
+        # ── LOSS 3: Heading consistency ───────────────────────────────────
         if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
-            T_min = min(pred_deg.shape[0], gt_deg.shape[0])
-            v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
-            v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
-            
+            T_min    = min(pred_deg.shape[0], gt_deg.shape[0])
+            v_pred   = pred_deg[1:T_min] - pred_deg[:T_min-1]
+            v_gt     = gt_deg[1:T_min]   - gt_deg[:T_min-1]
             v_pred_n = v_pred.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             v_gt_n   = v_gt.norm(dim=-1, keepdim=True).clamp(min=1e-6)
             cos_sim  = ((v_pred / v_pred_n) * (v_gt / v_gt_n)).sum(-1)
-            l_head   = F.relu(-cos_sim).pow(2).mean()  # penalize opposite direction
+            l_head   = F.relu(-cos_sim).pow(2).mean()
         else:
-            l_head = pred_abs.new_zeros(())
+            l_head = x_t.new_zeros(())
 
-        # ── Total Loss ─────────────────────────────────────────────────
-        # Phase 1: pure MSE
-        # Phase 2+: MSE + small velocity + small heading
+        # ── Phase weights ─────────────────────────────────────────────────
         if epoch < 15:
-            w_vel  = 0.0
-            w_head = 0.0
+            w_vel, w_head = 0.0, 0.0
         elif epoch < 40:
-            t_phase = (epoch - 15) / 25.0
-            w_vel  = t_phase * 0.3
-            w_head = t_phase * 0.2
+            phase_frac = (epoch - 15) / 25.0
+            w_vel  = phase_frac * 0.3
+            w_head = phase_frac * 0.2
         else:
-            w_vel  = 0.3
-            w_head = 0.2
+            w_vel, w_head = 0.3, 0.2
 
         total = l_mse + w_vel * l_vel + w_head * l_head
 
-        # ── Ensemble consistency (optional, epoch 40+) ─────────────────
-        # Train thêm 1 sample, penalize nếu quá khác nhau
-        l_ens_consist = pred_abs.new_zeros(())
+        # ── Ensemble consistency (epoch 40+) ──────────────────────────────
+        l_ens_consist = x_t.new_zeros(())
         if epoch >= 40 and self.n_train_ens >= 2:
-            x_t2, t2, te2, denom2 = self._cfm_noisy(x1, sigma_min=current_sigma)
+            x_t2, fm_t2, u_target2 = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
             pred_vel2 = self.net.forward_with_ctx(
-                x_t2, t2, raw_ctx, vel_obs_feat=vel_obs_feat)
-            x1_pred2 = x_t2 + denom2 * pred_vel2
-            pred_abs2, _ = self._to_abs(x1_pred2, lp, lm)
-            
-            # MSE of second sample → cũng phải gần gt
-            l_ens_consist = mse_hav_loss(pred_abs2, traj_gt)
+                x_t2, fm_t2, raw_ctx, vel_obs_feat=vel_obs_feat)
+            l_ens_consist = F.mse_loss(pred_vel2, u_target2)
             total = total + 0.3 * l_ens_consist
 
         if torch.isnan(total) or torch.isinf(total):
-            total = lp.new_zeros(())
+            total = x_t.new_zeros(())
 
         return dict(
             total=total,
@@ -3244,12 +3360,10 @@ class TCFlowMatching(nn.Module):
             heading=l_head.item(),
             ens_consist=l_ens_consist.item(),
             sigma=current_sigma,
-            # Backward compat
             fm=0.0, short_range=0.0, cont=0.0, pinn=0.0,
             spread=0.0, continuity=0.0, step=0.0, disp=0.0,
             recurv_ratio=0.0,
         )
-
     @torch.no_grad()
     def sample(self, batch_list, num_ensemble=50, ddim_steps=20, predict_csv=None):
         """
@@ -3273,7 +3387,9 @@ class TCFlowMatching(nn.Module):
 
         traj_s, me_s = [], []
         for _ in range(num_ensemble):
-            x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+            # x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
+            x_t = torch.randn(B, T, 4, device=device) * self.sigma_min
+
             for step in range(ddim_steps):
                 t_b = torch.full((B,), step * dt, device=device)
                 ns  = self.ctx_noise_scale if step < 3 else 0.0

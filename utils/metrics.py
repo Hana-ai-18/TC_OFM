@@ -913,7 +913,7 @@ STEP_HOURS   = 6
 PRED_LEN     = 12
 
 CLIPER_ALPHA = {h: h / 12 for h in range(1, 13)}
-HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 36: 5, 48: 7, 60: 9, 72: 11}
+HORIZON_STEPS: Dict[int, int] = {6: 0, 12: 1, 24: 3, 36: 5, 48: 7, 60: 9, 72: 11}
 RECURV_THR_DEG = 45.0
 
 LANDFALL_TARGETS = [
@@ -1662,7 +1662,7 @@ class StepErrorAccumulator:
             "n_samples":    int(self._count[0]),
         }
         for h, s in HORIZON_STEPS.items():
-            if s < active and self._count[s] > 0:
+            if s < self.pred_len and self._count[s] > 0:
                 out[f"{h}h"]     = float(ps[s])
                 out[f"{h}h_std"] = float(std[s])
             else:
