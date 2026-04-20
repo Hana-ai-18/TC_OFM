@@ -6300,6 +6300,46 @@ def endpoint_weighted_loss(pred_deg: torch.Tensor,
 #  ★ IDEA 4: Trajectory shape loss (local alignment)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def velocity_loss_per_sample(pred_deg: torch.Tensor,
+                              gt_deg: torch.Tensor) -> torch.Tensor:
+    """
+    Velocity matching loss using Huber (robust to outliers).
+    Input DEGREES. Output normalized to O(1).
+    """
+    if pred_deg.shape[0] < 2:
+        return pred_deg.new_zeros(pred_deg.shape[1])
+    v_pred = _step_displacements_km(pred_deg)
+    v_gt = _step_displacements_km(gt_deg)
+
+    T = v_pred.shape[0]
+    w = horizon_aware_weights(T, alpha=1.3, device=pred_deg.device)
+
+    # Huber speed loss
+    s_pred = v_pred.norm(dim=-1)
+    s_gt = v_gt.norm(dim=-1)
+    speed_diff = (s_pred - s_gt).abs()
+    huber_delta = 50.0  # km
+    huber = torch.where(
+        speed_diff < huber_delta,
+        0.5 * speed_diff.pow(2) / huber_delta,
+        speed_diff - 0.5 * huber_delta,
+    )
+    l_speed = (huber * w.unsqueeze(1)).mean(0) / huber_delta
+
+    # ATE (along-track error) — same Huber treatment
+    gn = v_gt.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+    gt_unit = v_gt / gn
+    ate = ((v_pred - v_gt) * gt_unit).sum(-1).abs()
+    huber_ate = torch.where(
+        ate < huber_delta,
+        0.5 * ate.pow(2) / huber_delta,
+        ate - 0.5 * huber_delta,
+    )
+    l_ate = (huber_ate * w.unsqueeze(1)).mean(0) / huber_delta
+
+    return l_speed + 0.5 * l_ate
+
+
 def trajectory_shape_loss(pred_deg: torch.Tensor,
                            gt_deg: torch.Tensor) -> torch.Tensor:
     """
@@ -6367,29 +6407,7 @@ def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
     return dt_km
 
 
-def velocity_loss_per_sample(pred_deg: torch.Tensor,
-                              gt_deg: torch.Tensor) -> torch.Tensor:
-    """Velocity matching loss. Input DEGREES."""
-    if pred_deg.shape[0] < 2:
-        return pred_deg.new_zeros(pred_deg.shape[1])
-    v_pred = _step_displacements_km(pred_deg)
-    v_gt = _step_displacements_km(gt_deg)
 
-    s_pred = v_pred.norm(dim=-1)
-    s_gt = v_gt.norm(dim=-1)
-
-    # Horizon-aware weight for velocity
-    T = v_pred.shape[0]
-    w = horizon_aware_weights(T, alpha=1.3, device=pred_deg.device)
-    l_speed = ((s_pred - s_gt).pow(2) * w.unsqueeze(1)).mean(0)
-
-    # ATE (along-track error)
-    gn = v_gt.norm(dim=-1, keepdim=True).clamp(min=1e-4)
-    gt_unit = v_gt / gn
-    ate = ((v_pred - v_gt) * gt_unit).sum(-1)
-    l_ate = (ate.pow(2) * w.unsqueeze(1)).mean(0)
-
-    return (l_speed + 0.5 * l_ate) / (STEP_KM ** 2)
 
 
 def heading_loss(pred_deg: torch.Tensor,
@@ -6413,7 +6431,10 @@ def heading_loss(pred_deg: torch.Tensor,
 
 def recurvature_loss(pred_deg: torch.Tensor,
                       gt_deg: torch.Tensor) -> torch.Tensor:
-    """Curvature matching for recurving storms."""
+    """
+    Curvature matching for recurving storms.
+    Normalized to be O(0.1) so won't dominate total.
+    """
     if pred_deg.shape[0] < 3:
         return pred_deg.new_zeros(())
     pv = pred_deg[1:] - pred_deg[:-1]
@@ -6424,10 +6445,15 @@ def recurvature_loss(pred_deg: torch.Tensor,
     pred_cross = (pv[:-1, :, 0] * pv[1:, :, 1]
                   - pv[:-1, :, 1] * pv[1:, :, 0])
 
-    # Sign consistency (same turning direction)
-    sign_loss = F.relu(-torch.sign(gt_cross) * torch.sign(pred_cross))
-    # Magnitude consistency
-    mag_loss = (pred_cross.abs() - gt_cross.abs()).pow(2)
+    # Sign consistency (same turning direction, detach sign to avoid oscillation)
+    with torch.no_grad():
+        gt_sign = torch.sign(gt_cross)
+    # smooth tanh instead of sign for pred
+    pred_sign_soft = torch.tanh(pred_cross * 10.0)
+    sign_loss = F.relu(-gt_sign * pred_sign_soft).pow(2)
+
+    # Magnitude consistency, clamp to avoid explosion
+    mag_loss = (pred_cross.abs() - gt_cross.abs()).clamp(-1.0, 1.0).pow(2)
 
     return (sign_loss + 0.1 * mag_loss).mean()
 

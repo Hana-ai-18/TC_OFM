@@ -4730,9 +4730,12 @@ class VelocityField(nn.Module):
         )
 
         # ★ NEW: Steering flow encoder (từ env 500hPa)
+        # Output dim = 256 để match transformer d_model
         self.steering_enc = nn.Sequential(
             nn.Linear(4, 64), nn.GELU(),   # [u_mean, v_mean, u_center, v_center]
-            nn.Linear(64, 128),
+            nn.LayerNorm(64),
+            nn.Linear(64, 128), nn.GELU(),
+            nn.Linear(128, 256),
         )
 
         # Time embedding
@@ -4825,9 +4828,9 @@ class VelocityField(nn.Module):
 
     # ★ NEW: Steering feature extraction
     def _get_steering_feat(self, env_data, B, device):
-        """Extract 500hPa steering as a single context vector [B, 128]."""
+        """Extract 500hPa steering as a context vector [B, 256]."""
         if env_data is None:
-            return torch.zeros(B, 128, device=device)
+            return torch.zeros(B, 256, device=device)
 
         def _safe_get(key, default_val=0.0):
             v = env_data.get(key, None)
@@ -4847,7 +4850,7 @@ class VelocityField(nn.Module):
         u_c = _safe_get("u500_center")
         v_c = _safe_get("v500_center")
         feat = torch.stack([u_m, v_m, u_c, v_c], dim=-1)  # [B, 4]
-        return self.steering_enc(feat)  # [B, 128]
+        return self.steering_enc(feat)  # [B, 256]
 
     def _beta_drift(self, x_t):
         """β-drift (Coriolis-derived) in normalized units."""
