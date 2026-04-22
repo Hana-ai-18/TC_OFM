@@ -6910,7 +6910,7 @@ def _composite_score(result):
     h24 = result.get("24h", float("inf"))
     h48 = result.get("48h", float("inf"))
     h72 = result.get("72h", float("inf"))
-    return 0.20 * ade + 0.20 * h12 + 0.20 * h24 + 0.20 * h48 + 0.20 * h72
+    return 0.10 * ade + 0.10 * h12 + 0.15 * h24 + 0.25 * h48 + 0.40 * h72
 
 
 def _get_ema_obj(model):
@@ -7324,7 +7324,7 @@ def get_args():
     p.add_argument("--val_subset_size", default=600, type=int)
 
     p.add_argument("--use_ema",         action="store_true", default=True)
-    p.add_argument("--ema_decay",       default=0.999, type=float)
+    p.add_argument("--ema_decay",       default=0.995, type=float)
     p.add_argument("--swa_start_epoch", default=55,   type=int)
     p.add_argument("--teacher_forcing", action="store_true", default=True)
 

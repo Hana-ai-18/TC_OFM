@@ -6625,7 +6625,7 @@ STEP_KM   = 113.0
 # mse_hav_horizon dùng ADE mean nên ít targeted; multi_scale dùng endpoint error
 WEIGHTS: Dict[str, float] = dict(
     mse_hav_horizon = 2.0,   # giảm từ 3.0 (mean-based, ít targeted 72h)
-    multi_scale     = 3.5,   # TĂNG từ 2.0 — endpoint-focused, push 72h mạnh nhất
+    multi_scale     = 5.0,   # TĂNG từ 2.0 — endpoint-focused, push 72h mạnh nhất
     endpoint        = 3.0,   # TĂNG từ 2.5 — FDE emphasis
     shape           = 0.8,   # giảm nhẹ từ 1.0
     velocity        = 0.3,   # giảm từ 0.5 — auxiliary only
@@ -6739,7 +6739,7 @@ def multi_scale_haversine(pred_deg: torch.Tensor,
         (1,  0.08, 50.0),    # 12h
         (3,  0.15, 100.0),   # 24h
         (7,  0.25, 200.0),   # 48h
-        (11, 0.52, 300.0),   # 72h — weight lớn nhất
+        (11, 0.65, 280.0),   # 72h — weight lớn nhất
     ]
 
     total = pred_deg.new_zeros(())
