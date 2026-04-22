@@ -6103,19 +6103,755 @@
 #         torch.cuda.manual_seed_all(42)
 #     main(args)
 
+# """
+# train_flowmatching_v34fix.py — Training cho TC-FlowMatching v34fix
+# ═══════════════════════════════════════════════════════════════════
+
+# FIXES từ v34:
+#   BUG 1 (EMA KeyError): torch.compile đổi tên key trong state_dict.
+#          evaluate_full_val_ade phải lấy ema_obj từ model._orig_mod
+#          (nếu compiled) thay vì model._ema (không tồn tại sau compile).
+#   BUG 2 (EMA update sau compile): ema_update() gọi trên compiled model
+#          phải đi qua _orig_mod.ema_update() để đúng.
+
+# COMPOSITE SCORE:
+#   score = 0.20*ADE + 0.20*12h + 0.20*24h + 0.20*48h + 0.20*72h
+# """
+# from __future__ import annotations
+
+# import sys
+# import os
+# sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# import argparse
+# import time
+# import math
+# import random
+# import copy
+
+# import numpy as np
+# import torch
+# import torch.optim as optim
+# from torch.amp import autocast, GradScaler
+# from torch.utils.data import DataLoader, Subset
+
+# from Model.data.loader_training import data_loader
+# from Model.flow_matching_model import TCFlowMatching
+# from Model.utils import get_cosine_schedule_with_warmup
+# from utils.metrics import (
+#     TCEvaluator, StepErrorAccumulator,
+#     save_metrics_csv, haversine_km_torch,
+#     denorm_torch, denorm_np, denorm_deg_np, HORIZON_STEPS,
+# )
+
+
+# # ── Helpers ───────────────────────────────────────────────────────────────────
+
+# def move(batch, device):
+#     out = list(batch)
+#     for i, x in enumerate(out):
+#         if torch.is_tensor(x):
+#             out[i] = x.to(device)
+#         elif isinstance(x, dict):
+#             out[i] = {k: v.to(device) if torch.is_tensor(v) else v
+#                       for k, v in x.items()}
+#     return out
+
+
+# def make_val_subset_loader(val_dataset, subset_size, batch_size,
+#                             collate_fn, num_workers):
+#     n   = len(val_dataset)
+#     rng = random.Random(42)
+#     idx = rng.sample(range(n), min(subset_size, n))
+#     return DataLoader(Subset(val_dataset, idx),
+#                       batch_size=batch_size, shuffle=False,
+#                       collate_fn=collate_fn, num_workers=0, drop_last=False)
+
+
+# def _composite_score(result):
+#     ade = result.get("ADE", float("inf"))
+#     h12 = result.get("12h", float("inf"))
+#     h24 = result.get("24h", float("inf"))
+#     h48 = result.get("48h", float("inf"))
+#     h72 = result.get("72h", float("inf"))
+#     return 0.20 * ade + 0.20 * h12 + 0.20 * h24 + 0.20 * h48 + 0.20 * h72
+
+
+# def _get_ema_obj(model):
+#     """
+#     FIX: lấy EMAModel object từ model, xử lý cả trường hợp
+#     model đã được torch.compile (wrapped thành _orig_mod).
+#     """
+#     # Trường hợp 1: raw model (chưa compile)
+#     if hasattr(model, '_ema') and model._ema is not None:
+#         return model._ema
+#     # Trường hợp 2: compiled model → unwrap _orig_mod
+#     if hasattr(model, '_orig_mod'):
+#         orig = model._orig_mod
+#         if hasattr(orig, '_ema') and orig._ema is not None:
+#             return orig._ema
+#     return None
+
+
+# def _call_ema_update(model):
+#     """
+#     FIX: gọi ema_update() đúng cách sau torch.compile.
+#     torch.compile wrap forward() nhưng không wrap custom methods,
+#     nên cần gọi trực tiếp trên _orig_mod.
+#     """
+#     # Trường hợp 1: raw model
+#     if hasattr(model, 'ema_update') and not hasattr(model, '_orig_mod'):
+#         model.ema_update()
+#         return
+#     # Trường hợp 2: compiled model
+#     if hasattr(model, '_orig_mod'):
+#         orig = model._orig_mod
+#         if hasattr(orig, 'ema_update'):
+#             orig.ema_update()
+#             return
+#     # Fallback: gọi trực tiếp
+#     if hasattr(model, 'ema_update'):
+#         model.ema_update()
+
+
+# # ── SWA ───────────────────────────────────────────────────────────────────────
+
+# class SWAManager:
+#     def __init__(self, model, start_epoch=50):
+#         self.start_epoch = start_epoch
+#         self.n_averaged  = 0
+#         self.avg_state   = None
+
+#     def update(self, model, epoch):
+#         if epoch < self.start_epoch:
+#             return
+#         # Unwrap compiled model
+#         m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#         sd = {k: v.detach().clone() for k, v in m.state_dict().items()
+#               if v.dtype.is_floating_point}
+#         if self.avg_state is None:
+#             self.avg_state = sd
+#             self.n_averaged = 1
+#         else:
+#             n = self.n_averaged
+#             for k in self.avg_state:
+#                 if k in sd:
+#                     self.avg_state[k].mul_(n / (n + 1)).add_(sd[k], alpha=1.0 / (n + 1))
+#             self.n_averaged += 1
+
+#     def apply_to(self, model):
+#         if self.avg_state is None:
+#             return None
+#         m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#         backup = {}
+#         sd = m.state_dict()
+#         for k, v in self.avg_state.items():
+#             if k in sd:
+#                 backup[k] = sd[k].detach().clone()
+#                 sd[k].copy_(v)
+#         return backup
+
+#     def restore(self, model, backup):
+#         if backup is None:
+#             return
+#         m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#         sd = m.state_dict()
+#         for k, v in backup.items():
+#             if k in sd:
+#                 sd[k].copy_(v)
+
+
+# # ── Evaluation ────────────────────────────────────────────────────────────────
+
+# def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=15):
+#     model.eval()
+#     acc = StepErrorAccumulator(pred_len)
+#     t0  = time.perf_counter()
+#     n   = 0
+#     spread_per_step = []
+
+#     with torch.no_grad():
+#         for batch in loader:
+#             bl = move(list(batch), device)
+#             pred, _, all_trajs = model.sample(
+#                 bl, num_ensemble=fast_ensemble, ddim_steps=ode_steps,
+#                 importance_weight=True)
+#             T_active  = pred.shape[0]
+#             gt_sliced = bl[1][:T_active]
+#             dist = haversine_km_torch(denorm_torch(pred), denorm_torch(gt_sliced))
+#             acc.update(dist)
+
+#             step_spreads = []
+#             for t in range(all_trajs.shape[1]):
+#                 step_data = all_trajs[:, t, :, :]
+#                 std_lon = step_data[:, :, 0].std(0)
+#                 std_lat = step_data[:, :, 1].std(0)
+#                 spread = ((std_lon**2 + std_lat**2).sqrt() * 500.0).mean().item()
+#                 step_spreads.append(spread)
+#             spread_per_step.append(step_spreads)
+#             n += 1
+
+#     r = acc.compute()
+#     r["ms_per_batch"] = (time.perf_counter() - t0) * 1e3 / max(n, 1)
+#     if spread_per_step:
+#         spreads = np.array(spread_per_step)
+#         r["spread_12h_km"] = float(spreads[:, 1].mean()) if spreads.shape[1] > 1 else 0.0
+#         r["spread_24h_km"] = float(spreads[:, 3].mean()) if spreads.shape[1] > 3 else 0.0
+#         r["spread_72h_km"] = float(spreads[:, -1].mean())
+#     return r
+
+
+# def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
+#                            fast_ensemble, metrics_csv, epoch,
+#                            use_ema=False, ema_obj=None):
+#     """
+#     Full val eval, optionally with EMA weights.
+#     FIX: dùng _get_ema_obj() để lấy đúng EMAModel kể cả sau torch.compile.
+#     """
+#     backup = None
+#     if use_ema and ema_obj is not None:
+#         try:
+#             backup = ema_obj.apply_to(model)
+#         except Exception as e:
+#             print(f"  ⚠  EMA apply_to failed: {e} — skipping EMA eval")
+#             backup = None
+#             use_ema = False
+
+#     model.eval()
+#     acc = StepErrorAccumulator(pred_len)
+#     t0  = time.perf_counter()
+#     n   = 0
+
+#     with torch.no_grad():
+#         for batch in val_loader:
+#             bl = move(list(batch), device)
+#             pred, _, _ = model.sample(
+#                 bl, num_ensemble=max(fast_ensemble, 20),
+#                 ddim_steps=max(ode_steps, 30),
+#                 importance_weight=True)
+#             T_pred = pred.shape[0]
+#             gt = bl[1][:T_pred]
+#             dist = haversine_km_torch(denorm_torch(pred), denorm_torch(gt))
+#             acc.update(dist)
+#             n += 1
+
+#     r = acc.compute()
+#     elapsed = time.perf_counter() - t0
+#     score   = _composite_score(r)
+
+#     tag = "EMA" if use_ema else "RAW"
+#     print(f"\n{'='*64}")
+#     print(f"  [FULL VAL ADE ({tag})  ep={epoch}  {elapsed:.0f}s  {n} batches]")
+#     print(f"  ADE = {r.get('ADE', float('nan')):.1f} km  "
+#           f"FDE = {r.get('FDE', float('nan')):.1f} km")
+#     print(f"  6h={r.get('6h', float('nan')):.0f}  "
+#           f"12h={r.get('12h', float('nan')):.0f}  "
+#           f"24h={r.get('24h', float('nan')):.0f}  "
+#           f"48h={r.get('48h', float('nan')):.0f}  "
+#           f"72h={r.get('72h', float('nan')):.0f} km")
+#     print(f"  Composite score = {score:.1f}")
+#     print(f"{'='*64}\n")
+
+#     from datetime import datetime
+#     from utils.metrics import DatasetMetrics, save_metrics_csv as _save_csv
+#     dm = DatasetMetrics(
+#         ade      = r.get("ADE",  float("nan")),
+#         fde      = r.get("FDE",  float("nan")),
+#         ugde_12h = r.get("12h",  float("nan")),
+#         ugde_24h = r.get("24h",  float("nan")),
+#         ugde_48h = r.get("48h",  float("nan")),
+#         ugde_72h = r.get("72h",  float("nan")),
+#         n_total  = r.get("n_samples", 0),
+#         timestamp= datetime.now().strftime("%Y%m%d_%H%M%S"),
+#     )
+#     _save_csv(dm, metrics_csv, tag=f"val_full_{tag}_ep{epoch:03d}")
+
+#     # Restore weights nếu đã apply EMA
+#     if backup is not None:
+#         try:
+#             ema_obj.restore(model, backup)
+#         except Exception as e:
+#             print(f"  ⚠  EMA restore failed: {e}")
+
+#     return r
+
+
+# # ── Horizon-specific BestModelSaver ───────────────────────────────────────────
+
+# class HorizonAwareBestSaver:
+#     def __init__(self, patience=30, tol=1.5):
+#         self.patience  = patience
+#         self.tol       = tol
+#         self.counter   = 0
+#         self.early_stop = False
+
+#         self.best_score = float("inf")
+#         self.best_ade   = float("inf")
+#         self.best_12h   = float("inf")
+#         self.best_24h   = float("inf")
+#         self.best_48h   = float("inf")
+#         self.best_72h   = float("inf")
+
+#     def _unwrap_state_dict(self, model):
+#         """Lấy state_dict từ raw model (unwrap compile nếu cần)."""
+#         m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#         return m.state_dict()
+
+#     def update(self, r, model, out_dir, epoch, optimizer, tl, vl,
+#                 min_epochs=50):
+#         ade  = r.get("ADE", float("inf"))
+#         h12  = r.get("12h", float("inf"))
+#         h24  = r.get("24h", float("inf"))
+#         h48  = r.get("48h", float("inf"))
+#         h72  = r.get("72h", float("inf"))
+#         score = _composite_score(r)
+
+#         improved_score = score < self.best_score - self.tol
+#         improved_any   = False
+
+#         sd = self._unwrap_state_dict(model)
+
+#         if ade < self.best_ade:
+#             self.best_ade = ade
+#             improved_any  = True
+#             torch.save(dict(
+#                 epoch=epoch, model_state_dict=sd,
+#                 ade=ade, h12=h12, h24=h24, h48=h48, h72=h72, tag="best_ade",
+#             ), os.path.join(out_dir, "best_ade.pth"))
+#         if h72 < self.best_72h:
+#             self.best_72h = h72
+#             improved_any  = True
+#             torch.save(dict(
+#                 epoch=epoch, model_state_dict=sd,
+#                 ade=ade, h12=h12, h24=h24, h48=h48, h72=h72, tag="best_72h",
+#             ), os.path.join(out_dir, "best_72h.pth"))
+#         if h48 < self.best_48h: self.best_48h = h48; improved_any = True
+#         if h24 < self.best_24h: self.best_24h = h24; improved_any = True
+#         if h12 < self.best_12h: self.best_12h = h12; improved_any = True
+
+#         if improved_score:
+#             self.best_score = score
+#             self.counter    = 0
+#             torch.save(dict(
+#                 epoch=epoch, model_state_dict=sd,
+#                 optimizer_state=optimizer.state_dict(),
+#                 train_loss=tl, val_loss=vl,
+#                 ade=ade, h12=h12, h24=h24, h48=h48, h72=h72,
+#                 composite_score=score, tag="best_composite",
+#                 model_version="v34fix",
+#             ), os.path.join(out_dir, "best_model.pth"))
+#             print(f"  ✅ Best COMPOSITE={score:.1f}  "
+#                   f"ADE={ade:.1f}  12h={h12:.0f}  24h={h24:.0f}  "
+#                   f"48h={h48:.0f}  72h={h72:.0f}  (ep {epoch})")
+#         else:
+#             if not improved_any:
+#                 self.counter += 1
+#             print(f"  No improvement {self.counter}/{self.patience}"
+#                   f"  (best_score={self.best_score:.1f}, cur={score:.1f})")
+
+#         if epoch >= min_epochs and self.counter >= self.patience:
+#             self.early_stop = True
+
+
+# # ── Env diagnostic ────────────────────────────────────────────────────────────
+
+# def _check_env(bl, train_dataset):
+#     try:
+#         env_dir = train_dataset.env_path
+#     except AttributeError:
+#         try:
+#             env_dir = train_dataset.dataset.env_path
+#         except AttributeError:
+#             env_dir = "UNKNOWN"
+#     print(f"  Env path: {env_dir}")
+
+#     env_data = bl[13]
+#     if env_data is None:
+#         print("  ⚠️  env_data is None"); return
+
+#     for key in ("gph500_mean", "gph500_center", "u500_mean", "v500_mean"):
+#         if key not in env_data:
+#             print(f"  ⚠️  {key} MISSING"); continue
+#         v    = env_data[key]
+#         mn   = v.mean().item()
+#         std  = v.std().item()
+#         zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
+#         print(f"  {'✅' if zero < 80 else '⚠️'}  {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
+
+
+# # ── Args ──────────────────────────────────────────────────────────────────────
+
+# def get_args():
+#     p = argparse.ArgumentParser(
+#         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+#     p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
+#     p.add_argument("--obs_len",         default=8,          type=int)
+#     p.add_argument("--pred_len",        default=12,         type=int)
+#     p.add_argument("--batch_size",      default=32,         type=int)
+#     p.add_argument("--num_epochs",      default=120,        type=int)
+#     p.add_argument("--g_learning_rate", default=3e-4,       type=float)
+#     p.add_argument("--weight_decay",    default=1e-4,       type=float)
+#     p.add_argument("--warmup_epochs",   default=5,          type=int)
+#     p.add_argument("--grad_clip",       default=1.0,        type=float)
+#     p.add_argument("--patience",        default=30,         type=int)
+#     p.add_argument("--min_epochs",      default=50,         type=int)
+#     p.add_argument("--n_train_ens",     default=4,          type=int)
+#     p.add_argument("--use_amp",         action="store_true")
+#     p.add_argument("--num_workers",     default=2,          type=int)
+
+#     p.add_argument("--sigma_min",            default=0.02,  type=float)
+#     p.add_argument("--ctx_noise_scale",      default=0.01,  type=float)
+#     p.add_argument("--initial_sample_sigma", default=0.03,  type=float)
+
+#     p.add_argument("--ode_steps_train", default=25,  type=int)
+#     p.add_argument("--ode_steps_val",   default=30,  type=int)
+#     p.add_argument("--ode_steps_test",  default=50,  type=int)
+
+#     p.add_argument("--val_ensemble",    default=30,  type=int)
+#     p.add_argument("--fast_ensemble",   default=15,  type=int)
+
+#     p.add_argument("--val_freq",        default=1,   type=int)
+#     p.add_argument("--val_ade_freq",    default=1,   type=int)
+#     p.add_argument("--val_subset_size", default=600, type=int)
+
+#     p.add_argument("--use_ema",         action="store_true", default=True)
+#     p.add_argument("--ema_decay",       default=0.999, type=float)
+#     p.add_argument("--swa_start_epoch", default=55,   type=int)
+#     p.add_argument("--teacher_forcing", action="store_true", default=True)
+
+#     p.add_argument("--output_dir",   default="runs/v34fix",    type=str)
+#     p.add_argument("--metrics_csv",  default="metrics.csv",    type=str)
+#     p.add_argument("--predict_csv",  default="predictions.csv", type=str)
+
+#     p.add_argument("--gpu_num",      default="0", type=str)
+#     p.add_argument("--delim",        default=" ")
+#     p.add_argument("--skip",         default=1,   type=int)
+#     p.add_argument("--min_ped",      default=1,   type=int)
+#     p.add_argument("--threshold",    default=0.002, type=float)
+#     p.add_argument("--other_modal",  default="gph")
+#     p.add_argument("--test_year",    default=None, type=int)
+
+#     p.add_argument("--resume",       default=None, type=str)
+#     p.add_argument("--resume_epoch", default=0,    type=int)
+
+#     return p.parse_args()
+
+
+# # ── MAIN ──────────────────────────────────────────────────────────────────────
+
+# def main(args):
+#     if torch.cuda.is_available():
+#         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
+#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#     os.makedirs(args.output_dir, exist_ok=True)
+
+#     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
+
+#     print("=" * 70)
+#     print("  TC-FlowMatching v34fix  |  HORIZON-AWARE + 72h FOCUSED + EMA FIX")
+#     print("  ─────────────────────────────────────────────")
+#     print("  FIXES từ v34:")
+#     print("    1. EMA KeyError: unwrap _orig_mod sau torch.compile")
+#     print("    2. multi_scale_haversine: 70% endpoint[h] + 30% ADE[:h]")
+#     print("    3. Sigma floor 0.03→0.06 (ensemble diversity)")
+#     print("    4. horizon alpha 1.5→2.0 (step 12 weight 9x step 1)")
+#     print("    5. endpoint gamma 2.0→2.5, norm 300→250")
+#     print("    6. WEIGHTS: multi_scale 2.0→3.5, endpoint 2.5→3.0")
+#     print("  TARGETS: 12h<50  24h<100  48h<200  72h<300 km")
+#     print("=" * 70)
+
+#     # ── Data ──────────────────────────────────────────────────────────────
+#     train_dataset, train_loader = data_loader(
+#         args, {"root": args.dataset_root, "type": "train"}, test=False)
+#     val_dataset, val_loader = data_loader(
+#         args, {"root": args.dataset_root, "type": "val"}, test=True)
+
+#     from Model.data.trajectoriesWithMe_unet_training import seq_collate
+#     val_subset_loader = make_val_subset_loader(
+#         val_dataset, args.val_subset_size, args.batch_size,
+#         seq_collate, args.num_workers)
+
+#     try:
+#         _, test_loader = data_loader(
+#             args, {"root": args.dataset_root, "type": "test"},
+#             test=True, test_year=None)
+#     except Exception as e:
+#         print(f"  Warning: test loader: {e}")
+
+#     print(f"  train : {len(train_dataset)} seq  ({len(train_loader)} batches)")
+#     print(f"  val   : {len(val_dataset)} seq")
+
+#     # ── Model ─────────────────────────────────────────────────────────────
+#     model = TCFlowMatching(
+#         pred_len             = args.pred_len,
+#         obs_len              = args.obs_len,
+#         sigma_min            = args.sigma_min,
+#         n_train_ens          = args.n_train_ens,
+#         ctx_noise_scale      = args.ctx_noise_scale,
+#         initial_sample_sigma = args.initial_sample_sigma,
+#         teacher_forcing      = args.teacher_forcing,
+#         use_ema              = args.use_ema,
+#         ema_decay            = args.ema_decay,
+#     ).to(device)
+
+#     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+#     print(f"  params  : {n_params:,}")
+
+#     # FIX: init_ema() TRƯỚC khi torch.compile để shadow có đúng key names
+#     model.init_ema()
+#     print(f"  EMA     : {'ON' if model._ema is not None else 'OFF'} (decay={args.ema_decay})")
+
+#     # ── Optimizer ─────────────────────────────────────────────────────────
+#     optimizer = optim.AdamW(
+#         model.parameters(),
+#         lr=args.g_learning_rate,
+#         weight_decay=args.weight_decay,
+#     )
+
+#     # Resume
+#     start_epoch = 0
+#     if args.resume is not None and os.path.exists(args.resume):
+#         print(f"  Loading checkpoint: {args.resume}")
+#         ckpt = torch.load(args.resume, map_location=device)
+#         # Unwrap nếu cần
+#         m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#         m.load_state_dict(ckpt["model_state_dict"], strict=False)
+#         start_epoch = args.resume_epoch
+#         print(f"  Resumed from epoch {start_epoch}")
+
+#     # FIX: torch.compile SAU init_ema() để _orig_mod.net.pos_enc có đúng key
+#     try:
+#         model = torch.compile(model, mode="reduce-overhead")
+#         print("  torch.compile: enabled")
+#     except Exception:
+#         pass
+
+#     steps_per_epoch = len(train_loader)
+#     total_steps     = steps_per_epoch * args.num_epochs
+#     warmup          = steps_per_epoch * args.warmup_epochs
+#     scheduler = get_cosine_schedule_with_warmup(
+#         optimizer, warmup, total_steps, min_lr=1e-6)
+
+#     if start_epoch > 0:
+#         for _ in range(start_epoch * steps_per_epoch):
+#             scheduler.step()
+
+#     saver  = HorizonAwareBestSaver(patience=args.patience, tol=1.5)
+#     scaler = GradScaler("cuda", enabled=args.use_amp)
+#     swa    = SWAManager(model, start_epoch=args.swa_start_epoch)
+
+#     print("=" * 70)
+#     print(f"  TRAINING  ({steps_per_epoch} steps/epoch)")
+#     print("=" * 70)
+
+#     epoch_times = []
+#     train_start = time.perf_counter()
+
+#     for epoch in range(start_epoch, args.num_epochs):
+#         model.train()
+#         sum_loss = 0.0
+#         t0 = time.perf_counter()
+
+#         for i, batch in enumerate(train_loader):
+#             bl = move(list(batch), device)
+
+#             if epoch == start_epoch and i == 0:
+#                 _check_env(bl, train_dataset)
+
+#             with autocast(device_type="cuda", enabled=args.use_amp):
+#                 bd = model.get_loss_breakdown(bl, epoch=epoch)
+
+#             optimizer.zero_grad()
+#             scaler.scale(bd["total"]).backward()
+#             scaler.unscale_(optimizer)
+#             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+#             scaler.step(optimizer)
+#             scaler.update()
+#             scheduler.step()
+
+#             # FIX: dùng _call_ema_update() thay vì trực tiếp gọi model.ema_update()
+#             _call_ema_update(model)
+
+#             sum_loss += bd["total"].item()
+
+#             if i % 20 == 0:
+#                 lr = optimizer.param_groups[0]["lr"]
+#                 print(f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
+#                       f"  tot={bd['total'].item():.3f}"
+#                       f"  fm={bd['fm_mse']:.3f}"
+#                       f"  hor={bd['mse_hav']:.3f}"
+#                       f"  ms={bd['multi_scale']:.3f}"
+#                       f"  end={bd['endpoint']:.3f}"
+#                       f"  shp={bd['shape']:.3f}"
+#                       f"  vel={bd['velocity']:.3f}"
+#                       f"  hd={bd['heading']:.3f}"
+#                       f"  str={bd['steering']:.3f}"
+#                       f"  σ={bd['sigma']:.3f}"
+#                       f"  lr={lr:.2e}")
+
+#         ep_s  = time.perf_counter() - t0
+#         epoch_times.append(ep_s)
+#         avg_t = sum_loss / len(train_loader)
+
+#         swa.update(model, epoch)
+
+#         # Val loss
+#         model.eval()
+#         val_loss = 0.0
+#         with torch.no_grad():
+#             for batch in val_loader:
+#                 bl_v = move(list(batch), device)
+#                 with autocast(device_type="cuda", enabled=args.use_amp):
+#                     val_loss += model.get_loss(bl_v, epoch=epoch).item()
+#         avg_vl = val_loss / len(val_loader)
+
+#         print(f"  Epoch {epoch:>3}  train={avg_t:.4f}  val={avg_vl:.4f}"
+#               f"  time={ep_s:.0f}s")
+
+#         # Fast eval
+#         m_fast = evaluate_fast(model, val_subset_loader, device,
+#                                 args.ode_steps_train, args.pred_len,
+#                                 args.fast_ensemble)
+
+#         h6  = m_fast.get("6h",  float("nan"))
+#         h12 = m_fast.get("12h", float("nan"))
+#         h24 = m_fast.get("24h", float("nan"))
+#         h48 = m_fast.get("48h", float("nan"))
+#         h72 = m_fast.get("72h", float("nan"))
+#         fast_score = _composite_score(m_fast)
+
+#         t6  = "🎯" if h6  < 30  else "❌"
+#         t12 = "🎯" if h12 < 50  else "❌"
+#         t24 = "🎯" if h24 < 100 else "❌"
+#         t48 = "🎯" if h48 < 200 else "❌"
+#         t72 = "🎯" if h72 < 300 else "❌"
+
+#         print(f"  [FAST ep{epoch}]"
+#               f"  ADE={m_fast['ADE']:.1f}"
+#               f"  6h={h6:.0f}{t6}"
+#               f"  12h={h12:.0f}{t12}"
+#               f"  24h={h24:.0f}{t24}"
+#               f"  48h={h48:.0f}{t48}"
+#               f"  72h={h72:.0f}{t72}"
+#               f"  score={fast_score:.1f}")
+
+#         # Full val
+#         if epoch % args.val_ade_freq == 0:
+#             # FIX: dùng _get_ema_obj() để lấy đúng EMA object sau compile
+#             ema_obj = _get_ema_obj(model)
+
+#             try:
+#                 # RAW eval
+#                 r_raw = evaluate_full_val_ade(
+#                     model, val_loader, device,
+#                     ode_steps=args.ode_steps_train, pred_len=args.pred_len,
+#                     fast_ensemble=args.fast_ensemble, metrics_csv=metrics_csv,
+#                     epoch=epoch, use_ema=False, ema_obj=None)
+
+#                 # EMA eval (nếu có và qua warmup)
+#                 r_use = r_raw
+#                 if ema_obj is not None and epoch >= 10:
+#                     r_ema = evaluate_full_val_ade(
+#                         model, val_loader, device,
+#                         ode_steps=args.ode_steps_train, pred_len=args.pred_len,
+#                         fast_ensemble=args.fast_ensemble, metrics_csv=metrics_csv,
+#                         epoch=epoch, use_ema=True, ema_obj=ema_obj)
+#                     if _composite_score(r_ema) < _composite_score(r_raw):
+#                         r_use = r_ema
+
+#                 saver.update(r_use, model, args.output_dir, epoch,
+#                              optimizer, avg_t, avg_vl,
+#                              min_epochs=args.min_epochs)
+#             except Exception as e:
+#                 print(f"  ⚠  Full val failed: {e}")
+#                 import traceback; traceback.print_exc()
+
+#         # Checkpoint
+#         if epoch % 5 == 0 or epoch == args.num_epochs - 1:
+#             m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#             torch.save({
+#                 "epoch": epoch,
+#                 "model_state_dict": m.state_dict(),
+#                 "optimizer_state": optimizer.state_dict(),
+#                 "train_loss": avg_t, "val_loss": avg_vl,
+#                 "ade": m_fast.get("ADE", float("nan")),
+#                 "h48": h48, "h72": h72,
+#             }, os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"))
+
+#         if epoch % 10 == 9:
+#             avg_ep    = sum(epoch_times) / len(epoch_times)
+#             remaining = (args.num_epochs - epoch - 1) * avg_ep / 3600
+#             elapsed_h = (time.perf_counter() - train_start) / 3600
+#             print(f"  ⏱  {elapsed_h:.1f}h elapsed | ~{remaining:.1f}h remaining")
+
+#         if saver.early_stop:
+#             print(f"  ⛔ Early stopping at epoch {epoch}")
+#             break
+
+#     # ── Final: evaluate SWA weights ───────────────────────────────────────
+#     print(f"\n{'='*70}")
+#     print("  Evaluating SWA weights...")
+#     swa_backup = swa.apply_to(model)
+#     if swa_backup is not None:
+#         r_swa = evaluate_full_val_ade(
+#             model, val_loader, device,
+#             ode_steps=args.ode_steps_val, pred_len=args.pred_len,
+#             fast_ensemble=args.val_ensemble, metrics_csv=metrics_csv,
+#             epoch=9999, use_ema=False)
+#         if _composite_score(r_swa) < saver.best_score:
+#             print(f"  ✅ SWA improved: {saver.best_score:.1f} → {_composite_score(r_swa):.1f}")
+#             m = model._orig_mod if hasattr(model, '_orig_mod') else model
+#             torch.save(dict(
+#                 epoch=9999, model_state_dict=m.state_dict(),
+#                 ade=r_swa.get("ADE", float("nan")),
+#                 h72=r_swa.get("72h", float("nan")),
+#                 tag="best_swa", model_version="v34fix-swa",
+#             ), os.path.join(args.output_dir, "best_swa.pth"))
+#         swa.restore(model, swa_backup)
+
+#     total_h = (time.perf_counter() - train_start) / 3600
+#     print(f"\n{'='*70}")
+#     print(f"  Best COMPOSITE : {saver.best_score:.1f}")
+#     print(f"  Best ADE  : {saver.best_ade:.1f} km")
+#     print(f"  Best 12h  : {saver.best_12h:.1f} km")
+#     print(f"  Best 24h  : {saver.best_24h:.1f} km")
+#     print(f"  Best 48h  : {saver.best_48h:.1f} km")
+#     print(f"  Best 72h  : {saver.best_72h:.1f} km")
+#     print(f"  Training  : {total_h:.2f}h")
+#     print("=" * 70)
+
+
+# if __name__ == "__main__":
+#     args = get_args()
+#     np.random.seed(42); torch.manual_seed(42)
+#     if torch.cuda.is_available():
+#         torch.cuda.manual_seed_all(42)
+#     main(args)
+
 """
-train_flowmatching_v34fix.py — Training cho TC-FlowMatching v34fix
-═══════════════════════════════════════════════════════════════════
+train_flowmatching_v34fix_resumable.py
 
-FIXES từ v34:
-  BUG 1 (EMA KeyError): torch.compile đổi tên key trong state_dict.
-         evaluate_full_val_ade phải lấy ema_obj từ model._orig_mod
-         (nếu compiled) thay vì model._ema (không tồn tại sau compile).
-  BUG 2 (EMA update sau compile): ema_update() gọi trên compiled model
-         phải đi qua _orig_mod.ema_update() để đúng.
+THAY ĐỔI SO VỚI v34fix GỐC:
+  1. Checkpoint lưu đầy đủ: scheduler_state, ema_shadow, saver state
+  2. Resume load đúng thứ tự: weights → EMA → compile → optimizer → scheduler
+  3. Không còn vòng lặp advance scheduler O(N*steps) khi resume
+  4. EMA shadow restore trước compile để key names khớp
 
-COMPOSITE SCORE:
-  score = 0.20*ADE + 0.20*12h + 0.20*24h + 0.20*48h + 0.20*72h
+CÁCH DÙNG:
+  # Lần đầu train từ đầu:
+  python train_v34fix_resumable.py --output_dir runs/v34fix [args...]
+
+  # Resume từ checkpoint:
+  python train_v34fix_resumable.py \
+    --resume /kaggle/input/my-checkpoint/ckpt_ep037.pth \
+    --resume_epoch 38 \
+    --output_dir runs/v34fix [args...]
+
+  # Resume từ best_model:
+  python train_v34fix_resumable.py \
+    --resume runs/v34fix/best_model.pth \
+    --resume_epoch 38 \
+    --output_dir runs/v34fix [args...]
 """
 from __future__ import annotations
 
@@ -6178,14 +6914,9 @@ def _composite_score(result):
 
 
 def _get_ema_obj(model):
-    """
-    FIX: lấy EMAModel object từ model, xử lý cả trường hợp
-    model đã được torch.compile (wrapped thành _orig_mod).
-    """
-    # Trường hợp 1: raw model (chưa compile)
+    """Lấy EMAModel object, xử lý cả compiled và raw model."""
     if hasattr(model, '_ema') and model._ema is not None:
         return model._ema
-    # Trường hợp 2: compiled model → unwrap _orig_mod
     if hasattr(model, '_orig_mod'):
         orig = model._orig_mod
         if hasattr(orig, '_ema') and orig._ema is not None:
@@ -6194,24 +6925,128 @@ def _get_ema_obj(model):
 
 
 def _call_ema_update(model):
-    """
-    FIX: gọi ema_update() đúng cách sau torch.compile.
-    torch.compile wrap forward() nhưng không wrap custom methods,
-    nên cần gọi trực tiếp trên _orig_mod.
-    """
-    # Trường hợp 1: raw model
-    if hasattr(model, 'ema_update') and not hasattr(model, '_orig_mod'):
-        model.ema_update()
-        return
-    # Trường hợp 2: compiled model
+    """Gọi ema_update() đúng cách sau torch.compile."""
     if hasattr(model, '_orig_mod'):
         orig = model._orig_mod
         if hasattr(orig, 'ema_update'):
             orig.ema_update()
             return
-    # Fallback: gọi trực tiếp
     if hasattr(model, 'ema_update'):
         model.ema_update()
+
+
+def _get_raw_model(model):
+    """Unwrap compiled model để lấy raw model."""
+    return model._orig_mod if hasattr(model, '_orig_mod') else model
+
+
+def _save_checkpoint(path, epoch, model, optimizer, scheduler,
+                     saver, avg_t, avg_vl, metrics=None):
+    """
+    Lưu checkpoint đầy đủ bao gồm scheduler và EMA.
+    Dùng hàm này ở MỌI nơi lưu checkpoint để đảm bảo nhất quán.
+    """
+    m = _get_raw_model(model)
+
+    # Lưu EMA shadow nếu có
+    ema_obj = _get_ema_obj(model)
+    ema_sd  = None
+    if ema_obj is not None and hasattr(ema_obj, 'shadow'):
+        try:
+            ema_sd = {k: v.cpu().clone() for k, v in ema_obj.shadow.items()}
+        except Exception:
+            ema_sd = None
+
+    payload = {
+        "epoch"            : epoch,
+        "model_state_dict" : m.state_dict(),
+        "optimizer_state"  : optimizer.state_dict(),
+        "scheduler_state"  : scheduler.state_dict(),
+        "ema_shadow"       : ema_sd,
+        # Saver state để resume patience đúng
+        "best_score"       : saver.best_score,
+        "best_ade"         : saver.best_ade,
+        "best_72h"         : saver.best_72h,
+        "best_48h"         : saver.best_48h,
+        "best_24h"         : saver.best_24h,
+        "best_12h"         : saver.best_12h,
+        "train_loss"       : avg_t,
+        "val_loss"         : avg_vl,
+    }
+    if metrics:
+        payload.update(metrics)
+
+    torch.save(payload, path)
+
+
+def _load_checkpoint(path, model, optimizer, scheduler, saver, device):
+    """
+    Load checkpoint và restore tất cả state.
+    Phải gọi SAU khi tất cả objects đã được tạo nhưng TRƯỚC torch.compile.
+    Trả về start_epoch.
+    """
+    if path is None or not os.path.exists(path):
+        if path is not None:
+            print(f"  ⚠  Checkpoint không tìm thấy: {path}")
+        return 0
+
+    print(f"  Loading checkpoint: {path}")
+    ckpt = torch.load(path, map_location=device)
+
+    # 1. Model weights — dùng raw model (chưa compile)
+    m = _get_raw_model(model)
+    missing, unexpected = m.load_state_dict(
+        ckpt["model_state_dict"], strict=False)
+    if missing:
+        print(f"  ⚠  Missing keys ({len(missing)}): "
+              f"{missing[:3]}{'...' if len(missing) > 3 else ''}")
+
+    # 2. EMA shadow — phải restore TRƯỚC compile
+    if "ema_shadow" in ckpt and ckpt["ema_shadow"] is not None:
+        ema_obj = _get_ema_obj(model)
+        if ema_obj is not None and hasattr(ema_obj, 'shadow'):
+            restored = 0
+            for k, v in ckpt["ema_shadow"].items():
+                if k in ema_obj.shadow:
+                    ema_obj.shadow[k].copy_(v.to(device))
+                    restored += 1
+            print(f"  EMA shadow restored ({restored} keys)")
+
+    # 3. Optimizer — load state, fix device
+    if "optimizer_state" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if torch.is_tensor(v):
+                        state[k] = v.to(device)
+            print("  Optimizer state restored")
+        except Exception as e:
+            print(f"  ⚠  Optimizer restore failed: {e} (using fresh)")
+
+    # 4. Scheduler — dùng state_dict nếu có, không thì advance manually
+    if "scheduler_state" in ckpt:
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state"])
+            print(f"  Scheduler restored  "
+                  f"(last_epoch={scheduler.last_epoch})")
+        except Exception as e:
+            print(f"  ⚠  Scheduler restore failed: {e}")
+    # Nếu không có scheduler_state, caller sẽ advance manually
+
+    # 5. Saver state — để patience tiếp tục đúng
+    if "best_score" in ckpt:
+        saver.best_score = ckpt["best_score"]
+        saver.best_ade   = ckpt.get("best_ade",  float("inf"))
+        saver.best_72h   = ckpt.get("best_72h",  float("inf"))
+        saver.best_48h   = ckpt.get("best_48h",  float("inf"))
+        saver.best_24h   = ckpt.get("best_24h",  float("inf"))
+        saver.best_12h   = ckpt.get("best_12h",  float("inf"))
+        print(f"  Saver state restored  (best_score={saver.best_score:.1f})")
+
+    start_epoch = ckpt.get("epoch", 0) + 1
+    print(f"  → Resuming from epoch {start_epoch}")
+    return start_epoch
 
 
 # ── SWA ───────────────────────────────────────────────────────────────────────
@@ -6225,8 +7060,7 @@ class SWAManager:
     def update(self, model, epoch):
         if epoch < self.start_epoch:
             return
-        # Unwrap compiled model
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
+        m  = _get_raw_model(model)
         sd = {k: v.detach().clone() for k, v in m.state_dict().items()
               if v.dtype.is_floating_point}
         if self.avg_state is None:
@@ -6242,19 +7076,18 @@ class SWAManager:
     def apply_to(self, model):
         if self.avg_state is None:
             return None
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
-        backup = {}
+        m  = _get_raw_model(model)
         sd = m.state_dict()
+        backup = {k: sd[k].detach().clone() for k in self.avg_state if k in sd}
         for k, v in self.avg_state.items():
             if k in sd:
-                backup[k] = sd[k].detach().clone()
                 sd[k].copy_(v)
         return backup
 
     def restore(self, model, backup):
         if backup is None:
             return
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
+        m  = _get_raw_model(model)
         sd = m.state_dict()
         for k, v in backup.items():
             if k in sd:
@@ -6284,9 +7117,9 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=15):
             step_spreads = []
             for t in range(all_trajs.shape[1]):
                 step_data = all_trajs[:, t, :, :]
-                std_lon = step_data[:, :, 0].std(0)
-                std_lat = step_data[:, :, 1].std(0)
-                spread = ((std_lon**2 + std_lat**2).sqrt() * 500.0).mean().item()
+                std_lon   = step_data[:, :, 0].std(0)
+                std_lat   = step_data[:, :, 1].std(0)
+                spread    = ((std_lon**2 + std_lat**2).sqrt() * 500.0).mean().item()
                 step_spreads.append(spread)
             spread_per_step.append(step_spreads)
             n += 1
@@ -6304,17 +7137,13 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=15):
 def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
                            fast_ensemble, metrics_csv, epoch,
                            use_ema=False, ema_obj=None):
-    """
-    Full val eval, optionally with EMA weights.
-    FIX: dùng _get_ema_obj() để lấy đúng EMAModel kể cả sau torch.compile.
-    """
     backup = None
     if use_ema and ema_obj is not None:
         try:
             backup = ema_obj.apply_to(model)
         except Exception as e:
             print(f"  ⚠  EMA apply_to failed: {e} — skipping EMA eval")
-            backup = None
+            backup  = None
             use_ema = False
 
     model.eval()
@@ -6335,16 +7164,16 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
             acc.update(dist)
             n += 1
 
-    r = acc.compute()
+    r       = acc.compute()
     elapsed = time.perf_counter() - t0
     score   = _composite_score(r)
+    tag     = "EMA" if use_ema else "RAW"
 
-    tag = "EMA" if use_ema else "RAW"
     print(f"\n{'='*64}")
     print(f"  [FULL VAL ADE ({tag})  ep={epoch}  {elapsed:.0f}s  {n} batches]")
     print(f"  ADE = {r.get('ADE', float('nan')):.1f} km  "
           f"FDE = {r.get('FDE', float('nan')):.1f} km")
-    print(f"  6h={r.get('6h', float('nan')):.0f}  "
+    print(f"  6h={r.get('6h',  float('nan')):.0f}  "
           f"12h={r.get('12h', float('nan')):.0f}  "
           f"24h={r.get('24h', float('nan')):.0f}  "
           f"48h={r.get('48h', float('nan')):.0f}  "
@@ -6366,7 +7195,6 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
     )
     _save_csv(dm, metrics_csv, tag=f"val_full_{tag}_ep{epoch:03d}")
 
-    # Restore weights nếu đã apply EMA
     if backup is not None:
         try:
             ema_obj.restore(model, backup)
@@ -6376,15 +7204,14 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
     return r
 
 
-# ── Horizon-specific BestModelSaver ───────────────────────────────────────────
+# ── BestModelSaver ────────────────────────────────────────────────────────────
 
 class HorizonAwareBestSaver:
     def __init__(self, patience=30, tol=1.5):
-        self.patience  = patience
-        self.tol       = tol
-        self.counter   = 0
+        self.patience   = patience
+        self.tol        = tol
+        self.counter    = 0
         self.early_stop = False
-
         self.best_score = float("inf")
         self.best_ade   = float("inf")
         self.best_12h   = float("inf")
@@ -6392,54 +7219,42 @@ class HorizonAwareBestSaver:
         self.best_48h   = float("inf")
         self.best_72h   = float("inf")
 
-    def _unwrap_state_dict(self, model):
-        """Lấy state_dict từ raw model (unwrap compile nếu cần)."""
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
-        return m.state_dict()
-
-    def update(self, r, model, out_dir, epoch, optimizer, tl, vl,
-                min_epochs=50):
-        ade  = r.get("ADE", float("inf"))
-        h12  = r.get("12h", float("inf"))
-        h24  = r.get("24h", float("inf"))
-        h48  = r.get("48h", float("inf"))
-        h72  = r.get("72h", float("inf"))
+    def update(self, r, model, out_dir, epoch, optimizer, scheduler,
+               tl, vl, saver_ref, min_epochs=50):
+        ade   = r.get("ADE", float("inf"))
+        h12   = r.get("12h", float("inf"))
+        h24   = r.get("24h", float("inf"))
+        h48   = r.get("48h", float("inf"))
+        h72   = r.get("72h", float("inf"))
         score = _composite_score(r)
 
-        improved_score = score < self.best_score - self.tol
-        improved_any   = False
-
-        sd = self._unwrap_state_dict(model)
+        improved_any = False
 
         if ade < self.best_ade:
-            self.best_ade = ade
-            improved_any  = True
-            torch.save(dict(
-                epoch=epoch, model_state_dict=sd,
-                ade=ade, h12=h12, h24=h24, h48=h48, h72=h72, tag="best_ade",
-            ), os.path.join(out_dir, "best_ade.pth"))
+            self.best_ade = ade;  improved_any = True
+            _save_checkpoint(
+                os.path.join(out_dir, "best_ade.pth"),
+                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
+                {"ade": ade, "h12": h12, "h48": h48, "h72": h72, "tag": "best_ade"})
         if h72 < self.best_72h:
-            self.best_72h = h72
-            improved_any  = True
-            torch.save(dict(
-                epoch=epoch, model_state_dict=sd,
-                ade=ade, h12=h12, h24=h24, h48=h48, h72=h72, tag="best_72h",
-            ), os.path.join(out_dir, "best_72h.pth"))
+            self.best_72h = h72;  improved_any = True
+            _save_checkpoint(
+                os.path.join(out_dir, "best_72h.pth"),
+                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
+                {"h72": h72, "tag": "best_72h"})
         if h48 < self.best_48h: self.best_48h = h48; improved_any = True
         if h24 < self.best_24h: self.best_24h = h24; improved_any = True
         if h12 < self.best_12h: self.best_12h = h12; improved_any = True
 
-        if improved_score:
+        if score < self.best_score - self.tol:
             self.best_score = score
             self.counter    = 0
-            torch.save(dict(
-                epoch=epoch, model_state_dict=sd,
-                optimizer_state=optimizer.state_dict(),
-                train_loss=tl, val_loss=vl,
-                ade=ade, h12=h12, h24=h24, h48=h48, h72=h72,
-                composite_score=score, tag="best_composite",
-                model_version="v34fix",
-            ), os.path.join(out_dir, "best_model.pth"))
+            _save_checkpoint(
+                os.path.join(out_dir, "best_model.pth"),
+                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
+                {"ade": ade, "h12": h12, "h24": h24,
+                 "h48": h48, "h72": h72,
+                 "composite_score": score, "tag": "best_composite"})
             print(f"  ✅ Best COMPOSITE={score:.1f}  "
                   f"ADE={ade:.1f}  12h={h12:.0f}  24h={h24:.0f}  "
                   f"48h={h48:.0f}  72h={h72:.0f}  (ep {epoch})")
@@ -6456,27 +7271,21 @@ class HorizonAwareBestSaver:
 # ── Env diagnostic ────────────────────────────────────────────────────────────
 
 def _check_env(bl, train_dataset):
-    try:
-        env_dir = train_dataset.env_path
+    try:    env_dir = train_dataset.env_path
     except AttributeError:
-        try:
-            env_dir = train_dataset.dataset.env_path
-        except AttributeError:
-            env_dir = "UNKNOWN"
+        try:    env_dir = train_dataset.dataset.env_path
+        except: env_dir = "UNKNOWN"
     print(f"  Env path: {env_dir}")
-
     env_data = bl[13]
     if env_data is None:
         print("  ⚠️  env_data is None"); return
-
     for key in ("gph500_mean", "gph500_center", "u500_mean", "v500_mean"):
         if key not in env_data:
             print(f"  ⚠️  {key} MISSING"); continue
         v    = env_data[key]
-        mn   = v.mean().item()
-        std  = v.std().item()
         zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
-        print(f"  {'✅' if zero < 80 else '⚠️'}  {key}: mean={mn:.4f} std={std:.4f} zero={zero:.1f}%")
+        print(f"  {'✅' if zero < 80 else '⚠️'}  {key}: "
+              f"mean={v.mean().item():.4f} std={v.std().item():.4f} zero={zero:.1f}%")
 
 
 # ── Args ──────────────────────────────────────────────────────────────────────
@@ -6519,20 +7328,25 @@ def get_args():
     p.add_argument("--swa_start_epoch", default=55,   type=int)
     p.add_argument("--teacher_forcing", action="store_true", default=True)
 
-    p.add_argument("--output_dir",   default="runs/v34fix",    type=str)
-    p.add_argument("--metrics_csv",  default="metrics.csv",    type=str)
-    p.add_argument("--predict_csv",  default="predictions.csv", type=str)
+    p.add_argument("--output_dir",  default="runs/v34fix",    type=str)
+    p.add_argument("--metrics_csv", default="metrics.csv",    type=str)
+    p.add_argument("--predict_csv", default="predictions.csv", type=str)
 
-    p.add_argument("--gpu_num",      default="0", type=str)
-    p.add_argument("--delim",        default=" ")
-    p.add_argument("--skip",         default=1,   type=int)
-    p.add_argument("--min_ped",      default=1,   type=int)
-    p.add_argument("--threshold",    default=0.002, type=float)
-    p.add_argument("--other_modal",  default="gph")
-    p.add_argument("--test_year",    default=None, type=int)
+    p.add_argument("--gpu_num",     default="0", type=str)
+    p.add_argument("--delim",       default=" ")
+    p.add_argument("--skip",        default=1,   type=int)
+    p.add_argument("--min_ped",     default=1,   type=int)
+    p.add_argument("--threshold",   default=0.002, type=float)
+    p.add_argument("--other_modal", default="gph")
+    p.add_argument("--test_year",   default=None, type=int)
 
-    p.add_argument("--resume",       default=None, type=str)
-    p.add_argument("--resume_epoch", default=0,    type=int)
+    # Resume args
+    p.add_argument("--resume",
+                   default=None, type=str,
+                   help="Path to checkpoint .pth (ckpt_epXXX.pth hoặc best_model.pth)")
+    p.add_argument("--resume_epoch",
+                   default=None, type=int,
+                   help="Epoch bắt đầu train (mặc định: tự lấy từ checkpoint)")
 
     return p.parse_args()
 
@@ -6549,14 +7363,6 @@ def main(args):
 
     print("=" * 70)
     print("  TC-FlowMatching v34fix  |  HORIZON-AWARE + 72h FOCUSED + EMA FIX")
-    print("  ─────────────────────────────────────────────")
-    print("  FIXES từ v34:")
-    print("    1. EMA KeyError: unwrap _orig_mod sau torch.compile")
-    print("    2. multi_scale_haversine: 70% endpoint[h] + 30% ADE[:h]")
-    print("    3. Sigma floor 0.03→0.06 (ensemble diversity)")
-    print("    4. horizon alpha 1.5→2.0 (step 12 weight 9x step 1)")
-    print("    5. endpoint gamma 2.0→2.5, norm 300→250")
-    print("    6. WEIGHTS: multi_scale 2.0→3.5, endpoint 2.5→3.0")
     print("  TARGETS: 12h<50  24h<100  48h<200  72h<300 km")
     print("=" * 70)
 
@@ -6571,6 +7377,7 @@ def main(args):
         val_dataset, args.val_subset_size, args.batch_size,
         seq_collate, args.num_workers)
 
+    test_loader = None
     try:
         _, test_loader = data_loader(
             args, {"root": args.dataset_root, "type": "test"},
@@ -6597,51 +7404,119 @@ def main(args):
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  params  : {n_params:,}")
 
-    # FIX: init_ema() TRƯỚC khi torch.compile để shadow có đúng key names
+    # EMA phải init TRƯỚC compile
     model.init_ema()
-    print(f"  EMA     : {'ON' if model._ema is not None else 'OFF'} (decay={args.ema_decay})")
+    print(f"  EMA     : {'ON' if model._ema is not None else 'OFF'}"
+          f"  (decay={args.ema_decay})")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────
+    # ── Optimizer + Scheduler (tạo trước khi load state) ─────────────────
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.g_learning_rate,
         weight_decay=args.weight_decay,
     )
 
-    # Resume
-    start_epoch = 0
-    if args.resume is not None and os.path.exists(args.resume):
-        print(f"  Loading checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
-        # Unwrap nếu cần
-        m = model._orig_mod if hasattr(model, '_orig_mod') else model
-        m.load_state_dict(ckpt["model_state_dict"], strict=False)
-        start_epoch = args.resume_epoch
-        print(f"  Resumed from epoch {start_epoch}")
+    saver  = HorizonAwareBestSaver(patience=args.patience, tol=1.5)
+    scaler = GradScaler("cuda", enabled=args.use_amp)
+    swa    = SWAManager(model, start_epoch=args.swa_start_epoch)
 
-    # FIX: torch.compile SAU init_ema() để _orig_mod.net.pos_enc có đúng key
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        print("  torch.compile: enabled")
-    except Exception:
-        pass
-
+    # Tạo scheduler tạm (sẽ được overwrite bởi load_state_dict)
     steps_per_epoch = len(train_loader)
     total_steps     = steps_per_epoch * args.num_epochs
     warmup          = steps_per_epoch * args.warmup_epochs
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, warmup, total_steps, min_lr=1e-6)
 
-    if start_epoch > 0:
+    # ══════════════════════════════════════════════════════════════════════
+    # RESUME — phải xảy ra TRƯỚC torch.compile
+    # Thứ tự: model weights → EMA → optimizer → scheduler → saver
+    # ══════════════════════════════════════════════════════════════════════
+    has_scheduler_state = False
+    start_epoch = 0
+
+    if args.resume is not None and os.path.exists(args.resume):
+        print(f"  Loading checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+
+        # 1. Model weights (raw model, chưa compile)
+        m = _get_raw_model(model)
+        missing, _ = m.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if missing:
+            print(f"  ⚠  Missing keys ({len(missing)}): "
+                  f"{missing[:3]}{'...' if len(missing)>3 else ''}")
+
+        # 2. EMA shadow — TRƯỚC compile để key names khớp
+        if "ema_shadow" in ckpt and ckpt["ema_shadow"] is not None:
+            ema_obj = _get_ema_obj(model)
+            if ema_obj is not None and hasattr(ema_obj, 'shadow'):
+                restored = sum(
+                    1 for k, v in ckpt["ema_shadow"].items()
+                    if k in ema_obj.shadow
+                    and not ema_obj.shadow[k].copy_(v.to(device)) is None
+                )
+                print(f"  EMA shadow restored ({restored} keys)")
+
+        # 3. Optimizer
+        if "optimizer_state" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+                for state in optimizer.state.values():
+                    for k, v in state.items():
+                        if torch.is_tensor(v):
+                            state[k] = v.to(device)
+                print("  Optimizer state restored")
+            except Exception as e:
+                print(f"  ⚠  Optimizer restore failed: {e}")
+
+        # 4. Scheduler (sẽ load state_dict sau khi scheduler được tạo lại)
+        has_scheduler_state = "scheduler_state" in ckpt
+        _ckpt_scheduler_state = ckpt.get("scheduler_state", None)
+
+        # 5. Saver state
+        if "best_score" in ckpt:
+            saver.best_score = ckpt["best_score"]
+            saver.best_ade   = ckpt.get("best_ade",  float("inf"))
+            saver.best_72h   = ckpt.get("best_72h",  float("inf"))
+            saver.best_48h   = ckpt.get("best_48h",  float("inf"))
+            saver.best_24h   = ckpt.get("best_24h",  float("inf"))
+            saver.best_12h   = ckpt.get("best_12h",  float("inf"))
+            print(f"  Saver state restored (best_score={saver.best_score:.1f})")
+
+        # 6. Xác định start_epoch
+        if args.resume_epoch is not None:
+            start_epoch = args.resume_epoch
+        else:
+            start_epoch = ckpt.get("epoch", 0) + 1
+        print(f"  → Resuming from epoch {start_epoch}")
+
+    elif args.resume is not None:
+        print(f"  ⚠  Checkpoint không tìm thấy: {args.resume}, train từ đầu")
+
+    # ── torch.compile SAU khi load weights và EMA ──────────────────────
+    try:
+        model = torch.compile(model, mode="reduce-overhead")
+        print("  torch.compile: enabled")
+    except Exception:
+        pass
+
+    # Load scheduler state sau compile (scheduler không bị compile ảnh hưởng)
+    if has_scheduler_state and _ckpt_scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(_ckpt_scheduler_state)
+            print(f"  Scheduler restored (last_epoch={scheduler.last_epoch})")
+        except Exception as e:
+            print(f"  ⚠  Scheduler restore failed: {e} — advancing manually")
+            for _ in range(start_epoch * steps_per_epoch):
+                scheduler.step()
+    elif start_epoch > 0:
+        # Checkpoint cũ không có scheduler_state → advance manually
+        # Nhanh vì chỉ update internal counter, không chạy optimizer
+        print(f"  Advancing scheduler {start_epoch * steps_per_epoch} steps...")
         for _ in range(start_epoch * steps_per_epoch):
             scheduler.step()
 
-    saver  = HorizonAwareBestSaver(patience=args.patience, tol=1.5)
-    scaler = GradScaler("cuda", enabled=args.use_amp)
-    swa    = SWAManager(model, start_epoch=args.swa_start_epoch)
-
     print("=" * 70)
-    print(f"  TRAINING  ({steps_per_epoch} steps/epoch)")
+    print(f"  TRAINING  ({steps_per_epoch} steps/epoch, start={start_epoch})")
     print("=" * 70)
 
     epoch_times = []
@@ -6669,7 +7544,6 @@ def main(args):
             scaler.update()
             scheduler.step()
 
-            # FIX: dùng _call_ema_update() thay vì trực tiếp gọi model.ema_update()
             _call_ema_update(model)
 
             sum_loss += bd["total"].item()
@@ -6678,15 +7552,15 @@ def main(args):
                 lr = optimizer.param_groups[0]["lr"]
                 print(f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
                       f"  tot={bd['total'].item():.3f}"
-                      f"  fm={bd['fm_mse']:.3f}"
-                      f"  hor={bd['mse_hav']:.3f}"
-                      f"  ms={bd['multi_scale']:.3f}"
-                      f"  end={bd['endpoint']:.3f}"
-                      f"  shp={bd['shape']:.3f}"
-                      f"  vel={bd['velocity']:.3f}"
-                      f"  hd={bd['heading']:.3f}"
-                      f"  str={bd['steering']:.3f}"
-                      f"  σ={bd['sigma']:.3f}"
+                      f"  fm={bd.get('fm_mse', 0):.3f}"
+                      f"  hor={bd.get('mse_hav', 0):.3f}"
+                      f"  ms={bd.get('multi_scale', 0):.3f}"
+                      f"  end={bd.get('endpoint', 0):.3f}"
+                      f"  shp={bd.get('shape', 0):.3f}"
+                      f"  vel={bd.get('velocity', 0):.3f}"
+                      f"  hd={bd.get('heading', 0):.3f}"
+                      f"  str={bd.get('steering', 0):.3f}"
+                      f"  σ={bd.get('sigma', 0):.3f}"
                       f"  lr={lr:.2e}")
 
         ep_s  = time.perf_counter() - t0
@@ -6709,10 +7583,9 @@ def main(args):
               f"  time={ep_s:.0f}s")
 
         # Fast eval
-        m_fast = evaluate_fast(model, val_subset_loader, device,
-                                args.ode_steps_train, args.pred_len,
-                                args.fast_ensemble)
-
+        m_fast    = evaluate_fast(model, val_subset_loader, device,
+                                   args.ode_steps_train, args.pred_len,
+                                   args.fast_ensemble)
         h6  = m_fast.get("6h",  float("nan"))
         h12 = m_fast.get("12h", float("nan"))
         h24 = m_fast.get("24h", float("nan"))
@@ -6720,35 +7593,25 @@ def main(args):
         h72 = m_fast.get("72h", float("nan"))
         fast_score = _composite_score(m_fast)
 
-        t6  = "🎯" if h6  < 30  else "❌"
-        t12 = "🎯" if h12 < 50  else "❌"
-        t24 = "🎯" if h24 < 100 else "❌"
-        t48 = "🎯" if h48 < 200 else "❌"
-        t72 = "🎯" if h72 < 300 else "❌"
-
         print(f"  [FAST ep{epoch}]"
               f"  ADE={m_fast['ADE']:.1f}"
-              f"  6h={h6:.0f}{t6}"
-              f"  12h={h12:.0f}{t12}"
-              f"  24h={h24:.0f}{t24}"
-              f"  48h={h48:.0f}{t48}"
-              f"  72h={h72:.0f}{t72}"
+              f"  6h={h6:.0f}{'🎯' if h6<30 else '❌'}"
+              f"  12h={h12:.0f}{'🎯' if h12<50 else '❌'}"
+              f"  24h={h24:.0f}{'🎯' if h24<100 else '❌'}"
+              f"  48h={h48:.0f}{'🎯' if h48<200 else '❌'}"
+              f"  72h={h72:.0f}{'🎯' if h72<300 else '❌'}"
               f"  score={fast_score:.1f}")
 
-        # Full val
+        # Full val eval
         if epoch % args.val_ade_freq == 0:
-            # FIX: dùng _get_ema_obj() để lấy đúng EMA object sau compile
             ema_obj = _get_ema_obj(model)
-
             try:
-                # RAW eval
                 r_raw = evaluate_full_val_ade(
                     model, val_loader, device,
                     ode_steps=args.ode_steps_train, pred_len=args.pred_len,
                     fast_ensemble=args.fast_ensemble, metrics_csv=metrics_csv,
                     epoch=epoch, use_ema=False, ema_obj=None)
 
-                # EMA eval (nếu có và qua warmup)
                 r_use = r_raw
                 if ema_obj is not None and epoch >= 10:
                     r_ema = evaluate_full_val_ade(
@@ -6760,23 +7623,20 @@ def main(args):
                         r_use = r_ema
 
                 saver.update(r_use, model, args.output_dir, epoch,
-                             optimizer, avg_t, avg_vl,
+                             optimizer, scheduler, avg_t, avg_vl,
+                             saver_ref=saver,
                              min_epochs=args.min_epochs)
             except Exception as e:
                 print(f"  ⚠  Full val failed: {e}")
                 import traceback; traceback.print_exc()
 
-        # Checkpoint
+        # ── Checkpoint định kỳ (dùng _save_checkpoint để đầy đủ) ────────
         if epoch % 5 == 0 or epoch == args.num_epochs - 1:
-            m = model._orig_mod if hasattr(model, '_orig_mod') else model
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": m.state_dict(),
-                "optimizer_state": optimizer.state_dict(),
-                "train_loss": avg_t, "val_loss": avg_vl,
-                "ade": m_fast.get("ADE", float("nan")),
-                "h48": h48, "h72": h72,
-            }, os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"))
+            _save_checkpoint(
+                os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"),
+                epoch, model, optimizer, scheduler, saver, avg_t, avg_vl,
+                {"ade": m_fast.get("ADE", float("nan")),
+                 "h48": h48, "h72": h72})
 
         if epoch % 10 == 9:
             avg_ep    = sum(epoch_times) / len(epoch_times)
@@ -6788,36 +7648,30 @@ def main(args):
             print(f"  ⛔ Early stopping at epoch {epoch}")
             break
 
-    # ── Final: evaluate SWA weights ───────────────────────────────────────
+    # ── Final: SWA eval ───────────────────────────────────────────────────
     print(f"\n{'='*70}")
-    print("  Evaluating SWA weights...")
     swa_backup = swa.apply_to(model)
     if swa_backup is not None:
+        print("  Evaluating SWA weights...")
         r_swa = evaluate_full_val_ade(
             model, val_loader, device,
             ode_steps=args.ode_steps_val, pred_len=args.pred_len,
             fast_ensemble=args.val_ensemble, metrics_csv=metrics_csv,
             epoch=9999, use_ema=False)
         if _composite_score(r_swa) < saver.best_score:
-            print(f"  ✅ SWA improved: {saver.best_score:.1f} → {_composite_score(r_swa):.1f}")
-            m = model._orig_mod if hasattr(model, '_orig_mod') else model
-            torch.save(dict(
-                epoch=9999, model_state_dict=m.state_dict(),
-                ade=r_swa.get("ADE", float("nan")),
-                h72=r_swa.get("72h", float("nan")),
-                tag="best_swa", model_version="v34fix-swa",
-            ), os.path.join(args.output_dir, "best_swa.pth"))
+            _save_checkpoint(
+                os.path.join(args.output_dir, "best_swa.pth"),
+                9999, model, optimizer, scheduler, saver,
+                avg_t=0.0, avg_vl=0.0,
+                metrics={"tag": "best_swa"})
+            print(f"  ✅ SWA checkpoint saved")
         swa.restore(model, swa_backup)
 
     total_h = (time.perf_counter() - train_start) / 3600
-    print(f"\n{'='*70}")
-    print(f"  Best COMPOSITE : {saver.best_score:.1f}")
-    print(f"  Best ADE  : {saver.best_ade:.1f} km")
-    print(f"  Best 12h  : {saver.best_12h:.1f} km")
-    print(f"  Best 24h  : {saver.best_24h:.1f} km")
-    print(f"  Best 48h  : {saver.best_48h:.1f} km")
-    print(f"  Best 72h  : {saver.best_72h:.1f} km")
-    print(f"  Training  : {total_h:.2f}h")
+    print(f"\n  Best score: {saver.best_score:.1f}  |  "
+          f"ADE={saver.best_ade:.1f}  12h={saver.best_12h:.1f}  "
+          f"24h={saver.best_24h:.1f}  48h={saver.best_48h:.1f}  "
+          f"72h={saver.best_72h:.1f}  |  {total_h:.2f}h")
     print("=" * 70)
 
 
