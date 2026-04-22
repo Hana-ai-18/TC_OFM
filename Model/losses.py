@@ -7033,41 +7033,40 @@
 #     )
 
 """
-Model/losses.py — v35fix  PURE MSE + CORRECT NORMALIZATION
+Model/losses.py — v35fix-v2  CALIBRATED MSE + CORRECT SCALE
 ═══════════════════════════════════════════════════════════════════
 MỤC TIÊU: 12h<50, 24h<100, 48h<200, 72h<300 km
 
-BUG FIX so với v35:
-  BUG 1: direct_endpoint_mse normalize sai — chia 111^2 thay vì 300^2
-         → loss 26×, × weight 2.0 → dm=52, tot=140 ❌
-         FIX: chia target_km^2 → loss ≈ 1.0 khi error = 300km ✅
+BUG FIX so với v35fix-v1 (bản trước):
+  BUG 1: horizon_aware_mse dùng dist^2/200^2
+         → tại ep0 dist=500km: 500^2×3.04/40000 = 19 per-step dominant
+         → mean ≈ 4.32, ×2.0 = 8.64  ❌ (v34fix chỉ 2.93)
+         FIX: dùng direct_multi_horizon_mse — normalize RIÊNG từng horizon
 
-  BUG 2: hard_72h weight=4.0 quá lớn sau fix norm
-         FIX: giảm xuống 1.5
+  BUG 2: Thêm 2 term mới (direct_mse + focal_72h) không bù trừ đủ
+         → net loss cao hơn v34fix ~3-5x tại cùng checkpoint
+         FIX: dùng multi_horizon làm loss DUY NHẤT cho accuracy,
+              focal_72h giữ nhẹ (×0.8)
 
-PHILOSOPHY — ĐỂ ĐÁNH BẠI LSTM:
-  LSTM thắng vì MSE gradient cực clean: grad = 2*(pred - gt).
-  Không có haversine, không focal, không auxiliary — chỉ MSE.
+BUG FIX so với v35 gốc (vẫn giữ):
+  BUG 3: direct_endpoint_mse chia 111² thay vì 300² → dm=40 ❌
+         (đã fix trong v1, giữ lại)
 
-  Chiến lược v35fix:
-    1. horizon_mse: MSE haversine tại mỗi step, weight tăng theo horizon
-    2. direct_mse_72h: MSE thuần km-space tại step 12 (≡ LSTM loss tại 72h)
-    3. focal_72h: nhẹ thôi, chỉ penalize khi >300km
-    4. auxiliary: shape + heading + steering với weight nhỏ
+LOSS SCALE SO VỚI v34fix:
+  v34fix tại ep0: tot ≈ 13-14  (Huber-based)
+  v35fix-v2 tại ep0: tot ≈ 12-14  ← CỰC GẦN v34fix ✅
+  v34fix tại ep63 (ADE=172km): tot ≈ 2-3
+  v35fix-v2 tại ep63: tot ≈ 4-5   ← cao hơn 1 chút, chấp nhận được ✅
 
-  Loss budget tại init (error ~500km ở 72h):
-    horizon_mse ≈ 1.5    (normalized đúng)
-    direct_mse  ≈ 2.78   (500^2/300^2)  × 2.0 = 5.56
-    focal_72h   ≈ 2.78   (focal=1.0 init) × 1.5 = 4.17
-    shape/head  ≈ 0.5
-    TOTAL       ≈ 11-13  (thay vì 140 của v35 bug) ✅
-
-TARGETS sau 60 epochs với v35fix:
-  Kỳ vọng: ADE ≈ 165-170 km, 72h ≈ 310-320 km (cải thiện ~5% so v34fix)
+PHILOSOPHY — ĐÁNH BẠI LSTM:
+  1. direct_multi_horizon_mse: MSE thuần, normalize per-horizon
+     → gradient = 2*(pred-gt)/target^2, cực clean như LSTM
+     → 72h chiếm 60% weight, không bị loãng bởi các step nhỏ
+  2. focal_72h: nhẹ, chỉ push khi error > 300km (LSTM không có điều này)
+  3. heading: tránh trajectory zig-zag
 """
 from __future__ import annotations
 
-import math
 from typing import Dict, Optional
 
 import torch
@@ -7075,9 +7074,9 @@ import torch.nn.functional as F
 
 __all__ = [
     "WEIGHTS", "compute_total_loss",
-    "horizon_aware_mse", "direct_endpoint_mse",
-    "focal_72h_loss", "trajectory_shape_loss",
-    "heading_loss", "steering_alignment_loss",
+    "direct_multi_horizon_mse", "focal_72h_loss",
+    "trajectory_shape_loss", "heading_loss",
+    "steering_alignment_loss",
     "_haversine", "_haversine_deg", "_norm_to_deg",
 ]
 
@@ -7087,17 +7086,31 @@ DT_6H     = 6 * 3600
 DEG_TO_KM = 111.0
 STEP_KM   = 113.0
 
-# ── Target km cho mỗi horizon (để normalize loss về O(1)) ────────────────────
-TARGET_KM = {1: 50.0, 3: 100.0, 7: 200.0, 11: 300.0}
+# ── Weights — calibrated để tổng ≈ 12-14 tại ep0 ────────────────────────────
+#
+# Budget tại ep0 (d1≈50, d3≈100, d7≈300, d11≈500 km):
+#   multi_horizon ≈ 2.38  × 3.0 =  7.14
+#   focal_72h     ≈ 3.58  × 0.8 =  2.86
+#   shape         ≈ 0.15  × 0.3 =  0.05
+#   heading       ≈ 0.30  × 0.3 =  0.09
+#   steering      ≈ 0.10  × 0.15=  0.02
+#   fm_mse (từ model) ≈ 0.3-1.0
+#   ───────────────────────────────────
+#   TOTAL  ≈ 10.2 + fm_mse ≈ 11-12   ✅ (gần v34fix ≈ 13-14)
+#
+# Budget tại ep63 (d1≈30, d3≈80, d7≈200, d11≈331 km):
+#   multi_horizon ≈ 1.06  × 3.0 =  3.18
+#   focal_72h     ≈ 1.28  × 0.8 =  1.02
+#   shape+head    ≈ 0.10  × 0.3 =  0.06 (mỗi)
+#   ───────────────────────────────────
+#   TOTAL ≈ 4.3 + fm_mse×0.3 ≈ 4.5   ✅ (cao hơn v34fix ≈ 2.5, chấp nhận)
 
-# ── Weights — budget rõ ràng, tổng ≈ 10-15 tại init ────────────────────────
 WEIGHTS: Dict[str, float] = dict(
-    horizon_mse = 2.0,   # MSE haversine toàn trajectory, horizon-weighted
-    direct_mse  = 2.0,   # MSE thuần km tại step 12 (≡ LSTM loss)   — FIX NORM
-    focal_72h   = 1.5,   # Focal penalty khi >300km                  — giảm từ 4.0
-    shape       = 0.3,   # Trajectory shape consistency
-    heading     = 0.3,   # Direction consistency
-    steering    = 0.15,  # 500hPa alignment
+    multi_horizon = 3.0,   # MSE per-horizon, 60% vào 72h
+    focal_72h     = 0.8,   # Focal push khi error > 300km
+    shape         = 0.3,   # Trajectory shape
+    heading       = 0.3,   # Direction consistency
+    steering      = 0.15,  # 500hPa alignment
 )
 
 
@@ -7107,7 +7120,6 @@ WEIGHTS: Dict[str, float] = dict(
 
 def _haversine(p1: torch.Tensor, p2: torch.Tensor,
                unit_01deg: bool = True) -> torch.Tensor:
-    """Haversine distance km. p1, p2 [..., 2]."""
     if unit_01deg:
         lon1 = (p1[..., 0] * 50.0 + 1800.0) / 10.0
         lat1 = (p1[..., 1] * 50.0) / 10.0
@@ -7135,83 +7147,37 @@ def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  1. Horizon-aware MSE haversine
-#     Đây là loss chính — gradient tại MỌI step, nhưng step 12 mạnh nhất
+#  1. MAIN LOSS: Direct MSE per horizon — normalize riêng từng horizon
+#     Đây là cốt lõi để đánh bại LSTM
 # ══════════════════════════════════════════════════════════════════════════════
-
-def horizon_aware_mse(pred_deg: torch.Tensor,
-                       gt_deg: torch.Tensor,
-                       alpha: float = 2.5) -> torch.Tensor:
-    """
-    MSE haversine với horizon-aware weighting.
-
-    w[t] = (t+1)^alpha, normalize mean=1.
-    alpha=2.5: step 12 weight = 12^2.5 / mean ≈ 10x step 1.
-
-    Normalize: chia 200^2 (target trung bình ADE).
-    → Loss ≈ 1.0 khi ADE ≈ 200km.
-
-    Input: DEGREES [T, B, 2]
-    """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    dist_km = _haversine_deg(pred_deg[:T], gt_deg[:T])        # [T, B]
-
-    w = torch.arange(1, T + 1, dtype=torch.float32,
-                     device=pred_deg.device).pow(alpha)
-    w = w / w.mean()                                           # mean-normalize
-
-    # MSE (không phải MAE) — clean gradient như LSTM
-    return (dist_km.pow(2) * w.unsqueeze(1)).mean() / (200.0 ** 2)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  2. Direct endpoint MSE — ĐÂY LÀ CORE: giống hệt LSTM loss tại step 12
-#     FIX: normalize đúng bằng target_km^2 thay vì 111^2
-# ══════════════════════════════════════════════════════════════════════════════
-
-def direct_endpoint_mse(pred_deg: torch.Tensor,
-                         gt_deg: torch.Tensor,
-                         target_km: float = 300.0) -> torch.Tensor:
-    """
-    MSE haversine thuần tại step 12 (72h).
-
-    ĐÂY LÀ LOSS GIỐNG LSTM NHẤT:
-      LSTM:  loss = MSE(pred_xy, gt_xy)  (normalized coords)
-      v35fx: loss = haversine(pred, gt)^2 / target^2
-
-    Tại init (error ~500km): loss = 500^2/300^2 ≈ 2.78 ✅
-    Tại target (error=300km): loss = 1.0 ✅
-    Tại tốt (error=200km): loss = 0.44 ✅
-
-    BUG v35: chia 111^2 thay vì 300^2
-    → loss = 500^2*2 / 111^2 ≈ 40  ← đây là dm=40 trong log ❌
-
-    Input: DEGREES [T, B, 2]
-    """
-    if pred_deg.shape[0] < 12:
-        return pred_deg.new_zeros(())
-
-    d = _haversine_deg(pred_deg[11], gt_deg[11])  # [B], km
-    return d.pow(2).mean() / (target_km ** 2)      # ✅ normalize đúng
-
 
 def direct_multi_horizon_mse(pred_deg: torch.Tensor,
-                               gt_deg: torch.Tensor) -> torch.Tensor:
+                              gt_deg: torch.Tensor) -> torch.Tensor:
     """
-    Mở rộng direct_endpoint_mse cho tất cả horizon.
-    Weights phản ánh target quan trọng nhất: 72h chiếm 60%.
+    MSE thuần, normalize theo target của TỪNG horizon.
 
-    Thay thế hoàn toàn multi_scale_haversine với gradient clean hơn.
+    TẠI SAO ĐÚNG HƠN horizon_aware_mse:
+      horizon_aware_mse dùng dist^2/200^2 cho MỌI step → step 12 (dist=500km)
+      cho 500^2/200^2=6.25, overpower hẳn. Normalization sai.
 
-    Input: DEGREES [T, B, 2]
+      direct_multi_horizon_mse dùng dist^2/target_h^2 riêng từng step:
+      - step 12: 500^2/300^2 = 2.78  ← đúng scale
+      - step 7: 300^2/200^2 = 2.25   ← đúng scale
+      - step 3: 100^2/100^2 = 1.0    ← đúng scale
+      Tổng có trọng số: 2.38 tại ep0 → 1.06 tại ep63  ✅
+
+    GRADIENT = 2*(pred-gt)/target_h^2 → clean như LSTM nhưng focus vào 72h.
+
+    Inputs: DEGREES [T, B, 2]
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return pred_deg.new_zeros(())
 
-    # (step_idx_0based, weight, target_km)
+    # (step_idx 0-based, weight, target_km)
+    # 72h chiếm 60% gradient → mạnh nhất
     horizons = [
-        (1,  0.05,  50.0),   # 12h — ít weight, thường đã tốt
+        (1,  0.05,  50.0),   # 12h — ít thôi, thường không phải bottleneck
         (3,  0.10, 100.0),   # 24h
         (7,  0.25, 200.0),   # 48h
         (11, 0.60, 300.0),   # 72h — chủ đạo
@@ -7220,13 +7186,14 @@ def direct_multi_horizon_mse(pred_deg: torch.Tensor,
     total = pred_deg.new_zeros(())
     for step, w, tgt in horizons:
         if T > step:
-            d    = _haversine_deg(pred_deg[step], gt_deg[step])  # [B]
+            d = _haversine_deg(pred_deg[step], gt_deg[step])   # [B] km
             total = total + w * d.pow(2).mean() / (tgt ** 2)
-    return total
+
+    return total  # ≈ 1.0 khi error = target tại mọi horizon
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  3. Focal 72h — nhẹ, chỉ push khi còn xa target
+#  2. Focal 72h — nhẹ, chỉ push khi error > 300km (LSTM không có)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def focal_72h_loss(pred_deg: torch.Tensor,
@@ -7234,22 +7201,21 @@ def focal_72h_loss(pred_deg: torch.Tensor,
                     target_km: float = 300.0,
                     focal_exp: float = 1.5) -> torch.Tensor:
     """
-    Focal penalty tại step 12.
+    Focal penalty tại step 12:
+      loss = d × (d/target)^focal_exp / target
 
-    Khi error > target: loss tăng phi tuyến → push harder.
-    Khi error < target: focal_w = 1.0 → không bị over-penalize.
+    Khi d > target: focal_w > 1 → push harder (advantage over LSTM)
+    Khi d < target: focal_w = 1 → không bị over-penalize (MAE scale, linear)
 
-    Normalize = target_km (MAE, không phải MSE) để scale ổn định.
-    Tại init (d=500km): focal_w=(500/300)^1.5=2.15, loss=500*2.15/300=3.58
-    Tại target (d=300km): focal_w=1.0, loss=1.0
-    Tại tốt (d=200km): focal_w=1.0, loss=0.67
-
-    Input: DEGREES [T, B, 2]
+    Scale:
+      Tại ep0 d=500km: (500/300)^1.5=2.15, 500*2.15/300=3.58
+      Tại ep63 d=331km: (331/300)^1.5=1.16, 331*1.16/300=1.28
+      Tại target d=300km: 1.0
     """
     if pred_deg.shape[0] < 12:
         return pred_deg.new_zeros(())
 
-    d = _haversine_deg(pred_deg[11], gt_deg[11])              # [B]
+    d = _haversine_deg(pred_deg[11], gt_deg[11])                # [B] km
     with torch.no_grad():
         focal_w = torch.where(d > target_km,
                                (d / target_km).pow(focal_exp),
@@ -7258,12 +7224,12 @@ def focal_72h_loss(pred_deg: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  4. Trajectory shape loss (giữ nhẹ — chỉ để tránh degenerate)
+#  3. Trajectory shape (nhẹ — chỉ tránh degenerate path)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def trajectory_shape_loss(pred_deg: torch.Tensor,
                            gt_deg: torch.Tensor) -> torch.Tensor:
-    """Shape consistency — weight 0.3, không optimize mạnh. Input: DEG [T,B,2]"""
+    """Shape displacement windows. Inputs: DEG [T,B,2]"""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 4:
         return pred_deg.new_zeros(())
@@ -7288,7 +7254,7 @@ def trajectory_shape_loss(pred_deg: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  5. Heading loss (giữ nhẹ)
+#  4. Heading loss (nhẹ — tránh zig-zag)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
@@ -7303,6 +7269,7 @@ def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
 
 def heading_loss(pred_deg: torch.Tensor,
                   gt_deg: torch.Tensor) -> torch.Tensor:
+    """Direction consistency. Inputs: DEG [T,B,2]"""
     if pred_deg.shape[0] < 2:
         return pred_deg.new_zeros(())
     pv = _step_displacements_km(pred_deg)
@@ -7319,7 +7286,7 @@ def heading_loss(pred_deg: torch.Tensor,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  6. Steering alignment (giữ nhẹ)
+#  5. Steering alignment (nhẹ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def steering_alignment_loss(pred_deg: torch.Tensor,
@@ -7378,29 +7345,22 @@ def compute_total_loss(
     """
     Aggregated loss. All inputs: DEGREES [T, B, 2].
 
-    Loss budget tại init (error ~500km ở 72h):
-      horizon_mse  ≈  2.5   × 2.0 =  5.0
-      direct_mse   ≈  2.78  × 2.0 =  5.6
-      focal_72h    ≈  3.6   × 1.5 =  5.4
-      shape        ≈  0.5   × 0.3 =  0.15
-      heading      ≈  0.5   × 0.3 =  0.15
-      steering     ≈  0.2   × 0.15=  0.03
-      ─────────────────────────────────────
-      TOTAL        ≈ 16-17          ← thay vì 140 của v35 bug ✅
+    Loss scale so sánh:
+                      ep0    ep63
+      v34fix tot:    13-14   2-3
+      v35fix-v2 tot: 11-13   4-5  ← gần v34fix hơn nhiều so với v35fix-v1
     """
     if weights is None:
         weights = WEIGHTS
 
-    l_hor    = horizon_aware_mse(pred_deg, gt_deg, alpha=2.5)
-    l_direct = direct_endpoint_mse(pred_deg, gt_deg, target_km=300.0)
+    l_multi  = direct_multi_horizon_mse(pred_deg, gt_deg)
     l_focal  = focal_72h_loss(pred_deg, gt_deg, target_km=300.0, focal_exp=1.5)
     l_shape  = trajectory_shape_loss(pred_deg, gt_deg)
     l_head   = heading_loss(pred_deg, gt_deg)
     l_steer  = steering_alignment_loss(pred_deg, env_data)
 
     total = (
-        weights["horizon_mse"] * l_hor
-        + weights["direct_mse"]  * l_direct
+        weights["multi_horizon"] * l_multi
         + weights["focal_72h"]   * l_focal
         + weights["shape"]       * l_shape
         + weights["heading"]     * l_head
@@ -7410,19 +7370,22 @@ def compute_total_loss(
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
 
+    # Individual values để log — giữ key names tương thích với train script
+    l_multi_val = l_multi.item()
+    l_focal_val = l_focal.item()
     return dict(
-        total       = total,
-        # Tên key khớp với log format trong train script
-        mse_hav     = l_hor.item(),
-        direct_mse  = l_direct.item(),
-        hard_72h    = l_focal.item(),
-        multi_scale = 0.0,       # không dùng nữa nhưng giữ key để log không lỗi
-        endpoint    = 0.0,
-        shape       = l_shape.item(),
-        heading     = l_head.item(),
-        steering    = l_steer.item(),
-        # keys cũ để tương thích với flow_matching_model.py
-        mse_hav_horizon = l_hor.item(),
-        velocity    = 0.0,
-        recurv      = 0.0,
+        total           = total,
+        # Keys cho log trong train script (flow_matching_model.py)
+        mse_hav_horizon = l_multi_val,   # thay cho mse_hav_horizon cũ
+        mse_hav         = l_multi_val,
+        multi_scale     = l_focal_val,   # dùng slot ms để log focal
+        endpoint        = 0.0,
+        shape           = l_shape.item(),
+        heading         = l_head.item(),
+        velocity        = 0.0,
+        recurv          = 0.0,
+        steering        = l_steer.item(),
+        # Keys mới
+        direct_mse      = l_multi_val,
+        hard_72h        = l_focal_val,
     )
