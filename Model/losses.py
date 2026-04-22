@@ -7033,24 +7033,37 @@
 #     )
 
 """
-Model/losses.py — v35  CLEAN + 72H FOCUSED
+Model/losses.py — v35fix  PURE MSE + CORRECT NORMALIZATION
 ═══════════════════════════════════════════════════════════════════
 MỤC TIÊU: 12h<50, 24h<100, 48h<200, 72h<300 km
 
-THAY ĐỔI SO VỚI v34fix:
-  - Bỏ velocity_loss (chiếm ~0.2-0.3 trong log, eating gradient budget)
-  - Bỏ recurvature_loss (auxiliary, không giúp 72h)
-  - Thêm hard_72h_focal_loss: focal penalty khi error > 300km
-  - Thêm direct_endpoint_mse: MSE thuần trong degree space tại step 12
-  - Tăng weight multi_scale lên 5.0, endpoint lên 6.0
-  - multi_scale 72h weight: 0.52 → 0.70, norm 300 → 250
-  - Tất cả gradient budget tập trung vào long-range accuracy
+BUG FIX so với v35:
+  BUG 1: direct_endpoint_mse normalize sai — chia 111^2 thay vì 300^2
+         → loss 26×, × weight 2.0 → dm=52, tot=140 ❌
+         FIX: chia target_km^2 → loss ≈ 1.0 khi error = 300km ✅
 
-PHILOSOPHY:
-  - velocity/recurv: gradient useful nhưng DILUTE 72h signal → bỏ
-  - 2 loss mới (hard_72h + direct_mse) gradient cực clean tại step 12
-  - focal weight: khi error > 300km, penalty tăng phi tuyến → push harder
-  - MSE trong degree space ≈ haversine cho vùng nhiệt đới (sai số <5%)
+  BUG 2: hard_72h weight=4.0 quá lớn sau fix norm
+         FIX: giảm xuống 1.5
+
+PHILOSOPHY — ĐỂ ĐÁNH BẠI LSTM:
+  LSTM thắng vì MSE gradient cực clean: grad = 2*(pred - gt).
+  Không có haversine, không focal, không auxiliary — chỉ MSE.
+
+  Chiến lược v35fix:
+    1. horizon_mse: MSE haversine tại mỗi step, weight tăng theo horizon
+    2. direct_mse_72h: MSE thuần km-space tại step 12 (≡ LSTM loss tại 72h)
+    3. focal_72h: nhẹ thôi, chỉ penalize khi >300km
+    4. auxiliary: shape + heading + steering với weight nhỏ
+
+  Loss budget tại init (error ~500km ở 72h):
+    horizon_mse ≈ 1.5    (normalized đúng)
+    direct_mse  ≈ 2.78   (500^2/300^2)  × 2.0 = 5.56
+    focal_72h   ≈ 2.78   (focal=1.0 init) × 1.5 = 4.17
+    shape/head  ≈ 0.5
+    TOTAL       ≈ 11-13  (thay vì 140 của v35 bug) ✅
+
+TARGETS sau 60 epochs với v35fix:
+  Kỳ vọng: ADE ≈ 165-170 km, 72h ≈ 310-320 km (cải thiện ~5% so v34fix)
 """
 from __future__ import annotations
 
@@ -7062,35 +7075,29 @@ import torch.nn.functional as F
 
 __all__ = [
     "WEIGHTS", "compute_total_loss",
-    "mse_haversine_horizon_aware", "multi_scale_haversine",
-    "endpoint_weighted_loss", "trajectory_shape_loss",
-    "hard_72h_focal_loss", "direct_endpoint_mse",
+    "horizon_aware_mse", "direct_endpoint_mse",
+    "focal_72h_loss", "trajectory_shape_loss",
     "heading_loss", "steering_alignment_loss",
     "_haversine", "_haversine_deg", "_norm_to_deg",
 ]
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-OMEGA     = 7.2921e-5
-R_EARTH   = 6.371e6
+R_EARTH   = 6371.0
 DT_6H     = 6 * 3600
 DEG_TO_KM = 111.0
 STEP_KM   = 113.0
 
-# ── Weights ───────────────────────────────────────────────────────────────────
-# Nguyên tắc: mọi gradient budget → long-range (48h, 72h)
-# velocity/recurv bỏ hoàn toàn — chúng dilute signal
-# hard_72h + direct_mse là 2 loss mới, cực direct
+# ── Target km cho mỗi horizon (để normalize loss về O(1)) ────────────────────
+TARGET_KM = {1: 50.0, 3: 100.0, 7: 200.0, 11: 300.0}
+
+# ── Weights — budget rõ ràng, tổng ≈ 10-15 tại init ────────────────────────
 WEIGHTS: Dict[str, float] = dict(
-    mse_hav_horizon = 1.5,   # baseline horizon-aware (giảm từ 2.0)
-    multi_scale     = 5.0,   # TĂNG từ 3.5 — 70% weight tại step 12
-    endpoint        = 6.0,   # TĂNG từ 3.0 — FDE emphasis
-    hard_72h        = 4.0,   # MỚI — focal penalty khi >300km
-    direct_mse      = 2.0,   # MỚI — MSE thuần tại step 12, gradient clean
-    shape           = 0.3,   # giảm từ 0.8 — chỉ giữ để smooth trajectory
-    heading         = 0.4,   # giảm từ 0.8 — auxiliary nhẹ
-    steering        = 0.2,   # giữ nhẹ
-    # velocity = 0          # ĐÃ BỎ
-    # recurv   = 0          # ĐÃ BỎ
+    horizon_mse = 2.0,   # MSE haversine toàn trajectory, horizon-weighted
+    direct_mse  = 2.0,   # MSE thuần km tại step 12 (≡ LSTM loss)   — FIX NORM
+    focal_72h   = 1.5,   # Focal penalty khi >300km                  — giảm từ 4.0
+    shape       = 0.3,   # Trajectory shape consistency
+    heading     = 0.3,   # Direction consistency
+    steering    = 0.15,  # 500hPa alignment
 )
 
 
@@ -7100,7 +7107,7 @@ WEIGHTS: Dict[str, float] = dict(
 
 def _haversine(p1: torch.Tensor, p2: torch.Tensor,
                unit_01deg: bool = True) -> torch.Tensor:
-    """Haversine distance in km. p1, p2 shape [..., 2]."""
+    """Haversine distance km. p1, p2 [..., 2]."""
     if unit_01deg:
         lon1 = (p1[..., 0] * 50.0 + 1800.0) / 10.0
         lat1 = (p1[..., 1] * 50.0) / 10.0
@@ -7109,15 +7116,11 @@ def _haversine(p1: torch.Tensor, p2: torch.Tensor,
     else:
         lon1, lat1 = p1[..., 0], p1[..., 1]
         lon2, lat2 = p2[..., 0], p2[..., 1]
-
-    lat1r = torch.deg2rad(lat1)
-    lat2r = torch.deg2rad(lat2)
-    dlon  = torch.deg2rad(lon2 - lon1)
-    dlat  = torch.deg2rad(lat2 - lat1)
+    lat1r, lat2r = torch.deg2rad(lat1), torch.deg2rad(lat2)
+    dlon, dlat   = torch.deg2rad(lon2 - lon1), torch.deg2rad(lat2 - lat1)
     a = (torch.sin(dlat / 2).pow(2)
          + torch.cos(lat1r) * torch.cos(lat2r) * torch.sin(dlon / 2).pow(2))
-    a = a.clamp(1e-12, 1.0 - 1e-12)
-    return 2.0 * 6371.0 * torch.asin(a.sqrt())
+    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
 
 
 def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
@@ -7125,7 +7128,6 @@ def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
 
 
 def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
-    """Normalized → degrees (lon, lat)."""
     out = arr.clone()
     out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
     out[..., 1] = (arr[..., 1] * 50.0) / 10.0
@@ -7133,46 +7135,73 @@ def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Horizon-aware weighting
+#  1. Horizon-aware MSE haversine
+#     Đây là loss chính — gradient tại MỌI step, nhưng step 12 mạnh nhất
 # ══════════════════════════════════════════════════════════════════════════════
 
-def horizon_aware_weights(T: int, alpha: float = 2.0,
-                           device=None) -> torch.Tensor:
+def horizon_aware_mse(pred_deg: torch.Tensor,
+                       gt_deg: torch.Tensor,
+                       alpha: float = 2.5) -> torch.Tensor:
     """
+    MSE haversine với horizon-aware weighting.
+
     w[t] = (t+1)^alpha, normalize mean=1.
-    alpha=2.0: step 12 weight ~9x step 1.
+    alpha=2.5: step 12 weight = 12^2.5 / mean ≈ 10x step 1.
+
+    Normalize: chia 200^2 (target trung bình ADE).
+    → Loss ≈ 1.0 khi ADE ≈ 200km.
+
+    Input: DEGREES [T, B, 2]
     """
-    w = torch.arange(1, T + 1, dtype=torch.float32, device=device).pow(alpha)
-    return w / w.mean()
-
-
-def mse_haversine_horizon_aware(pred_deg: torch.Tensor,
-                                 gt_deg: torch.Tensor,
-                                 alpha: float = 2.0,
-                                 huber_delta: float = 200.0) -> torch.Tensor:
-    """Huber haversine với horizon-aware weighting. Input: DEGREES [T, B, 2]."""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
-    dist_km = _haversine_deg(pred_deg[:T], gt_deg[:T])   # [T, B]
-    w = horizon_aware_weights(T, alpha, device=pred_deg.device)
+    dist_km = _haversine_deg(pred_deg[:T], gt_deg[:T])        # [T, B]
 
-    huber = torch.where(
-        dist_km < huber_delta,
-        0.5 * dist_km.pow(2) / huber_delta,
-        dist_km - 0.5 * huber_delta,
-    )
-    return (huber * w.unsqueeze(1)).mean() / huber_delta
+    w = torch.arange(1, T + 1, dtype=torch.float32,
+                     device=pred_deg.device).pow(alpha)
+    w = w / w.mean()                                           # mean-normalize
+
+    # MSE (không phải MAE) — clean gradient như LSTM
+    return (dist_km.pow(2) * w.unsqueeze(1)).mean() / (200.0 ** 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Multi-scale haversine — 72h weight tăng mạnh
+#  2. Direct endpoint MSE — ĐÂY LÀ CORE: giống hệt LSTM loss tại step 12
+#     FIX: normalize đúng bằng target_km^2 thay vì 111^2
 # ══════════════════════════════════════════════════════════════════════════════
 
-def multi_scale_haversine(pred_deg: torch.Tensor,
-                           gt_deg: torch.Tensor) -> torch.Tensor:
+def direct_endpoint_mse(pred_deg: torch.Tensor,
+                         gt_deg: torch.Tensor,
+                         target_km: float = 300.0) -> torch.Tensor:
     """
-    Multi-scale: 70% error tại ĐÚNG horizon step + 30% ADE[:h+1].
-    72h weight: 0.70 (tăng từ 0.52), norm 250 (giảm từ 300).
-    → gradient tại step 12 = 0.70 × weight_total, direct và mạnh.
+    MSE haversine thuần tại step 12 (72h).
+
+    ĐÂY LÀ LOSS GIỐNG LSTM NHẤT:
+      LSTM:  loss = MSE(pred_xy, gt_xy)  (normalized coords)
+      v35fx: loss = haversine(pred, gt)^2 / target^2
+
+    Tại init (error ~500km): loss = 500^2/300^2 ≈ 2.78 ✅
+    Tại target (error=300km): loss = 1.0 ✅
+    Tại tốt (error=200km): loss = 0.44 ✅
+
+    BUG v35: chia 111^2 thay vì 300^2
+    → loss = 500^2*2 / 111^2 ≈ 40  ← đây là dm=40 trong log ❌
+
+    Input: DEGREES [T, B, 2]
+    """
+    if pred_deg.shape[0] < 12:
+        return pred_deg.new_zeros(())
+
+    d = _haversine_deg(pred_deg[11], gt_deg[11])  # [B], km
+    return d.pow(2).mean() / (target_km ** 2)      # ✅ normalize đúng
+
+
+def direct_multi_horizon_mse(pred_deg: torch.Tensor,
+                               gt_deg: torch.Tensor) -> torch.Tensor:
+    """
+    Mở rộng direct_endpoint_mse cho tất cả horizon.
+    Weights phản ánh target quan trọng nhất: 72h chiếm 60%.
+
+    Thay thế hoàn toàn multi_scale_haversine với gradient clean hơn.
 
     Input: DEGREES [T, B, 2]
     """
@@ -7180,180 +7209,89 @@ def multi_scale_haversine(pred_deg: torch.Tensor,
     if T < 2:
         return pred_deg.new_zeros(())
 
-    dist_km = _haversine_deg(pred_deg[:T], gt_deg[:T])   # [T, B]
-
-    # (step_idx_0based, weight_in_loss, normalize_km)
-    scales = [
-        (1,  0.04, 50.0),    # 12h — giảm weight
-        (3,  0.08, 100.0),   # 24h — giảm weight
-        (7,  0.18, 200.0),   # 48h
-        (11, 0.70, 250.0),   # 72h — TĂNG từ 0.52, norm từ 300→250
+    # (step_idx_0based, weight, target_km)
+    horizons = [
+        (1,  0.05,  50.0),   # 12h — ít weight, thường đã tốt
+        (3,  0.10, 100.0),   # 24h
+        (7,  0.25, 200.0),   # 48h
+        (11, 0.60, 300.0),   # 72h — chủ đạo
     ]
 
     total = pred_deg.new_zeros(())
-    for h, w, norm in scales:
-        if T > h:
-            endpoint_err = dist_km[h].mean()
-            ade_err      = dist_km[:h + 1].mean()
-            combined     = 0.7 * endpoint_err + 0.3 * ade_err
-            total        = total + w * (combined / norm)
+    for step, w, tgt in horizons:
+        if T > step:
+            d    = _haversine_deg(pred_deg[step], gt_deg[step])  # [B]
+            total = total + w * d.pow(2).mean() / (tgt ** 2)
     return total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Endpoint-weighted loss
+#  3. Focal 72h — nhẹ, chỉ push khi còn xa target
 # ══════════════════════════════════════════════════════════════════════════════
 
-def endpoint_weighted_loss(pred_deg: torch.Tensor,
-                            gt_deg: torch.Tensor,
-                            gamma: float = 2.5) -> torch.Tensor:
+def focal_72h_loss(pred_deg: torch.Tensor,
+                    gt_deg: torch.Tensor,
+                    target_km: float = 300.0,
+                    focal_exp: float = 1.5) -> torch.Tensor:
     """
-    L = Σ (t/T)^gamma · d(pred_t, gt_t)
-    gamma=2.5: step 12 weight=1.0, step 6=0.177, step 1≈0.003.
-    norm=250 để gradient lớn hơn khi error gần target.
+    Focal penalty tại step 12.
 
-    Input: DEGREES [T, B, 2]
-    """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 1:
-        return pred_deg.new_zeros(())
+    Khi error > target: loss tăng phi tuyến → push harder.
+    Khi error < target: focal_w = 1.0 → không bị over-penalize.
 
-    dist_km = _haversine_deg(pred_deg[:T], gt_deg[:T])   # [T, B]
-    t_idx   = torch.arange(1, T + 1, dtype=torch.float32, device=pred_deg.device)
-    w       = (t_idx / T).pow(gamma)
-    w       = w / w.sum()
-    return (dist_km * w.unsqueeze(1)).mean() / 250.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  NEW: Hard 72h focal loss — chỉ quan tâm step 12
-# ══════════════════════════════════════════════════════════════════════════════
-
-def hard_72h_focal_loss(pred_deg: torch.Tensor,
-                         gt_deg: torch.Tensor,
-                         target_km: float = 300.0,
-                         focal_exp: float = 1.5) -> torch.Tensor:
-    """
-    Focal penalty tập trung HOÀN TOÀN vào step 12 (72h).
-    - Khi error > target_km: penalty tăng phi tuyến (focal_exp)
-    - Khi error < target_km: penalty giảm nhẹ → không waste gradient
-    - Gradient cực clean vì chỉ từ 1 step
-
-    focal_exp=1.5: error 400km → weight 1.54×, error 500km → weight 1.83×
-    norm=target_km để loss ≈ 1.0 khi error = target.
+    Normalize = target_km (MAE, không phải MSE) để scale ổn định.
+    Tại init (d=500km): focal_w=(500/300)^1.5=2.15, loss=500*2.15/300=3.58
+    Tại target (d=300km): focal_w=1.0, loss=1.0
+    Tại tốt (d=200km): focal_w=1.0, loss=0.67
 
     Input: DEGREES [T, B, 2]
     """
     if pred_deg.shape[0] < 12:
         return pred_deg.new_zeros(())
 
-    d = _haversine_deg(pred_deg[11], gt_deg[11])   # [B]
-
-    # Focal weight: error lớn hơn target → penalty mạnh hơn
-    # Dưới target: weight = 1.0 (vẫn học)
-    # Trên target: weight = (d/target)^focal_exp > 1.0
+    d = _haversine_deg(pred_deg[11], gt_deg[11])              # [B]
     with torch.no_grad():
-        focal_w = torch.where(
-            d > target_km,
-            (d / target_km).pow(focal_exp),
-            torch.ones_like(d),
-        )
-
+        focal_w = torch.where(d > target_km,
+                               (d / target_km).pow(focal_exp),
+                               torch.ones_like(d))
     return (d * focal_w).mean() / target_km
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NEW: Direct endpoint MSE — gradient thuần nhất
-# ══════════════════════════════════════════════════════════════════════════════
-
-def direct_endpoint_mse(pred_deg: torch.Tensor,
-                         gt_deg: torch.Tensor) -> torch.Tensor:
-    """
-    MSE thuần trong degree space tại step 12.
-    - Tương đương RMSE ≈ haversine cho vùng nhiệt đới (sai số <5%)
-    - Gradient clean nhất trong tất cả loss: chỉ (pred - gt)^2
-    - Đây là lý do LSTM đơn giản cạnh tranh được: MSE gradient không bị dilute
-
-    Normalize: 1 degree ≈ 111km → scale 111^2 để loss ≈ O(1).
-
-    Input: DEGREES [T, B, 2]
-    """
-    if pred_deg.shape[0] < 12:
-        return pred_deg.new_zeros(())
-
-    diff = pred_deg[11] - gt_deg[11]   # [B, 2]
-
-    # Latitude correction cho longitude: 1deg lon ≠ 111km tùy vĩ độ
-    # Dùng mean latitude của batch để approximate
-    lat_mean = gt_deg[11, :, 1].mean()
-    cos_lat  = torch.cos(torch.deg2rad(lat_mean)).clamp(min=0.3)
-
-    # Scale diff về km: lon_km = diff_lon * cos_lat * 111, lat_km = diff_lat * 111
-    diff_km = torch.stack([
-        diff[:, 0] * cos_lat * DEG_TO_KM,
-        diff[:, 1] * DEG_TO_KM,
-    ], dim=-1)   # [B, 2]
-
-    return diff_km.pow(2).sum(-1).mean() / (DEG_TO_KM ** 2)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Trajectory shape loss
+#  4. Trajectory shape loss (giữ nhẹ — chỉ để tránh degenerate)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def trajectory_shape_loss(pred_deg: torch.Tensor,
                            gt_deg: torch.Tensor) -> torch.Tensor:
-    """
-    Shape consistency — giữ lại nhưng weight nhỏ (0.3).
-    Chỉ để tránh degenerate trajectory, không optimize mạnh.
-
-    Input: DEGREES [T, B, 2]
-    """
+    """Shape consistency — weight 0.3, không optimize mạnh. Input: DEG [T,B,2]"""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 4:
         return pred_deg.new_zeros(())
 
-    def disp_km(start, end):
-        if end >= T:
-            end = T - 1
-        lat_mid = (pred_deg[start, :, 1] + pred_deg[end, :, 1]) * 0.5
+    def _disp_km(s, e):
+        e = min(e, T - 1)
+        lat_mid = (pred_deg[s, :, 1] + pred_deg[e, :, 1]) * 0.5
         cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
-        pred_d  = pred_deg[end] - pred_deg[start]
-        gt_d    = gt_deg[end] - gt_deg[start]
-        pred_km = torch.stack([
-            pred_d[:, 0] * cos_lat * DEG_TO_KM,
-            pred_d[:, 1] * DEG_TO_KM,
-        ], dim=-1)
-        gt_km = torch.stack([
-            gt_d[:, 0] * cos_lat * DEG_TO_KM,
-            gt_d[:, 1] * DEG_TO_KM,
-        ], dim=-1)
-        return pred_km, gt_km
+        pd = pred_deg[e] - pred_deg[s]
+        gd = gt_deg[e]   - gt_deg[s]
+        pk = torch.stack([pd[:, 0] * cos_lat * DEG_TO_KM, pd[:, 1] * DEG_TO_KM], -1)
+        gk = torch.stack([gd[:, 0] * cos_lat * DEG_TO_KM, gd[:, 1] * DEG_TO_KM], -1)
+        return pk, gk
 
-    total = pred_deg.new_zeros(())
-    count = 0.0
-
-    # Tập trung vào windows dài hơn (long-range shape)
-    windows = [
-        (0, 5,  0.5),
-        (5, 11, 1.0),   # 48h→72h window — trọng số cao nhất
-        (0, 11, 1.5),   # full trajectory
-    ]
-    for s, e, w in windows:
+    total, count = pred_deg.new_zeros(()), 0.0
+    for s, e, w in [(0, 5, 0.5), (5, 11, 1.0), (0, 11, 1.5)]:
         if e < T:
-            pk, gk = disp_km(s, e)
+            pk, gk = _disp_km(s, e)
             total  = total + w * F.smooth_l1_loss(pk, gk)
             count  += w
-
     return (total / max(count, 1.0)) / (STEP_KM ** 2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Heading loss (giữ nhẹ)
+#  5. Heading loss (giữ nhẹ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
-    """[T,B,2] degrees → [T-1,B,2] km displacement per step."""
     dt      = traj_deg[1:] - traj_deg[:-1]
     lat_mid = (traj_deg[:-1, :, 1] + traj_deg[1:, :, 1]) * 0.5
     cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
@@ -7365,56 +7303,46 @@ def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
 
 def heading_loss(pred_deg: torch.Tensor,
                   gt_deg: torch.Tensor) -> torch.Tensor:
-    """Direction consistency — chỉ penalize wrong direction, weight nhẹ."""
     if pred_deg.shape[0] < 2:
         return pred_deg.new_zeros(())
-
     pv = _step_displacements_km(pred_deg)
     gv = _step_displacements_km(gt_deg)
     pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
     gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
-
     cos_sim   = ((pv / pn) * (gv / gn)).sum(-1)
     wrong_dir = F.relu(-cos_sim).pow(2)
-
     T = pv.shape[0]
-    w = horizon_aware_weights(T, alpha=1.5, device=pred_deg.device)
+    w = torch.arange(1, T + 1, dtype=torch.float32,
+                     device=pred_deg.device).pow(1.5)
+    w = w / w.mean()
     return (wrong_dir * w.unsqueeze(1)).mean()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Steering alignment (giữ nhẹ)
+#  6. Steering alignment (giữ nhẹ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def steering_alignment_loss(pred_deg: torch.Tensor,
                               env_data: Optional[dict]) -> torch.Tensor:
-    """Align pred direction với 500hPa steering flow."""
     if env_data is None or pred_deg.shape[0] < 2:
         return pred_deg.new_zeros(())
-
     T, B   = pred_deg.shape[0] - 1, pred_deg.shape[1]
     device = pred_deg.device
 
-    def _extract_uv(key_mean, key_center):
-        v = env_data.get(key_center, env_data.get(key_mean, None))
-        if v is None or not torch.is_tensor(v):
-            return None
+    def _extract(k1, k2):
+        v = env_data.get(k2, env_data.get(k1, None))
+        if v is None or not torch.is_tensor(v): return None
         v = v.to(device).float()
-        if v.dim() == 3:
-            v = v[..., 0]
-        if v.dim() == 1:
-            v = v.unsqueeze(0).expand(B, -1)
+        if v.dim() == 3: v = v[..., 0]
+        if v.dim() == 1: v = v.unsqueeze(0).expand(B, -1)
         v = v.permute(1, 0)
         T_obs = v.shape[0]
-        if T_obs >= T:
-            return v[:T] * 30.0
-        pad = torch.zeros(T - T_obs, B, device=device)
-        return torch.cat([v * 30.0, pad], dim=0)
+        if T_obs >= T: return v[:T] * 30.0
+        return torch.cat([v * 30.0, torch.zeros(T - T_obs, B, device=device)], 0)
 
-    u500 = _extract_uv("u500_mean", "u500_center")
-    v500 = _extract_uv("v500_mean", "v500_center")
-    if u500 is None or v500 is None:
-        return pred_deg.new_zeros(())
+    u500 = _extract("u500_mean", "u500_center")
+    v500 = _extract("v500_mean", "v500_center")
+    if u500 is None or v500 is None: return pred_deg.new_zeros(())
 
     dlat    = pred_deg[1:] - pred_deg[:-1]
     lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
@@ -7422,16 +7350,15 @@ def steering_alignment_loss(pred_deg: torch.Tensor,
     u_tc    = dlat[:, :, 0] * cos_lat * 111000.0 / DT_6H
     v_tc    = dlat[:, :, 1] * 111000.0 / DT_6H
 
-    uv_mag       = torch.sqrt(u500.pow(2) + v500.pow(2))
+    uv_mag       = (u500.pow(2) + v500.pow(2)).sqrt()
     has_steering = (uv_mag > 5.0).float()
+    env_dir      = torch.stack([u500, v500], -1)
+    tc_dir       = torch.stack([u_tc, v_tc], -1)
+    cos_sim      = ((env_dir / env_dir.norm(dim=-1, keepdim=True).clamp(min=1.0))
+                    * (tc_dir / tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5))).sum(-1)
 
-    env_dir  = torch.stack([u500, v500], dim=-1)
-    tc_dir   = torch.stack([u_tc, v_tc], dim=-1)
-    env_norm = env_dir.norm(dim=-1, keepdim=True).clamp(min=1.0)
-    tc_norm  = tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5)
-    cos_sim  = ((env_dir / env_norm) * (tc_dir / tc_norm)).sum(-1)
-
-    w_t      = horizon_aware_weights(T, alpha=1.5, device=device)
+    w_t      = torch.arange(1, T + 1, dtype=torch.float32, device=device).pow(1.5)
+    w_t      = w_t / w_t.mean()
     misalign = F.relu(0.3 - cos_sim).pow(2)
     return (misalign * has_steering * w_t.unsqueeze(1)).mean()
 
@@ -7449,54 +7376,53 @@ def compute_total_loss(
     **kwargs,
 ) -> dict:
     """
-    Aggregated loss với breakdown đầy đủ.
-    All inputs: DEGREES [T, B, 2].
+    Aggregated loss. All inputs: DEGREES [T, B, 2].
 
-    Loss hierarchy (theo gradient priority):
-      1. hard_72h      (focal, chỉ step 12)       — weight 4.0
-      2. direct_mse    (MSE thuần tại step 12)     — weight 2.0
-      3. endpoint      (weighted FDE)              — weight 6.0
-      4. multi_scale   (70% tại đúng horizon)      — weight 5.0
-      5. mse_hav       (baseline ADE)              — weight 1.5
-      6. shape/heading/steering                    — weight nhỏ
+    Loss budget tại init (error ~500km ở 72h):
+      horizon_mse  ≈  2.5   × 2.0 =  5.0
+      direct_mse   ≈  2.78  × 2.0 =  5.6
+      focal_72h    ≈  3.6   × 1.5 =  5.4
+      shape        ≈  0.5   × 0.3 =  0.15
+      heading      ≈  0.5   × 0.3 =  0.15
+      steering     ≈  0.2   × 0.15=  0.03
+      ─────────────────────────────────────
+      TOTAL        ≈ 16-17          ← thay vì 140 của v35 bug ✅
     """
     if weights is None:
         weights = WEIGHTS
 
-    # Core losses — long-range focused
-    l_mse_hor = mse_haversine_horizon_aware(pred_deg, gt_deg, alpha=2.0)
-    l_multi   = multi_scale_haversine(pred_deg, gt_deg)
-    l_endpt   = endpoint_weighted_loss(pred_deg, gt_deg, gamma=2.5)
-    l_hard72  = hard_72h_focal_loss(pred_deg, gt_deg, target_km=300.0, focal_exp=1.5)
-    l_direct  = direct_endpoint_mse(pred_deg, gt_deg)
-
-    # Auxiliary losses — weight nhỏ
-    l_shape   = trajectory_shape_loss(pred_deg, gt_deg)
-    l_head    = heading_loss(pred_deg, gt_deg)
-    l_steer   = steering_alignment_loss(pred_deg, env_data)
+    l_hor    = horizon_aware_mse(pred_deg, gt_deg, alpha=2.5)
+    l_direct = direct_endpoint_mse(pred_deg, gt_deg, target_km=300.0)
+    l_focal  = focal_72h_loss(pred_deg, gt_deg, target_km=300.0, focal_exp=1.5)
+    l_shape  = trajectory_shape_loss(pred_deg, gt_deg)
+    l_head   = heading_loss(pred_deg, gt_deg)
+    l_steer  = steering_alignment_loss(pred_deg, env_data)
 
     total = (
-        weights["mse_hav_horizon"] * l_mse_hor
-        + weights["multi_scale"]   * l_multi
-        + weights["endpoint"]      * l_endpt
-        + weights["hard_72h"]      * l_hard72
-        + weights["direct_mse"]    * l_direct
-        + weights["shape"]         * l_shape
-        + weights["heading"]       * l_head
-        + weights["steering"]      * l_steer
+        weights["horizon_mse"] * l_hor
+        + weights["direct_mse"]  * l_direct
+        + weights["focal_72h"]   * l_focal
+        + weights["shape"]       * l_shape
+        + weights["heading"]     * l_head
+        + weights["steering"]    * l_steer
     )
 
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
 
     return dict(
-        total           = total,
-        mse_hav_horizon = l_mse_hor.item(),
-        multi_scale     = l_multi.item(),
-        endpoint        = l_endpt.item(),
-        hard_72h        = l_hard72.item(),
-        direct_mse      = l_direct.item(),
-        shape           = l_shape.item(),
-        heading         = l_head.item(),
-        steering        = l_steer.item(),
+        total       = total,
+        # Tên key khớp với log format trong train script
+        mse_hav     = l_hor.item(),
+        direct_mse  = l_direct.item(),
+        hard_72h    = l_focal.item(),
+        multi_scale = 0.0,       # không dùng nữa nhưng giữ key để log không lỗi
+        endpoint    = 0.0,
+        shape       = l_shape.item(),
+        heading     = l_head.item(),
+        steering    = l_steer.item(),
+        # keys cũ để tương thích với flow_matching_model.py
+        mse_hav_horizon = l_hor.item(),
+        velocity    = 0.0,
+        recurv      = 0.0,
     )
