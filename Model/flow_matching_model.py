@@ -7777,8 +7777,8 @@ class TCFlowMatching(nn.Module):
         x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
 
         # Scheduled teacher forcing
-        if self.teacher_forcing and self.training and epoch >= 3:
-            p_teacher = max(0.0, 0.5 * (1.0 - (epoch - 3) / 37.0))
+        if self.teacher_forcing and self.training and epoch >= 6:
+            p_teacher = max(0.0, 0.5 * (1.0 - (epoch - 6) / 34.0))
             if p_teacher > 0 and torch.rand(1).item() < p_teacher:
                 far_mask = torch.zeros_like(x_t)
                 far_mask[:, 6:, :] = 0.3
