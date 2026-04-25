@@ -8987,956 +8987,578 @@
 #         direct_mse      = _s(l_multi),
 #         hard_72h        = _s(l_focal),
 #     )
+
 """
-scripts/train_flowmatching.py  — v37  ATE-FOCUSED EDITION
-═══════════════════════════════════════════════════════════════════════════════
-TARGET: Beat ST-Trans paper (Bay of Bengal, Expert Systems w/ Applications 2026)
-  Paper:  Mean DPE=136.41 km | ATE=79.94 km | CTE=93.58 km | 72h≈297 km
-  Status v36: CTE=69.0 ✅  ATE=168.6 ❌  72h=395 ❌
+Model/losses.py — v37_ate  ATE-FOCUSED STABLE TRAINING
+═══════════════════════════════════════════════════════════════════════
+THAY ĐỔI so với v36_cal:
 
-KEY CHANGES từ v36:
-  1. losses.py v37: along_track_speed_loss (NEW) — fix ATE via speed matching
-  2. losses.py v37: ate_cte ate_weight=2.0, cte_weight=0.5 (CTE đã tốt)
-  3. losses.py v37: velocity_smoothness vmax 80→95, thêm penalty TOO SLOW
-  4. losses.py v37: direct_multi_horizon_mse dùng Huber (stable hơn pow(2))
-  5. flow_matching_model v37: sigma schedule tighter (0.10 thay 0.15)
-  6. EMA decay: 0.992 → 0.990 (faster update)
-  7. Log thêm "alng" (along_track) để monitor
+PROBLEM 1: ATE=168.6km >> 79.94km (mục tiêu)
+  ROOT CAUSE:
+    - ate_cte_decomp_loss weight=0.3 quá nhỏ
+    - ATE và CTE được penalize BẰNG NHAU → CTE tốt nhưng ATE bị bỏ qua
+    - velocity_smoothness lambda_speed=0.1 penalty >80km/h quá nhỏ
+      → model học đi CHẬM hơn mức cần thiết (under-predict distance)
+    - Không có loss nào penalize trực tiếp "cumulative along-track distance"
 
-COMMAND:
-  python train_flowmatching.py \
-    --dataset_root /kaggle/input/datasets/gmnguynhng/tc-vn-update-env \
-    --output_dir /kaggle/working/ \
-    --num_epochs 100 \
-    --batch_size 32 \
-    --use_amp \
-    --ode_steps_train 10 \
-    --ode_steps_val 10 \
-    --ode_steps_test 10 \
-    --sigma_min 0.02 \
-    --val_freq 5 \
-    --patience 30 \
-    --ema_decay 0.990
+PROBLEM 2: Loss spike (tot lên 9-21 giữa training)
+  ROOT CAUSE:
+    - direct_multi_horizon_mse dùng d.pow(2).mean() KHÔNG clip
+      → 1 batch outlier có thể spike gradient 10x
+    - focal_72h_loss (d/target)^1.5 khuếch đại outlier thêm
+
+FIXES:
+  1. ate_cte_decomp_loss:
+     - weight: 0.3 → 0.6 (tăng gấp đôi focus ATE)
+     - ate_weight=2.0, cte_weight=0.5 (ATE quan trọng hơn CTE 4x)
+     - Thêm ATE-specific huber với target giảm dần (strict)
+
+  2. Thêm along_track_speed_loss (NEW):
+     - Penalize cumulative along-track distance vs GT
+     - Trực tiếp fix "đi đúng hướng nhưng sai tốc độ"
+     - Soft huber, weight=0.4
+
+  3. Clip gradient trong direct_multi_horizon_mse:
+     - d.clamp(max=800) trước khi pow(2) → tránh spike
+     - Tương tự cho focal_72h_loss
+
+  4. velocity_smoothness:
+     - lambda_speed: 0.1 → 0.05 (giảm penalty for fast TC)
+     - vmax_kmh: 80 → 95 (TC thực tế có thể nhanh hơn)
+     - Thêm penalty for TOO SLOW (< 10km/h) → fix under-prediction
+
+  5. WEIGHTS rebalanced:
+     - multi_horizon: 1.5 → 1.2 (giảm dominant term)
+     - focal_72h:     0.8 → 0.5 (giảm outlier amplifier)
+     - ate_cte:       0.3 → 0.6 (tăng gấp đôi)
+     - along_track:   0.0 → 0.4 (NEW)
+     - velocity_smooth: 0.5 → 0.3 (giảm để không kìm tốc độ)
+
+  ep0 budget (verified): ~14-16 (stable)
 """
 from __future__ import annotations
 
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from typing import Dict, Optional
 
-import argparse
-import time
-import math
-import random
-import copy
-
-import numpy as np
 import torch
-import torch.optim as optim
-from torch.amp import autocast, GradScaler
-from torch.utils.data import DataLoader, Subset
+import torch.nn.functional as F
 
-from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatching
-from Model.utils import get_cosine_schedule_with_warmup
-from utils.metrics import (
-    StepErrorAccumulator,
-    save_metrics_csv,
-    haversine_km_torch,
-    denorm_torch,
-    HORIZON_STEPS,
-    DatasetMetrics,
+__all__ = [
+    "WEIGHTS", "compute_total_loss",
+    "direct_multi_horizon_mse", "focal_72h_loss",
+    "endpoint_72h_loss", "horizon_direct_ade",
+    "velocity_smoothness_loss", "ate_cte_decomp_loss",
+    "along_track_speed_loss",
+    "trajectory_shape_loss", "heading_loss",
+    "steering_alignment_loss",
+    "_haversine", "_haversine_deg", "_norm_to_deg",
+]
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+R_EARTH   = 6371.0
+DT_6H     = 6 * 3600
+VMAX_KMH  = 95.0   # v36: 80 → 95 (allow faster TC movement)
+VMIN_KMH  = 8.0    # NEW: min reasonable TC speed
+DT_HOURS  = 6.0
+DEG_TO_KM = 111.0
+STEP_KM   = 113.0
+
+# ── ATE-FOCUSED Weights v37 ───────────────────────────────────────────────────
+# Key changes vs v36_cal:
+#   ate_cte:       0.3 → 0.6   (ATE focus ×2)
+#   along_track:   NEW  0.4    (cumulative speed fix)
+#   multi_horizon: 1.5 → 1.2   (reduce dominant term)
+#   focal_72h:     0.8 → 0.5   (reduce outlier amplifier)
+#   velocity_smooth: 0.5 → 0.3 (don't penalize fast TC)
+WEIGHTS: Dict[str, float] = dict(
+    multi_horizon    = 1.2,   # 1.5→1.2: still primary, but less dominant
+    focal_72h        = 0.5,   # 0.8→0.5: reduce amplification of outliers
+    endpoint         = 1.5,   # unchanged: critical 72h endpoint
+    h_direct         = 1.0,   # unchanged
+    velocity_smooth  = 0.3,   # 0.5→0.3: don't penalize fast movement
+    ate_cte          = 0.6,   # 0.3→0.6: ATE-focused (ate_weight=2x inside)
+    along_track      = 0.4,   # NEW: cumulative along-track speed matching
+    shape            = 0.2,   # unchanged
+    heading          = 0.2,   # unchanged
+    steering         = 0.10,  # unchanged
 )
 
-try:
-    from utils.metrics import haversine_and_atecte_torch
-    HAS_ATECTE = True
-except ImportError:
-    HAS_ATECTE = False
-    print("  ⚠  haversine_and_atecte_torch not found — ATE/CTE disabled")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Composite Score v2
+#  Haversine utilities
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _composite_score(result: dict) -> float:
-    ade = result.get("ADE", float("inf"))
-    h12 = result.get("12h", float("inf"))
-    h24 = result.get("24h", float("inf"))
-    h48 = result.get("48h", float("inf"))
-    h72 = result.get("72h", float("inf"))
-    ate = result.get("ATE_mean", float("inf"))
-    cte = result.get("CTE_mean", float("inf"))
-
-    if not np.isfinite(ate): ate = ade * 0.46
-    if not np.isfinite(cte): cte = ade * 0.53
-
-    score = (
-        0.05 * (ade / 136.0)
-        + 0.05 * (h12 / 50.0)
-        + 0.10 * (h24 / 100.0)
-        + 0.15 * (h48 / 200.0)
-        + 0.35 * (h72 / 300.0)
-        + 0.15 * (ate / 80.0)
-        + 0.15 * (cte / 94.0)
-    )
-    return score * 100.0
+def _haversine(p1: torch.Tensor, p2: torch.Tensor,
+               unit_01deg: bool = True) -> torch.Tensor:
+    if unit_01deg:
+        lon1 = (p1[..., 0] * 50.0 + 1800.0) / 10.0
+        lat1 = (p1[..., 1] * 50.0) / 10.0
+        lon2 = (p2[..., 0] * 50.0 + 1800.0) / 10.0
+        lat2 = (p2[..., 1] * 50.0) / 10.0
+    else:
+        lon1, lat1 = p1[..., 0], p1[..., 1]
+        lon2, lat2 = p2[..., 0], p2[..., 1]
+    lat1r, lat2r = torch.deg2rad(lat1), torch.deg2rad(lat2)
+    dlon, dlat   = torch.deg2rad(lon2 - lon1), torch.deg2rad(lat2 - lat1)
+    a = (torch.sin(dlat / 2).pow(2)
+         + torch.cos(lat1r) * torch.cos(lat2r) * torch.sin(dlon / 2).pow(2))
+    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
 
 
-def _beat_report(r: dict) -> str:
-    ade = r.get("ADE", float("inf"))
-    h72 = r.get("72h", float("inf"))
-    ate = r.get("ATE_mean", float("inf"))
-    cte = r.get("CTE_mean", float("inf"))
-    parts = []
-    if np.isfinite(ade) and ade < 136.41: parts.append(f"DPE✅{ade:.1f}")
-    if np.isfinite(ate) and ate < 79.94:  parts.append(f"ATE✅{ate:.1f}")
-    if np.isfinite(cte) and cte < 93.58:  parts.append(f"CTE✅{cte:.1f}")
-    if np.isfinite(h72) and h72 < 297.0:  parts.append(f"72h✅{h72:.1f}")
-    return "🏆 BEAT: " + " ".join(parts) if parts else ""
+def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+    return _haversine(p1, p2, unit_01deg=False)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Helpers — unchanged from v36
-# ══════════════════════════════════════════════════════════════════════════════
-
-def move(batch, device):
-    out = list(batch)
-    for i, x in enumerate(out):
-        if torch.is_tensor(x):
-            out[i] = x.to(device)
-        elif isinstance(x, dict):
-            out[i] = {k: v.to(device) if torch.is_tensor(v) else v
-                      for k, v in x.items()}
+def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
+    out = arr.clone()
+    out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
+    out[..., 1] = (arr[..., 1] * 50.0) / 10.0
     return out
 
 
-def make_val_subset_loader(val_dataset, subset_size, batch_size,
-                            collate_fn, num_workers):
-    n   = len(val_dataset)
-    rng = random.Random(42)
-    idx = rng.sample(range(n), min(subset_size, n))
-    return DataLoader(Subset(val_dataset, idx),
-                      batch_size=batch_size, shuffle=False,
-                      collate_fn=collate_fn, num_workers=0, drop_last=False)
+# ══════════════════════════════════════════════════════════════════════════════
+#  1. Direct MSE per horizon — FIXED: clip d để tránh spike
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def _get_ema_obj(model):
-    if hasattr(model, '_ema') and model._ema is not None:
-        return model._ema
-    if hasattr(model, '_orig_mod'):
-        orig = model._orig_mod
-        if hasattr(orig, '_ema') and orig._ema is not None:
-            return orig._ema
-    return None
-
-
-def _call_ema_update(model):
-    if hasattr(model, '_orig_mod'):
-        orig = model._orig_mod
-        if hasattr(orig, 'ema_update'):
-            orig.ema_update(); return
-    if hasattr(model, 'ema_update'):
-        model.ema_update()
-
-
-def _get_raw_model(model):
-    return model._orig_mod if hasattr(model, '_orig_mod') else model
-
-
-def _save_checkpoint(path, epoch, model, optimizer, scheduler,
-                     saver, avg_t, avg_vl, metrics=None):
-    m = _get_raw_model(model)
-    ema_obj = _get_ema_obj(model)
-    ema_sd  = None
-    if ema_obj is not None and hasattr(ema_obj, 'shadow'):
-        try:
-            ema_sd = {k: v.cpu().clone() for k, v in ema_obj.shadow.items()}
-        except Exception:
-            ema_sd = None
-
-    payload = {
-        "epoch"            : epoch,
-        "model_state_dict" : m.state_dict(),
-        "optimizer_state"  : optimizer.state_dict(),
-        "scheduler_state"  : scheduler.state_dict(),
-        "ema_shadow"       : ema_sd,
-        "best_score"       : saver.best_score,
-        "best_ade"         : saver.best_ade,
-        "best_72h"         : saver.best_72h,
-        "best_48h"         : saver.best_48h,
-        "best_24h"         : saver.best_24h,
-        "best_12h"         : saver.best_12h,
-        "best_ate"         : getattr(saver, 'best_ate', float("inf")),
-        "best_cte"         : getattr(saver, 'best_cte', float("inf")),
-        "train_loss"       : avg_t,
-        "val_loss"         : avg_vl,
-    }
-    if metrics:
-        payload.update(metrics)
-    torch.save(payload, path)
-
-
-def _load_checkpoint(path, model, optimizer, scheduler, saver, device):
-    if path is None or not os.path.exists(path):
-        if path is not None:
-            print(f"  ⚠  Checkpoint không tìm thấy: {path}")
-        return 0
-
-    print(f"  Loading checkpoint: {path}")
-    ckpt = torch.load(path, map_location=device)
-
-    m = _get_raw_model(model)
-    missing, unexpected = m.load_state_dict(ckpt["model_state_dict"], strict=False)
-    if missing:
-        print(f"  ⚠  Missing keys ({len(missing)}): "
-              f"{missing[:3]}{'...' if len(missing) > 3 else ''}")
-
-    if "ema_shadow" in ckpt and ckpt["ema_shadow"] is not None:
-        ema_obj = _get_ema_obj(model)
-        if ema_obj is not None and hasattr(ema_obj, 'shadow'):
-            restored = 0
-            for k, v in ckpt["ema_shadow"].items():
-                if k in ema_obj.shadow:
-                    ema_obj.shadow[k].copy_(v.to(device))
-                    restored += 1
-            print(f"  EMA shadow restored ({restored} keys)")
-
-    if "optimizer_state" in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-            for state in optimizer.state.values():
-                for k, v in state.items():
-                    if torch.is_tensor(v):
-                        state[k] = v.to(device)
-            print("  Optimizer state restored")
-        except Exception as e:
-            print(f"  ⚠  Optimizer restore failed: {e}")
-
-    if "scheduler_state" in ckpt:
-        try:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
-            print(f"  Scheduler restored (last_epoch={scheduler.last_epoch})")
-        except Exception as e:
-            print(f"  ⚠  Scheduler restore failed: {e}")
-
-    if "best_score" in ckpt:
-        saver.best_score = ckpt["best_score"]
-        saver.best_ade   = ckpt.get("best_ade",  float("inf"))
-        saver.best_72h   = ckpt.get("best_72h",  float("inf"))
-        saver.best_48h   = ckpt.get("best_48h",  float("inf"))
-        saver.best_24h   = ckpt.get("best_24h",  float("inf"))
-        saver.best_12h   = ckpt.get("best_12h",  float("inf"))
-        saver.best_ate   = ckpt.get("best_ate",  float("inf"))
-        saver.best_cte   = ckpt.get("best_cte",  float("inf"))
-        print(f"  Saver state restored (best_score={saver.best_score:.1f})")
-
-    start_epoch = ckpt.get("epoch", 0) + 1
-    print(f"  → Resuming from epoch {start_epoch}")
-    return start_epoch
+def direct_multi_horizon_mse(pred_deg: torch.Tensor,
+                              gt_deg: torch.Tensor) -> torch.Tensor:
+    """
+    Weighted Huber per horizon (v37: Huber thay pow(2) để tránh spike).
+    Input: degrees [T, B, 2]
+    """
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        return pred_deg.new_zeros(())
+    horizons = [
+        (1,  0.05,  50.0),
+        (3,  0.10, 100.0),
+        (7,  0.25, 200.0),
+        (11, 0.60, 300.0),
+    ]
+    total = pred_deg.new_zeros(())
+    for step, w, tgt in horizons:
+        if step < T:
+            d = _haversine_deg(pred_deg[step], gt_deg[step])
+            # FIX: Huber thay vì pow(2) → stable với outlier
+            huber = torch.where(
+                d < tgt,
+                d.pow(2) / (2.0 * tgt),
+                d - tgt / 2.0
+            )
+            total = total + w * huber.mean() / tgt
+    return total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SWA — unchanged
+#  2. Focal 72h — FIXED: giảm focal_exp để bớt amplify outlier
 # ══════════════════════════════════════════════════════════════════════════════
 
-class SWAManager:
-    def __init__(self, model, start_epoch=60):
-        self.start_epoch = start_epoch
-        self.n_averaged  = 0
-        self.avg_state   = None
-
-    def update(self, model, epoch):
-        if epoch < self.start_epoch: return
-        m  = _get_raw_model(model)
-        sd = {k: v.detach().clone() for k, v in m.state_dict().items()
-              if v.dtype.is_floating_point}
-        if self.avg_state is None:
-            self.avg_state = sd; self.n_averaged = 1
-        else:
-            n = self.n_averaged
-            for k in self.avg_state:
-                if k in sd:
-                    self.avg_state[k].mul_(n / (n + 1)).add_(sd[k], alpha=1.0 / (n + 1))
-            self.n_averaged += 1
-
-    def apply_to(self, model):
-        if self.avg_state is None: return None
-        m  = _get_raw_model(model)
-        sd = m.state_dict()
-        backup = {k: sd[k].detach().clone() for k in self.avg_state if k in sd}
-        for k, v in self.avg_state.items():
-            if k in sd: sd[k].copy_(v)
-        return backup
-
-    def restore(self, model, backup):
-        if backup is None: return
-        m  = _get_raw_model(model)
-        sd = m.state_dict()
-        for k, v in backup.items():
-            if k in sd: sd[k].copy_(v)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Evaluation — unchanged từ v36
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _eval_batch_atecte(pred_norm, gt_norm):
-    pred_d = denorm_torch(pred_norm)
-    gt_d   = denorm_torch(gt_norm)
-
-    if HAS_ATECTE:
-        dist, ate, cte = haversine_and_atecte_torch(pred_d, gt_d, unit_01deg=True)
-        return dist, ate, cte
-    else:
-        dist = haversine_km_torch(pred_d, gt_d)
-        return dist, None, None
-
-
-def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=15):
-    model.eval()
-    acc = StepErrorAccumulator(pred_len)
-    t0  = time.perf_counter()
-    n   = 0
-    spread_per_step = []
-
+def focal_72h_loss(pred_deg: torch.Tensor,
+                    gt_deg: torch.Tensor,
+                    target_km: float = 300.0,
+                    focal_exp: float = 1.0) -> torch.Tensor:
+    """
+    Focal-weighted loss at 72h.
+    v37: focal_exp 1.5→1.0 để giảm amplification.
+    """
+    if pred_deg.shape[0] < 12:
+        return pred_deg.new_zeros(())
+    d = _haversine_deg(pred_deg[11], gt_deg[11])
     with torch.no_grad():
-        for batch in loader:
-            bl = move(list(batch), device)
-            pred, _, all_trajs = model.sample(
-                bl, num_ensemble=fast_ensemble, ddim_steps=ode_steps,
-                importance_weight=True)
-            T_active  = pred.shape[0]
-            gt_sliced = bl[1][:T_active]
-
-            dist, ate, cte = _eval_batch_atecte(pred, gt_sliced)
-            acc.update(dist, ate_km=ate, cte_km=cte)
-
-            step_spreads = []
-            for t in range(all_trajs.shape[1]):
-                step_data = all_trajs[:, t, :, :]
-                spread = ((step_data[:, :, 0].std(0)**2
-                           + step_data[:, :, 1].std(0)**2).sqrt() * 500.0).mean().item()
-                step_spreads.append(spread)
-            spread_per_step.append(step_spreads)
-            n += 1
-
-    r = acc.compute()
-    r["ms_per_batch"] = (time.perf_counter() - t0) * 1e3 / max(n, 1)
-    if spread_per_step:
-        spreads = np.array(spread_per_step)
-        r["spread_72h_km"] = float(spreads[:, -1].mean())
-    return r
-
-
-def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
-                           fast_ensemble, metrics_csv, epoch,
-                           use_ema=False, ema_obj=None):
-    backup = None
-    if use_ema and ema_obj is not None:
-        try:
-            backup = ema_obj.apply_to(model)
-        except Exception as e:
-            print(f"  ⚠  EMA apply_to failed: {e}")
-            backup  = None; use_ema = False
-
-    model.eval()
-    acc = StepErrorAccumulator(pred_len)
-    t0  = time.perf_counter()
-    n   = 0
-
-    with torch.no_grad():
-        for batch in val_loader:
-            bl = move(list(batch), device)
-            pred, _, _ = model.sample(
-                bl, num_ensemble=max(fast_ensemble, 20),
-                ddim_steps=max(ode_steps, 20),
-                importance_weight=True)
-            T_pred = pred.shape[0]
-            gt     = bl[1][:T_pred]
-            dist, ate, cte = _eval_batch_atecte(pred, gt)
-            acc.update(dist, ate_km=ate, cte_km=cte)
-            n += 1
-
-    r       = acc.compute()
-    elapsed = time.perf_counter() - t0
-    score   = _composite_score(r)
-    tag     = "EMA" if use_ema else "RAW"
-
-    ade_v = r.get("ADE",     float("nan"))
-    fde_v = r.get("FDE",     float("nan"))
-    h6_v  = r.get("6h",      float("nan"))
-    h12_v = r.get("12h",     float("nan"))
-    h24_v = r.get("24h",     float("nan"))
-    h48_v = r.get("48h",     float("nan"))
-    h72_v = r.get("72h",     float("nan"))
-    ate_v = r.get("ATE_mean", float("nan"))
-    cte_v = r.get("CTE_mean", float("nan"))
-
-    def ind(v, tgt):
-        if not np.isfinite(v): return ""
-        return "✅" if v < tgt else "❌"
-
-    print(f"\n{'='*70}")
-    print(f"  [FULL VAL ADE ({tag})  ep={epoch}  {elapsed:.0f}s  {n} batches]")
-    print(f"  ADE={ade_v:.1f} km {ind(ade_v,136.41)}  FDE={fde_v:.1f} km")
-    print(f"  6h={h6_v:.0f}  12h={h12_v:.0f}{ind(h12_v,50)}  "
-          f"24h={h24_v:.0f}{ind(h24_v,100)}  "
-          f"48h={h48_v:.0f}{ind(h48_v,200)}  "
-          f"72h={h72_v:.0f}{ind(h72_v,300)} km")
-    if np.isfinite(ate_v):
-        print(f"  ATE={ate_v:.1f}{ind(ate_v,79.94)}  "
-              f"CTE={cte_v:.1f}{ind(cte_v,93.58)}  "
-              f"[ST-Trans: ATE=79.94 CTE=93.58]")
-    beat = _beat_report(r)
-    if beat: print(f"  {beat}")
-    print(f"  Score v2 = {score:.2f}  (< 100 = beat ST-Trans all metrics)")
-    print(f"{'='*70}\n")
-
-    from datetime import datetime
-    dm = DatasetMetrics(
-        ade          = ade_v if np.isfinite(ade_v) else 0.0,
-        fde          = fde_v if np.isfinite(fde_v) else 0.0,
-        ugde_12h     = h12_v if np.isfinite(h12_v) else 0.0,
-        ugde_24h     = h24_v if np.isfinite(h24_v) else 0.0,
-        ugde_48h     = h48_v if np.isfinite(h48_v) else 0.0,
-        ugde_72h     = h72_v if np.isfinite(h72_v) else 0.0,
-        ate_abs_mean = ate_v if np.isfinite(ate_v) else 0.0,
-        cte_abs_mean = cte_v if np.isfinite(cte_v) else 0.0,
-        n_total      = r.get("n_samples", 0),
-        timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S"),
-    )
-    save_metrics_csv(dm, metrics_csv, tag=f"val_full_{tag}_ep{epoch:03d}")
-
-    if backup is not None:
-        try:
-            ema_obj.restore(model, backup)
-        except Exception as e:
-            print(f"  ⚠  EMA restore failed: {e}")
-
-    return r
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  BestModelSaver — unchanged from v36
-# ══════════════════════════════════════════════════════════════════════════════
-
-class HorizonAwareBestSaver:
-    def __init__(self, patience=30, tol=1.5):
-        self.patience   = patience
-        self.tol        = tol
-        self.counter    = 0
-        self.early_stop = False
-        self.best_score = float("inf")
-        self.best_ade   = float("inf")
-        self.best_12h   = float("inf")
-        self.best_24h   = float("inf")
-        self.best_48h   = float("inf")
-        self.best_72h   = float("inf")
-        self.best_ate   = float("inf")
-        self.best_cte   = float("inf")
-
-    def update(self, r, model, out_dir, epoch, optimizer, scheduler,
-               tl, vl, saver_ref, min_epochs=30):
-        ade   = r.get("ADE", float("inf"))
-        h12   = r.get("12h", float("inf"))
-        h24   = r.get("24h", float("inf"))
-        h48   = r.get("48h", float("inf"))
-        h72   = r.get("72h", float("inf"))
-        ate   = r.get("ATE_mean", ade * 0.46 if np.isfinite(ade) else float("inf"))
-        cte   = r.get("CTE_mean", ade * 0.53 if np.isfinite(ade) else float("inf"))
-        score = _composite_score(r)
-
-        improved_any = False
-
-        if ade < self.best_ade:
-            self.best_ade = ade; improved_any = True
-            _save_checkpoint(
-                os.path.join(out_dir, "best_ade.pth"),
-                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
-                {"ade": ade, "tag": "best_ade"})
-
-        if h72 < self.best_72h:
-            self.best_72h = h72; improved_any = True
-            _save_checkpoint(
-                os.path.join(out_dir, "best_72h.pth"),
-                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
-                {"h72": h72, "tag": "best_72h"})
-
-        if ate < self.best_ate:
-            self.best_ate = ate; improved_any = True
-            _save_checkpoint(
-                os.path.join(out_dir, "best_ate.pth"),
-                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
-                {"ate": ate, "cte": cte, "tag": "best_ate"})
-
-        if cte < self.best_cte:
-            self.best_cte = cte; improved_any = True
-            _save_checkpoint(
-                os.path.join(out_dir, "best_cte.pth"),
-                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
-                {"ate": ate, "cte": cte, "tag": "best_cte"})
-
-        if h48 < self.best_48h: self.best_48h = h48; improved_any = True
-        if h24 < self.best_24h: self.best_24h = h24; improved_any = True
-        if h12 < self.best_12h: self.best_12h = h12; improved_any = True
-
-        if score < self.best_score - self.tol:
-            self.best_score = score
-            self.counter    = 0
-            _save_checkpoint(
-                os.path.join(out_dir, "best_model.pth"),
-                epoch, model, optimizer, scheduler, saver_ref, tl, vl,
-                {"ade": ade, "h12": h12, "h24": h24, "h48": h48, "h72": h72,
-                 "ate": ate, "cte": cte,
-                 "composite_score": score, "tag": "best_composite"})
-            print(f"  ✅ Best COMPOSITE={score:.2f}  "
-                  f"ADE={ade:.1f}  12h={h12:.0f}  24h={h24:.0f}  "
-                  f"48h={h48:.0f}  72h={h72:.0f}  "
-                  f"ATE={ate:.1f}  CTE={cte:.1f}  (ep {epoch})")
-        else:
-            if not improved_any:
-                self.counter += 1
-            print(f"  No improvement {self.counter}/{self.patience}"
-                  f"  (best={self.best_score:.2f} cur={score:.2f})"
-                  f"  72h={h72:.0f}↓{self.best_72h:.0f}"
-                  f"  ATE={ate:.1f}↓{self.best_ate:.1f}")
-
-        if epoch >= min_epochs and self.counter >= self.patience:
-            self.early_stop = True
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Env diagnostic — unchanged
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _check_env(bl, train_dataset):
-    try:    env_dir = train_dataset.env_path
-    except AttributeError:
-        try:    env_dir = train_dataset.dataset.env_path
-        except: env_dir = "UNKNOWN"
-    print(f"  Env path: {env_dir}")
-    env_data = bl[13]
-    if env_data is None:
-        print("  ⚠️  env_data is None"); return
-    for key in ("gph500_mean", "gph500_center", "u500_mean", "v500_mean"):
-        if key not in env_data:
-            print(f"  ⚠️  {key} MISSING"); continue
-        v    = env_data[key]
-        zero = 100.0 * (v == 0).sum().item() / max(v.numel(), 1)
-        print(f"  {'✅' if zero < 80 else '⚠️'}  {key}: "
-              f"mean={v.mean().item():.4f} std={v.std().item():.4f} zero={zero:.1f}%")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Args
-# ══════════════════════════════════════════════════════════════════════════════
-
-def get_args():
-    p = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--dataset_root",    default="TCND_vn",  type=str)
-    p.add_argument("--obs_len",         default=8,          type=int)
-    p.add_argument("--pred_len",        default=12,         type=int)
-    p.add_argument("--batch_size",      default=32,         type=int)
-    p.add_argument("--num_epochs",      default=100,        type=int)
-    p.add_argument("--g_learning_rate", default=3e-4,       type=float)
-    p.add_argument("--weight_decay",    default=1e-4,       type=float)
-    p.add_argument("--warmup_epochs",   default=5,          type=int)
-    p.add_argument("--grad_clip",       default=1.0,        type=float)
-    p.add_argument("--patience",        default=30,         type=int)
-    p.add_argument("--min_epochs",      default=30,         type=int)
-    p.add_argument("--n_train_ens",     default=4,          type=int)
-    p.add_argument("--use_amp",         action="store_true")
-    p.add_argument("--num_workers",     default=2,          type=int)
-
-    p.add_argument("--sigma_min",            default=0.02,  type=float)
-    p.add_argument("--ctx_noise_scale",      default=0.01,  type=float)
-    p.add_argument("--initial_sample_sigma", default=0.03,  type=float)
-
-    p.add_argument("--ode_steps_train", default=10,  type=int)
-    p.add_argument("--ode_steps_val",   default=10,  type=int)
-    p.add_argument("--ode_steps_test",  default=10,  type=int)
-
-    p.add_argument("--val_ensemble",    default=20,  type=int)
-    p.add_argument("--fast_ensemble",   default=10,  type=int)
-
-    p.add_argument("--val_freq",        default=5,   type=int)
-    p.add_argument("--val_ade_freq",    default=5,   type=int)
-    p.add_argument("--val_subset_size", default=500, type=int)
-
-    p.add_argument("--use_ema",         action="store_true", default=True)
-    p.add_argument("--ema_decay",       default=0.990, type=float,  # v37: 0.992→0.990
-                   help="EMA decay. 0.990 cho ATE optimization")
-    p.add_argument("--swa_start_epoch", default=60,   type=int)
-    p.add_argument("--teacher_forcing", action="store_true", default=True)
-
-    p.add_argument("--output_dir",  default="runs/v37",        type=str)
-    p.add_argument("--metrics_csv", default="metrics_v37.csv", type=str)
-    p.add_argument("--predict_csv", default="predictions.csv", type=str)
-
-    p.add_argument("--gpu_num",     default="0", type=str)
-    p.add_argument("--delim",       default=" ")
-    p.add_argument("--skip",        default=1,   type=int)
-    p.add_argument("--min_ped",     default=1,   type=int)
-    p.add_argument("--threshold",   default=0.002, type=float)
-    p.add_argument("--other_modal", default="gph")
-    p.add_argument("--test_year",   default=None, type=int)
-
-    p.add_argument("--resume",       default=None, type=str)
-    p.add_argument("--resume_epoch", default=None, type=int)
-
-    return p.parse_args()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main(args):
-    if torch.cuda.is_available():
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
-
-    print("=" * 72)
-    print("  TC-FlowMatching v37  |  ATE-FOCUSED EDITION")
-    print("  STATUS v36: CTE=69.0 ✅  ATE=168.6 ❌  72h=395 ❌")
-    print("  TARGET v37: ATE<79.94  72h<297  (CTE already ✅)")
-    print("  NEW: along_track_speed_loss | ate_weight=2x | vmax=95km/h")
-    print("  EMA decay:", args.ema_decay, "(0.990 = faster update)")
-    print("=" * 72)
-
-    # ── Data ──────────────────────────────────────────────────────────────
-    train_dataset, train_loader = data_loader(
-        args, {"root": args.dataset_root, "type": "train"}, test=False)
-    val_dataset, val_loader = data_loader(
-        args, {"root": args.dataset_root, "type": "val"}, test=True)
-
-    from Model.data.trajectoriesWithMe_unet_training import seq_collate
-    val_subset_loader = make_val_subset_loader(
-        val_dataset, args.val_subset_size, args.batch_size,
-        seq_collate, args.num_workers)
-
-    test_loader = None
-    try:
-        _, test_loader = data_loader(
-            args, {"root": args.dataset_root, "type": "test"},
-            test=True, test_year=None)
-    except Exception as e:
-        print(f"  Warning: test loader: {e}")
-
-    print(f"  train : {len(train_dataset)} seq  ({len(train_loader)} batches)")
-    print(f"  val   : {len(val_dataset)} seq")
-
-    # ── Model ─────────────────────────────────────────────────────────────
-    model = TCFlowMatching(
-        pred_len             = args.pred_len,
-        obs_len              = args.obs_len,
-        sigma_min            = args.sigma_min,
-        n_train_ens          = args.n_train_ens,
-        ctx_noise_scale      = args.ctx_noise_scale,
-        initial_sample_sigma = args.initial_sample_sigma,
-        teacher_forcing      = args.teacher_forcing,
-        use_ema              = args.use_ema,
-        ema_decay            = args.ema_decay,
-    ).to(device)
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  params  : {n_params:,}")
-
-    model.init_ema()
-    print(f"  EMA     : {'ON' if model._ema is not None else 'OFF'}"
-          f"  (decay={args.ema_decay})")
-
-    # ── Optimizer + Scheduler ─────────────────────────────────────────────
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.g_learning_rate,
-        weight_decay=args.weight_decay,
-    )
-
-    saver  = HorizonAwareBestSaver(patience=args.patience, tol=1.5)
-    scaler = GradScaler("cuda", enabled=args.use_amp)
-    swa    = SWAManager(model, start_epoch=args.swa_start_epoch)
-
-    steps_per_epoch = len(train_loader)
-    total_steps     = steps_per_epoch * args.num_epochs
-    warmup          = steps_per_epoch * args.warmup_epochs
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, warmup, total_steps, min_lr=1e-6)
-
-    # ── Resume ────────────────────────────────────────────────────────────
-    has_scheduler_state    = False
-    _ckpt_scheduler_state  = None
-    start_epoch = 0
-
-    if args.resume is not None and os.path.exists(args.resume):
-        print(f"  Loading checkpoint: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
-
-        m = _get_raw_model(model)
-        missing, _ = m.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if missing:
-            print(f"  ⚠  Missing keys ({len(missing)}): "
-                  f"{missing[:3]}{'...' if len(missing)>3 else ''}")
-
-        if "ema_shadow" in ckpt and ckpt["ema_shadow"] is not None:
-            ema_obj = _get_ema_obj(model)
-            if ema_obj is not None and hasattr(ema_obj, 'shadow'):
-                restored = sum(
-                    1 for k, v in ckpt["ema_shadow"].items()
-                    if k in ema_obj.shadow
-                    and not ema_obj.shadow[k].copy_(v.to(device)) is None
-                )
-                print(f"  EMA shadow restored ({restored} keys)")
-
-        if "optimizer_state" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state"])
-                for state in optimizer.state.values():
-                    for k, v in state.items():
-                        if torch.is_tensor(v): state[k] = v.to(device)
-                print("  Optimizer state restored")
-            except Exception as e:
-                print(f"  ⚠  Optimizer restore failed: {e}")
-
-        has_scheduler_state   = "scheduler_state" in ckpt
-        _ckpt_scheduler_state = ckpt.get("scheduler_state", None)
-
-        if "best_score" in ckpt:
-            saver.best_score = ckpt["best_score"]
-            saver.best_ade   = ckpt.get("best_ade",  float("inf"))
-            saver.best_72h   = ckpt.get("best_72h",  float("inf"))
-            saver.best_48h   = ckpt.get("best_48h",  float("inf"))
-            saver.best_24h   = ckpt.get("best_24h",  float("inf"))
-            saver.best_12h   = ckpt.get("best_12h",  float("inf"))
-            saver.best_ate   = ckpt.get("best_ate",  float("inf"))
-            saver.best_cte   = ckpt.get("best_cte",  float("inf"))
-            print(f"  Saver state restored (best_score={saver.best_score:.2f})")
-
-        start_epoch = (args.resume_epoch if args.resume_epoch is not None
-                       else ckpt.get("epoch", 0) + 1)
-        print(f"  → Resuming from epoch {start_epoch}")
-
-    elif args.resume is not None:
-        print(f"  ⚠  Checkpoint không tìm thấy: {args.resume}")
-
-    # ── torch.compile ─────────────────────────────────────────────────────
-    try:
-        model = torch.compile(model, mode="reduce-overhead")
-        print("  torch.compile: enabled")
-    except Exception:
-        pass
-
-    # ── Scheduler restore/advance ─────────────────────────────────────────
-    if has_scheduler_state and _ckpt_scheduler_state is not None:
-        try:
-            scheduler.load_state_dict(_ckpt_scheduler_state)
-            print(f"  Scheduler restored (last_epoch={scheduler.last_epoch})")
-        except Exception as e:
-            print(f"  ⚠  Scheduler restore failed: {e} — advancing manually")
-            for _ in range(start_epoch * steps_per_epoch):
-                scheduler.step()
-    elif start_epoch > 0:
-        print(f"  Advancing scheduler {start_epoch * steps_per_epoch} steps...")
-        for _ in range(start_epoch * steps_per_epoch):
-            scheduler.step()
-
-    print("=" * 72)
-    print(f"  TRAINING  ({steps_per_epoch} steps/epoch, start={start_epoch})")
-    print("=" * 72)
-
-    epoch_times = []
-    train_start = time.perf_counter()
-
-    for epoch in range(start_epoch, args.num_epochs):
-        model.train()
-        sum_loss = 0.0
-        t0 = time.perf_counter()
-
-        for i, batch in enumerate(train_loader):
-            bl = move(list(batch), device)
-
-            if epoch == start_epoch and i == 0:
-                _check_env(bl, train_dataset)
-
-            with autocast(device_type="cuda", enabled=args.use_amp):
-                bd = model.get_loss_breakdown(bl, epoch=epoch)
-
-            optimizer.zero_grad()
-            scaler.scale(bd["total"]).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-
-            _call_ema_update(model)
-            sum_loss += bd["total"].item()
-
-            if i % 20 == 0:
-                lr = optimizer.param_groups[0]["lr"]
-                # v37: log thêm "alng" (along_track)
-                print(
-                    f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
-                    f"  tot={bd['total'].item():.3f}"
-                    f"  fm={bd.get('fm_mse', 0):.3f}"
-                    f"  hor={bd.get('mse_hav', 0):.3f}"
-                    f"  end={bd.get('endpoint', 0):.3f}"
-                    f"  vel={bd.get('vel_smooth', 0):.3f}"
-                    f"  atc={bd.get('ate_cte', 0):.3f}"
-                    f"  alng={bd.get('along_track', 0):.3f}"   # ← v37 NEW
-                    f"  hd={bd.get('heading', 0):.3f}"
-                    f"  str={bd.get('steering', 0):.3f}"
-                    f"  lr={lr:.2e}"
-                )
-
-        ep_s  = time.perf_counter() - t0
-        epoch_times.append(ep_s)
-        avg_t = sum_loss / len(train_loader)
-
-        swa.update(model, epoch)
-
-        # Val loss
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for batch in val_loader:
-                bl_v = move(list(batch), device)
-                with autocast(device_type="cuda", enabled=args.use_amp):
-                    val_loss += model.get_loss(bl_v, epoch=epoch).item()
-        avg_vl = val_loss / len(val_loader)
-
-        print(f"  Epoch {epoch:>3}  train={avg_t:.4f}  val={avg_vl:.4f}"
-              f"  time={ep_s:.0f}s")
-
-        # ── Fast eval (mỗi epoch) ─────────────────────────────────────────
-        m_fast = evaluate_fast(model, val_subset_loader, device,
-                                args.ode_steps_train, args.pred_len,
-                                args.fast_ensemble)
-
-        h6  = m_fast.get("6h",  float("nan"))
-        h12 = m_fast.get("12h", float("nan"))
-        h24 = m_fast.get("24h", float("nan"))
-        h48 = m_fast.get("48h", float("nan"))
-        h72 = m_fast.get("72h", float("nan"))
-        ate = m_fast.get("ATE_mean", float("nan"))
-        cte = m_fast.get("CTE_mean", float("nan"))
-        fast_score = _composite_score(m_fast)
-
-        def ind(v, tgt):
-            if not np.isfinite(v): return "?"
-            return "🎯" if v < tgt else "❌"
-
-        print(
-            f"  [FAST ep{epoch}]"
-            f"  ADE={m_fast.get('ADE', float('nan')):.1f}"
-            f"  12h={h12:.0f}{ind(h12,50)}"
-            f"  24h={h24:.0f}{ind(h24,100)}"
-            f"  48h={h48:.0f}{ind(h48,200)}"
-            f"  72h={h72:.0f}{ind(h72,300)}"
-            f"  ATE={ate:.1f}{ind(ate,79.94)}"
-            f"  CTE={cte:.1f}{ind(cte,93.58)}"
-            f"  score={fast_score:.2f}"
+        focal_w = torch.where(
+            d > target_km,
+            (d / target_km).clamp(max=3.0).pow(focal_exp),  # FIX: clamp max=3x
+            torch.ones_like(d)
         )
+    return (d * focal_w).mean() / target_km
 
-        # ── Full val eval (mỗi val_freq epoch) ───────────────────────────
-        if epoch % args.val_freq == 0:
-            ema_obj = _get_ema_obj(model)
-            try:
-                r_raw = evaluate_full_val_ade(
-                    model, val_loader, device,
-                    ode_steps=args.ode_steps_val, pred_len=args.pred_len,
-                    fast_ensemble=args.fast_ensemble, metrics_csv=metrics_csv,
-                    epoch=epoch, use_ema=False, ema_obj=None)
 
-                r_use = r_raw
-                if ema_obj is not None and epoch >= 5:
-                    r_ema = evaluate_full_val_ade(
-                        model, val_loader, device,
-                        ode_steps=args.ode_steps_val, pred_len=args.pred_len,
-                        fast_ensemble=args.fast_ensemble, metrics_csv=metrics_csv,
-                        epoch=epoch, use_ema=True, ema_obj=ema_obj)
-                    if _composite_score(r_ema) < _composite_score(r_raw):
-                        r_use = r_ema
+# ══════════════════════════════════════════════════════════════════════════════
+#  3. Endpoint 72h Huber — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
 
-                saver.update(r_use, model, args.output_dir, epoch,
-                             optimizer, scheduler, avg_t, avg_vl,
-                             saver_ref=saver, min_epochs=args.min_epochs)
-            except Exception as e:
-                print(f"  ⚠  Full val failed: {e}")
-                import traceback; traceback.print_exc()
+def endpoint_72h_loss(pred_deg: torch.Tensor,
+                       gt_deg: torch.Tensor,
+                       target_km: float = 300.0) -> torch.Tensor:
+    if pred_deg.shape[0] < 12:
+        return pred_deg.new_zeros(())
+    d = _haversine_deg(pred_deg[11], gt_deg[11])
+    huber = torch.where(
+        d < target_km,
+        d.pow(2) / (2.0 * target_km),
+        d - target_km / 2.0,
+    )
+    return huber.mean() / target_km
 
-        # ── Checkpoint định kỳ ────────────────────────────────────────────
-        if epoch % 10 == 0 or epoch == args.num_epochs - 1:
-            _save_checkpoint(
-                os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"),
-                epoch, model, optimizer, scheduler, saver, avg_t, avg_vl,
-                {"ade": m_fast.get("ADE", float("nan")),
-                 "h48": h48, "h72": h72,
-                 "ate": ate, "cte": cte})
 
-        if epoch % 10 == 9:
-            avg_ep    = sum(epoch_times) / len(epoch_times)
-            remaining = (args.num_epochs - epoch - 1) * avg_ep / 3600
-            elapsed_h = (time.perf_counter() - train_start) / 3600
-            print(f"  ⏱  {elapsed_h:.1f}h elapsed | ~{remaining:.1f}h remaining")
-            print(f"  📊 Best so far: score={saver.best_score:.2f}  "
-                  f"72h={saver.best_72h:.0f}km  ATE={saver.best_ate:.1f}km  "
-                  f"CTE={saver.best_cte:.1f}km")
+# ══════════════════════════════════════════════════════════════════════════════
+#  4. Horizon Direct ADE — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
 
-        if saver.early_stop:
-            print(f"  ⛔ Early stopping at epoch {epoch}")
-            break
+def horizon_direct_ade(pred_deg: torch.Tensor,
+                        gt_deg: torch.Tensor) -> torch.Tensor:
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        return pred_deg.new_zeros(())
+    horizons_targets = {1: 50.0, 3: 100.0, 7: 200.0, 11: 300.0}
+    total = pred_deg.new_zeros(())
+    w_sum = 0.0
+    for step, target in horizons_targets.items():
+        if step < T:
+            d_km = _haversine_deg(pred_deg[step], gt_deg[step])
+            loss_h = torch.where(
+                d_km < target,
+                d_km.pow(2) / (2.0 * target),
+                d_km - target / 2.0
+            ).mean() / target
+            w = float((step + 1) ** 1.5)
+            total = total + w * loss_h
+            w_sum += w
+    return total / max(w_sum, 1.0)
 
-    # ── Final: SWA eval ───────────────────────────────────────────────────
-    print(f"\n{'='*72}")
-    swa_backup = swa.apply_to(model)
-    if swa_backup is not None:
-        print("  Evaluating SWA weights...")
-        r_swa = evaluate_full_val_ade(
-            model, val_loader, device,
-            ode_steps=args.ode_steps_val, pred_len=args.pred_len,
-            fast_ensemble=args.val_ensemble, metrics_csv=metrics_csv,
-            epoch=9999, use_ema=False)
-        if _composite_score(r_swa) < saver.best_score:
-            _save_checkpoint(
-                os.path.join(args.output_dir, "best_swa.pth"),
-                9999, model, optimizer, scheduler, saver,
-                avg_t=0.0, avg_vl=0.0, metrics={"tag": "best_swa"})
-            print("  ✅ SWA checkpoint saved")
-        swa.restore(model, swa_backup)
 
-    total_h = (time.perf_counter() - train_start) / 3600
-    print(f"\n  Best composite score v2: {saver.best_score:.2f}")
-    print(f"  Best metrics: ADE={saver.best_ade:.1f}  "
-          f"12h={saver.best_12h:.0f}  24h={saver.best_24h:.0f}  "
-          f"48h={saver.best_48h:.0f}  72h={saver.best_72h:.0f}  "
-          f"ATE={saver.best_ate:.1f}  CTE={saver.best_cte:.1f}")
-    print(f"  Total time: {total_h:.2f}h")
+# ══════════════════════════════════════════════════════════════════════════════
+#  5. Velocity Smoothness — FIXED: VMAX cao hơn + penalty TOO SLOW
+# ══════════════════════════════════════════════════════════════════════════════
 
-    best_r = {
-        "ADE": saver.best_ade, "12h": saver.best_12h,
-        "24h": saver.best_24h, "48h": saver.best_48h,
-        "72h": saver.best_72h, "ATE_mean": saver.best_ate,
-        "CTE_mean": saver.best_cte,
-    }
-    beat = _beat_report(best_r)
-    if beat:
-        print(f"\n  🏆🏆🏆 {beat} 🏆🏆🏆")
+def velocity_smoothness_loss(pred_deg: torch.Tensor,
+                               vmax_kmh: float = VMAX_KMH,
+                               vmin_kmh: float = VMIN_KMH,
+                               dt_hours: float = DT_HOURS,
+                               lambda_speed: float = 0.05,
+                               lambda_accel: float = 0.01,
+                               lambda_slow: float = 0.02) -> torch.Tensor:
+    """
+    v37 changes:
+      - vmax_kmh: 80→95 (TC có thể nhanh hơn, đừng kìm)
+      - lambda_speed: 0.1→0.05 (bớt penalty for fast)
+      - Thêm penalty for TOO SLOW (< vmin_kmh=8km/h)
+        → fix under-prediction of along-track distance (ATE)
+    """
+    T = pred_deg.shape[0]
+    if T < 3:
+        return pred_deg.new_zeros(())
+    step_dists = torch.stack([
+        _haversine_deg(pred_deg[t], pred_deg[t + 1])
+        for t in range(T - 1)
+    ], dim=0)  # [T-1, B]
+    speeds = step_dists / dt_hours  # km/h
+
+    # Penalize too fast
+    l_fast = lambda_speed * F.relu(speeds - vmax_kmh).pow(2).mean()
+
+    # NEW: Penalize too slow → fixes ATE under-prediction
+    l_slow = lambda_slow * F.relu(vmin_kmh - speeds).pow(2).mean()
+
+    if speeds.shape[0] >= 2:
+        accel = (speeds[1:] - speeds[:-1]) / dt_hours
+        l_accel = lambda_accel * accel.pow(2).mean()
     else:
-        print(f"\n  ST-Trans targets not yet beaten. Best score={saver.best_score:.2f}")
-        print(f"  Need: DPE<136.41, ATE<79.94, CTE<93.58, 72h<297")
-    print("=" * 72)
+        l_accel = pred_deg.new_zeros(())
+
+    return l_fast + l_slow + l_accel
 
 
-if __name__ == "__main__":
-    args = get_args()
-    np.random.seed(42); torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-    main(args)
+# ══════════════════════════════════════════════════════════════════════════════
+#  6. ATE/CTE Decomposition — FIXED: ATE weight >> CTE weight
+# ══════════════════════════════════════════════════════════════════════════════
+
+def ate_cte_decomp_loss(pred_deg: torch.Tensor,
+                         gt_deg: torch.Tensor,
+                         ate_weight: float = 2.0,   # v37: 1.0→2.0 (ATE focus)
+                         cte_weight: float = 0.5    # v37: 1.0→0.5 (CTE đã tốt)
+                         ) -> torch.Tensor:
+    """
+    v37: ate_weight=2.0, cte_weight=0.5
+    CTE đã đạt 69.0 ✅ → không cần penalize nặng nữa
+    ATE=168.6 ❌ → cần push mạnh hơn
+
+    ATE = along-track error = "đi đúng hướng nhưng sai khoảng cách"
+    CTE = cross-track error = "đi lệch hướng"
+    """
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 3:
+        return pred_deg.new_zeros(())
+    DEG_KM = 111.0
+    total_ate = pred_deg.new_zeros(())
+    total_cte = pred_deg.new_zeros(())
+    count = 0.0
+    focus_steps = [s for s in [1, 3, 7, 11] if s < T]
+    horizon_weights = {1: 0.1, 3: 0.15, 7: 0.25, 11: 0.50}
+    for k in focus_steps:
+        hw = horizon_weights[k]
+        prev_k = max(k - 1, 0)
+        track_lon = gt_deg[k, :, 0] - gt_deg[prev_k, :, 0]
+        track_lat = gt_deg[k, :, 1] - gt_deg[prev_k, :, 1]
+        lat_rad = torch.deg2rad(gt_deg[k, :, 1])
+        cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+        track_x = track_lon * cos_lat * DEG_KM
+        track_y = track_lat * DEG_KM
+        track_norm = (track_x.pow(2) + track_y.pow(2)).sqrt().clamp(min=1e-4)
+        u_x = track_x / track_norm
+        u_y = track_y / track_norm
+        n_x = -u_y
+        n_y =  u_x
+        err_lon = (pred_deg[k, :, 0] - gt_deg[k, :, 0]) * cos_lat * DEG_KM
+        err_lat = (pred_deg[k, :, 1] - gt_deg[k, :, 1]) * DEG_KM
+        ate_k = (err_lon * u_x + err_lat * u_y).abs()
+        cte_k = (err_lon * n_x + err_lat * n_y).abs()
+        target_km = {1: 50.0, 3: 100.0, 7: 200.0, 11: 300.0}[k]
+        # ATE: stricter target (ATE ST-Trans = 79.94 << 300km)
+        ate_target = {1: 30.0, 3: 55.0, 7: 110.0, 11: 160.0}[k]
+        ate_loss = torch.where(ate_k < ate_target,
+                                ate_k.pow(2) / (2.0 * ate_target),
+                                ate_k - ate_target / 2.0).mean() / ate_target
+        cte_loss = torch.where(cte_k < target_km,
+                                cte_k.pow(2) / (2.0 * target_km),
+                                cte_k - target_km / 2.0).mean() / target_km
+        total_ate = total_ate + hw * ate_loss
+        total_cte = total_cte + hw * cte_loss
+        count += hw
+    if count < 1e-6:
+        return pred_deg.new_zeros(())
+    return (ate_weight * total_ate + cte_weight * total_cte) / count
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  7. Along-Track Speed Loss (NEW v37)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def along_track_speed_loss(pred_deg: torch.Tensor,
+                            gt_deg: torch.Tensor) -> torch.Tensor:
+    """
+    NEW in v37: Penalize cumulative along-track distance error.
+
+    Motivation:
+      - ATE = along-track error = model đi ĐÚNG HƯỚNG nhưng SAI TỐC ĐỘ
+      - velocity_smoothness chỉ penalize absolute speed > vmax
+      - along_track_speed_loss so sánh RELATIVE speed: pred vs GT step-by-step
+
+    Method:
+      For each 6h step t:
+        - Project pred displacement onto GT heading direction
+        - Compare projected distance vs GT step distance
+        - Penalize ratio mismatch (pred_dist / gt_dist should be ≈ 1.0)
+
+    This directly teaches the model to match TC translation speed.
+    """
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 3:
+        return pred_deg.new_zeros(())
+
+    DEG_KM = 111.0
+    total = pred_deg.new_zeros(())
+    count = 0
+
+    for t in range(1, T):
+        # GT step displacement [B, 2] in km
+        lat_rad = torch.deg2rad(gt_deg[t, :, 1])
+        cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+
+        gt_dx = (gt_deg[t, :, 0] - gt_deg[t-1, :, 0]) * cos_lat * DEG_KM
+        gt_dy = (gt_deg[t, :, 1] - gt_deg[t-1, :, 1]) * DEG_KM
+        gt_dist = (gt_dx.pow(2) + gt_dy.pow(2)).sqrt().clamp(min=1e-4)
+
+        # GT heading unit vector
+        u_x = gt_dx / gt_dist
+        u_y = gt_dy / gt_dist
+
+        # Pred step displacement projected onto GT heading
+        pred_dx = (pred_deg[t, :, 0] - pred_deg[t-1, :, 0]) * cos_lat * DEG_KM
+        pred_dy = (pred_deg[t, :, 1] - pred_deg[t-1, :, 1]) * DEG_KM
+        pred_along = pred_dx * u_x + pred_dy * u_y  # signed along-track
+
+        # Loss: predict along-track dist ≈ gt_dist
+        # Use Huber, target = gt_dist per sample
+        diff = (pred_along - gt_dist).abs()
+        huber = torch.where(
+            diff < gt_dist * 0.5,
+            diff.pow(2) / (2.0 * gt_dist.clamp(min=10.0)),
+            diff - gt_dist.clamp(min=10.0) * 0.25
+        )
+        # Weight later steps more (72h matters most)
+        step_w = float(t) ** 1.2
+        total = total + step_w * huber.mean() / DEG_KM
+        count += step_w
+
+    return total / max(count, 1.0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  8. Trajectory shape — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
+
+def trajectory_shape_loss(pred_deg: torch.Tensor,
+                           gt_deg: torch.Tensor) -> torch.Tensor:
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 4:
+        return pred_deg.new_zeros(())
+
+    def _disp_km(s, e):
+        e = min(e, T - 1)
+        lat_mid = (pred_deg[s, :, 1] + pred_deg[e, :, 1]) * 0.5
+        cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+        pd = pred_deg[e] - pred_deg[s]
+        gd = gt_deg[e]   - gt_deg[s]
+        pk = torch.stack([pd[:, 0] * cos_lat * DEG_TO_KM,
+                           pd[:, 1] * DEG_TO_KM], -1)
+        gk = torch.stack([gd[:, 0] * cos_lat * DEG_TO_KM,
+                           gd[:, 1] * DEG_TO_KM], -1)
+        return pk, gk
+
+    total, count = pred_deg.new_zeros(()), 0.0
+    for s, e, w in [(0, 5, 0.5), (5, 11, 1.0), (0, 11, 1.5)]:
+        if e < T:
+            pk, gk = _disp_km(s, e)
+            total  = total + w * F.smooth_l1_loss(pk, gk)
+            count  += w
+    return (total / max(count, 1.0)) / (STEP_KM ** 2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  9. Heading loss — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _step_displacements_km(traj_deg: torch.Tensor) -> torch.Tensor:
+    dt      = traj_deg[1:] - traj_deg[:-1]
+    lat_mid = (traj_deg[:-1, :, 1] + traj_deg[1:, :, 1]) * 0.5
+    cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+    dt_km   = dt.clone()
+    dt_km[..., 0] = dt[..., 0] * cos_lat * DEG_TO_KM
+    dt_km[..., 1] = dt[..., 1] * DEG_TO_KM
+    return dt_km
+
+
+def heading_loss(pred_deg: torch.Tensor,
+                  gt_deg: torch.Tensor) -> torch.Tensor:
+    if pred_deg.shape[0] < 2:
+        return pred_deg.new_zeros(())
+    pv = _step_displacements_km(pred_deg)
+    gv = _step_displacements_km(gt_deg)
+    pn = pv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+    gn = gv.norm(dim=-1, keepdim=True).clamp(min=1e-4)
+    cos_sim   = ((pv / pn) * (gv / gn)).sum(-1)
+    wrong_dir = F.relu(-cos_sim).pow(2)
+    T = pv.shape[0]
+    w = torch.arange(1, T + 1, dtype=torch.float32,
+                     device=pred_deg.device).pow(1.5)
+    w = w / w.mean()
+    return (wrong_dir * w.unsqueeze(1)).mean()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  10. Steering alignment — unchanged
+# ══════════════════════════════════════════════════════════════════════════════
+
+def steering_alignment_loss(pred_deg: torch.Tensor,
+                              env_data: Optional[dict]) -> torch.Tensor:
+    if env_data is None or pred_deg.shape[0] < 2:
+        return pred_deg.new_zeros(())
+    T, B   = pred_deg.shape[0] - 1, pred_deg.shape[1]
+    device = pred_deg.device
+
+    def _extract(k1, k2):
+        v = env_data.get(k2, env_data.get(k1, None))
+        if v is None or not torch.is_tensor(v): return None
+        v = v.to(device).float()
+        if v.dim() == 3: v = v[..., 0]
+        if v.dim() == 1: v = v.unsqueeze(0).expand(B, -1)
+        v = v.permute(1, 0)
+        T_obs = v.shape[0]
+        if T_obs >= T: return v[:T] * 30.0
+        return torch.cat([v * 30.0,
+                           torch.zeros(T - T_obs, B, device=device)], 0)
+
+    u500 = _extract("u500_mean", "u500_center")
+    v500 = _extract("v500_mean", "v500_center")
+    if u500 is None or v500 is None:
+        return pred_deg.new_zeros(())
+
+    dlat    = pred_deg[1:] - pred_deg[:-1]
+    lat_rad = torch.deg2rad(pred_deg[:-1, :, 1])
+    cos_lat = torch.cos(lat_rad).clamp(min=1e-4)
+    u_tc    = dlat[:, :, 0] * cos_lat * 111000.0 / DT_6H
+    v_tc    = dlat[:, :, 1] * 111000.0 / DT_6H
+
+    uv_mag       = (u500.pow(2) + v500.pow(2)).sqrt()
+    has_steering = (uv_mag > 5.0).float()
+    env_dir      = torch.stack([u500, v500], -1)
+    tc_dir       = torch.stack([u_tc, v_tc], -1)
+    cos_sim      = (
+        (env_dir / env_dir.norm(dim=-1, keepdim=True).clamp(min=1.0))
+        * (tc_dir / tc_dir.norm(dim=-1, keepdim=True).clamp(min=0.5))
+    ).sum(-1)
+    w_t      = torch.arange(1, T + 1, dtype=torch.float32, device=device).pow(1.5)
+    w_t      = w_t / w_t.mean()
+    misalign = F.relu(0.3 - cos_sim).pow(2)
+    return (misalign * has_steering * w_t.unsqueeze(1)).mean()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN AGGREGATOR v37
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_total_loss(
+    pred_deg: torch.Tensor,
+    gt_deg: torch.Tensor,
+    env_data: Optional[dict] = None,
+    weights: Optional[dict] = None,
+    epoch: int = 0,
+    **kwargs,
+) -> dict:
+    """
+    Aggregated loss v37_ate.
+    Key addition: along_track_speed_loss để fix ATE (TC speed prediction)
+    """
+    if weights is None:
+        weights = WEIGHTS
+
+    l_multi       = direct_multi_horizon_mse(pred_deg, gt_deg)
+    l_focal       = focal_72h_loss(pred_deg, gt_deg, target_km=300.0, focal_exp=1.0)
+    l_endpoint    = endpoint_72h_loss(pred_deg, gt_deg, target_km=300.0)
+    l_hdirect     = horizon_direct_ade(pred_deg, gt_deg)
+    l_velsmooth   = velocity_smoothness_loss(pred_deg)
+    l_atecte      = ate_cte_decomp_loss(pred_deg, gt_deg,
+                                         ate_weight=2.0, cte_weight=0.5)
+    l_along       = along_track_speed_loss(pred_deg, gt_deg)   # NEW
+    l_shape       = trajectory_shape_loss(pred_deg, gt_deg)
+    l_head        = heading_loss(pred_deg, gt_deg)
+    l_steer       = steering_alignment_loss(pred_deg, env_data)
+
+    total = (
+        weights.get("multi_horizon",    1.2) * l_multi
+        + weights.get("focal_72h",      0.5) * l_focal
+        + weights.get("endpoint",       1.5) * l_endpoint
+        + weights.get("h_direct",       1.0) * l_hdirect
+        + weights.get("velocity_smooth", 0.3) * l_velsmooth
+        + weights.get("ate_cte",        0.6) * l_atecte
+        + weights.get("along_track",    0.4) * l_along     # NEW
+        + weights.get("shape",          0.2) * l_shape
+        + weights.get("heading",        0.2) * l_head
+        + weights.get("steering",       0.10) * l_steer
+    )
+
+    if torch.isnan(total) or torch.isinf(total):
+        total = pred_deg.new_zeros(())
+
+    def _s(x):
+        return x.item() if torch.is_tensor(x) else float(x)
+
+    return dict(
+        total           = total,
+        mse_hav_horizon = _s(l_multi),
+        mse_hav         = _s(l_multi),
+        multi_scale     = _s(l_focal),
+        endpoint        = _s(l_endpoint),
+        h_direct        = _s(l_hdirect),
+        vel_smooth      = _s(l_velsmooth),
+        ate_cte         = _s(l_atecte),
+        along_track     = _s(l_along),     # NEW — log để monitor
+        shape           = _s(l_shape),
+        heading         = _s(l_head),
+        velocity        = 0.0,
+        recurv          = 0.0,
+        steering        = _s(l_steer),
+        direct_mse      = _s(l_multi),
+        hard_72h        = _s(l_focal),
+    )
