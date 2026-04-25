@@ -6864,6 +6864,12 @@ import time
 import math
 import random
 import copy
+from train_patch import (
+      _composite_score,
+      evaluate_fast_v2 as evaluate_fast,
+      evaluate_full_val_ade_v2 as evaluate_full_val_ade,
+      log_fast_eval,
+  )
 
 import numpy as np
 import torch
@@ -7593,15 +7599,15 @@ def main(args):
         h72 = m_fast.get("72h", float("nan"))
         fast_score = _composite_score(m_fast)
 
-        print(f"  [FAST ep{epoch}]"
-              f"  ADE={m_fast['ADE']:.1f}"
-              f"  6h={h6:.0f}{'🎯' if h6<30 else '❌'}"
-              f"  12h={h12:.0f}{'🎯' if h12<50 else '❌'}"
-              f"  24h={h24:.0f}{'🎯' if h24<100 else '❌'}"
-              f"  48h={h48:.0f}{'🎯' if h48<200 else '❌'}"
-              f"  72h={h72:.0f}{'🎯' if h72<300 else '❌'}"
-              f"  score={fast_score:.1f}")
-
+        # print(f"  [FAST ep{epoch}]"
+        #       f"  ADE={m_fast['ADE']:.1f}"
+        #       f"  6h={h6:.0f}{'🎯' if h6<30 else '❌'}"
+        #       f"  12h={h12:.0f}{'🎯' if h12<50 else '❌'}"
+        #       f"  24h={h24:.0f}{'🎯' if h24<100 else '❌'}"
+        #       f"  48h={h48:.0f}{'🎯' if h48<200 else '❌'}"
+        #       f"  72h={h72:.0f}{'🎯' if h72<300 else '❌'}"
+        #       f"  score={fast_score:.1f}")
+        log_fast_eval(m_fast, epoch)
         # Full val eval
         if epoch % args.val_ade_freq == 0:
             ema_obj = _get_ema_obj(model)
