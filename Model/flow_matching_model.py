@@ -9630,7 +9630,7 @@ class VelocityField(nn.Module):
         # v44: 1.5 → sigmoid(1.5)≈0.82, physics contribution mạnh hơn
         # Khi FNO bị bypass, cần physics priors có ảnh hưởng đủ lớn
         self.physics_scale  = nn.Parameter(torch.ones(4) * 1.5)   # sigmoid≈0.82
-        self.steering_scale = nn.Parameter(torch.ones(4) * 2.0)   # sigmoid≈0.88
+        self.steering_scale = nn.Parameter(torch.ones(4) * 1.0)   # sigmoid≈0.88
 
         self._init_weights()
 
