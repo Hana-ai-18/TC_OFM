@@ -9107,13 +9107,17 @@ class TCFlowMatching(nn.Module):
         # Augmentation
         batch_list = self._lon_flip_aug(batch_list)
         batch_list = self._obs_noise_aug(batch_list, sigma=0.005)
+        # if epoch >= 5:
+        #     batch_list = self._mixup_aug(batch_list, alpha=0.2, p=0.15)
+        # if epoch >= 10:
+        #     batch_list = self._speed_aug(batch_list, p=0.4)        # v41: speed bias fix
+        # if epoch >= 8:
+        #     batch_list = self._temporal_reverse_aug(batch_list, p=0.15)  # v41
+        if epoch >= 3:                                    # sớm hơn 7 epoch!
+            batch_list = self._speed_aug(batch_list, p=0.35)
         if epoch >= 5:
-            batch_list = self._mixup_aug(batch_list, alpha=0.2, p=0.15)
-        if epoch >= 10:
-            batch_list = self._speed_aug(batch_list, p=0.4)        # v41: speed bias fix
-        if epoch >= 8:
-            batch_list = self._temporal_reverse_aug(batch_list, p=0.15)  # v41
-
+            batch_list = self._temporal_reverse_aug(batch_list, p=0.15)
+        
         traj_gt  = batch_list[1]
         Me_gt    = batch_list[8]
         obs_t    = batch_list[0]
@@ -9122,13 +9126,20 @@ class TCFlowMatching(nn.Module):
         lp, lm   = obs_t[-1], obs_Me[-1]
 
         # Sigma schedule
-        if epoch < 15:
-            current_sigma = 0.15
-        elif epoch < 40:
-            current_sigma = 0.15 - (epoch - 15) / 25.0 * 0.09
+        # if epoch < 15:
+        #     current_sigma = 0.15
+        # elif epoch < 40:
+        #     current_sigma = 0.15 - (epoch - 15) / 25.0 * 0.09
+        # else:
+        #     current_sigma = 0.06
+        if epoch < 5:
+            current_sigma = 0.12          # giảm từ 0.15 → 0.12
+        elif epoch < 15:
+            current_sigma = 0.12 - (epoch - 5) / 10.0 * 0.06   # 0.12 → 0.06
+        elif epoch < 30:
+            current_sigma = 0.06 - (epoch - 15) / 15.0 * 0.03  # 0.06 → 0.03
         else:
-            current_sigma = 0.06
-
+            current_sigma = 0.03          # training sạch hơn nhiều ở epoch muộn
         raw_ctx       = self.net._context(batch_list)
         vel_obs_feat  = self.net._get_vel_obs_feat(obs_t)
         steering_feat = self.net._get_steering_feat(

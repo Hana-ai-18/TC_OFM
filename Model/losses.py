@@ -10602,35 +10602,65 @@ def compute_total_loss(
         weights = WEIGHTS
 
     # ── Progressive schedule ────────────────────────────────────────────────
+    # if epoch < 10:
+    #     t = epoch / 10.0
+    #     ef_w     = 3.5                       # endpoint_focal — stay high
+    #     mh_w     = 1.2                       # multi_horizon
+    #     cd_w     = 0.6 + 0.2 * t            # cumul_disp:  0.6 → 0.8
+    #     spd_w    = 0.4 + 0.3 * t            # speed:       0.4 → 0.7
+    #     acc_w    = 0.15 + 0.1 * t           # accel:       0.15 → 0.25
+    #     dcp_w    = 0.05 + 0.05 * t          # decomp:      0.05 → 0.10  (raw~6)
+    #     cns_w    = 0.05 + 0.05 * t          # consistency: 0.05 → 0.10  (raw~4)
+
+    # elif epoch < 30:
+    #     t = (epoch - 10) / 20.0
+    #     ef_w     = 3.5 - 1.0 * t            # 3.5 → 2.5
+    #     mh_w     = 1.2                       # stable
+    #     cd_w     = 0.8                       # stable
+    #     spd_w    = 0.7 + 0.8 * t            # 0.7 → 1.5
+    #     acc_w    = 0.25 + 0.45 * t          # 0.25 → 0.70
+    #     dcp_w    = 0.10 + 0.20 * t          # 0.10 → 0.30
+    #     cns_w    = 0.10 + 0.15 * t          # 0.10 → 0.25
+
+    # else:
+    #     ef_w  = 2.0    # reduced after model converges
+    #     mh_w  = 1.2
+    #     cd_w  = 0.8
+    #     spd_w = 1.5
+    #     acc_w = 0.7    # operating level — matches ST-Trans lambda_accel importance
+    #     dcp_w = 0.30   # operating level (raw ~6 → contribution ~1.8)
+    #     cns_w = 0.25   # operating level (raw ~4 → contribution ~1.0)
+    # Trong compute_total_loss(), thay toàn bộ progressive schedule:
+
     if epoch < 10:
         t = epoch / 10.0
-        ef_w     = 3.5                       # endpoint_focal — stay high
-        mh_w     = 1.2                       # multi_horizon
-        cd_w     = 0.6 + 0.2 * t            # cumul_disp:  0.6 → 0.8
-        spd_w    = 0.4 + 0.3 * t            # speed:       0.4 → 0.7
-        acc_w    = 0.15 + 0.1 * t           # accel:       0.15 → 0.25
-        dcp_w    = 0.05 + 0.05 * t          # decomp:      0.05 → 0.10  (raw~6)
-        cns_w    = 0.05 + 0.05 * t          # consistency: 0.05 → 0.10  (raw~4)
+        ef_w  = 3.5
+        mh_w  = 1.2
+        cd_w  = 0.6 + 0.2 * t
+        spd_w = 0.4 + 0.3 * t
+        acc_w = 0.20 + 0.15 * t        # 0.20 → 0.35 (tăng mạnh hơn)
+        dcp_w = 0.10 + 0.10 * t        # 0.10 → 0.20 (tăng gấp đôi vs v41!)
+        cns_w = 0.05 + 0.05 * t
 
     elif epoch < 30:
         t = (epoch - 10) / 20.0
-        ef_w     = 3.5 - 1.0 * t            # 3.5 → 2.5
-        mh_w     = 1.2                       # stable
-        cd_w     = 0.8                       # stable
-        spd_w    = 0.7 + 0.8 * t            # 0.7 → 1.5
-        acc_w    = 0.25 + 0.45 * t          # 0.25 → 0.70
-        dcp_w    = 0.10 + 0.20 * t          # 0.10 → 0.30
-        cns_w    = 0.10 + 0.15 * t          # 0.10 → 0.25
+        ef_w  = 3.5 - 1.0 * t          # 3.5 → 2.5
+        mh_w  = 1.2
+        cd_w  = 0.8
+        spd_w = 0.7 + 0.8 * t
+        acc_w = 0.35 + 0.65 * t        # 0.35 → 1.0  ← KEY change
+        dcp_w = 0.20 + 0.40 * t        # 0.20 → 0.60 ← KEY change
+        cns_w = 0.10 + 0.15 * t
 
     else:
-        ef_w  = 2.0    # reduced after model converges
+        ef_w  = 2.0
         mh_w  = 1.2
         cd_w  = 0.8
         spd_w = 1.5
-        acc_w = 0.7    # operating level — matches ST-Trans lambda_accel importance
-        dcp_w = 0.30   # operating level (raw ~6 → contribution ~1.8)
-        cns_w = 0.25   # operating level (raw ~4 → contribution ~1.0)
-
+        acc_w = 1.0                     # tăng từ 0.7 → 1.0
+        dcp_w = 0.60                    # tăng từ 0.30 → 0.60
+        cns_w = 0.25
+        
     # ── Compute losses ──────────────────────────────────────────────────────
     l_ef   = endpoint_focal_72h(pred_deg, gt_deg, target_km=280.0, gamma=1.0)
     l_mh   = multi_horizon_mse(pred_deg, gt_deg)
