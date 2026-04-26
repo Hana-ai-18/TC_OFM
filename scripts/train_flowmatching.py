@@ -11806,6 +11806,9 @@ def main(args):
                     f"  hd={bd.get('heading',    0):.3f}"
                     f"  lr={lr:.2e}"
                 )
+                # Sau epoch 5 (hoặc bất kỳ epoch nào):
+                if epoch == 5:
+                    diagnose_fno_encoder(model, val_subset_loader, device)
 
         ep_s  = time.perf_counter() - t0
         epoch_times.append(ep_s)
@@ -11933,9 +11936,102 @@ def main(args):
         print(f"\n  Need: DPE<136.41, ATE<79.94, CTE<93.58, 72h<297")
     print("=" * 72)
 
+# Trong train script, thêm function này:
+
+def diagnose_fno_encoder(model, val_loader, device, n_batches=5):
+    """
+    3 test để kiểm tra FNO3D có đang học geopotential height không.
+    
+    Test 1: Ablation — zero out env, xem performance drop bao nhiêu
+    Test 2: Gradient flow — encoder có nhận gradient không
+    Test 3: Feature variance — bottleneck features có đa dạng không
+    """
+    raw_model = _get_raw_model(model)
+    model.eval()
+    
+    results = {"with_env": [], "without_env": [], "feat_var": []}
+    
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if i >= n_batches:
+                break
+            bl = move(list(batch), device)
+            
+            # ── Test 1: So sánh pred với/không có env ──────────────
+            pred_normal, _, _ = model.sample(bl, num_ensemble=10, 
+                                              ddim_steps=10,
+                                              importance_weight=False)
+            
+            # Zero out env data
+            bl_no_env = list(bl)
+            if bl_no_env[13] is not None:
+                env_zeroed = {k: torch.zeros_like(v) if torch.is_tensor(v) else v
+                              for k, v in bl_no_env[13].items()}
+                bl_no_env[13] = env_zeroed
+            
+            pred_no_env, _, _ = model.sample(bl_no_env, num_ensemble=10,
+                                              ddim_steps=10,
+                                              importance_weight=False)
+            
+            T = min(pred_normal.shape[0], bl[1].shape[0])
+            gt = bl[1][:T]
+            
+            d_normal  = haversine_km_torch(denorm_torch(pred_normal[:T]),
+                                            denorm_torch(gt)).mean().item()
+            d_no_env  = haversine_km_torch(denorm_torch(pred_no_env[:T]),
+                                            denorm_torch(gt)).mean().item()
+            
+            results["with_env"].append(d_normal)
+            results["without_env"].append(d_no_env)
+            
+            # ── Test 3: Feature variance của bottleneck ─────────────
+            obs_t    = bl[0]
+            img      = bl[11]
+            env_data = bl[13]
+            if img.dim() == 4:
+                img = img.unsqueeze(2)
+            
+            bot, _ = raw_model.net.spatial_enc.encode(img)
+            # bot: [B, 128, T, 4, 4]
+            feat_var = bot.var(dim=[0,2,3,4]).mean().item()
+            results["feat_var"].append(feat_var)
+    
+    avg_with    = sum(results["with_env"]) / len(results["with_env"])
+    avg_without = sum(results["without_env"]) / len(results["without_env"])
+    avg_var     = sum(results["feat_var"]) / len(results["feat_var"])
+    
+    improvement = (avg_without - avg_with) / avg_without * 100
+    
+    print(f"\n{'='*55}")
+    print(f"  FNO3D ENCODER DIAGNOSTIC")
+    print(f"{'='*55}")
+    print(f"  ADE with env    : {avg_with:.1f} km")
+    print(f"  ADE without env : {avg_without:.1f} km")
+    print(f"  Env contribution: {improvement:+.1f}%  ", end="")
+    
+    if improvement > 5:
+        print(f"✅ Encoder đang học được (env giúp {improvement:.0f}%)")
+    elif improvement > 0:
+        print(f"⚠️  Encoder học rất ít ({improvement:.1f}%) — FNO chưa converge")
+    else:
+        print(f"❌ Encoder KHÔNG đóng góp — model bỏ qua env hoàn toàn!")
+        print(f"     → Gợi ý: kiểm tra gradient flow vào FNO layers")
+    
+    print(f"\n  Bottleneck feature variance: {avg_var:.4f}")
+    if avg_var < 0.01:
+        print(f"  ❌ Variance quá thấp — FNO output gần như constant!")
+        print(f"     → FNO không học được gì từ geopotential field")
+    elif avg_var < 0.1:
+        print(f"  ⚠️  Variance thấp — FNO đang học nhưng chưa nhiều")
+    else:
+        print(f"  ✅ Variance ổn — FNO đang extract đa dạng features")
+    
+    print(f"{'='*55}\n")
+    return results
 
 if __name__ == "__main__":
     args = get_args()
+    
     np.random.seed(42); torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
