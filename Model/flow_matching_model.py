@@ -8772,7 +8772,7 @@ class VelocityField(nn.Module):
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
                 dropout=0.15, activation="gelu", batch_first=True),  # v41: 0.10→0.15 (reduce overfit)
-            num_layers=5)
+            num_layers=2)
 
         self.out_fc1 = nn.Linear(256, 512)
         self.out_fc2 = nn.Linear(512, 4)
