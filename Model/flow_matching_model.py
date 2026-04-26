@@ -9179,9 +9179,12 @@ class TCFlowMatching(nn.Module):
             epoch=epoch,
         )
 
-        w_fm  = max(0.3, 1.0 - epoch / 60.0)
-        total = w_fm * l_fm_mse + loss_dict["total"]
-
+        # w_fm  = max(0.3, 1.0 - epoch / 60.0)
+        # total = w_fm * l_fm_mse + loss_dict["total"]
+        w_fm     = max(0.8, 1.5 - epoch / 40.0)   # fm weight CAO hơn
+        w_pos    = min(0.4, 0.1 + epoch / 50.0)   # position weight bắt đầu nhỏ
+        total    = w_fm * l_fm_mse + w_pos * loss_dict["total"]
+        # → epoch 0: total = 1.5 * 0.57 + 0.1 * X = fm chiếm ~50%+
         l_ens = x_t.new_zeros(())
         if epoch >= 40 and self.n_train_ens >= 2:
             x_t2, fm_t2, u_t2 = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
