@@ -12757,28 +12757,50 @@ def main(args):
             scaler.scale(bd["total"]).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            # FIX v45: Chỉ step scheduler nếu optimizer thực sự đã step (tránh AMP warning)
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            scale_after = scaler.get_scale()
+
+            if scale_after >= scale_before:
+                scheduler.step()
             _call_ema_update(model)
+
             sum_loss += bd["total"].item()
 
+            # if i % 20 == 0:
+            #     lr = optimizer.param_groups[0]["lr"]
+            #     # ── LOG LINE v44: thêm aux_fno (FNO auxiliary loss)
+            #     # KEY MONITOR: spd phải > 0 (nếu vẫn 0.000 → loss bug)
+            #     # KEY MONITOR: aux phải > 0 (nếu 0.000 → FNO không học)
+            #     print(
+            #         f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
+            #         f"  tot={bd['total'].item():.3f}"
+            #         f"  fm={bd.get('fm_mse',     0):.4f}"
+            #         f"  hor={bd.get('mse_hav',   0):.1f}"
+            #         f"  end={bd.get('endpoint',  0):.1f}"
+            #         f"  spd={bd.get('speed_acc', 0):.3f}"   # ← PHẢI > 0 sau fix
+            #         f"  acc={bd.get('accel',     0):.3f}"
+            #         f"  dcp={bd.get('decomp',    0):.4f}"
+            #         f"  cns={bd.get('cons',      0):.3f}"
+            #         f"  aux={bd.get('aux_fno',   0):.4f}"   # ← FNO learning signal
+            #         f"  lr={lr:.2e}"
+            #     )
             if i % 20 == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                # ── LOG LINE v44: thêm aux_fno (FNO auxiliary loss)
-                # KEY MONITOR: spd phải > 0 (nếu vẫn 0.000 → loss bug)
-                # KEY MONITOR: aux phải > 0 (nếu 0.000 → FNO không học)
+                # v45 log: physical units (km, km/h) thay vì normalized values
                 print(
                     f"  [{epoch:>3}][{i:>3}/{len(train_loader)}]"
                     f"  tot={bd['total'].item():.3f}"
                     f"  fm={bd.get('fm_mse',     0):.4f}"
-                    f"  hor={bd.get('mse_hav',   0):.1f}"
-                    f"  end={bd.get('endpoint',  0):.1f}"
-                    f"  spd={bd.get('speed_acc', 0):.3f}"   # ← PHẢI > 0 sau fix
-                    f"  acc={bd.get('accel',     0):.3f}"
-                    f"  dcp={bd.get('decomp',    0):.4f}"
+                    f"  hav={bd.get('hav_km',    0):.1f}km"      # raw km
+                    f"  h72={bd.get('h72_km',    0):.1f}km"      # raw km @ 72h
+                    f"  spd={bd.get('spd_kmh',   0):.2f}km/h"    # raw km/h error
+                    f"  acc={bd.get('acc_kmh2',  0):.2f}"        # raw km/h²
                     f"  cns={bd.get('cons',      0):.3f}"
-                    f"  aux={bd.get('aux_fno',   0):.4f}"   # ← FNO learning signal
+                    f"  aux={bd.get('aux_fno',   0):.4f}"        # FNO signal
                     f"  lr={lr:.2e}"
                 )
 

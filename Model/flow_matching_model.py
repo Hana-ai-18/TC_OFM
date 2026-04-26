@@ -9634,6 +9634,16 @@ class VelocityField(nn.Module):
 
         self._init_weights()
 
+    # def _init_weights(self):
+    #     with torch.no_grad():
+    #         for name, m in self.named_modules():
+    #             if isinstance(m, nn.Linear) and 'out_fc' in name:
+    #                 nn.init.xavier_uniform_(m.weight, gain=0.1)
+    #                 if m.bias is not None:
+    #                     nn.init.zeros_(m.bias)
+    #         # Khởi tạo aux_steering_head nhỏ để không ảnh hưởng training ban đầu
+    #         nn.init.xavier_uniform_(self.aux_steering_head.weight, gain=0.01)
+    #         nn.init.zeros_(self.aux_steering_head.bias)
     def _init_weights(self):
         with torch.no_grad():
             for name, m in self.named_modules():
@@ -9641,10 +9651,12 @@ class VelocityField(nn.Module):
                     nn.init.xavier_uniform_(m.weight, gain=0.1)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
-            # Khởi tạo aux_steering_head nhỏ để không ảnh hưởng training ban đầu
-            nn.init.xavier_uniform_(self.aux_steering_head.weight, gain=0.01)
+            # FIX v45: aux_steering_head dùng init bình thường để có gradient signal
+            # v44 dùng gain=0.01 → output ≈ 0 → MSE ≈ 0.0025 → loss quá nhỏ
+            # v45: gain=1.0 (default) → output ~ N(0, 1/sqrt(128)) ≈ N(0, 0.09)
+            # phù hợp với scale của u500/v500 (~0.05) → MSE ban đầu ~0.01
+            nn.init.xavier_uniform_(self.aux_steering_head.weight, gain=1.0)
             nn.init.zeros_(self.aux_steering_head.bias)
-
     def _time_emb(self, t, dim=256):
         half = dim // 2
         freq = torch.exp(
@@ -9771,11 +9783,16 @@ class VelocityField(nn.Module):
         cos_lat = torch.cos(torch.deg2rad(lat_deg)).clamp(min=1e-3)
         out = torch.zeros_like(x_t)
 
-        # FIX: hệ số 0.2 cũ quá nhỏ, giờ dùng 0.5 để ERA5 có ảnh hưởng rõ hơn
-        # v41: * 0.2 (quá nhỏ → steering contribution yếu)
-        # v44: * 0.5 (tăng để physics prior mạnh hơn khi FNO bị bypass)
-        out[:, :, 0] = u.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0 * cos_lat) * 0.5
-        out[:, :, 1] = v.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0) * 0.5
+        # # FIX: hệ số 0.2 cũ quá nhỏ, giờ dùng 0.5 để ERA5 có ảnh hưởng rõ hơn
+        # # v41: * 0.2 (quá nhỏ → steering contribution yếu)
+        # # v44: * 0.5 (tăng để physics prior mạnh hơn khi FNO bị bypass)
+        # out[:, :, 0] = u.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0 * cos_lat) * 0.5
+        # out[:, :, 1] = v.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0) * 0.5
+        # return out
+        # FIX v45: hệ số 1.0 (từ 0.5) — physics steering có ảnh hưởng đầy đủ
+        # khi FNO bị bypass. Sau khi aux loss buộc FNO học, có thể giảm lại.
+        out[:, :, 0] = u.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0 * cos_lat) * 1.0
+        out[:, :, 1] = v.unsqueeze(1) * 30.0 * 21600.0 / (111.0 * 1000.0) * 1.0
         return out
 
     def _decode(self, x_t, t, ctx, vel_obs_feat=None, steering_feat=None,
@@ -10044,38 +10061,47 @@ class TCFlowMatching(nn.Module):
             except Exception:
                 l_aux = x_t.new_zeros(())
 
-        # ── FIX 4: Cân bằng FM / Position loss ───────────────────────────────
-        # v41: w_fm=1.0, w_pos=0.2 → l_fm_mse(0.03) vs pos(5-10)
-        #   → pos dominate 30-60× → FM velocity field không học được sạch
-        # v44: w_fm=30.0 → l_fm_mse contribution ≈ 0.03*30=0.9
-        #       w_pos=1.0 → pos contribution ≈ 5-10
-        #   → FM vẫn nhỏ hơn pos nhưng có gradient signal đủ lớn
-        # w_aux=0.3: đủ để ép FNO học, không quá lớn để phá FM
-        w_fm  = 30.0   # FIX 4: tăng từ 1.0 → 30.0
-        w_pos = 1.0    # FIX 4: tăng từ 0.2 → 1.0
-        w_aux = 0.3    # FIX 6: aux steering loss weight
+        # ─────────────────────────────────────────────────────────────────────
+        # FIX v45: Loss balance sau khi position losses đã normalized
+        # ─────────────────────────────────────────────────────────────────────
+        # Sau khi compute_total_loss đã normalize, loss_dict["total"] ≈ 3-7
+        # → có thể balance với fm_mse (~0.03-0.5) bằng weight nhỏ hơn nhiều
+        #
+        # Mục tiêu contributions:
+        #   FM:    w_fm * 0.1   ≈ 1.0   (FM velocity field học sạch)
+        #   POS:   w_pos * 4.0  ≈ 4.0   (primary position learning)
+        #   AUX:   w_aux * 0.01 ≈ 1.0   (FNO bị ép phải học steering)
+        #
+        # Total ≈ 6.0 → gradient clip 1.0 hoạt động chuẩn
+        w_fm  = 10.0   # FM coefficient (giảm từ v44=30 vì pos đã normalized)
+        w_pos = 1.0    # position loss (đã normalized)
+        w_aux = 100.0  # CRITICAL: aux phải lớn để ép FNO học (l_aux ~ 0.01)
 
         total = w_fm * l_fm_mse + w_pos * loss_dict["total"] + w_aux * l_aux
 
         if torch.isnan(total) or torch.isinf(total):
             total = x_t.new_zeros(())
 
-        # FIX 5: Return dict đầy đủ tất cả keys cần thiết cho logging
-        # v41 thiếu 'speed_acc' → bd.get('speed_acc', 0) = 0.000 LUÔN
+        # Return dict đầy đủ — bao gồm cả normalized và raw values
         return dict(
-            total    = total,
-            fm_mse   = l_fm_mse.item(),
-            mse_hav  = loss_dict.get("mse_hav", 0.0),
-            endpoint = loss_dict.get("endpoint", 0.0),
-            # FIX 5: speed_acc từ loss_dict (bây giờ có giá trị thực!)
-            speed_acc = loss_dict.get("speed_acc", 0.0),
-            accel     = loss_dict.get("accel", 0.0),
-            decomp    = loss_dict.get("decomp", 0.0),
-            cons      = loss_dict.get("cons", 0.0),
-            aux_fno   = l_aux.item() if torch.is_tensor(l_aux) else float(l_aux),
-            sigma     = current_sigma,
+            total       = total,
+            fm_mse      = l_fm_mse.item(),
+            # Normalized losses (small scale, stable for monitoring)
+            mse_hav     = loss_dict.get("mse_hav", 0.0),
+            endpoint    = loss_dict.get("endpoint", 0.0),
+            speed_acc   = loss_dict.get("speed_acc", 0.0),
+            accel       = loss_dict.get("accel", 0.0),
+            decomp      = loss_dict.get("decomp", 0.0),
+            cons        = loss_dict.get("cons", 0.0),
+            # Raw physical values (for human interpretation)
+            hav_km      = loss_dict.get("l_hav_km", 0.0),
+            h72_km      = loss_dict.get("l_72h_km", 0.0),
+            spd_kmh     = loss_dict.get("l_speed_kmh", 0.0),
+            acc_kmh2    = loss_dict.get("l_acc_kmh2", 0.0),
+            # Auxiliary FNO learning signal
+            aux_fno     = l_aux.item() if torch.is_tensor(l_aux) else float(l_aux),
+            sigma       = current_sigma,
         )
-
     # ── Sampling — không đổi từ v34fix ─────────────────────────────────────
 
     @torch.no_grad()
