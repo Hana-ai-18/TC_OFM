@@ -10712,72 +10712,769 @@
 #         hard_72h   = _s(l_ef),
 #     )
 
+# """
+# Model/losses.py — v40_clean
+# ════════════════════════════════════════════════════════════════════════════════
+# THIẾT KẾ: 7 loss, không có cặp nào cos > 0.7, không có conflict
+
+# PHÂN TÍCH GRADIENT REDUNDANCY (từ cosine similarity matrix):
+#   ❌ multi_horizon ↔ h_direct    cos=0.97  → bỏ h_direct
+#   ❌ focal_72h     ↔ endpoint    cos=0.93  → merge thành 1 loss mạnh hơn
+#   ✓  heading                     cos≈0.01  → giữ (gần vuông góc với tất cả)
+#   ✓  accel                       cos≈0.10  → giữ (gần vuông góc)
+#   ✓  consistency                 cos≈0.15  → giữ (gần vuông góc)
+#   ✓  decomp                      cos≈0.37  → giữ (bổ sung ATE signal)
+#   ✓  vel_smooth                  cos≈0.12  → giữ (guard loss, gần vuông góc)
+
+# 7 LOSSES CUỐI:
+
+#   ┌──────────────────────────┬────────────┬───────────────────────────────────┐
+#   │ Loss                     │ Gradient   │ Chức năng                         │
+#   │                          │ Norm rank  │                                   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 1. endpoint_focal_72h    │ #1 (0.074) │ MERGE focal+endpoint: FDE@72h     │
+#   │    (merged focal+FDE)    │            │ với per-sample hard-weighting     │
+#   │    Citation: Lin 2017    │            │ → PRIMARY 72h reduction signal    │
+#   │    + Alahi 2016          │            │                                   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 2. multi_horizon         │ #4 (0.048) │ Huber@12h,24h,48h,72h exp weight  │
+#   │    Citation: CLIPER5     │            │ → Coarse horizon guidance         │
+#   │    DeMaria 2005          │            │                                   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 3. cumul_disp            │ #5 (0.037) │ Per-step position drift penalty   │
+#   │    Citation: MID 2021    │            │ → Anti-accumulation               │
+#   │    GroupNet 2022         │            │                                   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 4. speed_acc             │ #6 (0.039) │ Speed magnitude matching          │
+#   │    Citation: TrackNet    │            │ → Timing accuracy                 │
+#   │    Ruttgers 2019         │            │                                   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 5. accel ★NEW            │ #8 (0.026) │ Acceleration matching             │
+#   │    Citation: ST-Trans    │            │ → KEY for ATE: ST-Trans proved    │
+#   │    Faiaz 2026            │            │   ATE↓16.6% with this term        │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 6. decomp ★NEW           │ #2 (0.261) │ Along-track error direct signal   │
+#   │    Citation: FRAC 2023   │            │ → ATE-proxy loss, 2× priority     │
+#   │    ST-Trans ATE decomp   │            │   on along-track vs cross-track   │
+#   ├──────────────────────────┼────────────┼───────────────────────────────────┤
+#   │ 7. consistency ★NEW      │ #3 (0.099) │ Trajectory momentum smoothing     │
+#   │    Citation: Social LSTM │            │ → Prevent zig-zag oscillation     │
+#   │    Alahi 2016, Chan 1982 │            │   (seen in training logs)         │
+#   └──────────────────────────┴────────────┴───────────────────────────────────┘
+
+# GRADIENT ORTHOGONALITY (sau khi bỏ redundant):
+#   Max cosine similarity: decomp ↔ speed_acc = 0.53  (acceptable)
+#   All other pairs: < 0.45
+#   No conflict pairs (no negative cosine)
+
+# SCALE ISSUE FIX:
+#   decomp raw = 6.0 (10× larger than others) → normalize bằng factor
+#   consistency raw = 4.1 → normalize
+#   → weight nhỏ ban đầu + normalize inside function
+
+# PROGRESSIVE SCHEDULE v40_clean:
+#   ep 0-10:   shape first  (decomp_w=0.1, accel_w=0.2, cons_w=0.1)
+#   ep 10-30:  kinematics   (decomp_w→0.5, accel_w→0.6, cons_w→0.3)
+#   ep 30+:    fine-tune    (decomp_w=0.6, accel_w=0.8, cons_w=0.4)
+
+# TOTAL ep0 budget: ~8-10 (similar to v39, stable)
+# """
+# from __future__ import annotations
+# from typing import Dict, Optional
+# import torch
+# import torch.nn.functional as F
+
+# __all__ = [
+#     "WEIGHTS", "compute_total_loss",
+#     "endpoint_focal_72h", "multi_horizon_mse",
+#     "cumulative_displacement_loss", "speed_accuracy_loss",
+#     "acceleration_loss", "displacement_decomp_loss",
+#     "temporal_consistency_loss",
+#     "_haversine_deg", "_norm_to_deg",
+# ]
+
+# # ── Physical constants ──────────────────────────────────────────────────────
+# R_EARTH  = 6371.0
+# DT_HOURS = 6.0
+# DEG2KM   = 111.0
+# V0_KMH   = 30.0     # climatological mean TC speed (km/h)
+# VMAX_KMH = 95.0     # max observed TC speed (km/h)
+# A0_KMH2  = 10.0     # max observed TC acceleration (km/h per hour)
+
+# WEIGHTS: Dict[str, float] = dict(
+#     hav_weighted = 1.0,   # PRIMARY position signal
+#     accel        = 0.05,  # kinematic regularization (từ ST-Trans)
+#     consistency  = 0.05,  # chống zig-zag
+# )
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Utilities
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+#     """Great-circle distance in km. Input in degrees [*, 2]."""
+#     lat1r = torch.deg2rad(p1[..., 1])
+#     lat2r = torch.deg2rad(p2[..., 1])
+#     dlon  = torch.deg2rad(p2[..., 0] - p1[..., 0])
+#     dlat  = torch.deg2rad(p2[..., 1] - p1[..., 1])
+#     a = (torch.sin(dlat / 2).pow(2)
+#          + torch.cos(lat1r) * torch.cos(lat2r) * torch.sin(dlon / 2).pow(2))
+#     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+
+
+# def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
+#     out = arr.clone()
+#     out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
+#     out[..., 1] = (arr[..., 1] * 50.0) / 10.0
+#     return out
+
+
+# def _haversine(p1, p2, unit_01deg=True):
+#     if unit_01deg:
+#         p1 = _norm_to_deg(p1); p2 = _norm_to_deg(p2)
+#     return _haversine_deg(p1, p2)
+
+
+# def _huber(x: torch.Tensor, delta: float) -> torch.Tensor:
+#     return torch.where(x.abs() < delta, x.pow(2) / (2.0 * delta), x.abs() - delta / 2.0)
+
+
+# def _step_vels_km(traj_deg: torch.Tensor) -> torch.Tensor:
+#     """Step-wise displacement vectors in km. [T,B,2]→[T-1,B,2]"""
+#     dt      = traj_deg[1:] - traj_deg[:-1]
+#     lat_mid = (traj_deg[:-1,:,1] + traj_deg[1:,:,1]) * 0.5
+#     cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+#     d = dt.clone()
+#     d[..., 0] = dt[..., 0] * cos_lat * DEG2KM
+#     d[..., 1] = dt[..., 1] * DEG2KM
+#     return d   # [T-1, B, 2] km
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 1 — endpoint_focal_72h  (MERGED focal + FDE)
+# #  ────────────────────────────────────────────────────────────────────────────
+# #  Gradient analysis showed focal_72h ↔ endpoint cos=0.93 → near-identical.
+# #  Solution: merge into one stronger loss that does BOTH:
+# #    - FDE Huber at 72h (Alahi 2016 Social LSTM)
+# #    - Focal per-sample weighting for hard samples (Lin 2017 RetinaNet)
+# #  Combined: d_72h × focal_weight, Huber(d × focal_w, target)
+# #
+# #  This gives stronger gradient than either alone AND eliminates redundancy.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def endpoint_focal_72h(pred_deg: torch.Tensor,
+#                         gt_deg: torch.Tensor,
+#                         target_km: float = 280.0,
+#                         gamma: float = 1.0) -> torch.Tensor:
+#     """
+#     Merged FDE + Focal loss at 72h step.
+
+#     Citation:
+#       Lin et al. (2017) RetinaNet: focal loss for hard sample upweighting.
+#       Alahi et al. (2016) Social LSTM: FDE as primary optimization target.
+#       NHC/JTWC: 72h is operationally critical forecast horizon.
+
+#     Formula:
+#       d = haversine(ŷ_72h, y_72h)
+#       focal_w = max(1, (d/target)^gamma)   [upweight hard samples]
+#       loss = Huber(d × focal_w, target) / target
+#     """
+#     if pred_deg.shape[0] < 12:
+#         return pred_deg.new_zeros(())
+
+#     d = _haversine_deg(pred_deg[11], gt_deg[11])   # [B]
+#     with torch.no_grad():
+#         focal_w = torch.where(d > target_km,
+#                               (d / target_km).clamp(max=4.0).pow(gamma),
+#                               torch.ones_like(d))
+#     d_weighted = d * focal_w
+#     return _huber(d_weighted, target_km).mean() / target_km
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 2 — multi_horizon_mse
+# #  Citation: CLIPER5 (DeMaria 2005), NHC/JTWC verification standard.
+# #  Exponential horizon weighting (Bi et al. 2023 Pangu-Weather):
+# #    72h gets 8× weight of 12h → aggressive long-range optimization.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def multi_horizon_mse(pred_deg: torch.Tensor,
+#                        gt_deg: torch.Tensor) -> torch.Tensor:
+#     """
+#     Huber at fixed horizons with exponential time weighting.
+
+#     Citation:
+#       DeMaria et al. (2005) CLIPER5: standard TC track verification at 12/24/48/72h.
+#       Bi et al. (2023) Pangu-Weather: exponential lead-time weighting scheme.
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 2:
+#         return pred_deg.new_zeros(())
+
+#     # (step, exp_weight, huber_delta_km)
+#     horizons = [(1, 1.0, 50.0), (3, 2.0, 100.0), (7, 4.0, 200.0), (11, 8.0, 300.0)]
+#     w_sum  = sum(w for _, w, _ in horizons)
+#     total  = pred_deg.new_zeros(())
+#     for step, w, delta in horizons:
+#         if step < T:
+#             d = _haversine_deg(pred_deg[step], gt_deg[step])
+#             total = total + (w / w_sum) * _huber(d, delta).mean() / delta
+#     return total
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 3 — cumulative_displacement_loss
+# #  Citation: MID (Zhao et al. 2021), GroupNet (Xu et al. 2022).
+# #  Per-step position loss → prevents error accumulation along trajectory.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def cumulative_displacement_loss(pred_deg: torch.Tensor,
+#                                   gt_deg: torch.Tensor) -> torch.Tensor:
+#     """
+#     Per-step Huber distance loss with linearly increasing lead-time weight.
+
+#     Citation:
+#       Zhao et al. (2021) MID: cumulative trajectory error supervision.
+#       Xu et al. (2022) GroupNet: multi-scale trajectory displacement loss.
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 2:
+#         return pred_deg.new_zeros(())
+
+#     # Climatological target distance (km) per step
+#     targets = [30, 40, 55, 70, 90, 110, 140, 170, 200, 230, 265, 300]
+
+#     total, w_sum = pred_deg.new_zeros(()), 0.0
+#     for t in range(T):
+#         d   = _haversine_deg(pred_deg[t], gt_deg[t])
+#         tgt = targets[min(t, len(targets)-1)]
+#         w   = float(t + 1)
+#         total = total + w * _huber(d, tgt).mean() / tgt
+#         w_sum += w
+#     return total / max(w_sum, 1.0)
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 4 — speed_accuracy_loss
+# #  Citation: Ruttgers et al. (2019) TrackNet, Jiang et al. (2023) FRAC.
+# #  Directly supervises TC translation speed → reduces ATE (timing error).
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def speed_accuracy_loss(pred_deg: torch.Tensor,
+#                          gt_deg: torch.Tensor,
+#                          v0_kmh: float = V0_KMH) -> torch.Tensor:
+#     """
+#     Match predicted TC translation speed (km/h) to GT at each step.
+
+#     Citation:
+#       Ruttgers et al. (2019) TrackNet: "mean translation speed error" metric.
+#       Jiang et al. (2023) FRAC: step-wise speed supervision framework.
+#     """
+#     pv = _step_vels_km(pred_deg)   # [T-1, B, 2]
+#     gv = _step_vels_km(gt_deg)
+
+#     if pv.shape[0] < 1:
+#         return pred_deg.new_zeros(())
+
+#     pred_spd = pv.norm(dim=-1) / DT_HOURS   # [T-1, B] km/h
+#     gt_spd   = gv.norm(dim=-1) / DT_HOURS
+
+#     T_v = pred_spd.shape[0]
+#     w   = torch.arange(1, T_v+1, dtype=torch.float32, device=pred_deg.device)
+#     w   = w / w.mean()
+
+#     return (_huber(pred_spd - gt_spd, v0_kmh) * w.unsqueeze(1)).mean() / v0_kmh
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 5 ★NEW — acceleration_loss
+# #  ────────────────────────────────────────────────────────────────────────────
+# #  THE KEY MISSING PIECE in v39.
+# #  ST-Trans (Faiaz 2026): physics-guided loss includes acceleration term.
+# #  Ablation Table 8 proves: acceleration penalty reduces ATE 16.6%.
+# #  Best config: lambda_accel=0.02, v_max=60km/h → acceleration dominates ATE.
+# #
+# #  TC kinematics (Chan & Gray 1982): "translation speed changes smoothly
+# #  on synoptic timescales" — acceleration rarely exceeds 10 km/h per 6h.
+# #  → Supervise Δspeed between consecutive steps.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def acceleration_loss(pred_deg: torch.Tensor,
+#                        gt_deg: torch.Tensor,
+#                        a0_kmh2: float = A0_KMH2) -> torch.Tensor:
+#     """
+#     Match predicted TC acceleration (speed change rate) to GT.
+
+#     Citation:
+#       Faiaz et al. (2026) ST-Trans: acceleration term in physics-guided loss.
+#         "kinematic regularization penalizing implausible translation speeds
+#          and accelerations" → ATE reduction 16.6% (95.89→79.94km).
+#       Chan & Gray (1982): TC translation speed changes smoothly over 6h.
+#       Helbing (1995) Social Force: momentum conservation in motion models.
+
+#     Args:
+#         a0_kmh2: normalization = max observed TC acceleration (km/h per hour)
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 3:
+#         return pred_deg.new_zeros(())
+
+#     pred_spd = _step_vels_km(pred_deg).norm(dim=-1) / DT_HOURS   # [T-1, B]
+#     gt_spd   = _step_vels_km(gt_deg  ).norm(dim=-1) / DT_HOURS
+
+#     # Acceleration = change in speed per unit time [T-2, B]
+#     pred_a = (pred_spd[1:] - pred_spd[:-1]) / DT_HOURS
+#     gt_a   = (gt_spd[1:]   - gt_spd[:-1]  ) / DT_HOURS
+
+#     T_a = pred_a.shape[0]
+#     w   = torch.arange(1, T_a+1, dtype=torch.float32, device=pred_deg.device)
+#     w   = w / w.mean()
+
+#     return (_huber(pred_a - gt_a, a0_kmh2) * w.unsqueeze(1)).mean() / a0_kmh2
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 6 ★NEW — displacement_decomp_loss  (ATE-direct)
+# #  ────────────────────────────────────────────────────────────────────────────
+# #  Gradient analysis: cos with position losses = 0.37-0.53 (acceptable overlap)
+# #  but provides DIRECT ATE gradient that other losses cannot.
+# #
+# #  At each step, decompose error into along-track (ATE) + cross-track (CTE)
+# #  components in the GT local frame. Penalize ATE 3× more than CTE because:
+# #    ATE >> CTE in our training (ATE=172km vs CTE=60km at ep5 EMA)
+# #    → Need asymmetric gradient pressure to correct imbalance.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def displacement_decomp_loss(pred_deg: torch.Tensor,
+#                               gt_deg: torch.Tensor,
+#                               delta_km: float = 100.0,
+#                               alpha_ate: float = 3.0,
+#                               beta_cte: float = 0.5) -> torch.Tensor:
+#     """
+#     Decompose position error into along-track (ATE) and cross-track (CTE)
+#     components in GT local frame. Penalize ATE asymmetrically (alpha > beta).
+
+#     Citation:
+#       Jiang et al. (2023) FRAC: separate along/cross-track supervision.
+#       Faiaz et al. (2026) ST-Trans: ATE/CTE decomposition as key metric.
+#         ATE reduction = primary benefit of kinematic regularization.
+#       NHC/JTWC: ATE = timing error, operationally critical for TC landfall.
+
+#     Note: raw values ~6.0 (10× other losses) → use small weight (0.15 default)
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 2:
+#         return pred_deg.new_zeros(())
+
+#     total, w_sum = pred_deg.new_zeros(()), 0.0
+
+#     for t in range(1, T):
+#         # GT local tangent frame: direction of GT motion at step t-1 → t
+#         gt_disp = gt_deg[t] - gt_deg[t-1]   # [B, 2] degrees
+#         lat_ref = gt_deg[t-1, :, 1]
+#         cos_ref = torch.cos(torch.deg2rad(lat_ref)).clamp(min=1e-4)
+
+#         # GT displacement in km [B, 2]
+#         gt_km = torch.stack([gt_disp[:,0]*cos_ref*DEG2KM, gt_disp[:,1]*DEG2KM], -1)
+#         gt_nm = gt_km.norm(dim=-1, keepdim=True).clamp(min=0.5)  # avoid div by 0
+
+#         u_along = gt_km / gt_nm                          # [B, 2] along-track
+#         u_cross = torch.stack([-u_along[:,1], u_along[:,0]], -1)  # [B, 2] cross
+
+#         # Prediction error in km [B, 2]
+#         err_deg = pred_deg[t] - gt_deg[t]
+#         err_km  = torch.stack([err_deg[:,0]*cos_ref*DEG2KM, err_deg[:,1]*DEG2KM], -1)
+
+#         # Project onto local frame
+#         ate = (err_km * u_along).sum(-1).abs().clamp(max=800.0)
+#         cte = (err_km * u_cross).sum(-1).abs().clamp(max=800.0)
+
+#         w = float(t)**1.5   # stronger weight for later steps
+#         loss_t = alpha_ate * _huber(ate, delta_km) / delta_km \
+#                + beta_cte  * _huber(cte, delta_km) / delta_km
+#         total = total + w * loss_t.mean()
+#         w_sum += w
+
+#     return total / max(w_sum, 1.0)
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Loss 7 ★NEW — temporal_consistency_loss  (Momentum)
+# #  ────────────────────────────────────────────────────────────────────────────
+# #  Gradient analysis: cos with all other losses < 0.45 → genuinely orthogonal.
+# #  Addresses the training log oscillation (72h: 587→738→511 in fast eval).
+# #
+# #  TC kinematic persistence (Chan & Gray 1982): velocity changes smoothly.
+# #  Penalize when predicted velocity at step t deviates from momentum prediction.
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def temporal_consistency_loss(pred_deg: torch.Tensor,
+#                                gt_deg: torch.Tensor,
+#                                alpha: float = 0.7,
+#                                v_scale_km: float = 80.0) -> torch.Tensor:
+#     """
+#     Penalize abrupt velocity changes (jerk) in predicted trajectory.
+#     Expected velocity: momentum blend = 0.7 * prev_pred + 0.3 * GT_signal
+
+#     Citation:
+#       Alahi et al. (2016) Social LSTM: momentum term for smooth trajectories.
+#       Chan & Gray (1982): TC translation speed changes smoothly over 6h.
+#       Faiaz et al. (2026): "suppress zig-zag artifacts under coordinate-driven
+#         optimization" — temporal consistency as key design goal.
+
+#     Note: raw values ~4.0 → use small weight (0.1 default)
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 3:
+#         return pred_deg.new_zeros(())
+
+#     pred_vel = pred_deg[1:T] - pred_deg[:T-1]   # [T-1, B, 2] degrees
+#     gt_vel   = gt_deg[1:T]   - gt_deg[:T-1]
+
+#     total, w_sum = pred_deg.new_zeros(()), 0.0
+#     T_v = pred_vel.shape[0]
+
+#     for t in range(1, T_v):
+#         # Momentum: blend previous pred velocity with GT velocity at t
+#         momentum = (alpha * pred_vel[t-1].detach()
+#                     + (1 - alpha) * gt_vel[t])   # [B, 2] in degrees
+
+#         diff_deg = pred_vel[t] - momentum
+#         lat_ref  = pred_deg[t, :, 1]
+#         cos_ref  = torch.cos(torch.deg2rad(lat_ref)).clamp(min=1e-4)
+
+#         diff_km = torch.stack([
+#             diff_deg[:,0] * cos_ref * DEG2KM,
+#             diff_deg[:,1] * DEG2KM,
+#         ], -1).norm(dim=-1).clamp(max=500.0)   # [B] km
+
+#         w = float(t)**0.5
+#         total = total + w * _huber(diff_km, v_scale_km).mean() / v_scale_km
+#         w_sum += w
+
+#     return total / max(w_sum, 1.0)
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  MAIN AGGREGATOR — v40_clean
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# # def compute_total_loss(
+# #     pred_deg: torch.Tensor,
+# #     gt_deg: torch.Tensor,
+# #     env_data: Optional[dict] = None,
+# #     weights: Optional[dict] = None,
+# #     epoch: int = 0,
+# #     **kwargs,
+# # ) -> dict:
+# #     """
+# #     v40_clean: 7 gradient-orthogonal losses, progressive curriculum.
+
+# #     Phase 1 (ep 0-10):   Learn trajectory shape first
+# #         endpoint_focal high, kinematic losses low
+# #     Phase 2 (ep 10-30):  Ramp up kinematic supervision
+# #         accel + decomp + consistency increase toward targets
+# #     Phase 3 (ep 30+):    Fine-tune with full kinematic pressure
+# #         all weights at operating level
+
+# #     ep0 budget: ~9-11 (stable)
+# #     ep10+ budget: ~4-7
+# #     ep40+ budget: ~1-3
+# #     """
+# #     if weights is None:
+# #         weights = WEIGHTS
+
+# #     # ── Progressive schedule ────────────────────────────────────────────────
+# #     # if epoch < 10:
+# #     #     t = epoch / 10.0
+# #     #     ef_w     = 3.5                       # endpoint_focal — stay high
+# #     #     mh_w     = 1.2                       # multi_horizon
+# #     #     cd_w     = 0.6 + 0.2 * t            # cumul_disp:  0.6 → 0.8
+# #     #     spd_w    = 0.4 + 0.3 * t            # speed:       0.4 → 0.7
+# #     #     acc_w    = 0.15 + 0.1 * t           # accel:       0.15 → 0.25
+# #     #     dcp_w    = 0.05 + 0.05 * t          # decomp:      0.05 → 0.10  (raw~6)
+# #     #     cns_w    = 0.05 + 0.05 * t          # consistency: 0.05 → 0.10  (raw~4)
+
+# #     # elif epoch < 30:
+# #     #     t = (epoch - 10) / 20.0
+# #     #     ef_w     = 3.5 - 1.0 * t            # 3.5 → 2.5
+# #     #     mh_w     = 1.2                       # stable
+# #     #     cd_w     = 0.8                       # stable
+# #     #     spd_w    = 0.7 + 0.8 * t            # 0.7 → 1.5
+# #     #     acc_w    = 0.25 + 0.45 * t          # 0.25 → 0.70
+# #     #     dcp_w    = 0.10 + 0.20 * t          # 0.10 → 0.30
+# #     #     cns_w    = 0.10 + 0.15 * t          # 0.10 → 0.25
+
+# #     # else:
+# #     #     ef_w  = 2.0    # reduced after model converges
+# #     #     mh_w  = 1.2
+# #     #     cd_w  = 0.8
+# #     #     spd_w = 1.5
+# #     #     acc_w = 0.7    # operating level — matches ST-Trans lambda_accel importance
+# #     #     dcp_w = 0.30   # operating level (raw ~6 → contribution ~1.8)
+# #     #     cns_w = 0.25   # operating level (raw ~4 → contribution ~1.0)
+# #     # Trong compute_total_loss(), thay toàn bộ progressive schedule:
+
+# #     if epoch < 10:
+# #         t = epoch / 10.0
+# #         ef_w  = 3.5
+# #         mh_w  = 1.2
+# #         cd_w  = 0.6 + 0.2 * t
+# #         spd_w = 0.4 + 0.3 * t
+# #         acc_w = 0.20 + 0.15 * t        # 0.20 → 0.35 (tăng mạnh hơn)
+# #         dcp_w = 0.10 + 0.10 * t        # 0.10 → 0.20 (tăng gấp đôi vs v41!)
+# #         cns_w = 0.05 + 0.05 * t
+
+# #     elif epoch < 30:
+# #         t = (epoch - 10) / 20.0
+# #         ef_w  = 3.5 - 1.0 * t          # 3.5 → 2.5
+# #         mh_w  = 1.2
+# #         cd_w  = 0.8
+# #         spd_w = 0.7 + 0.8 * t
+# #         acc_w = 0.35 + 0.65 * t        # 0.35 → 1.0  ← KEY change
+# #         dcp_w = 0.20 + 0.40 * t        # 0.20 → 0.60 ← KEY change
+# #         cns_w = 0.10 + 0.15 * t
+
+# #     else:
+# #         ef_w  = 2.0
+# #         mh_w  = 1.2
+# #         cd_w  = 0.8
+# #         spd_w = 1.5
+# #         acc_w = 1.0                     # tăng từ 0.7 → 1.0
+# #         dcp_w = 0.60                    # tăng từ 0.30 → 0.60
+# #         cns_w = 0.25
+        
+# #     # ── Compute losses ──────────────────────────────────────────────────────
+# #     l_ef   = endpoint_focal_72h(pred_deg, gt_deg, target_km=280.0, gamma=1.0)
+# #     l_mh   = multi_horizon_mse(pred_deg, gt_deg)
+# #     l_cd   = cumulative_displacement_loss(pred_deg, gt_deg)
+# #     l_spd  = speed_accuracy_loss(pred_deg, gt_deg, v0_kmh=V0_KMH)
+# #     l_acc  = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
+# #     l_dcp  = displacement_decomp_loss(pred_deg, gt_deg,
+# #                                        delta_km=100.0, alpha_ate=3.0, beta_cte=0.5)
+# #     l_cns  = temporal_consistency_loss(pred_deg, gt_deg,
+# #                                         alpha=0.7, v_scale_km=80.0)
+
+# #     total = (
+# #         ef_w  * l_ef
+# #         + mh_w  * l_mh
+# #         + cd_w  * l_cd
+# #         + spd_w * l_spd
+# #         + acc_w * l_acc
+# #         + dcp_w * l_dcp
+# #         + cns_w * l_cns
+# #     )
+
+# #     if torch.isnan(total) or torch.isinf(total):
+# #         total = pred_deg.new_zeros(())
+
+# #     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+
+# #     return dict(
+# #         total           = total,
+# #         # ── Log keys ────────────────────────────────────────────────────────
+# #         mse_hav_horizon = _s(l_mh),
+# #         mse_hav         = _s(l_mh),
+# #         multi_scale     = _s(l_ef),
+# #         endpoint        = _s(l_ef),
+# #         speed_acc       = _s(l_spd),
+# #         cumul_disp      = _s(l_cd),
+# #         accel           = _s(l_acc),
+# #         decomp          = _s(l_dcp),
+# #         cons            = _s(l_cns),
+# #         # ── Backward compat zeros ────────────────────────────────────────────
+# #         h_direct   = 0.0,
+# #         vel_smooth = 0.0,
+# #         heading    = 0.0,
+# #         ate_cte    = 0.0,
+# #         velocity   = 0.0,
+# #         recurv     = 0.0,
+# #         steering   = 0.0,
+# #         shape      = 0.0,
+# #         direct_mse = _s(l_mh),
+# #         hard_72h   = _s(l_ef),
+# #     )
+# # def compute_total_loss(
+# #     pred_deg: torch.Tensor,
+# #     gt_deg: torch.Tensor,
+# #     epoch: int = 0,
+# #     **kwargs,
+# # ) -> dict:
+# #     """
+# #     v42: 3-loss clean version cho flow matching.
+    
+# #     Triết lý: fm_mse là PRIMARY learner của velocity field.
+# #     Position losses chỉ là lightweight regularizer — không nên dominate.
+    
+# #     ST-Trans dùng: DPE + 0.05*MSE + 0.1*speed + 0.01*accel
+# #     Ta dùng tương tự nhưng weighted haversine thay vì flat mean.
+# #     """
+# #     T = min(pred_deg.shape[0], gt_deg.shape[0])
+# #     if T < 2:
+# #         return dict(total=pred_deg.new_zeros(()),
+# #                     mse_hav_horizon=0.0, mse_hav=0.0,
+# #                     multi_scale=0.0, endpoint=0.0,
+# #                     speed_acc=0.0, cumul_disp=0.0,
+# #                     accel=0.0, decomp=0.0, cons=0.0,
+# #                     h_direct=0.0, vel_smooth=0.0,
+# #                     ate_cte=0.0, velocity=0.0,
+# #                     heading=0.0, recurv=0.0,
+# #                     steering=0.0, shape=0.0,
+# #                     direct_mse=0.0, hard_72h=0.0)
+
+# #     # ── Loss 1: Weighted haversine tất cả steps ───────────────────────
+# #     # Weight tăng dần: step 12 (72h) được weight 12× so với step 1
+# #     # Đây là equivalent của ST-Trans LDPE nhưng weighted
+# #     total_hav = pred_deg.new_zeros(())
+# #     w_sum = 0.0
+# #     horizon_targets = [50, 70, 90, 120, 150, 180, 210, 240, 265, 280, 290, 300]
+# #     for t in range(T):
+# #         d   = _haversine_deg(pred_deg[t], gt_deg[t])
+# #         tgt = float(horizon_targets[min(t, len(horizon_targets)-1)])
+# #         w   = float(t + 1) ** 1.2   # superlinear: 72h gets 17x weight vs 6h
+# #         total_hav = total_hav + w * _huber(d, tgt).mean() / tgt
+# #         w_sum += w
+# #     l_hav = total_hav / max(w_sum, 1.0)
+
+# #     # ── Loss 2: Acceleration (từ ST-Trans, proven ATE reduction) ─────
+# #     l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
+
+# #     # ── Loss 3: Consistency (chống zig-zag) ──────────────────────────
+# #     l_cns = temporal_consistency_loss(pred_deg, gt_deg,
+# #                                        alpha=0.7, v_scale_km=80.0)
+
+# #     # ── Progressive: chỉ scale accel/consistency, giữ hav cố định ────
+# #     if epoch < 15:
+# #         t_ = epoch / 15.0
+# #         acc_w = 0.02 + 0.08 * t_    # 0.02 → 0.10
+# #         cns_w = 0.02 + 0.03 * t_    # 0.02 → 0.05
+# #     else:
+# #         acc_w = 0.10
+# #         cns_w = 0.05
+
+# #     total = l_hav + acc_w * l_acc + cns_w * l_cns
+
+# #     if torch.isnan(total) or torch.isinf(total):
+# #         total = pred_deg.new_zeros(())
+
+# #     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+# #     return dict(
+# #         total           = total,
+# #         mse_hav_horizon = _s(l_hav),
+# #         mse_hav         = _s(l_hav),
+# #         multi_scale     = _s(l_hav),
+# #         endpoint        = _s(l_hav),
+# #         speed_acc       = 0.0,
+# #         cumul_disp      = 0.0,
+# #         accel           = _s(l_acc),
+# #         decomp          = 0.0,
+# #         cons            = _s(l_cns),
+# #         h_direct=0.0, vel_smooth=0.0, ate_cte=0.0,
+# #         velocity=0.0, heading=0.0, recurv=0.0,
+# #         steering=0.0, shape=0.0,
+# #         direct_mse=_s(l_hav), hard_72h=_s(l_hav),
+# #     )
+# def compute_total_loss(
+#     pred_deg: torch.Tensor,
+#     gt_deg: torch.Tensor,
+#     epoch: int = 0,
+#     **kwargs,
+# ) -> dict:
+#     """
+#     v43_aggressive: Chiến thuật phá ngưỡng 340km.
+#     Tập trung toàn lực vào ATE (Along-track) và Focal-72h.
+#     """
+#     T = pred_deg.shape[0]
+#     if T < 12: # Đảm bảo đủ 72h
+#         return {"total": pred_deg.new_zeros(())}
+
+#     # ── 1. Haversine với trọng số thời gian cực gắt ──
+#     # Step 12 (72h) sẽ nặng hơn Step 1 khoảng 500 lần (12^2.5)
+#     total_hav = pred_deg.new_zeros(())
+#     w_sum = 0.0
+#     for t in range(T):
+#         d = _haversine_deg(pred_deg[t], gt_deg[t])
+#         w = float(t + 1) ** 2.5 
+#         total_hav = total_hav + w * d.mean()
+#         w_sum += w
+#     l_hav = total_hav / w_sum
+
+#     # ── 2. ĐẶC TRỊ ATE: Displacement Decomposition ──
+#     # alpha_ate=15.0: Phạt sai số tốc độ gấp 15 lần sai số hướng
+#     l_dcp = displacement_decomp_loss(
+#         pred_deg, gt_deg, 
+#         alpha_ate=15.0, 
+#         beta_cte=1.0, 
+#         delta_km=50.0
+#     )
+
+#     # ── 3. FOCAL 72H: Cú hích phá ngưỡng 300km ──
+#     # Nếu sai số 72h > 290km, gradient sẽ tăng theo hàm bình phương
+#     d_72h = _haversine_deg(pred_deg[11], gt_deg[11])
+#     l_72h = torch.where(
+#         d_72h > 290.0,
+#         (d_72h / 290.0)**2 * d_72h,
+#         d_72h
+#     ).mean() / 290.0
+
+#     # ── 4. Regularizers nhẹ ──
+#     l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
+#     l_cns = temporal_consistency_loss(pred_deg, gt_deg, alpha=0.7)
+
+#     # Tổng hợp trọng số
+#     # Ưu tiên dcp (ATE) và 72h để ép model đổi vận tốc
+#     total = 1.0 * l_hav + 0.8 * l_dcp + 2.0 * l_72h + 0.1 * l_acc + 0.05 * l_cns
+
+#     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+#     return dict(
+#         total           = total,
+#         mse_hav_horizon = _s(l_hav),
+#         endpoint        = _s(l_72h),
+#         decomp          = _s(l_dcp),
+#         accel           = _s(l_acc),
+#         cons            = _s(l_cns),
+#         # Gán các key cũ về 0 để tránh lỗi log
+#         mse_hav=_s(l_hav), multi_scale=_s(l_hav), speed_acc=0.0, cumul_disp=0.0
+#     )
+
 """
-Model/losses.py — v40_clean
+Model/losses.py — v44_speed_fix
 ════════════════════════════════════════════════════════════════════════════════
-THIẾT KẾ: 7 loss, không có cặp nào cos > 0.7, không có conflict
+ROOT CAUSE FIXES (từ phân tích 22 epoch training):
 
-PHÂN TÍCH GRADIENT REDUNDANCY (từ cosine similarity matrix):
-  ❌ multi_horizon ↔ h_direct    cos=0.97  → bỏ h_direct
-  ❌ focal_72h     ↔ endpoint    cos=0.93  → merge thành 1 loss mạnh hơn
-  ✓  heading                     cos≈0.01  → giữ (gần vuông góc với tất cả)
-  ✓  accel                       cos≈0.10  → giữ (gần vuông góc)
-  ✓  consistency                 cos≈0.15  → giữ (gần vuông góc)
-  ✓  decomp                      cos≈0.37  → giữ (bổ sung ATE signal)
-  ✓  vel_smooth                  cos≈0.12  → giữ (guard loss, gần vuông góc)
+  BUG 1: speed_acc=0.000 LUÔN LUÔN
+    → v43 hardcode speed_acc=0.0 trong return dict
+    → FIX: thêm l_speed THỰC SỰ = huber_loss(pred_spd, gt_spd)
 
-7 LOSSES CUỐI:
+  BUG 2: t^2.5 weighting phá vỡ việc học tốc độ
+    → w = (t+1)^2.5 → step 12 nặng ~500× step 1
+    → Model bỏ qua dynamics trung gian, chỉ opt vị trí cuối
+    → FIX: linear weighting w = (t+1) hoặc flat
 
-  ┌──────────────────────────┬────────────┬───────────────────────────────────┐
-  │ Loss                     │ Gradient   │ Chức năng                         │
-  │                          │ Norm rank  │                                   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 1. endpoint_focal_72h    │ #1 (0.074) │ MERGE focal+endpoint: FDE@72h     │
-  │    (merged focal+FDE)    │            │ với per-sample hard-weighting     │
-  │    Citation: Lin 2017    │            │ → PRIMARY 72h reduction signal    │
-  │    + Alahi 2016          │            │                                   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 2. multi_horizon         │ #4 (0.048) │ Huber@12h,24h,48h,72h exp weight  │
-  │    Citation: CLIPER5     │            │ → Coarse horizon guidance         │
-  │    DeMaria 2005          │            │                                   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 3. cumul_disp            │ #5 (0.037) │ Per-step position drift penalty   │
-  │    Citation: MID 2021    │            │ → Anti-accumulation               │
-  │    GroupNet 2022         │            │                                   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 4. speed_acc             │ #6 (0.039) │ Speed magnitude matching          │
-  │    Citation: TrackNet    │            │ → Timing accuracy                 │
-  │    Ruttgers 2019         │            │                                   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 5. accel ★NEW            │ #8 (0.026) │ Acceleration matching             │
-  │    Citation: ST-Trans    │            │ → KEY for ATE: ST-Trans proved    │
-  │    Faiaz 2026            │            │   ATE↓16.6% with this term        │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 6. decomp ★NEW           │ #2 (0.261) │ Along-track error direct signal   │
-  │    Citation: FRAC 2023   │            │ → ATE-proxy loss, 2× priority     │
-  │    ST-Trans ATE decomp   │            │   on along-track vs cross-track   │
-  ├──────────────────────────┼────────────┼───────────────────────────────────┤
-  │ 7. consistency ★NEW      │ #3 (0.099) │ Trajectory momentum smoothing     │
-  │    Citation: Social LSTM │            │ → Prevent zig-zag oscillation     │
-  │    Alahi 2016, Chan 1982 │            │   (seen in training logs)         │
-  └──────────────────────────┴────────────┴───────────────────────────────────┘
+  BUG 3: displacement_decomp alpha_ate=15 gây instability
+    → Gradient quá lớn so với các loss khác
+    → FIX: bỏ decomp phức tạp, dùng speed matching trực tiếp
 
-GRADIENT ORTHOGONALITY (sau khi bỏ redundant):
-  Max cosine similarity: decomp ↔ speed_acc = 0.53  (acceptable)
-  All other pairs: < 0.45
-  No conflict pairs (no negative cosine)
+KIẾN TRÚC v44:
+  5 loss terms, ST-Trans inspired:
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ 1. l_hav      — weighted haversine (linear w), PRIMARY position  │
+  │ 2. l_72h      — focal endpoint@72h, phá ngưỡng 300km             │
+  │ 3. l_speed    — huber(pred_spd, gt_spd), FIX ATE=165km → <100km │
+  │ 4. l_speed_cap— one-sided penalty khi vượt 80km/h (safety)      │
+  │ 5. l_acc      — huber(pred_accel, gt_accel), smooth kinematics   │
+  │ 6. l_cns      — temporal consistency, chống zig-zag              │
+  └──────────────────────────────────────────────────────────────────┘
 
-SCALE ISSUE FIX:
-  decomp raw = 6.0 (10× larger than others) → normalize bằng factor
-  consistency raw = 4.1 → normalize
-  → weight nhỏ ban đầu + normalize inside function
+  total = 1.0*l_hav + 1.0*l_72h + 0.5*l_speed + 0.05*l_cap + 0.1*l_acc + 0.05*l_cns
 
-PROGRESSIVE SCHEDULE v40_clean:
-  ep 0-10:   shape first  (decomp_w=0.1, accel_w=0.2, cons_w=0.1)
-  ep 10-30:  kinematics   (decomp_w→0.5, accel_w→0.6, cons_w→0.3)
-  ep 30+:    fine-tune    (decomp_w=0.6, accel_w=0.8, cons_w=0.4)
+  Kỳ vọng sau 10 epoch:
+    ATE: 165km → ~100-120km  (speed loss fix)
+    72h: 384km → ~320-340km  (haversine + focal 72h)
 
-TOTAL ep0 budget: ~8-10 (similar to v39, stable)
+THAM CHIẾU:
+  ST-Trans (Faiaz 2026): L = L_DPE + 0.05*L_MSE + 0.1*L_speed + 0.01*L_accel
+  Huber loss delta: speed=10km/h, accel=2km/h² (empirically tuned cho TC)
 """
 from __future__ import annotations
 from typing import Dict, Optional
@@ -10790,76 +11487,87 @@ __all__ = [
     "cumulative_displacement_loss", "speed_accuracy_loss",
     "acceleration_loss", "displacement_decomp_loss",
     "temporal_consistency_loss",
-    "_haversine_deg", "_norm_to_deg",
+    "_haversine_deg", "_norm_to_deg", "_step_vels_km",
 ]
 
 # ── Physical constants ──────────────────────────────────────────────────────
 R_EARTH  = 6371.0
-DT_HOURS = 6.0
-DEG2KM   = 111.0
-V0_KMH   = 30.0     # climatological mean TC speed (km/h)
-VMAX_KMH = 95.0     # max observed TC speed (km/h)
-A0_KMH2  = 10.0     # max observed TC acceleration (km/h per hour)
+DT_HOURS = 6.0        # Timestep: 6 giờ / bước
+DEG2KM   = 111.0      # km/degree latitude
+V0_KMH   = 30.0       # Climatological mean TC translation speed (km/h)
+VMAX_KMH = 80.0       # Max TC speed để safety-cap (km/h)
+A0_KMH2  = 10.0       # Max TC acceleration (km/h per hour)
 
+# Weights dictionary (backward compat)
 WEIGHTS: Dict[str, float] = dict(
-    hav_weighted = 1.0,   # PRIMARY position signal
-    accel        = 0.05,  # kinematic regularization (từ ST-Trans)
-    consistency  = 0.05,  # chống zig-zag
+    hav_weighted = 1.0,
+    speed        = 0.5,
+    speed_cap    = 0.05,
+    accel        = 0.1,
+    consistency  = 0.05,
 )
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-#  Utilities
+#  Utility functions
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    """Great-circle distance in km. Input in degrees [*, 2]."""
+    """
+    Great-circle distance in km. Input in degrees [*, 2] (lon, lat).
+    Returns tensor of shape [*] km.
+    """
     lat1r = torch.deg2rad(p1[..., 1])
     lat2r = torch.deg2rad(p2[..., 1])
     dlon  = torch.deg2rad(p2[..., 0] - p1[..., 0])
     dlat  = torch.deg2rad(p2[..., 1] - p1[..., 1])
     a = (torch.sin(dlat / 2).pow(2)
          + torch.cos(lat1r) * torch.cos(lat2r) * torch.sin(dlon / 2).pow(2))
-    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1.0 - 1e-12).sqrt())
 
 
 def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
+    """Convert normalized coords to degrees. lon: [0,360], lat: [-90,90]"""
     out = arr.clone()
-    out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0
-    out[..., 1] = (arr[..., 1] * 50.0) / 10.0
+    out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0   # lon
+    out[..., 1] = (arr[..., 1] * 50.0) / 10.0              # lat
     return out
 
 
 def _haversine(p1, p2, unit_01deg=True):
     if unit_01deg:
-        p1 = _norm_to_deg(p1); p2 = _norm_to_deg(p2)
+        p1 = _norm_to_deg(p1)
+        p2 = _norm_to_deg(p2)
     return _haversine_deg(p1, p2)
 
 
 def _huber(x: torch.Tensor, delta: float) -> torch.Tensor:
-    return torch.where(x.abs() < delta, x.pow(2) / (2.0 * delta), x.abs() - delta / 2.0)
+    """Huber loss: quadratic cho |x|<delta, linear cho |x|>=delta."""
+    return torch.where(
+        x.abs() < delta,
+        x.pow(2) / (2.0 * delta),
+        x.abs() - delta / 2.0
+    )
 
 
 def _step_vels_km(traj_deg: torch.Tensor) -> torch.Tensor:
-    """Step-wise displacement vectors in km. [T,B,2]→[T-1,B,2]"""
-    dt      = traj_deg[1:] - traj_deg[:-1]
-    lat_mid = (traj_deg[:-1,:,1] + traj_deg[1:,:,1]) * 0.5
+    """
+    Tính displacement vector tại mỗi bước trong km.
+    Input: [T, B, 2] degrees (lon, lat)
+    Output: [T-1, B, 2] km (dx, dy)
+    """
+    dt      = traj_deg[1:] - traj_deg[:-1]                # [T-1, B, 2] deg
+    lat_mid = (traj_deg[:-1, :, 1] + traj_deg[1:, :, 1]) * 0.5  # [T-1, B]
     cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+
     d = dt.clone()
-    d[..., 0] = dt[..., 0] * cos_lat * DEG2KM
-    d[..., 1] = dt[..., 1] * DEG2KM
+    d[..., 0] = dt[..., 0] * cos_lat * DEG2KM   # dx: tính theo cos(lat)
+    d[..., 1] = dt[..., 1] * DEG2KM              # dy: bình thường
     return d   # [T-1, B, 2] km
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Loss 1 — endpoint_focal_72h  (MERGED focal + FDE)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Gradient analysis showed focal_72h ↔ endpoint cos=0.93 → near-identical.
-#  Solution: merge into one stronger loss that does BOTH:
-#    - FDE Huber at 72h (Alahi 2016 Social LSTM)
-#    - Focal per-sample weighting for hard samples (Lin 2017 RetinaNet)
-#  Combined: d_72h × focal_weight, Huber(d × focal_w, target)
-#
-#  This gives stronger gradient than either alone AND eliminates redundancy.
+#  Individual loss functions (giữ nguyên để backward compat)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def endpoint_focal_72h(pred_deg: torch.Tensor,
@@ -10867,54 +11575,36 @@ def endpoint_focal_72h(pred_deg: torch.Tensor,
                         target_km: float = 280.0,
                         gamma: float = 1.0) -> torch.Tensor:
     """
-    Merged FDE + Focal loss at 72h step.
-
-    Citation:
-      Lin et al. (2017) RetinaNet: focal loss for hard sample upweighting.
-      Alahi et al. (2016) Social LSTM: FDE as primary optimization target.
-      NHC/JTWC: 72h is operationally critical forecast horizon.
-
-    Formula:
-      d = haversine(ŷ_72h, y_72h)
-      focal_w = max(1, (d/target)^gamma)   [upweight hard samples]
-      loss = Huber(d × focal_w, target) / target
+    Merged FDE + Focal loss tại bước 72h.
+    Citation: Lin et al. (2017) RetinaNet focal loss; Alahi et al. (2016) Social LSTM FDE.
     """
     if pred_deg.shape[0] < 12:
         return pred_deg.new_zeros(())
 
-    d = _haversine_deg(pred_deg[11], gt_deg[11])   # [B]
+    d = _haversine_deg(pred_deg[11], gt_deg[11])    # [B]
     with torch.no_grad():
-        focal_w = torch.where(d > target_km,
-                              (d / target_km).clamp(max=4.0).pow(gamma),
-                              torch.ones_like(d))
+        focal_w = torch.where(
+            d > target_km,
+            (d / target_km).clamp(max=4.0).pow(gamma),
+            torch.ones_like(d)
+        )
     d_weighted = d * focal_w
     return _huber(d_weighted, target_km).mean() / target_km
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 2 — multi_horizon_mse
-#  Citation: CLIPER5 (DeMaria 2005), NHC/JTWC verification standard.
-#  Exponential horizon weighting (Bi et al. 2023 Pangu-Weather):
-#    72h gets 8× weight of 12h → aggressive long-range optimization.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def multi_horizon_mse(pred_deg: torch.Tensor,
                        gt_deg: torch.Tensor) -> torch.Tensor:
     """
-    Huber at fixed horizons with exponential time weighting.
-
-    Citation:
-      DeMaria et al. (2005) CLIPER5: standard TC track verification at 12/24/48/72h.
-      Bi et al. (2023) Pangu-Weather: exponential lead-time weighting scheme.
+    Huber loss tại các horizon cố định với exponential time weighting.
+    Citation: DeMaria et al. (2005) CLIPER5; Bi et al. (2023) Pangu-Weather.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return pred_deg.new_zeros(())
 
-    # (step, exp_weight, huber_delta_km)
     horizons = [(1, 1.0, 50.0), (3, 2.0, 100.0), (7, 4.0, 200.0), (11, 8.0, 300.0)]
-    w_sum  = sum(w for _, w, _ in horizons)
-    total  = pred_deg.new_zeros(())
+    w_sum = sum(w for _, w, _ in horizons)
+    total = pred_deg.new_zeros(())
     for step, w, delta in horizons:
         if step < T:
             d = _haversine_deg(pred_deg[step], gt_deg[step])
@@ -10922,128 +11612,73 @@ def multi_horizon_mse(pred_deg: torch.Tensor,
     return total
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 3 — cumulative_displacement_loss
-#  Citation: MID (Zhao et al. 2021), GroupNet (Xu et al. 2022).
-#  Per-step position loss → prevents error accumulation along trajectory.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def cumulative_displacement_loss(pred_deg: torch.Tensor,
                                   gt_deg: torch.Tensor) -> torch.Tensor:
     """
-    Per-step Huber distance loss with linearly increasing lead-time weight.
-
-    Citation:
-      Zhao et al. (2021) MID: cumulative trajectory error supervision.
-      Xu et al. (2022) GroupNet: multi-scale trajectory displacement loss.
+    Per-step Huber distance loss với linear lead-time weight.
+    Citation: Zhao et al. (2021) MID; Xu et al. (2022) GroupNet.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return pred_deg.new_zeros(())
 
-    # Climatological target distance (km) per step
     targets = [30, 40, 55, 70, 90, 110, 140, 170, 200, 230, 265, 300]
-
     total, w_sum = pred_deg.new_zeros(()), 0.0
     for t in range(T):
         d   = _haversine_deg(pred_deg[t], gt_deg[t])
-        tgt = targets[min(t, len(targets)-1)]
+        tgt = float(targets[min(t, len(targets) - 1)])
         w   = float(t + 1)
         total = total + w * _huber(d, tgt).mean() / tgt
         w_sum += w
     return total / max(w_sum, 1.0)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 4 — speed_accuracy_loss
-#  Citation: Ruttgers et al. (2019) TrackNet, Jiang et al. (2023) FRAC.
-#  Directly supervises TC translation speed → reduces ATE (timing error).
-# ══════════════════════════════════════════════════════════════════════════════
-
 def speed_accuracy_loss(pred_deg: torch.Tensor,
                          gt_deg: torch.Tensor,
                          v0_kmh: float = V0_KMH) -> torch.Tensor:
     """
-    Match predicted TC translation speed (km/h) to GT at each step.
-
-    Citation:
-      Ruttgers et al. (2019) TrackNet: "mean translation speed error" metric.
-      Jiang et al. (2023) FRAC: step-wise speed supervision framework.
+    Match predicted TC translation speed (km/h) với GT speed tại mỗi bước.
+    Citation: Ruttgers et al. (2019) TrackNet; Jiang et al. (2023) FRAC.
     """
-    pv = _step_vels_km(pred_deg)   # [T-1, B, 2]
+    pv = _step_vels_km(pred_deg)
     gv = _step_vels_km(gt_deg)
-
     if pv.shape[0] < 1:
         return pred_deg.new_zeros(())
 
-    pred_spd = pv.norm(dim=-1) / DT_HOURS   # [T-1, B] km/h
+    pred_spd = pv.norm(dim=-1) / DT_HOURS    # [T-1, B] km/h
     gt_spd   = gv.norm(dim=-1) / DT_HOURS
 
     T_v = pred_spd.shape[0]
-    w   = torch.arange(1, T_v+1, dtype=torch.float32, device=pred_deg.device)
+    w   = torch.arange(1, T_v + 1, dtype=torch.float32, device=pred_deg.device)
     w   = w / w.mean()
 
     return (_huber(pred_spd - gt_spd, v0_kmh) * w.unsqueeze(1)).mean() / v0_kmh
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 5 ★NEW — acceleration_loss
-#  ────────────────────────────────────────────────────────────────────────────
-#  THE KEY MISSING PIECE in v39.
-#  ST-Trans (Faiaz 2026): physics-guided loss includes acceleration term.
-#  Ablation Table 8 proves: acceleration penalty reduces ATE 16.6%.
-#  Best config: lambda_accel=0.02, v_max=60km/h → acceleration dominates ATE.
-#
-#  TC kinematics (Chan & Gray 1982): "translation speed changes smoothly
-#  on synoptic timescales" — acceleration rarely exceeds 10 km/h per 6h.
-#  → Supervise Δspeed between consecutive steps.
-# ══════════════════════════════════════════════════════════════════════════════
-
 def acceleration_loss(pred_deg: torch.Tensor,
                        gt_deg: torch.Tensor,
                        a0_kmh2: float = A0_KMH2) -> torch.Tensor:
     """
-    Match predicted TC acceleration (speed change rate) to GT.
-
-    Citation:
-      Faiaz et al. (2026) ST-Trans: acceleration term in physics-guided loss.
-        "kinematic regularization penalizing implausible translation speeds
-         and accelerations" → ATE reduction 16.6% (95.89→79.94km).
-      Chan & Gray (1982): TC translation speed changes smoothly over 6h.
-      Helbing (1995) Social Force: momentum conservation in motion models.
-
-    Args:
-        a0_kmh2: normalization = max observed TC acceleration (km/h per hour)
+    Match predicted TC acceleration với GT acceleration.
+    Citation: Faiaz et al. (2026) ST-Trans: ATE giảm 16.6% với term này.
+    Citation: Chan & Gray (1982): TC speed thay đổi mượt mà theo thời gian.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 3:
         return pred_deg.new_zeros(())
 
     pred_spd = _step_vels_km(pred_deg).norm(dim=-1) / DT_HOURS   # [T-1, B]
-    gt_spd   = _step_vels_km(gt_deg  ).norm(dim=-1) / DT_HOURS
+    gt_spd   = _step_vels_km(gt_deg).norm(dim=-1) / DT_HOURS
 
-    # Acceleration = change in speed per unit time [T-2, B]
-    pred_a = (pred_spd[1:] - pred_spd[:-1]) / DT_HOURS
-    gt_a   = (gt_spd[1:]   - gt_spd[:-1]  ) / DT_HOURS
+    pred_a = (pred_spd[1:] - pred_spd[:-1]) / DT_HOURS    # [T-2, B] km/h²
+    gt_a   = (gt_spd[1:]   - gt_spd[:-1])   / DT_HOURS
 
     T_a = pred_a.shape[0]
-    w   = torch.arange(1, T_a+1, dtype=torch.float32, device=pred_deg.device)
+    w   = torch.arange(1, T_a + 1, dtype=torch.float32, device=pred_deg.device)
     w   = w / w.mean()
 
     return (_huber(pred_a - gt_a, a0_kmh2) * w.unsqueeze(1)).mean() / a0_kmh2
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 6 ★NEW — displacement_decomp_loss  (ATE-direct)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Gradient analysis: cos with position losses = 0.37-0.53 (acceptable overlap)
-#  but provides DIRECT ATE gradient that other losses cannot.
-#
-#  At each step, decompose error into along-track (ATE) + cross-track (CTE)
-#  components in the GT local frame. Penalize ATE 3× more than CTE because:
-#    ATE >> CTE in our training (ATE=172km vs CTE=60km at ep5 EMA)
-#    → Need asymmetric gradient pressure to correct imbalance.
-# ══════════════════════════════════════════════════════════════════════════════
 
 def displacement_decomp_loss(pred_deg: torch.Tensor,
                               gt_deg: torch.Tensor,
@@ -11051,329 +11686,89 @@ def displacement_decomp_loss(pred_deg: torch.Tensor,
                               alpha_ate: float = 3.0,
                               beta_cte: float = 0.5) -> torch.Tensor:
     """
-    Decompose position error into along-track (ATE) and cross-track (CTE)
-    components in GT local frame. Penalize ATE asymmetrically (alpha > beta).
+    Decompose position error thành along-track (ATE) và cross-track (CTE).
+    Penalize ATE mạnh hơn CTE vì ATE >> CTE trong training logs.
+    Citation: Jiang et al. (2023) FRAC; Faiaz et al. (2026) ST-Trans ATE decomp.
 
-    Citation:
-      Jiang et al. (2023) FRAC: separate along/cross-track supervision.
-      Faiaz et al. (2026) ST-Trans: ATE/CTE decomposition as key metric.
-        ATE reduction = primary benefit of kinematic regularization.
-      NHC/JTWC: ATE = timing error, operationally critical for TC landfall.
-
-    Note: raw values ~6.0 (10× other losses) → use small weight (0.15 default)
+    NOTE: Hàm này không dùng trong compute_total_loss v44 nữa (đã thay bằng
+    speed loss trực tiếp). Giữ lại để backward compat.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return pred_deg.new_zeros(())
 
     total, w_sum = pred_deg.new_zeros(()), 0.0
-
     for t in range(1, T):
-        # GT local tangent frame: direction of GT motion at step t-1 → t
-        gt_disp = gt_deg[t] - gt_deg[t-1]   # [B, 2] degrees
-        lat_ref = gt_deg[t-1, :, 1]
+        gt_disp = gt_deg[t] - gt_deg[t - 1]    # [B, 2] deg
+        lat_ref = gt_deg[t - 1, :, 1]
         cos_ref = torch.cos(torch.deg2rad(lat_ref)).clamp(min=1e-4)
 
-        # GT displacement in km [B, 2]
-        gt_km = torch.stack([gt_disp[:,0]*cos_ref*DEG2KM, gt_disp[:,1]*DEG2KM], -1)
-        gt_nm = gt_km.norm(dim=-1, keepdim=True).clamp(min=0.5)  # avoid div by 0
+        gt_km  = torch.stack([gt_disp[:, 0] * cos_ref * DEG2KM,
+                               gt_disp[:, 1] * DEG2KM], dim=-1)        # [B, 2]
+        gt_nm  = gt_km.norm(dim=-1, keepdim=True).clamp(min=0.5)
 
-        u_along = gt_km / gt_nm                          # [B, 2] along-track
-        u_cross = torch.stack([-u_along[:,1], u_along[:,0]], -1)  # [B, 2] cross
+        u_along = gt_km / gt_nm                                          # [B, 2]
+        u_cross = torch.stack([-u_along[:, 1], u_along[:, 0]], dim=-1)  # [B, 2]
 
-        # Prediction error in km [B, 2]
-        err_deg = pred_deg[t] - gt_deg[t]
-        err_km  = torch.stack([err_deg[:,0]*cos_ref*DEG2KM, err_deg[:,1]*DEG2KM], -1)
+        err_deg = pred_deg[t] - gt_deg[t]                               # [B, 2]
+        err_km  = torch.stack([err_deg[:, 0] * cos_ref * DEG2KM,
+                                err_deg[:, 1] * DEG2KM], dim=-1)        # [B, 2]
 
-        # Project onto local frame
-        ate = (err_km * u_along).sum(-1).abs().clamp(max=800.0)
-        cte = (err_km * u_cross).sum(-1).abs().clamp(max=800.0)
+        ate = (err_km * u_along).sum(dim=-1).abs().clamp(max=800.0)     # [B]
+        cte = (err_km * u_cross).sum(dim=-1).abs().clamp(max=800.0)     # [B]
 
-        w = float(t)**1.5   # stronger weight for later steps
-        loss_t = alpha_ate * _huber(ate, delta_km) / delta_km \
-               + beta_cte  * _huber(cte, delta_km) / delta_km
-        total = total + w * loss_t.mean()
-        w_sum += w
+        w      = float(t) ** 1.5
+        loss_t = (alpha_ate * _huber(ate, delta_km) / delta_km
+                  + beta_cte * _huber(cte, delta_km) / delta_km)
+        total  = total + w * loss_t.mean()
+        w_sum  += w
 
     return total / max(w_sum, 1.0)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Loss 7 ★NEW — temporal_consistency_loss  (Momentum)
-#  ────────────────────────────────────────────────────────────────────────────
-#  Gradient analysis: cos with all other losses < 0.45 → genuinely orthogonal.
-#  Addresses the training log oscillation (72h: 587→738→511 in fast eval).
-#
-#  TC kinematic persistence (Chan & Gray 1982): velocity changes smoothly.
-#  Penalize when predicted velocity at step t deviates from momentum prediction.
-# ══════════════════════════════════════════════════════════════════════════════
 
 def temporal_consistency_loss(pred_deg: torch.Tensor,
                                gt_deg: torch.Tensor,
                                alpha: float = 0.7,
                                v_scale_km: float = 80.0) -> torch.Tensor:
     """
-    Penalize abrupt velocity changes (jerk) in predicted trajectory.
-    Expected velocity: momentum blend = 0.7 * prev_pred + 0.3 * GT_signal
-
-    Citation:
-      Alahi et al. (2016) Social LSTM: momentum term for smooth trajectories.
-      Chan & Gray (1982): TC translation speed changes smoothly over 6h.
-      Faiaz et al. (2026): "suppress zig-zag artifacts under coordinate-driven
-        optimization" — temporal consistency as key design goal.
-
-    Note: raw values ~4.0 → use small weight (0.1 default)
+    Phạt thay đổi velocity đột ngột (jerk) trong predicted trajectory.
+    Expected velocity = 0.7*prev_pred + 0.3*GT_signal.
+    Citation: Alahi et al. (2016) Social LSTM; Chan & Gray (1982).
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 3:
         return pred_deg.new_zeros(())
 
-    pred_vel = pred_deg[1:T] - pred_deg[:T-1]   # [T-1, B, 2] degrees
-    gt_vel   = gt_deg[1:T]   - gt_deg[:T-1]
+    pred_vel = pred_deg[1:T] - pred_deg[:T - 1]    # [T-1, B, 2] deg
+    gt_vel   = gt_deg[1:T]   - gt_deg[:T - 1]
 
     total, w_sum = pred_deg.new_zeros(()), 0.0
     T_v = pred_vel.shape[0]
 
     for t in range(1, T_v):
-        # Momentum: blend previous pred velocity with GT velocity at t
-        momentum = (alpha * pred_vel[t-1].detach()
-                    + (1 - alpha) * gt_vel[t])   # [B, 2] in degrees
+        momentum = (alpha * pred_vel[t - 1].detach()
+                    + (1.0 - alpha) * gt_vel[t])    # [B, 2] deg
 
         diff_deg = pred_vel[t] - momentum
         lat_ref  = pred_deg[t, :, 1]
         cos_ref  = torch.cos(torch.deg2rad(lat_ref)).clamp(min=1e-4)
 
         diff_km = torch.stack([
-            diff_deg[:,0] * cos_ref * DEG2KM,
-            diff_deg[:,1] * DEG2KM,
-        ], -1).norm(dim=-1).clamp(max=500.0)   # [B] km
+            diff_deg[:, 0] * cos_ref * DEG2KM,
+            diff_deg[:, 1] * DEG2KM,
+        ], dim=-1).norm(dim=-1).clamp(max=500.0)   # [B] km
 
-        w = float(t)**0.5
-        total = total + w * _huber(diff_km, v_scale_km).mean() / v_scale_km
-        w_sum += w
+        w      = float(t) ** 0.5
+        total  = total + w * _huber(diff_km, v_scale_km).mean() / v_scale_km
+        w_sum  += w
 
     return total / max(w_sum, 1.0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MAIN AGGREGATOR — v40_clean
+#  MAIN AGGREGATOR — v44_speed_fix
 # ══════════════════════════════════════════════════════════════════════════════
 
-# def compute_total_loss(
-#     pred_deg: torch.Tensor,
-#     gt_deg: torch.Tensor,
-#     env_data: Optional[dict] = None,
-#     weights: Optional[dict] = None,
-#     epoch: int = 0,
-#     **kwargs,
-# ) -> dict:
-#     """
-#     v40_clean: 7 gradient-orthogonal losses, progressive curriculum.
-
-#     Phase 1 (ep 0-10):   Learn trajectory shape first
-#         endpoint_focal high, kinematic losses low
-#     Phase 2 (ep 10-30):  Ramp up kinematic supervision
-#         accel + decomp + consistency increase toward targets
-#     Phase 3 (ep 30+):    Fine-tune with full kinematic pressure
-#         all weights at operating level
-
-#     ep0 budget: ~9-11 (stable)
-#     ep10+ budget: ~4-7
-#     ep40+ budget: ~1-3
-#     """
-#     if weights is None:
-#         weights = WEIGHTS
-
-#     # ── Progressive schedule ────────────────────────────────────────────────
-#     # if epoch < 10:
-#     #     t = epoch / 10.0
-#     #     ef_w     = 3.5                       # endpoint_focal — stay high
-#     #     mh_w     = 1.2                       # multi_horizon
-#     #     cd_w     = 0.6 + 0.2 * t            # cumul_disp:  0.6 → 0.8
-#     #     spd_w    = 0.4 + 0.3 * t            # speed:       0.4 → 0.7
-#     #     acc_w    = 0.15 + 0.1 * t           # accel:       0.15 → 0.25
-#     #     dcp_w    = 0.05 + 0.05 * t          # decomp:      0.05 → 0.10  (raw~6)
-#     #     cns_w    = 0.05 + 0.05 * t          # consistency: 0.05 → 0.10  (raw~4)
-
-#     # elif epoch < 30:
-#     #     t = (epoch - 10) / 20.0
-#     #     ef_w     = 3.5 - 1.0 * t            # 3.5 → 2.5
-#     #     mh_w     = 1.2                       # stable
-#     #     cd_w     = 0.8                       # stable
-#     #     spd_w    = 0.7 + 0.8 * t            # 0.7 → 1.5
-#     #     acc_w    = 0.25 + 0.45 * t          # 0.25 → 0.70
-#     #     dcp_w    = 0.10 + 0.20 * t          # 0.10 → 0.30
-#     #     cns_w    = 0.10 + 0.15 * t          # 0.10 → 0.25
-
-#     # else:
-#     #     ef_w  = 2.0    # reduced after model converges
-#     #     mh_w  = 1.2
-#     #     cd_w  = 0.8
-#     #     spd_w = 1.5
-#     #     acc_w = 0.7    # operating level — matches ST-Trans lambda_accel importance
-#     #     dcp_w = 0.30   # operating level (raw ~6 → contribution ~1.8)
-#     #     cns_w = 0.25   # operating level (raw ~4 → contribution ~1.0)
-#     # Trong compute_total_loss(), thay toàn bộ progressive schedule:
-
-#     if epoch < 10:
-#         t = epoch / 10.0
-#         ef_w  = 3.5
-#         mh_w  = 1.2
-#         cd_w  = 0.6 + 0.2 * t
-#         spd_w = 0.4 + 0.3 * t
-#         acc_w = 0.20 + 0.15 * t        # 0.20 → 0.35 (tăng mạnh hơn)
-#         dcp_w = 0.10 + 0.10 * t        # 0.10 → 0.20 (tăng gấp đôi vs v41!)
-#         cns_w = 0.05 + 0.05 * t
-
-#     elif epoch < 30:
-#         t = (epoch - 10) / 20.0
-#         ef_w  = 3.5 - 1.0 * t          # 3.5 → 2.5
-#         mh_w  = 1.2
-#         cd_w  = 0.8
-#         spd_w = 0.7 + 0.8 * t
-#         acc_w = 0.35 + 0.65 * t        # 0.35 → 1.0  ← KEY change
-#         dcp_w = 0.20 + 0.40 * t        # 0.20 → 0.60 ← KEY change
-#         cns_w = 0.10 + 0.15 * t
-
-#     else:
-#         ef_w  = 2.0
-#         mh_w  = 1.2
-#         cd_w  = 0.8
-#         spd_w = 1.5
-#         acc_w = 1.0                     # tăng từ 0.7 → 1.0
-#         dcp_w = 0.60                    # tăng từ 0.30 → 0.60
-#         cns_w = 0.25
-        
-#     # ── Compute losses ──────────────────────────────────────────────────────
-#     l_ef   = endpoint_focal_72h(pred_deg, gt_deg, target_km=280.0, gamma=1.0)
-#     l_mh   = multi_horizon_mse(pred_deg, gt_deg)
-#     l_cd   = cumulative_displacement_loss(pred_deg, gt_deg)
-#     l_spd  = speed_accuracy_loss(pred_deg, gt_deg, v0_kmh=V0_KMH)
-#     l_acc  = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
-#     l_dcp  = displacement_decomp_loss(pred_deg, gt_deg,
-#                                        delta_km=100.0, alpha_ate=3.0, beta_cte=0.5)
-#     l_cns  = temporal_consistency_loss(pred_deg, gt_deg,
-#                                         alpha=0.7, v_scale_km=80.0)
-
-#     total = (
-#         ef_w  * l_ef
-#         + mh_w  * l_mh
-#         + cd_w  * l_cd
-#         + spd_w * l_spd
-#         + acc_w * l_acc
-#         + dcp_w * l_dcp
-#         + cns_w * l_cns
-#     )
-
-#     if torch.isnan(total) or torch.isinf(total):
-#         total = pred_deg.new_zeros(())
-
-#     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
-
-#     return dict(
-#         total           = total,
-#         # ── Log keys ────────────────────────────────────────────────────────
-#         mse_hav_horizon = _s(l_mh),
-#         mse_hav         = _s(l_mh),
-#         multi_scale     = _s(l_ef),
-#         endpoint        = _s(l_ef),
-#         speed_acc       = _s(l_spd),
-#         cumul_disp      = _s(l_cd),
-#         accel           = _s(l_acc),
-#         decomp          = _s(l_dcp),
-#         cons            = _s(l_cns),
-#         # ── Backward compat zeros ────────────────────────────────────────────
-#         h_direct   = 0.0,
-#         vel_smooth = 0.0,
-#         heading    = 0.0,
-#         ate_cte    = 0.0,
-#         velocity   = 0.0,
-#         recurv     = 0.0,
-#         steering   = 0.0,
-#         shape      = 0.0,
-#         direct_mse = _s(l_mh),
-#         hard_72h   = _s(l_ef),
-#     )
-# def compute_total_loss(
-#     pred_deg: torch.Tensor,
-#     gt_deg: torch.Tensor,
-#     epoch: int = 0,
-#     **kwargs,
-# ) -> dict:
-#     """
-#     v42: 3-loss clean version cho flow matching.
-    
-#     Triết lý: fm_mse là PRIMARY learner của velocity field.
-#     Position losses chỉ là lightweight regularizer — không nên dominate.
-    
-#     ST-Trans dùng: DPE + 0.05*MSE + 0.1*speed + 0.01*accel
-#     Ta dùng tương tự nhưng weighted haversine thay vì flat mean.
-#     """
-#     T = min(pred_deg.shape[0], gt_deg.shape[0])
-#     if T < 2:
-#         return dict(total=pred_deg.new_zeros(()),
-#                     mse_hav_horizon=0.0, mse_hav=0.0,
-#                     multi_scale=0.0, endpoint=0.0,
-#                     speed_acc=0.0, cumul_disp=0.0,
-#                     accel=0.0, decomp=0.0, cons=0.0,
-#                     h_direct=0.0, vel_smooth=0.0,
-#                     ate_cte=0.0, velocity=0.0,
-#                     heading=0.0, recurv=0.0,
-#                     steering=0.0, shape=0.0,
-#                     direct_mse=0.0, hard_72h=0.0)
-
-#     # ── Loss 1: Weighted haversine tất cả steps ───────────────────────
-#     # Weight tăng dần: step 12 (72h) được weight 12× so với step 1
-#     # Đây là equivalent của ST-Trans LDPE nhưng weighted
-#     total_hav = pred_deg.new_zeros(())
-#     w_sum = 0.0
-#     horizon_targets = [50, 70, 90, 120, 150, 180, 210, 240, 265, 280, 290, 300]
-#     for t in range(T):
-#         d   = _haversine_deg(pred_deg[t], gt_deg[t])
-#         tgt = float(horizon_targets[min(t, len(horizon_targets)-1)])
-#         w   = float(t + 1) ** 1.2   # superlinear: 72h gets 17x weight vs 6h
-#         total_hav = total_hav + w * _huber(d, tgt).mean() / tgt
-#         w_sum += w
-#     l_hav = total_hav / max(w_sum, 1.0)
-
-#     # ── Loss 2: Acceleration (từ ST-Trans, proven ATE reduction) ─────
-#     l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
-
-#     # ── Loss 3: Consistency (chống zig-zag) ──────────────────────────
-#     l_cns = temporal_consistency_loss(pred_deg, gt_deg,
-#                                        alpha=0.7, v_scale_km=80.0)
-
-#     # ── Progressive: chỉ scale accel/consistency, giữ hav cố định ────
-#     if epoch < 15:
-#         t_ = epoch / 15.0
-#         acc_w = 0.02 + 0.08 * t_    # 0.02 → 0.10
-#         cns_w = 0.02 + 0.03 * t_    # 0.02 → 0.05
-#     else:
-#         acc_w = 0.10
-#         cns_w = 0.05
-
-#     total = l_hav + acc_w * l_acc + cns_w * l_cns
-
-#     if torch.isnan(total) or torch.isinf(total):
-#         total = pred_deg.new_zeros(())
-
-#     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
-#     return dict(
-#         total           = total,
-#         mse_hav_horizon = _s(l_hav),
-#         mse_hav         = _s(l_hav),
-#         multi_scale     = _s(l_hav),
-#         endpoint        = _s(l_hav),
-#         speed_acc       = 0.0,
-#         cumul_disp      = 0.0,
-#         accel           = _s(l_acc),
-#         decomp          = 0.0,
-#         cons            = _s(l_cns),
-#         h_direct=0.0, vel_smooth=0.0, ate_cte=0.0,
-#         velocity=0.0, heading=0.0, recurv=0.0,
-#         steering=0.0, shape=0.0,
-#         direct_mse=_s(l_hav), hard_72h=_s(l_hav),
-#     )
 def compute_total_loss(
     pred_deg: torch.Tensor,
     gt_deg: torch.Tensor,
@@ -11381,58 +11776,171 @@ def compute_total_loss(
     **kwargs,
 ) -> dict:
     """
-    v43_aggressive: Chiến thuật phá ngưỡng 340km.
-    Tập trung toàn lực vào ATE (Along-track) và Focal-72h.
+    v44_speed_fix: Fix systematic speed bias (ATE 165km → <100km mục tiêu).
+
+    ROOT CAUSE được xác nhận sau 22 epochs:
+      1. speed_acc=0.000 LUÔN = không có speed loss thực sự
+      2. t^2.5 weighting → model bỏ qua dynamics, chỉ tối ưu vị trí cuối
+      3. Kết quả: CTE=58km (tốt!) nhưng ATE=165km (sai tốc độ)
+
+    FIXES:
+      1. l_speed = huber_loss(pred_spd_kmh, gt_spd_kmh, delta=10)
+         → Phạt trực tiếp sai số tốc độ (km/h), cả thiếu lẫn thừa
+      2. l_speed_cap = relu(pred_spd - 80).^2
+         → One-sided safety guard, không phạt tốc độ bình thường
+      3. l_hav với linear weight (t+1), không phải (t+1)^2.5
+         → Model học đều trên toàn trajectory, không chỉ endpoint
+      4. l_72h = simple mean haversine@72h (giảm complexity)
+      5. l_acc = huber(pred_accel, gt_accel, delta=2)
+         → ST-Trans proved: giảm ATE 16.6%
+      6. l_cns = temporal consistency (chống zig-zag)
+
+    WEIGHTS (ST-Trans inspired, proven trên cùng basin):
+      total = 1.0*l_hav + 1.0*l_72h + 0.5*l_speed + 0.05*l_cap + 0.1*l_acc + 0.05*l_cns
+
+    MONITOR: Sau khi fix, log phải hiện:
+      spd=0.5~2.0  (huber loss, không phải 0.000)
+      acc=0.1~0.5
+      Nếu spd vẫn 0.000 → check return dict trong get_loss_breakdown
+
+    Args:
+        pred_deg: [T, B, 2] predicted positions in degrees
+        gt_deg:   [T, B, 2] ground truth positions in degrees
+        epoch:    current training epoch (dùng cho progressive schedule)
+
+    Returns:
+        dict with 'total' tensor + scalar log values
     """
     T = pred_deg.shape[0]
-    if T < 12: # Đảm bảo đủ 72h
-        return {"total": pred_deg.new_zeros(())}
 
-    # ── 1. Haversine với trọng số thời gian cực gắt ──
-    # Step 12 (72h) sẽ nặng hơn Step 1 khoảng 500 lần (12^2.5)
+    # Safety check: cần ít nhất 12 bước cho 72h
+    if T < 12:
+        _zero = pred_deg.new_zeros(())
+        return dict(
+            total=_zero, mse_hav_horizon=0.0, mse_hav=0.0,
+            endpoint=0.0, speed_acc=0.0, accel=0.0,
+            decomp=0.0, cons=0.0, multi_scale=0.0, cumul_disp=0.0,
+            h_direct=0.0, vel_smooth=0.0, ate_cte=0.0,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 1: Haversine với TUYẾN TÍNH weighting (FIX từ t^2.5 → t+1)
+    # ─────────────────────────────────────────────────────────────────────────
+    # t^2.5 cũ: step 12 nặng ~500× step 1 → bỏ qua dynamics trung gian
+    # Linear mới: step 12 nặng ~12× step 1 → cân bằng hơn, học được speed
     total_hav = pred_deg.new_zeros(())
-    w_sum = 0.0
+    w_sum_hav = 0.0
     for t in range(T):
-        d = _haversine_deg(pred_deg[t], gt_deg[t])
-        w = float(t + 1) ** 2.5 
+        d = _haversine_deg(pred_deg[t], gt_deg[t])   # [B] km
+        w = float(t + 1)                               # LINEAR, không phải ^2.5
         total_hav = total_hav + w * d.mean()
-        w_sum += w
-    l_hav = total_hav / w_sum
+        w_sum_hav += w
+    l_hav = total_hav / w_sum_hav    # đơn vị: km
 
-    # ── 2. ĐẶC TRỊ ATE: Displacement Decomposition ──
-    # alpha_ate=15.0: Phạt sai số tốc độ gấp 15 lần sai số hướng
-    l_dcp = displacement_decomp_loss(
-        pred_deg, gt_deg, 
-        alpha_ate=15.0, 
-        beta_cte=1.0, 
-        delta_km=50.0
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 2: 72h Endpoint Loss — giảm weight từ 2.0 → 1.0 (v43: 2.0*l_72h)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Simple mean thay vì focal phức tạp — focal chỉ cần thiết khi model
+    # đã gần ngưỡng target (<300km). Hiện tại ở 384km → simple mean ổn hơn.
+    d_72h = _haversine_deg(pred_deg[11], gt_deg[11])   # [B] km
+    l_72h = d_72h.mean()                                # đơn vị: km
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 3: SPEED MATCHING LOSS (THE KEY FIX — giải quyết ATE 165km)
+    # ─────────────────────────────────────────────────────────────────────────
+    # l_speed = huber(pred_speed_kmh, gt_speed_kmh, delta=10km/h)
+    # → delta=10: sai số <10km/h dùng quadratic, >10km/h dùng linear
+    # → Phạt CẢ HAI chiều: chạy nhanh quá VÀ chạy chậm quá
+    # → Đây là lý do gốc của ATE=165km: không có loss nào kiểm soát speed!
+    pv       = _step_vels_km(pred_deg)                   # [T-1, B, 2] km
+    gv       = _step_vels_km(gt_deg)
+    pred_spd = pv.norm(dim=-1) / DT_HOURS                # [T-1, B] km/h
+    gt_spd   = gv.norm(dim=-1) / DT_HOURS                # [T-1, B] km/h
+
+    # Huber với delta=10km/h: sai số nhỏ được penalize quadratically,
+    # sai số lớn được penalize linearly (ít penalty hơn MSE thuần cho outliers)
+    l_speed = F.huber_loss(pred_spd, gt_spd, delta=10.0)   # đơn vị: km/h
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 4: Speed Cap — chỉ phạt khi vượt VMAX_KMH (one-sided)
+    # ─────────────────────────────────────────────────────────────────────────
+    # Khác với l_speed (penalize cả 2 chiều), l_speed_cap chỉ phạt khi
+    # pred_speed > 80km/h. TC hầu như không đạt >80km/h translation speed.
+    # Scale nhỏ (0.05) vì chỉ là safety guard, không phải primary loss.
+    l_speed_cap = F.relu(pred_spd - VMAX_KMH).pow(2).mean()   # đơn vị: km²/h²
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 5: Acceleration Matching
+    # ─────────────────────────────────────────────────────────────────────────
+    # ST-Trans (Faiaz 2026) Table 8: acceleration term giảm ATE 16.6%
+    # pred_a = (spd[t+1] - spd[t]) / DT_HOURS  [km/h²]
+    # delta=2 km/h²: TC acceleration thường rất nhỏ, delta nhỏ để phát hiện
+    if pred_spd.shape[0] >= 2:
+        pred_a = (pred_spd[1:] - pred_spd[:-1]) / DT_HOURS    # [T-2, B] km/h²
+        gt_a   = (gt_spd[1:]   - gt_spd[:-1])   / DT_HOURS
+        l_acc  = F.huber_loss(pred_a, gt_a, delta=2.0)          # đơn vị: km/h²
+    else:
+        l_acc = pred_deg.new_zeros(())
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Loss 6: Temporal Consistency — chống zig-zag
+    # ─────────────────────────────────────────────────────────────────────────
+    # Weight nhỏ (0.05) vì CTE đã tốt (58km < 94km target). Chỉ maintain.
+    l_cns = temporal_consistency_loss(pred_deg, gt_deg, alpha=0.7, v_scale_km=80.0)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Tổng hợp — ST-Trans weights (proven trên cùng basin)
+    # ─────────────────────────────────────────────────────────────────────────
+    # l_hav   [km]:    primary position signal, linear weight
+    # l_72h   [km]:    endpoint loss, weight=1.0 (giảm từ 2.0)
+    # l_speed [km/h]:  KEY FIX, weight=0.5 (significant nhưng không dominate)
+    # l_cap   [km²]:   safety guard, weight=0.05
+    # l_acc   [km/h²]: smoothness, weight=0.1
+    # l_cns   [km]:    consistency, weight=0.05
+    #
+    # Scale thực tế (km units tương đương):
+    #   l_hav ≈ 200-400km → contribution ≈ 200-400
+    #   l_72h ≈ 300-400km → contribution ≈ 300-400
+    #   l_speed ≈ 10-30km/h → contribution ≈ 5-15  ← tương đối nhỏ, fine
+    #   l_acc ≈ 1-5 → contribution ≈ 0.1-0.5
+    #   l_cns ≈ 20-50km → contribution ≈ 1-3
+    total = (
+        1.00 * l_hav
+        + 1.00 * l_72h
+        + 0.50 * l_speed
+        + 0.05 * l_speed_cap
+        + 0.10 * l_acc
+        + 0.05 * l_cns
     )
 
-    # ── 3. FOCAL 72H: Cú hích phá ngưỡng 300km ──
-    # Nếu sai số 72h > 290km, gradient sẽ tăng theo hàm bình phương
-    d_72h = _haversine_deg(pred_deg[11], gt_deg[11])
-    l_72h = torch.where(
-        d_72h > 290.0,
-        (d_72h / 290.0)**2 * d_72h,
-        d_72h
-    ).mean() / 290.0
+    if torch.isnan(total) or torch.isinf(total):
+        total = pred_deg.new_zeros(())
 
-    # ── 4. Regularizers nhẹ ──
-    l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
-    l_cns = temporal_consistency_loss(pred_deg, gt_deg, alpha=0.7)
-
-    # Tổng hợp trọng số
-    # Ưu tiên dcp (ATE) và 72h để ép model đổi vận tốc
-    total = 1.0 * l_hav + 0.8 * l_dcp + 2.0 * l_72h + 0.1 * l_acc + 0.05 * l_cns
-
+    # Helper để convert tensor → float cho logging
     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+
     return dict(
+        # ── Primary output ────────────────────────────────────────────────────
         total           = total,
+        # ── Loss components (for logging) ─────────────────────────────────────
         mse_hav_horizon = _s(l_hav),
+        mse_hav         = _s(l_hav),
         endpoint        = _s(l_72h),
-        decomp          = _s(l_dcp),
+        speed_acc       = _s(l_speed),       # ← THỰC SỰ có giá trị bây giờ!
         accel           = _s(l_acc),
+        decomp          = _s(l_speed_cap),   # dùng slot 'decomp' cho speed_cap
         cons            = _s(l_cns),
-        # Gán các key cũ về 0 để tránh lỗi log
-        mse_hav=_s(l_hav), multi_scale=_s(l_hav), speed_acc=0.0, cumul_disp=0.0
+        # ── Backward compat zeros ────────────────────────────────────────────
+        multi_scale     = _s(l_hav),
+        cumul_disp      = 0.0,
+        h_direct        = 0.0,
+        vel_smooth      = 0.0,
+        ate_cte         = 0.0,
+        velocity        = 0.0,
+        heading         = 0.0,
+        recurv          = 0.0,
+        steering        = 0.0,
+        shape           = 0.0,
+        direct_mse      = _s(l_hav),
+        hard_72h        = _s(l_72h),
     )
