@@ -11388,7 +11388,7 @@ def evaluate_fast(model, loader, device, ode_steps, pred_len, fast_ensemble=15):
         for batch in loader:
             bl = move(list(batch), device)
             pred, _, all_trajs = model.sample(
-                bl, num_ensemble=fast_ensemble, ddim_steps=ode_steps,
+                bl, num_ensemble=max(fast_ensemble,20), ddim_steps=ode_steps,
                 importance_weight=True)
             T_active  = pred.shape[0]
             gt_sliced = bl[1][:T_active]

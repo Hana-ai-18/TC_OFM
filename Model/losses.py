@@ -11294,6 +11294,86 @@ def temporal_consistency_loss(pred_deg: torch.Tensor,
 #         direct_mse = _s(l_mh),
 #         hard_72h   = _s(l_ef),
 #     )
+# def compute_total_loss(
+#     pred_deg: torch.Tensor,
+#     gt_deg: torch.Tensor,
+#     epoch: int = 0,
+#     **kwargs,
+# ) -> dict:
+#     """
+#     v42: 3-loss clean version cho flow matching.
+    
+#     Triết lý: fm_mse là PRIMARY learner của velocity field.
+#     Position losses chỉ là lightweight regularizer — không nên dominate.
+    
+#     ST-Trans dùng: DPE + 0.05*MSE + 0.1*speed + 0.01*accel
+#     Ta dùng tương tự nhưng weighted haversine thay vì flat mean.
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 2:
+#         return dict(total=pred_deg.new_zeros(()),
+#                     mse_hav_horizon=0.0, mse_hav=0.0,
+#                     multi_scale=0.0, endpoint=0.0,
+#                     speed_acc=0.0, cumul_disp=0.0,
+#                     accel=0.0, decomp=0.0, cons=0.0,
+#                     h_direct=0.0, vel_smooth=0.0,
+#                     ate_cte=0.0, velocity=0.0,
+#                     heading=0.0, recurv=0.0,
+#                     steering=0.0, shape=0.0,
+#                     direct_mse=0.0, hard_72h=0.0)
+
+#     # ── Loss 1: Weighted haversine tất cả steps ───────────────────────
+#     # Weight tăng dần: step 12 (72h) được weight 12× so với step 1
+#     # Đây là equivalent của ST-Trans LDPE nhưng weighted
+#     total_hav = pred_deg.new_zeros(())
+#     w_sum = 0.0
+#     horizon_targets = [50, 70, 90, 120, 150, 180, 210, 240, 265, 280, 290, 300]
+#     for t in range(T):
+#         d   = _haversine_deg(pred_deg[t], gt_deg[t])
+#         tgt = float(horizon_targets[min(t, len(horizon_targets)-1)])
+#         w   = float(t + 1) ** 1.2   # superlinear: 72h gets 17x weight vs 6h
+#         total_hav = total_hav + w * _huber(d, tgt).mean() / tgt
+#         w_sum += w
+#     l_hav = total_hav / max(w_sum, 1.0)
+
+#     # ── Loss 2: Acceleration (từ ST-Trans, proven ATE reduction) ─────
+#     l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
+
+#     # ── Loss 3: Consistency (chống zig-zag) ──────────────────────────
+#     l_cns = temporal_consistency_loss(pred_deg, gt_deg,
+#                                        alpha=0.7, v_scale_km=80.0)
+
+#     # ── Progressive: chỉ scale accel/consistency, giữ hav cố định ────
+#     if epoch < 15:
+#         t_ = epoch / 15.0
+#         acc_w = 0.02 + 0.08 * t_    # 0.02 → 0.10
+#         cns_w = 0.02 + 0.03 * t_    # 0.02 → 0.05
+#     else:
+#         acc_w = 0.10
+#         cns_w = 0.05
+
+#     total = l_hav + acc_w * l_acc + cns_w * l_cns
+
+#     if torch.isnan(total) or torch.isinf(total):
+#         total = pred_deg.new_zeros(())
+
+#     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+#     return dict(
+#         total           = total,
+#         mse_hav_horizon = _s(l_hav),
+#         mse_hav         = _s(l_hav),
+#         multi_scale     = _s(l_hav),
+#         endpoint        = _s(l_hav),
+#         speed_acc       = 0.0,
+#         cumul_disp      = 0.0,
+#         accel           = _s(l_acc),
+#         decomp          = 0.0,
+#         cons            = _s(l_cns),
+#         h_direct=0.0, vel_smooth=0.0, ate_cte=0.0,
+#         velocity=0.0, heading=0.0, recurv=0.0,
+#         steering=0.0, shape=0.0,
+#         direct_mse=_s(l_hav), hard_72h=_s(l_hav),
+#     )
 def compute_total_loss(
     pred_deg: torch.Tensor,
     gt_deg: torch.Tensor,
@@ -11301,76 +11381,58 @@ def compute_total_loss(
     **kwargs,
 ) -> dict:
     """
-    v42: 3-loss clean version cho flow matching.
-    
-    Triết lý: fm_mse là PRIMARY learner của velocity field.
-    Position losses chỉ là lightweight regularizer — không nên dominate.
-    
-    ST-Trans dùng: DPE + 0.05*MSE + 0.1*speed + 0.01*accel
-    Ta dùng tương tự nhưng weighted haversine thay vì flat mean.
+    v43_aggressive: Chiến thuật phá ngưỡng 340km.
+    Tập trung toàn lực vào ATE (Along-track) và Focal-72h.
     """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 2:
-        return dict(total=pred_deg.new_zeros(()),
-                    mse_hav_horizon=0.0, mse_hav=0.0,
-                    multi_scale=0.0, endpoint=0.0,
-                    speed_acc=0.0, cumul_disp=0.0,
-                    accel=0.0, decomp=0.0, cons=0.0,
-                    h_direct=0.0, vel_smooth=0.0,
-                    ate_cte=0.0, velocity=0.0,
-                    heading=0.0, recurv=0.0,
-                    steering=0.0, shape=0.0,
-                    direct_mse=0.0, hard_72h=0.0)
+    T = pred_deg.shape[0]
+    if T < 12: # Đảm bảo đủ 72h
+        return {"total": pred_deg.new_zeros(())}
 
-    # ── Loss 1: Weighted haversine tất cả steps ───────────────────────
-    # Weight tăng dần: step 12 (72h) được weight 12× so với step 1
-    # Đây là equivalent của ST-Trans LDPE nhưng weighted
+    # ── 1. Haversine với trọng số thời gian cực gắt ──
+    # Step 12 (72h) sẽ nặng hơn Step 1 khoảng 500 lần (12^2.5)
     total_hav = pred_deg.new_zeros(())
     w_sum = 0.0
-    horizon_targets = [50, 70, 90, 120, 150, 180, 210, 240, 265, 280, 290, 300]
     for t in range(T):
-        d   = _haversine_deg(pred_deg[t], gt_deg[t])
-        tgt = float(horizon_targets[min(t, len(horizon_targets)-1)])
-        w   = float(t + 1) ** 1.2   # superlinear: 72h gets 17x weight vs 6h
-        total_hav = total_hav + w * _huber(d, tgt).mean() / tgt
+        d = _haversine_deg(pred_deg[t], gt_deg[t])
+        w = float(t + 1) ** 2.5 
+        total_hav = total_hav + w * d.mean()
         w_sum += w
-    l_hav = total_hav / max(w_sum, 1.0)
+    l_hav = total_hav / w_sum
 
-    # ── Loss 2: Acceleration (từ ST-Trans, proven ATE reduction) ─────
+    # ── 2. ĐẶC TRỊ ATE: Displacement Decomposition ──
+    # alpha_ate=15.0: Phạt sai số tốc độ gấp 15 lần sai số hướng
+    l_dcp = displacement_decomp_loss(
+        pred_deg, gt_deg, 
+        alpha_ate=15.0, 
+        beta_cte=1.0, 
+        delta_km=50.0
+    )
+
+    # ── 3. FOCAL 72H: Cú hích phá ngưỡng 300km ──
+    # Nếu sai số 72h > 290km, gradient sẽ tăng theo hàm bình phương
+    d_72h = _haversine_deg(pred_deg[11], gt_deg[11])
+    l_72h = torch.where(
+        d_72h > 290.0,
+        (d_72h / 290.0)**2 * d_72h,
+        d_72h
+    ).mean() / 290.0
+
+    # ── 4. Regularizers nhẹ ──
     l_acc = acceleration_loss(pred_deg, gt_deg, a0_kmh2=A0_KMH2)
+    l_cns = temporal_consistency_loss(pred_deg, gt_deg, alpha=0.7)
 
-    # ── Loss 3: Consistency (chống zig-zag) ──────────────────────────
-    l_cns = temporal_consistency_loss(pred_deg, gt_deg,
-                                       alpha=0.7, v_scale_km=80.0)
-
-    # ── Progressive: chỉ scale accel/consistency, giữ hav cố định ────
-    if epoch < 15:
-        t_ = epoch / 15.0
-        acc_w = 0.02 + 0.08 * t_    # 0.02 → 0.10
-        cns_w = 0.02 + 0.03 * t_    # 0.02 → 0.05
-    else:
-        acc_w = 0.10
-        cns_w = 0.05
-
-    total = l_hav + acc_w * l_acc + cns_w * l_cns
-
-    if torch.isnan(total) or torch.isinf(total):
-        total = pred_deg.new_zeros(())
+    # Tổng hợp trọng số
+    # Ưu tiên dcp (ATE) và 72h để ép model đổi vận tốc
+    total = 1.0 * l_hav + 0.8 * l_dcp + 2.0 * l_72h + 0.1 * l_acc + 0.05 * l_cns
 
     def _s(x): return x.item() if torch.is_tensor(x) else float(x)
     return dict(
         total           = total,
         mse_hav_horizon = _s(l_hav),
-        mse_hav         = _s(l_hav),
-        multi_scale     = _s(l_hav),
-        endpoint        = _s(l_hav),
-        speed_acc       = 0.0,
-        cumul_disp      = 0.0,
+        endpoint        = _s(l_72h),
+        decomp          = _s(l_dcp),
         accel           = _s(l_acc),
-        decomp          = 0.0,
         cons            = _s(l_cns),
-        h_direct=0.0, vel_smooth=0.0, ate_cte=0.0,
-        velocity=0.0, heading=0.0, recurv=0.0,
-        steering=0.0, shape=0.0,
-        direct_mse=_s(l_hav), hard_72h=_s(l_hav),
+        # Gán các key cũ về 0 để tránh lỗi log
+        mse_hav=_s(l_hav), multi_scale=_s(l_hav), speed_acc=0.0, cumul_disp=0.0
     )

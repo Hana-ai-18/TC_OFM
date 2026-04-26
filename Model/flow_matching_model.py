@@ -9125,110 +9125,164 @@ class TCFlowMatching(nn.Module):
         env_data = batch_list[13] if len(batch_list) > 13 else None
         lp, lm   = obs_t[-1], obs_Me[-1]
 
-        # Sigma schedule
-        # if epoch < 15:
-        #     current_sigma = 0.15
-        # elif epoch < 40:
-        #     current_sigma = 0.15 - (epoch - 15) / 25.0 * 0.09
-        # else:
-        #     current_sigma = 0.06
-        if epoch < 5:
-            current_sigma = 0.12          # giảm từ 0.15 → 0.12
-        elif epoch < 15:
-            current_sigma = 0.12 - (epoch - 5) / 10.0 * 0.06   # 0.12 → 0.06
-        elif epoch < 30:
-            current_sigma = 0.06 - (epoch - 15) / 15.0 * 0.03  # 0.06 → 0.03
-        else:
-            current_sigma = 0.03          # training sạch hơn nhiều ở epoch muộn
-        raw_ctx       = self.net._context(batch_list)
-        vel_obs_feat  = self.net._get_vel_obs_feat(obs_t)
-        steering_feat = self.net._get_steering_feat(
-            env_data, obs_t.shape[1], obs_t.device)
+        # Sigma schedule (giữ nguyên v41)
+        if epoch < 5: current_sigma = 0.12
+        elif epoch < 15: current_sigma = 0.12 - (epoch - 5) / 10.0 * 0.06
+        else: current_sigma = 0.03
 
-        x1_rel = self._to_rel(traj_gt, Me_gt, lp, lm)
+        # FM Forward
+        raw_ctx = self.net._context(batch_list)
+        obs_t = batch_list[0]
+        env_data = batch_list[13] if len(batch_list) > 13 else None
+        lp, lm = obs_t[-1], batch_list[7][-1]
+        
+        x1_rel = self._to_rel(batch_list[1], batch_list[8], lp, lm)
         x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
 
-        # Scheduled teacher forcing
-        if self.teacher_forcing and self.training and epoch >= 3:
-            p_teacher = max(0.0, 0.5 * (1.0 - (epoch - 3) / 37.0))
-            if p_teacher > 0 and torch.rand(1).item() < p_teacher:
-                far_mask = torch.zeros_like(x_t)
-                far_mask[:, 6:, :] = 0.3
-                x_t = x_t * (1 - far_mask) + x1_rel * far_mask
-
         pred_vel = self.net.forward_with_ctx(
-            x_t, fm_t, raw_ctx,
-            vel_obs_feat=vel_obs_feat,
-            steering_feat=steering_feat,
-            env_data=env_data,
+            x_t, fm_t, raw_ctx, env_data=env_data,
+            vel_obs_feat=self.net._get_vel_obs_feat(obs_t),
+            steering_feat=self.net._get_steering_feat(env_data, obs_t.shape[1], obs_t.device)
         )
 
         l_fm_mse = F.mse_loss(pred_vel, u_target)
 
-        fm_te   = fm_t.view(x1_rel.shape[0], 1, 1)
-        x1_pred = x_t + (1.0 - fm_te) * pred_vel
-        pred_abs, _ = self._to_abs(x1_pred, lp, lm)
-        pred_deg    = _norm_to_deg_fn(pred_abs)
-        gt_deg      = _norm_to_deg_fn(traj_gt)
+        # Chuyển sang tọa độ thật để tính position loss
+        with torch.no_grad():
+            fm_te = fm_t.view(x1_rel.shape[0], 1, 1)
+            x1_pred = x_t + (1.0 - fm_te) * pred_vel
+            pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+            pred_deg = _norm_to_deg_fn(pred_abs)
+            gt_deg = _norm_to_deg_fn(batch_list[1])
 
-        loss_dict = compute_total_loss(
-            pred_deg=pred_deg,
-            gt_deg=gt_deg,
-            env_data=env_data,
-            weights=WEIGHTS,
-            epoch=epoch,
-        )
+        # Gọi hàm loss v43 vừa sửa ở trên
+        loss_dict = compute_total_loss(pred_deg, gt_deg, epoch=epoch)
 
-        # w_fm  = max(0.3, 1.0 - epoch / 60.0)
-        # total = w_fm * l_fm_mse + loss_dict["total"]
-        w_fm     = max(0.8, 1.5 - epoch / 40.0)   # fm weight CAO hơn
-        w_pos    = min(0.4, 0.1 + epoch / 50.0)   # position weight bắt đầu nhỏ
-        total    = w_fm * l_fm_mse + w_pos * loss_dict["total"]
-        # → epoch 0: total = 1.5 * 0.57 + 0.1 * X = fm chiếm ~50%+
-        l_ens = x_t.new_zeros(())
-        if epoch >= 40 and self.n_train_ens >= 2:
-            x_t2, fm_t2, u_t2 = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
-            pv2 = self.net.forward_with_ctx(
-                x_t2, fm_t2, raw_ctx,
-                vel_obs_feat=vel_obs_feat,
-                steering_feat=steering_feat,
-                env_data=env_data,
-            )
-            l_ens = F.mse_loss(pv2, u_t2)
-            total = total + 0.3 * l_ens
+        # CÂN BẰNG TRỌNG SỐ: 
+        # fm_mse thường rất nhỏ (0.03), loss_dict["total"] thường lớn (5.0 - 10.0)
+        # Chúng ta dùng w_pos nhỏ để không phá vỡ cấu trúc Flow Matching
+        w_fm  = 1.0 
+        w_pos = 0.2 # Giảm xuống để l_fm_mse vẫn là leader
+        
+        total = w_fm * l_fm_mse + w_pos * loss_dict["total"]
 
         if torch.isnan(total) or torch.isinf(total):
             total = x_t.new_zeros(())
 
-        # ── RETURN DICT — v39 compat: thêm speed_acc + cumul_disp ────────
         return dict(
-            total        = total,
-            fm_mse       = l_fm_mse.item(),
-            mse_hav      = loss_dict["mse_hav_horizon"],
-            multi_scale  = loss_dict["multi_scale"],
-            endpoint     = loss_dict["endpoint"],
-            h_direct     = loss_dict.get("h_direct",    0.0),
-            vel_smooth   = loss_dict.get("vel_smooth",  0.0),
-            speed_acc    = loss_dict.get("speed_acc",   0.0),
-            cumul_disp   = loss_dict.get("cumul_disp",  0.0),
-            accel        = loss_dict.get("accel",       0.0),  # ← v40 NEW
-            decomp       = loss_dict.get("decomp",      0.0),  # ← v40 NEW
-            cons         = loss_dict.get("cons",        0.0),  # ← v40 NEW
-            ate_cte      = loss_dict.get("ate_cte",     0.0),  # compat (=0)
-            shape        = loss_dict.get("shape",       0.0),
-            velocity     = loss_dict.get("velocity",    0.0),
-            heading      = loss_dict.get("heading",     0.0),
-            recurv       = loss_dict.get("recurv",      0.0),
-            steering     = loss_dict.get("steering",    0.0),
-            ens_consist  = (l_ens.item() if torch.is_tensor(l_ens)
-                            else float(l_ens)),
-            sigma        = current_sigma,
-            w_fm         = w_fm,
-            long_range=0.0, fde=0.0, w_lr=0.0, w_fde=0.0,
-            fm=0.0, short_range=0.0, cont=0.0, pinn=0.0,
-            spread=0.0, continuity=0.0, step=0.0, disp=0.0,
-            recurv_ratio=0.0,
+            total=total,
+            fm_mse=l_fm_mse.item(),
+            mse_hav=loss_dict["mse_hav"],
+            endpoint=loss_dict["endpoint"],
+            decomp=loss_dict["decomp"],
+            accel=loss_dict["accel"],
+            cons=loss_dict["cons"],
+            sigma=current_sigma
         )
+            # # Sigma schedule
+        # # if epoch < 15:
+        # #     current_sigma = 0.15
+        # # elif epoch < 40:
+        # #     current_sigma = 0.15 - (epoch - 15) / 25.0 * 0.09
+        # # else:
+        # #     current_sigma = 0.06
+        # if epoch < 5:
+        #     current_sigma = 0.12          # giảm từ 0.15 → 0.12
+        # elif epoch < 15:
+        #     current_sigma = 0.12 - (epoch - 5) / 10.0 * 0.06   # 0.12 → 0.06
+        # elif epoch < 30:
+        #     current_sigma = 0.06 - (epoch - 15) / 15.0 * 0.03  # 0.06 → 0.03
+        # else:
+        #     current_sigma = 0.03          # training sạch hơn nhiều ở epoch muộn
+        # raw_ctx       = self.net._context(batch_list)
+        # vel_obs_feat  = self.net._get_vel_obs_feat(obs_t)
+        # steering_feat = self.net._get_steering_feat(
+        #     env_data, obs_t.shape[1], obs_t.device)
+
+        # x1_rel = self._to_rel(traj_gt, Me_gt, lp, lm)
+        # x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
+
+        # # Scheduled teacher forcing
+        # if self.teacher_forcing and self.training and epoch >= 3:
+        #     p_teacher = max(0.0, 0.5 * (1.0 - (epoch - 3) / 37.0))
+        #     if p_teacher > 0 and torch.rand(1).item() < p_teacher:
+        #         far_mask = torch.zeros_like(x_t)
+        #         far_mask[:, 6:, :] = 0.3
+        #         x_t = x_t * (1 - far_mask) + x1_rel * far_mask
+
+        # pred_vel = self.net.forward_with_ctx(
+        #     x_t, fm_t, raw_ctx,
+        #     vel_obs_feat=vel_obs_feat,
+        #     steering_feat=steering_feat,
+        #     env_data=env_data,
+        # )
+
+        # l_fm_mse = F.mse_loss(pred_vel, u_target)
+
+        # fm_te   = fm_t.view(x1_rel.shape[0], 1, 1)
+        # x1_pred = x_t + (1.0 - fm_te) * pred_vel
+        # pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+        # pred_deg    = _norm_to_deg_fn(pred_abs)
+        # gt_deg      = _norm_to_deg_fn(traj_gt)
+
+        # loss_dict = compute_total_loss(
+        #     pred_deg=pred_deg,
+        #     gt_deg=gt_deg,
+        #     env_data=env_data,
+        #     weights=WEIGHTS,
+        #     epoch=epoch,
+        # )
+
+        # # w_fm  = max(0.3, 1.0 - epoch / 60.0)
+        # # total = w_fm * l_fm_mse + loss_dict["total"]
+        # w_fm     = max(0.8, 1.5 - epoch / 40.0)   # fm weight CAO hơn
+        # w_pos    = min(0.4, 0.1 + epoch / 50.0)   # position weight bắt đầu nhỏ
+        # total    = w_fm * l_fm_mse + w_pos * loss_dict["total"]
+        # # → epoch 0: total = 1.5 * 0.57 + 0.1 * X = fm chiếm ~50%+
+        # l_ens = x_t.new_zeros(())
+        # if epoch >= 40 and self.n_train_ens >= 2:
+        #     x_t2, fm_t2, u_t2 = self._cfm_noisy(x1_rel, sigma_min=current_sigma)
+        #     pv2 = self.net.forward_with_ctx(
+        #         x_t2, fm_t2, raw_ctx,
+        #         vel_obs_feat=vel_obs_feat,
+        #         steering_feat=steering_feat,
+        #         env_data=env_data,
+        #     )
+        #     l_ens = F.mse_loss(pv2, u_t2)
+        #     total = total + 0.3 * l_ens
+
+        # if torch.isnan(total) or torch.isinf(total):
+        #     total = x_t.new_zeros(())
+
+        # # ── RETURN DICT — v39 compat: thêm speed_acc + cumul_disp ────────
+        # return dict(
+        #     total        = total,
+        #     fm_mse       = l_fm_mse.item(),
+        #     mse_hav      = loss_dict["mse_hav_horizon"],
+        #     multi_scale  = loss_dict["multi_scale"],
+        #     endpoint     = loss_dict["endpoint"],
+        #     h_direct     = loss_dict.get("h_direct",    0.0),
+        #     vel_smooth   = loss_dict.get("vel_smooth",  0.0),
+        #     speed_acc    = loss_dict.get("speed_acc",   0.0),
+        #     cumul_disp   = loss_dict.get("cumul_disp",  0.0),
+        #     accel        = loss_dict.get("accel",       0.0),  # ← v40 NEW
+        #     decomp       = loss_dict.get("decomp",      0.0),  # ← v40 NEW
+        #     cons         = loss_dict.get("cons",        0.0),  # ← v40 NEW
+        #     ate_cte      = loss_dict.get("ate_cte",     0.0),  # compat (=0)
+        #     shape        = loss_dict.get("shape",       0.0),
+        #     velocity     = loss_dict.get("velocity",    0.0),
+        #     heading      = loss_dict.get("heading",     0.0),
+        #     recurv       = loss_dict.get("recurv",      0.0),
+        #     steering     = loss_dict.get("steering",    0.0),
+        #     ens_consist  = (l_ens.item() if torch.is_tensor(l_ens)
+        #                     else float(l_ens)),
+        #     sigma        = current_sigma,
+        #     w_fm         = w_fm,
+        #     long_range=0.0, fde=0.0, w_lr=0.0, w_fde=0.0,
+        #     fm=0.0, short_range=0.0, cont=0.0, pinn=0.0,
+        #     spread=0.0, continuity=0.0, step=0.0, disp=0.0,
+        #     recurv_ratio=0.0,
+        # )
 
     # ── Sampling — unchanged from v34fix ─────────────────────────────────────
     @torch.no_grad()
