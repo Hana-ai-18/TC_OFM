@@ -10217,9 +10217,9 @@ WEIGHTS: Dict[str, float] = dict(
     endpoint_focal  = 3.0,   # merged focal+FDE — primary signal
     multi_horizon   = 1.2,   # horizon guidance
     cumul_disp      = 0.8,   # anti-drift
-    speed_acc       = 1.0,   # timing/speed
-    accel           = 0.3,   # acceleration (progressive)
-    decomp          = 0.15,  # ATE-direct (progressive, raw ~6 → effective ~0.9)
+    speed_acc       = 1.5,   # timing/speed
+    accel           = 0.5,   # acceleration (progressive)
+    decomp          = 0.5,  # ATE-direct (progressive, raw ~6 → effective ~0.9)
     consistency     = 0.1,   # momentum (progressive, raw ~4 → effective ~0.4)
 )
 
