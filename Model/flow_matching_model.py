@@ -11069,7 +11069,7 @@ DEG2KM   = 111.0
 # Step weights: nhấn mạnh 48h (step 8) và 72h (step 12)
 # 6h  12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
 STEP_WEIGHTS = [
-    1.0, 2.0, 1.0, 2.5, 1.0, 1.5, 1.0, 3.0, 1.0, 1.5, 1.0, 4.0
+    1.0, 2.0, 1.0, 2.5, 2.0, 2.5, 2.0, 3.0, 4.0, 4.5, 4.0, 5.0
 ]
 
 # Data-driven speed prior (km/h, 6h step) — từ thống kê dataset thực
