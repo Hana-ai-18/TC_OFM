@@ -10303,10 +10303,10 @@ STEP_WEIGHTS = [
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
-    out = t.clone()
-    out[..., 0] = (t[..., 0] * 50.0 + 1800.0) / 10.0
-    out[..., 1] = (t[..., 1] * 50.0) / 10.0
-    return out
+    """Convert normalized coords to degrees. Differentiable."""
+    lon = (t[..., 0] * 50.0 + 1800.0) / 10.0
+    lat = (t[..., 1] * 50.0) / 10.0
+    return torch.stack([lon, lat], dim=-1)
 
 
 def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
@@ -10839,25 +10839,29 @@ class TCFlowMatching(nn.Module):
             steering_feat=self.net._get_steering_feat(env_data, obs_t.shape[1], obs_t.device)
         )
 
-        # FM consistency loss (nhẹ, giúp FM học velocity field)
+        # ── FM velocity loss (gradient flows through pred_vel) ───────────────
         l_fm_mse = F.mse_loss(pred_vel, u_target)
 
-        # ── Convert to degree coordinates ─────────────────────────────────────
-        # Dùng full prediction (t=1 endpoint) cho position loss
-        with torch.no_grad():
-            fm_te   = fm_t.view(x1_rel.shape[0], 1, 1)
-            x1_pred = x_t + (1.0 - fm_te) * pred_vel
-            pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+        # ── Convert to degree coordinates — VỚI GRADIENT ─────────────────────
+        # Bug cũ: wrap torch.no_grad() → position loss không có gradient!
+        # Fix: tính pred_abs trực tiếp từ pred_vel (có gradient)
+        #
+        # FM interpolation: x1_pred = x_t + (1 - fm_te) * pred_vel
+        # Đây là ODE 1-step approximation tại t=fm_t → x1
+        # Khi fm_t ~ Uniform(0,1), E[x1_pred] ≈ x1_gt nếu model tốt
+        fm_te   = fm_t.view(x1_rel.shape[0], 1, 1)
+        x1_pred = x_t + (1.0 - fm_te) * pred_vel   # [B, T, 4] — CÓ GRADIENT
+        pred_abs, _ = self._to_abs(x1_pred, lp, lm) # [T, B, 2] normalized
 
-        pred_deg = _norm_to_deg(pred_abs)    # [T, B, 2] degrees
-        gt_deg   = _norm_to_deg(batch_list[1])  # [T, B, 2] degrees
+        pred_deg = _norm_to_deg(pred_abs)            # [T, B, 2] degrees — CÓ GRADIENT
+        gt_deg   = _norm_to_deg(batch_list[1])       # [T, B, 2] degrees
 
         # ── ST-Trans loss ─────────────────────────────────────────────────────
         loss_dict = compute_st_trans_loss(pred_deg, gt_deg, epoch=epoch)
 
-        # Combine: FM velocity loss (nhỏ) + ST-Trans position loss
-        # FM loss giúp model học velocity field, position loss là primary signal
-        total = 0.5 * l_fm_mse + loss_dict["total"]
+        # Combine: FM velocity loss + ST-Trans position loss
+        # Tỉ lệ 1:2 — position loss là primary signal
+        total = 1.0 * l_fm_mse + 2.0 * loss_dict["total"]
 
         if torch.isnan(total) or torch.isinf(total):
             total = x_t.new_zeros(())
