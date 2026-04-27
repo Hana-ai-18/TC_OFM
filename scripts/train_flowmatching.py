@@ -13630,7 +13630,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatching, apply_patch
+from Model.flow_matching_model import TCFlowMatching
 # import Model.flow_matching_model as _fm_mod   # for monkey-patch
 
 # from flow_matching_model import apply_patch   # ← v50 patch
