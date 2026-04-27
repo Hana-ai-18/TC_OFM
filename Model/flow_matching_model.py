@@ -13063,15 +13063,15 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
         total=total, dpe=_s(l_dpe), mse=_s(l_mse),
         speed=_s(l_speed), accel=_s(l_accel),
         speed_match=_s(l_speed_match),
-        spd_kmh  =_s(pred_speed.mean()) if pred_speed is not None else 0.0,
-        gt_spd_kmh=_s(gt_speed.mean())  if gt_speed  is not None else 0.0,
-        v_opt=float(v_opt), v_hard_cap=float(v_hard_cap),
-        # backward compat
-        fm_mse=0.0, mse_hav=_s(l_dpe), endpoint=0.0,
-        speed_acc=0.0, accel_b=0.0, decomp=0.0, cons=0.0,
-        hav_km=_s(dist.mean()) if T > 0 else 0.0,
-        h72_km=_s(_haversine_deg(
-            pred_deg[min(11,T-1)], gt_deg[min(11,T-1)]).mean()) if T > 0 else 0.0,
+        # spd_kmh  =_s(pred_speed.mean()) if pred_speed is not None else 0.0,
+        # gt_spd_kmh=_s(gt_speed.mean())  if gt_speed  is not None else 0.0,
+        # v_opt=float(v_opt), v_hard_cap=float(v_hard_cap),
+        # # backward compat
+        # fm_mse=0.0, mse_hav=_s(l_dpe), endpoint=0.0,
+        # speed_acc=0.0, accel_b=0.0, decomp=0.0, cons=0.0,
+        # hav_km=_s(dist.mean()) if T > 0 else 0.0,
+        # h72_km=_s(_haversine_deg(
+        #     pred_deg[min(11,T-1)], gt_deg[min(11,T-1)]).mean()) if T > 0 else 0.0,
         acc_kmh2=0.0, aux_fno=0.0, sigma=0.0,
     )
 
