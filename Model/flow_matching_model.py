@@ -11068,9 +11068,8 @@ DEG2KM   = 111.0
 
 # Step weights: nhấn mạnh 48h (step 8) và 72h (step 12)
 # 6h  12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
-STEP_WEIGHTS = [
-    1.0, 2.0, 1.0, 2.5, 2.0, 2.5, 2.0, 3.0, 4.0, 4.5, 4.0, 5.0
-]
+# Đổi thành (giảm trọng số đầu, tăng mạnh hơn ở 48-72h):
+STEP_WEIGHTS = [0.5, 1.0, 1.0, 1.5, 1.5, 2.0, 2.5, 3.5, 4.5, 5.0, 5.0, 6.0]
 
 # Data-driven speed prior (km/h, 6h step) — từ thống kê dataset thực
 # Computed từ obs: mean~11, std~3, p95~16, max~25
@@ -11293,8 +11292,59 @@ def compute_st_trans_loss(
     else:
         l_accel = pred_deg.new_zeros(())
 
+    # Trong compute_st_trans_loss(), thêm sau l_accel:
+
+    def _along_track_error(pred_deg, gt_deg):
+        """ATE = projection của error lên direction of motion."""
+        T = pred_deg.shape[0]
+        if T < 2:
+            return pred_deg.new_zeros(())
+        
+        # Direction of GT motion at each step
+        gt_motion = gt_deg[1:] - gt_deg[:-1]  # [T-1, B, 2]
+        lat_mid = gt_deg[:-1, :, 1]
+        cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(min=1e-4)
+        
+        # Scale lon by cos(lat) để đúng metric
+        scale = torch.stack([cos_lat * DEG2KM, 
+                            torch.ones_like(cos_lat) * DEG2KM], dim=-1)
+        
+        gt_vec  = gt_motion * scale          # [T-1, B, 2] km
+        gt_norm = gt_vec.norm(dim=-1, keepdim=True).clamp(min=1e-3)
+        gt_unit = gt_vec / gt_norm           # unit vector along track
+        
+        # Error vector
+        err     = (pred_deg[:-1] - gt_deg[:-1]) * scale  # [T-1, B, 2] km
+        
+        # Along-track component
+        ate_per = (err * gt_unit).sum(dim=-1).abs()       # [T-1, B]
+        
+        # Weight later steps more (ATE accumulates)
+        w = torch.arange(1, T, device=pred_deg.device, dtype=torch.float)
+        w = w / w.sum()
+        
+        return (ate_per * w.unsqueeze(1)).mean()
+
+    # Thêm l_cumulative vào compute_st_trans_loss():
+
+    # Cumulative displacement error (penalize tốc độ tích lũy sai)
+    pred_cum = torch.cumsum(
+        _haversine_deg(pred_deg[:-1], pred_deg[1:]), dim=0)  # [T-1, B]
+    gt_cum   = torch.cumsum(
+        _haversine_deg(gt_deg[:-1],   gt_deg[1:]),   dim=0)  # [T-1, B]
+
+    # Penalty khi tích lũy sai > 20% so với GT
+    cum_ratio = (pred_cum / (gt_cum + 1.0)).clamp(0.3, 3.0)
+    l_cumspeed = (cum_ratio - 1.0).pow(2).mean()
     # ── Total (ST-Trans weights) ──────────────────────────────────────────────
-    total = l_dpe + 0.05 * l_mse + 0.1 * l_speed + 0.01 * l_accel
+    # total = l_dpe + 0.05 * l_mse + 0.1 * l_speed + 0.01 * l_accel
+    l_ate       = _along_track_error(pred_deg[:T], gt_deg[:T])
+    total = (l_dpe 
+         + 0.05  * l_mse 
+         + 0.05  * l_speed      # giảm instantaneous speed penalty
+         + 0.01  * l_accel 
+         + 0.15  * l_ate        # ← NEW: direct ATE loss
+         + 0.10  * l_cumspeed)  # ← NEW: penalize tốc độ tích lũy sai
 
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
