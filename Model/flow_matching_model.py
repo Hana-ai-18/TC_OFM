@@ -15185,7 +15185,7 @@ def _score_ensemble(traj_norm, obs_traj_norm, speed_stats=None):
 #  Sigma schedule v50
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _sigma_schedule_v50(epoch):
+def _sigma_schedule(epoch):
     """Giảm sớm từ ep2 để model học velocity chính xác sớm hơn."""
     if epoch < 2:   return 0.15
     if epoch < 20:  return 0.15 - (epoch-2)/18.0*(0.15-0.04)
@@ -15197,7 +15197,7 @@ def _sigma_schedule_v50(epoch):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def sample_v50(self, batch_list, num_ensemble=50, ddim_steps=20,
+def sample(self, batch_list, num_ensemble=50, ddim_steps=20,
                predict_csv=None, importance_weight=True):
     """
     v50 sample — hoạt động hoàn toàn trong normalized space.
@@ -15224,13 +15224,17 @@ def sample_v50(self, batch_list, num_ensemble=50, ddim_steps=20,
     steering_feat = self.net._get_steering_feat(env_data, B, device)
     env_kine_feat = self.net._get_env_kine_feat(env_data, B, device)
 
-    try:
-        from Model.flow_matching_model import compute_speed_stats_from_norm
-    except ImportError:
+    compute_speed_stats_from_norm = None
+    for _mp in ("Model.flow_matching_model_v48", "Model.flow_matching_model_v47",
+                "Model.flow_matching_model_v46", "Model.flow_matching_model"):
         try:
-            from Model.flow_matching_model import compute_speed_stats_from_norm
+            import importlib as _il
+            _m = _il.import_module(_mp)
+            if hasattr(_m, "compute_speed_stats_from_norm"):
+                compute_speed_stats_from_norm = _m.compute_speed_stats_from_norm
+                break
         except ImportError:
-            compute_speed_stats_from_norm = None
+            continue
 
     speed_stats = (compute_speed_stats_from_norm(obs_t[..., :2])
                    if compute_speed_stats_from_norm else _SPEED_PRIOR)
@@ -15326,7 +15330,7 @@ def sample_v50(self, batch_list, num_ensemble=50, ddim_steps=20,
 #  apply_v50_patch — gọi sau model.init_ema(), trước torch.compile
 # ══════════════════════════════════════════════════════════════════════════════
 
-def apply_v50_patch(model, fm_module):
+def apply_patch(model, fm_module):
     """
     Áp dụng tất cả v50 patches.
 
@@ -15345,8 +15349,8 @@ def apply_v50_patch(model, fm_module):
 
     # 2. Patch class methods (affects all instances including after compile)
     cls = type(model)
-    cls._sigma_schedule = staticmethod(_sigma_schedule_v50)
-    cls.sample          = sample_v50
+    cls._sigma_schedule = staticmethod(_sigma_schedule)
+    cls.sample          = sample
 
     print("  [v50 patch] compute_st_trans_loss, _sigma_schedule, sample → patched")
     return model

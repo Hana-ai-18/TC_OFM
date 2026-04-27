@@ -13630,10 +13630,10 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatching
+from Model.flow_matching_model import TCFlowMatching, apply_patch
 import Model.flow_matching_model as _fm_mod   # for monkey-patch
 
-from flow_matching_v50_patch import apply_v50_patch   # ← v50 patch
+# from flow_matching_model import apply_patch   # ← v50 patch
 
 from Model.utils import get_cosine_schedule_with_warmup
 from utils.metrics import (
@@ -14004,7 +14004,7 @@ def main(args):
     print(f"  EMA     : {'ON' if model._ema is not None else 'OFF'}")
 
     # ── [v50] Apply patches TRƯỚC torch.compile ────────────────────────────
-    apply_v50_patch(model, _fm_mod)
+    apply_patch(model, _fm_mod)
 
     optimizer = optim.AdamW(model.parameters(),
                              lr=args.g_learning_rate, weight_decay=args.weight_decay)
