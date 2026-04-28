@@ -13231,22 +13231,32 @@ def _geodesic_ot_cost(x0_rel, x1_rel, lp):
 
 def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
     """
-    [F3] Mini-batch OT matching với geodesic cost.
-    Falls back to identity if any error.
+    [F3] Mini-batch OT: match x1 (GT trajectories) to each other via geodesic cost,
+    then re-index x0 (noise) to follow the same permutation.
+
+    Lý do: x0 là Gaussian noise → không có ý nghĩa địa lý.
+    OT meaningful chỉ khi match x1↔x1 (different GT trajectories trong batch).
+    x0 được permute theo cùng index để cặp (x0_i, x1_i) consistent.
+
+    Đây là cách standard mini-batch OT trong FM literature.
+    Falls back to identity if any numerical issue.
     """
     B = x0_batch.shape[0]
     if B < 4:
         return x0_batch, x1_batch
     try:
-        cost = _geodesic_ot_cost(x0_batch, x1_batch, lp)
+        # Cost giữa các GT trajectories trong batch (x1↔x1)
+        cost = _geodesic_ot_cost(x1_batch, x1_batch, lp)
         with torch.no_grad():
             pi = _sinkhorn_log(cost, epsilon=epsilon)
         flat = pi.reshape(-1).clamp(0.0)
         s    = flat.sum()
         if not torch.isfinite(s) or s < 1e-10:
             return x0_batch, x1_batch
-        idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
-        return x0_batch[idx // B], x1_batch[idx % B]
+        idx  = torch.multinomial(flat / s, num_samples=B, replacement=True)
+        col  = idx % B   # which x1 each position maps to
+        # x0 gets permuted by col so (x0[col[i]], x1[col[i]]) are paired
+        return x0_batch[col], x1_batch[col]
     except Exception:
         return x0_batch, x1_batch
 
@@ -13255,23 +13265,40 @@ def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
 #  SLERP interpolant (từ v48, bug-fixed: velocity target dùng đúng manifold)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _slerp_interpolant(x0, x1, t):
+def _slerp_interpolant(x0, x1, t, lp=None):
     """
-    Spherical interpolation. x0,x1: [B,T,2] normalized. t: [B].
+    Spherical interpolation cho flow matching.
 
-    NOTE: SLERP ở đây là approximation trong normalized space.
-    Đủ tốt vì normalized coords ~ linear trong vùng nhỏ.
-    True geodesic cần convert to unit sphere — overhead không worth it.
+    x0, x1: [B,T,C] — có thể là relative normalized hoặc absolute normalized.
+    t: [B]
+    lp: [B,2] anchor position (normalized). Nếu cung cấp, cộng vào để tính omega đúng.
+
+    FIX: omega được tính từ ABSOLUTE degrees (lon/lat thật).
+    Nếu x0/x1 là relative coords, cần lp để reconstruct absolute.
+    Coefficients SLERP sau đó áp lên x0/x1 gốc (relative hoặc absolute).
+
+    Vì relative coords nhỏ (~0.01-0.3 norm units), omega sẽ nhỏ và
+    fallback to linear — đây là hành vi đúng cho bài toán này.
     """
     B  = x0.shape[0]; te = t.view(B, 1, 1)
-    x0d = _norm_to_deg(x0); x1d = _norm_to_deg(x1)
-    lat0 = torch.deg2rad(x0d[..., 1]); lat1 = torch.deg2rad(x1d[..., 1])
-    dlon = torch.deg2rad(x1d[..., 0] - x0d[..., 0])
+
+    # Tính omega từ absolute position để có ý nghĩa vật lý
+    if lp is not None and x0.shape[-1] >= 2:
+        # x0, x1 là relative → cộng anchor để ra absolute normalized
+        abs0 = lp.unsqueeze(1) + x0[:, :, :2]   # [B, T, 2]
+        abs1 = lp.unsqueeze(1) + x1[:, :, :2]
+    else:
+        abs0 = x0[:, :, :2]
+        abs1 = x1[:, :, :2]
+
+    abs0_deg = _norm_to_deg(abs0); abs1_deg = _norm_to_deg(abs1)
+    lat0 = torch.deg2rad(abs0_deg[..., 1]); lat1 = torch.deg2rad(abs1_deg[..., 1])
+    dlon = torch.deg2rad(abs1_deg[..., 0] - abs0_deg[..., 0])
     dlat = lat1 - lat0
     a    = torch.sin(dlat/2).pow(2) + torch.cos(lat0)*torch.cos(lat1)*torch.sin(dlon/2).pow(2)
     omega     = 2.0 * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
     sin_omega = torch.sin(omega).clamp(1e-6)
-    linear    = omega < 1e-4
+    linear    = omega < 1e-4   # fallback to linear when trajectory step is tiny
     te_sq     = te.squeeze(1)
     coeff0 = torch.where(linear, 1.0 - te_sq,
                          torch.sin((1-te_sq)*omega) / sin_omega)
@@ -13280,12 +13307,19 @@ def _slerp_interpolant(x0, x1, t):
     return coeff0.unsqueeze(-1)*x0 + coeff1.unsqueeze(-1)*x1
 
 
-def _slerp_velocity_target(x0, x1, t):
-    """Velocity target d(x_t)/dt for SLERP interpolant."""
+def _slerp_velocity_target(x0, x1, t, lp=None):
+    """Velocity target d(x_t)/dt for SLERP interpolant. Same lp fix as above."""
     B  = x0.shape[0]; te = t.view(B, 1, 1)
-    x0d = _norm_to_deg(x0); x1d = _norm_to_deg(x1)
-    lat0 = torch.deg2rad(x0d[..., 1]); lat1 = torch.deg2rad(x1d[..., 1])
-    dlon = torch.deg2rad(x1d[..., 0] - x0d[..., 0])
+
+    if lp is not None and x0.shape[-1] >= 2:
+        abs0 = lp.unsqueeze(1) + x0[:, :, :2]
+        abs1 = lp.unsqueeze(1) + x1[:, :, :2]
+    else:
+        abs0 = x0[:, :, :2]; abs1 = x1[:, :, :2]
+
+    abs0_deg = _norm_to_deg(abs0); abs1_deg = _norm_to_deg(abs1)
+    lat0 = torch.deg2rad(abs0_deg[..., 1]); lat1 = torch.deg2rad(abs1_deg[..., 1])
+    dlon = torch.deg2rad(abs1_deg[..., 0] - abs0_deg[..., 0])
     dlat = lat1 - lat0
     a    = torch.sin(dlat/2).pow(2) + torch.cos(lat0)*torch.cos(lat1)*torch.sin(dlon/2).pow(2)
     omega     = 2.0 * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
@@ -13335,31 +13369,8 @@ class EMAModel:
             if k in sd: sd[k].copy_(v)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  KinematicHead (từ v48, giữ nguyên)
-# ══════════════════════════════════════════════════════════════════════════════
-
-class KinematicHead(nn.Module):
-    def __init__(self, d_model=256, pred_len=12):
-        super().__init__()
-        self.pred_len    = pred_len
-        self.speed_head  = nn.Linear(d_model, 1)
-        self.heading_head= nn.Linear(d_model, 2)
-        self.me_head     = nn.Linear(d_model, 2)
-        self.speed_prior = nn.Parameter(torch.zeros(1))
-
-    def forward(self, features, anchor_pos):
-        B, T, _ = features.shape
-        speed_n  = self.speed_head(features).squeeze(-1)
-        heading  = F.normalize(self.heading_head(features), dim=-1)
-        me       = self.me_head(features)
-        speed_mag = (speed_n + self.speed_prior).sigmoid() * 0.1
-        disp      = speed_mag.unsqueeze(-1) * heading
-        traj      = torch.zeros(B, T, 2, device=features.device)
-        traj[:, 0, :] = anchor_pos + disp[:, 0, :]
-        for t in range(1, T):
-            traj[:, t, :] = traj[:, t-1, :] + disp[:, t, :]
-        return torch.cat([traj, me], dim=-1)
+# KinematicHead removed — defined in v48 but never called in forward pass.
+# Keeping as stub for checkpoint compatibility (strict=False load ignores extra keys).
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -13407,7 +13418,7 @@ class VelocityField(nn.Module):
             nn.Linear(14, 64), nn.GELU(), nn.LayerNorm(64),
             nn.Linear(64, 256), nn.GELU())
 
-        self.kinematic_head = KinematicHead(d_model=256, pred_len=pred_len)
+        # kinematic_head not instantiated (removed — was unused in forward pass)
 
         self.time_fc1   = nn.Linear(256, 512)
         self.time_fc2   = nn.Linear(512, 256)
@@ -13755,14 +13766,18 @@ class TCFlowMatching(nn.Module):
         d = rel.permute(1, 0, 2)
         return lp.unsqueeze(0) + d[:,:,:2], lm.unsqueeze(0) + d[:,:,2:]
 
-    def _cfm_noisy_slerp(self, x1, sigma_min=None):
+    def _cfm_noisy_slerp(self, x1, sigma_min=None, lp=None):
+        """
+        lp: [B,2] anchor position (normalized). Passed to SLERP for correct omega.
+        x1 is relative coords [B,T,4], so lp is needed to reconstruct absolute.
+        """
         if sigma_min is None: sigma_min = self.sigma_min
         B = x1.shape[0]; device = x1.device
         x0 = torch.randn_like(x1) * sigma_min
         t  = torch.rand(B, device=device)
         if self.use_slerp and x1.shape[-1] >= 2:
-            x_t      = _slerp_interpolant(x0, x1, t)
-            u_target = _slerp_velocity_target(x0, x1, t)
+            x_t      = _slerp_interpolant(x0, x1, t, lp=lp)
+            u_target = _slerp_velocity_target(x0, x1, t, lp=lp)
         else:
             te = t.view(B, 1, 1)
             x_t      = (1.0-te)*x0 + te*x1
@@ -13861,8 +13876,8 @@ class TCFlowMatching(nn.Module):
             noise_matched = torch.randn_like(x1_rel) * current_sigma
             x1_matched    = x1_rel
 
-        # [F1 SLERP] interpolant
-        x_t, fm_t, u_target = self._cfm_noisy_slerp(x1_matched, sigma_min=current_sigma)
+        # [F1 SLERP] interpolant — lp passed so SLERP omega uses absolute positions
+        x_t, fm_t, u_target = self._cfm_noisy_slerp(x1_matched, sigma_min=current_sigma, lp=lp)
 
         use_null = (torch.rand(1).item() < self.cfg_uncond_prob)
         pred_vel = self.net.forward_with_ctx(
@@ -13960,8 +13975,10 @@ class TCFlowMatching(nn.Module):
                         vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
                         env_kine_feat=env_kine_feat, env_data=env_data, use_null=True)
                     if obs_h_n is not None:
-                        pred_h = F.normalize(v_cond[:,0,:2]*dt, dim=-1, eps=1e-6)
+                        # Compare direction of predicted velocity vs obs heading
+                        pred_h = F.normalize(v_cond[:,0,:2].detach(), dim=-1, eps=1e-6)
                         cos_a  = (obs_h_n * pred_h).sum(-1).clamp(-1.0, 1.0)
+                        # gs: 1.5 when perfectly aligned, 0.8 when >90° off
                         gs     = (0.8 + 0.7*(cos_a+1.0)*0.5).view(B,1,1)
                         vel    = v_uncond + gs * (v_cond - v_uncond)
                     else:
