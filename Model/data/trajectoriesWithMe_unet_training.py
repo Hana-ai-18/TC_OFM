@@ -1844,13 +1844,35 @@ DATA3D_W  = 81
 DATA3D_CH = 13
 
 DATA3D_MEAN = np.array([
-    33.64, 5843.14, 1482.47, 5930.27, 1622.27,
-    0.27, -0.34, -0.86, 0.25, 1.76, 1.34, 0.94, 300.95,
+    12444.037,  # CH0: GPH_200  — from compute_data3d_stats_v2
+     5844.935,  # CH1: GPH_500
+     1482.430,  # CH2: GPH_850
+      752.466,  # CH3: GPH_925
+       -1.052,  # CH4: U_200
+       -0.188,  # CH5: U_500
+       -0.407,  # CH6: U_850
+       -0.888,  # CH7: U_925
+       -0.055,  # CH8: V_200
+        1.655,  # CH9: V_500
+        1.343,  # CH10: V_850
+        1.018,  # CH11: V_925
+      301.133,  # CH12: SST
 ], dtype=np.float32)
-
+ 
 DATA3D_STD = np.array([
-    7.08, 50.55, 29.42, 1025.26, 1600.32,
-    4.73, 2.98, 2.75, 5.37, 2.29, 2.21, 2.68, 3.05,
+    113.583,  # CH0: GPH_200
+     57.135,  # CH1: GPH_500
+     37.852,  # CH2: GPH_850
+     37.274,  # CH3: GPH_925
+     13.315,  # CH4: U_200
+      8.042,  # CH5: U_500
+      7.911,  # CH6: U_850
+      7.494,  # CH7: U_925
+      8.377,  # CH8: V_200
+      5.999,  # CH9: V_500
+      6.203,  # CH10: V_850
+      6.555,  # CH11: V_925
+      3.023,  # CH12: SST
 ], dtype=np.float32)
 
 _DATA3D_SENTINEL_LARGE         = 20000.0
@@ -1860,7 +1882,7 @@ _DATA3D_GPH_VALID_MAX          = 95.0
 _DATA3D_SST_CHANNEL            = 12
 _SST_VALID_MIN                 = 270.0
 _SST_FILL_K                    = 298.0
-_MOVE_VEL_NORM                 = 1219.84
+_MOVE_VEL_NORM                 = 150.0
 
 # FIX-DATA-25: coordinate filter bounds
 _LON_VALID_MIN  = 100.0
@@ -1987,7 +2009,7 @@ def _build_csv_env_lookup(csv_path: str) -> dict:
         d = {
             "gph500_mean"           : gph_mean,
             "gph500_center"         : gph_center,
-            "gph500_already_normed" : False,  # CSV: raw dam → cần z-score
+            "gph500_already_normed" : True,  # CSV: raw dam → cần z-score
             # FIX-DATA-28: normalized [-1,1], key consistent với .npy
             "u500_mean"             : u500_mean,
             "u500_center"           : u500_center,
@@ -2474,6 +2496,8 @@ class TrajectoryDataset(Dataset):
         for c in range(DATA3D_CH):
             ch = arr[:, :, c]
             ch[ch > _DATA3D_SENTINEL_LARGE] = np.nan
+            if c < 4:  # FIX-v26: GPH channels — filter negative sentinels
+                ch[ch < 0] = np.nan
             if c in _DATA3D_SENTINEL_ZERO_CHANNELS:
                 ch[ch == 0.0] = np.nan
             if c == _DATA3D_SST_CHANNEL:
