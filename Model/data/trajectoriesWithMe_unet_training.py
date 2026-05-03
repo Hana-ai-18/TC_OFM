@@ -122,7 +122,7 @@
 # # _DATA3D_SST_CHANNEL            = 12
 # # _SST_VALID_MIN                 = 270.0
 # # _SST_FILL_K                    = 298.0
-# # _MOVE_VEL_NORM                 = 1219.84
+# # _MOVE_VEL_NORM = 150.0    # FIX-v57: single normalize /150
 
 # # # ── Key mapping: build_env_data_scs_v10.py lưu suffix "_n" ───────────────────
 # # # FIX-DATA-15 (kept): Map từ key cũ (có _n) sang key chuẩn
@@ -904,7 +904,7 @@
 # _DATA3D_SST_CHANNEL            = 12
 # _SST_VALID_MIN                 = 270.0
 # _SST_FILL_K                    = 298.0
-# _MOVE_VEL_NORM                 = 1219.84
+# _MOVE_VEL_NORM = 150.0    # FIX-v57: single normalize /150
 
 # # FIX-DATA-25: coordinate filter bounds
 # _LON_VALID_MIN  = 100.0
@@ -959,7 +959,7 @@
 #         logger.warning(f"CSV load failed: {e}")
 #         return {}
  
-#     _MOVE_VEL_NORM = 1219.84
+#     _MOVE_VEL_NORM = 150.0    # FIX-v57: single normalize /150
 #     lookup: dict = {}
 #     for _, row in df.iterrows():
 #         yr         = str(int(float(row["year"])))
@@ -2619,7 +2619,7 @@ class TrajectoryDataset(Dataset):
                         # gph500_mean = (gph-5900)/200, u500_mean = clip(u/30,-1,1)
                         # Đây đều là đã normalized
                         # remapped["gph500_already_normed"] = True\
-                        remapped["gph500_already_normed"] = False
+                        remapped["gph500_already_normed"] = True   # FIX-v57: GPH cần normalize
 
                     
                     result = env_data_processing(remapped)
