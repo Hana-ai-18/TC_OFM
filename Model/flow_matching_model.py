@@ -20111,8 +20111,8 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
              + 0.05 * l_speed
              + 0.01 * l_accel
              + w_heading    * l_heading       # [FIX-ATE-2] 0.20→0.08
-             + 1.20 * l_vel_reg               # [FIX-ATE-4] 0.60→1.20
-             + 0.25 * l_speed_bias            # [FIX-ATE-5] NEW
+             + 2.00 * l_vel_reg      # [FIX-v57-F] 1.20→2.00               # [FIX-ATE-4] 0.60→1.20
+             + 0.30 * l_speed_bias   # [FIX-v57-F] 0.25→0.30            # [FIX-ATE-5] NEW
              + 0.25 * l_sph_ate               # ATE-reweighted
              + 0.15 * l_endpoint
              + w_signed_ate * l_signed_ate    # [FIX-ATE-2+3] 0.40→0.80~1.40
@@ -20378,10 +20378,10 @@ class VelocityField(nn.Module):
             nn.Linear(7, 64), nn.GELU(), nn.LayerNorm(64),   # FIX-BUG3+GAP3: 4→7 inputs
             nn.Linear(64, 128), nn.GELU(), nn.Linear(128, 256))
 
-        # [FIX-v57-E] env_kine_enc: 14→24 dim
-        # Thêm: velocity_history(4)+rapid_intensification(1)+history_inten24(4)+gph500(1)
+        # [FIX-v57-E] env_kine_enc: 14→28 dim
+        # 1+8+8+5+4+1+1 = 28-dim với keys thực tế từ ENV builder
         self.env_kine_enc = nn.Sequential(
-            nn.Linear(24, 128), nn.GELU(), nn.LayerNorm(128),
+            nn.Linear(28, 128), nn.GELU(), nn.LayerNorm(128),
             nn.Linear(128, 256), nn.GELU())
 
         # [FIX-v57-C] Speed conditioning encoder
@@ -20538,15 +20538,25 @@ class VelocityField(nn.Module):
             return torch.zeros(B, dim, device=device)
         # [FIX-v57-E] Thêm velocity_history(4), rapid_intensification(1),
         # history_inten24(4), gph500_center(1) → 24-dim total
+        # [FIX-v57-E-corrected] Dùng đúng tên key từ ENV builder thực tế
+        # velocity_history KHÔNG TỒN TẠI → dùng history_direction12 (motion pattern 12h)
+        # history_intensification_24 → tên đúng là "history_inte_change24"
+        # rapid_intensification KHÔNG TỒN TẠI → dùng intensity_class proxy
+        def _ri_proxy(B, device):
+            """RI proxy: intensity_class (6-dim) → scalar tăng cường suất."""
+            ic = _get_t("intensity_class", 6)   # one-hot 0=TD..5=SuperTY
+            return (ic * torch.arange(6, dtype=torch.float, device=device)
+                    .unsqueeze(0) / 5.0).sum(-1, keepdim=True).clamp(0, 1)
+
         feat = torch.cat([
-            _get_t("move_velocity",             1),  # current speed (normalized)
-            _get_t("velocity_history",          4),  # [v_t-3..v_t] acceleration pattern
-            _get_t("history_direction24",       8),  # direction history
-            _get_t("delta_velocity",            5),  # delta speed onehot
-            _get_t("rapid_intensification",     1),  # RI flag: speed surge
-            _get_t("history_intensification_24",4),  # intensity trend → speed trend
-            _get_t("gph500_center",             1),  # ridge strength → steering speed
-        ], dim=-1)                                   # = 24-dim total
+            (_get_t("move_velocity", 1) * (1219.84 / 150.0)).clamp(-3, 3),  # rescale /1219.84 → /150
+            _get_t("history_direction12",  8),  # motion direction 12h history
+            _get_t("history_direction24",  8),  # motion direction 24h history
+            _get_t("delta_velocity",       5),  # speed change onehot
+            _get_t("history_inte_change24",4),  # intensity change 24h (tên đúng!)
+            _get_t("gph500_center",        1),  # ridge strength → steering speed
+            _ri_proxy(B, device),               # intensity class → RI proxy (1-dim)
+        ], dim=-1)                              # 1+8+8+5+4+1+1 = 28-dim
         return self.env_kine_enc(feat)
 
     # [FIX-v57-C] Compute speed conditioning from obs trajectory
@@ -20614,12 +20624,14 @@ class VelocityField(nn.Module):
 
     def forward_with_ctx(self, x_t, t, raw_ctx, noise_scale=0.0,
                           vel_obs_feat=None, steering_feat=None,
-                          env_kine_feat=None, env_data=None, use_null=False):
+                          env_kine_feat=None, speed_cond_feat=None,  # [FIX-v57-C]
+                          env_data=None, use_null=False):
         ctx = self._apply_ctx_head(raw_ctx, noise_scale, use_null=use_null)
         return self._decode(x_t, t, ctx,
-                            vel_obs_feat=vel_obs_feat,
-                            steering_feat=steering_feat,
-                            env_kine_feat=env_kine_feat,
+                            vel_obs_feat   = vel_obs_feat,
+                            steering_feat  = steering_feat,
+                            env_kine_feat  = env_kine_feat,
+                            speed_cond_feat= speed_cond_feat,  # [FIX-v57-C]
                             env_data=env_data)
 
 
@@ -21072,13 +21084,13 @@ class TCFlowMatching(nn.Module):
                     v_cond   = self.net.forward_with_ctx(
                         x_t, t_b, raw_ctx, noise_scale=ns,
                         vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
-                        env_kine_feat=env_kine_feat, env_data=env_data,
-                        use_null=False)
+                        env_kine_feat=env_kine_feat, speed_cond_feat=speed_cond_feat,
+                        env_data=env_data, use_null=False)
                     v_uncond = self.net.forward_with_ctx(
                         x_t, t_b, raw_ctx, noise_scale=0.0,
                         vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
-                        env_kine_feat=env_kine_feat, env_data=env_data,
-                        use_null=True)
+                        env_kine_feat=env_kine_feat, speed_cond_feat=speed_cond_feat,
+                        env_data=env_data, use_null=True)
                     if obs_h_n is not None:
                         pred_h = F.normalize(
                             v_cond[:,0,:2].detach(), dim=-1, eps=1e-6)
@@ -21091,7 +21103,8 @@ class TCFlowMatching(nn.Module):
                     vel = self.net.forward_with_ctx(
                         x_t, t_b, raw_ctx, noise_scale=ns,
                         vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
-                        env_kine_feat=env_kine_feat, env_data=env_data)
+                        env_kine_feat=env_kine_feat, speed_cond_feat=speed_cond_feat,
+                        env_data=env_data)
 
                 m_s = _mom_str(step, ddim_steps)
                 if m_s > 1e-4:
