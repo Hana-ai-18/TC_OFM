@@ -27311,7 +27311,7 @@ class SSFMVelocityField(nn.Module):
         # ── Auxiliary feature encoders ─────────────────────────────────────
         self.vel_obs_enc = nn.Sequential(
             nn.Linear(obs_len * 6, 128), nn.GELU(), nn.LayerNorm(128),
-            nn.Linear(256, 256), nn.GELU())
+            nn.Linear(128, 256), nn.GELU())
         self.steering_enc = nn.Sequential(
             nn.Linear(7, 64), nn.GELU(), nn.LayerNorm(64),
             nn.Linear(64, 128), nn.GELU(), nn.Linear(128, 256))
