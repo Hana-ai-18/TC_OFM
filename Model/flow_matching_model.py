@@ -26763,9 +26763,9 @@ class NonARTransformerHead(nn.Module):
         ctx_dim:  int = 256,
         pred_len: int = 12,
         n_heads:  int = 8,
-        n_layers: int = 3,
+        n_layers: int = 2,
         dropout:  float = 0.10,
-        expand_memory: int = 4,   # expand context to multi-token memory
+        expand_memory: int = 2,   # expand context to multi-token memory
     ):
         super().__init__()
         self.pred_len = pred_len
@@ -26785,7 +26785,7 @@ class NonARTransformerHead(nn.Module):
         decoder_layer = nn.TransformerDecoderLayer(
             d_model     = ctx_dim,
             nhead       = n_heads,
-            dim_feedforward = ctx_dim * 4,
+            dim_feedforward = ctx_dim * 2,
             dropout     = dropout,
             activation  = "gelu",
             batch_first = True,
@@ -26959,8 +26959,11 @@ def _spread_error_calibration_loss(
 
     # Std of ensemble in normalized coords
     spread_norm = ensemble_deg.std(0)                          # (T, B, 2)
-    spread_lon_km = spread_norm[:, :, 0] * cos_lat * DEG2KM * _NORM_TO_DEG
-    spread_lat_km = spread_norm[:, :, 1]                       * DEG2KM * _NORM_TO_DEG
+    # spread_lon_km = spread_norm[:, :, 0] * cos_lat * DEG2KM * _NORM_TO_DEG
+    # spread_lat_km = spread_norm[:, :, 1]                       * DEG2KM * _NORM_TO_DEG
+    # spread_km = torch.sqrt(spread_lon_km.pow(2) + spread_lat_km.pow(2) + 1e-6)
+    spread_lon_km = spread_norm[:, :, 0] * cos_lat * DEG2KM
+    spread_lat_km = spread_norm[:, :, 1]             * DEG2KM
     spread_km = torch.sqrt(spread_lon_km.pow(2) + spread_lat_km.pow(2) + 1e-6)
 
     # ── Log-space calibration loss ──────────────────────────────────────────
@@ -27239,8 +27242,8 @@ class SpeedConditioningEncoder(nn.Module):
         super().__init__()
         self.speed_max = speed_max
         self.mlp = nn.Sequential(
-            nn.Linear(64, 256), nn.GELU(), nn.LayerNorm(256),
-            nn.Linear(256, out_dim), nn.GELU(),
+            nn.Linear(64, 128), nn.GELU(), nn.LayerNorm(128),
+            nn.Linear(128, out_dim), nn.GELU(),
         )
         self.scale = nn.Parameter(torch.ones(1) * 0.5)
 
@@ -27307,7 +27310,7 @@ class SSFMVelocityField(nn.Module):
 
         # ── Auxiliary feature encoders ─────────────────────────────────────
         self.vel_obs_enc = nn.Sequential(
-            nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
+            nn.Linear(obs_len * 6, 128), nn.GELU(), nn.LayerNorm(128),
             nn.Linear(256, 256), nn.GELU())
         self.steering_enc = nn.Sequential(
             nn.Linear(7, 64), nn.GELU(), nn.LayerNorm(64),
@@ -27339,9 +27342,9 @@ class SSFMVelocityField(nn.Module):
         self.step_embed = nn.Embedding(pred_len, 256)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
-                d_model=256, nhead=8, dim_feedforward=1024,
+                d_model=256, nhead=8, dim_feedforward=512,
                 dropout=0.15, activation="gelu", batch_first=True),
-            num_layers=4)
+            num_layers=3)
         self.out_fc1 = nn.Linear(256, 512)
         self.out_fc2 = nn.Linear(512, 4)
 
