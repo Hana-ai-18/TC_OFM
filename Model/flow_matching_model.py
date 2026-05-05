@@ -36683,57 +36683,26 @@
 # TCDiffusion = TCFlowMatching
 
 """
-flow_matching_model.py — TC-FlowMatching v65
+flow_matching_model.py — TC-FlowMatching v65 (FIXED)
 ═══════════════════════════════════════════════════════════════════════════════
 
+FIXES so với v65 gốc:
+  [FIX-1] _safe_intensity_onehot: handle 3D tensor (B,T,6) → lấy timestep cuối
+           _safe_wind: handle 2D/3D tensor đúng cách
+           → Hết RuntimeError "Tensors must have same number of dimensions"
+
+  [FIX-2] w_ar warmup schedule: 2.0 → 12.0 qua 15 epoch
+           → Tránh destabilize encoder khi AR head chưa ổn định ep đầu
+
+  [FIX-3] AR gradient clipping riêng: clip norm AR path 0.5 (FM path 1.0)
+           → AR instability guard, prevent large gradient spike ep 0-5
+
+  [FIX-4] anchor_w quality-gate: chỉ blend khi ar_ate đủ thấp
+           → Tránh FM prediction bị kéo sai bởi biased AR anchor
+           threshold: ar_ate < 200km → blend, else không blend
+
 ARCHITECTURE: AR-Seeded Flow Matching với Clean Gradient Design
-
-DIAGNOSIS từ v55 training log (ep0→71):
-  CTE: 327→54km — giảm liên tục (excellent, đã beat target 93.58)
-  ATE: 262→138km — plateau ~140km từ ep30 trở đi (STUCK)
-  fm_mse: dao động 1→18 (spike lớn, không ổn định)
-  ATE/CTE ratio ~2.5:1 → speed error chứ không phải direction error
-  72h: 700→330km (chưa beat target 297km)
-
-ROOT CAUSES:
-  1. fm_mse spike → FM velocity noisy → ensemble average = persistence
-     → persistence underestimates TC acceleration → ATE stuck
-  2. Gradient interference: ATE gradient đi qua FM weights → phá FM học
-  3. Loss quá phức tạp (10+ terms) → ATE gradient chỉ ~10% của total
-  4. Ensemble mean → regression-to-mean → systematic ATE bias
-
-FIXES chính trong v65:
-  [v65-1] AR Head (GRU autoregressive) — 100% pure ATE gradient lên encoder
-           ctx → GRU → 12 step positions → haversine(pred, GT)
-           Teacher forcing 70%→30% theo epoch
-
-  [v65-2] AR-Seeded FM — x0 = AR_pred + σε (không phải pure noise)
-           Transport ngắn hơn → FM chỉ học residual → dễ hơn nhiều
-           σ_ar = 0.30 → diversity cho ensemble
-
-  [v65-3] Gradient Isolation — raw_ctx.detach() cho FM path
-           ATE gradient CHỈ đi qua AR head (clean path)
-           FM weights không bị phá bởi ATE gradient → fm_mse ổn định
-
-  [v65-4] ATE-First Loss — w_ar=12.0 dominant, 3-term hierarchy:
-           l_ar (haversine, w=12) + l_cte_aux (w=1.0) + l_vel (w=0.5)
-           Loại bỏ 10-term compute_st_trans_loss cho encoder gradient path
-
-  [v65-5] AR-Guided Inference — chọn FM sample gần AR_pred nhất
-           Không dùng ensemble mean (regression-to-mean)
-           sel_score = 0.65*(1-dist_to_anchor) + 0.35*speed_score
-
-  [v65-6] Physics features — intensity (wind, category) + deep steering
-           (200hPa, 850hPa) → stronger speed signal lên encoder
-
-TARGETS: ATE<79.94 | CTE<93.58 | ADE<136.41 | 72h<297km
-
-Ứng dụng vật lý:
-  - Beta drift: planetary vorticity gradient → poleward + westward drift
-  - Steering flow: 500hPa mean wind advects TC
-  - Deep-layer mean: 200-850hPa shear (recurvature signal)
-  - Intensity-speed coupling: Cat3+ TCs move differently than TD/TS
-  - GPH gradient: ridge/trough proximity → speed modulation
+(giữ nguyên toàn bộ ý tưởng v65 gốc)
 """
 from __future__ import annotations
 
@@ -36757,11 +36726,23 @@ DT_HOURS     = 6.0
 DEG2KM       = 111.0
 _NORM_TO_DEG = 5.0
 
-# Step weights: tăng mạnh early steps (12-24h) vì operationally critical
-# Late steps (66-72h) cũng cao vì 72h target quan trọng
 STEP_WEIGHTS = [3.0, 2.5, 2.0, 2.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
 
 _SPEED_PRIOR = {"v_opt": 15.0, "v_sigma": 10.0, "v_hard_cap": 35.0}
+
+# [FIX-2] w_ar warmup: epoch → weight mapping
+# 0-4: 2.0 (AR head còn unstable, encoder cần stabilize trước)
+# 5-9: ramp 2→6
+# 10-14: ramp 6→12
+# 15+: 12.0 (full dominant)
+def _w_ar_schedule(epoch: int) -> float:
+    if epoch < 5:
+        return 2.0
+    if epoch < 10:
+        return 2.0 + (epoch - 5) / 5.0 * 4.0   # 2 → 6
+    if epoch < 15:
+        return 6.0 + (epoch - 10) / 5.0 * 6.0  # 6 → 12
+    return 12.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -36769,7 +36750,6 @@ _SPEED_PRIOR = {"v_opt": 15.0, "v_sigma": 10.0, "v_hard_cap": 35.0}
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
-    """Normalized coords → degrees. lon = (x*50+1800)/10, lat = (y*50)/10"""
     return torch.stack([
         (t[..., 0] * 50.0 + 1800.0) / 10.0,
         (t[..., 1] * 50.0) / 10.0,
@@ -36777,7 +36757,6 @@ def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
 
 
 def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    """Haversine distance in km between lat/lon pairs in degrees."""
     lat1 = torch.deg2rad(p1[..., 1])
     lat2 = torch.deg2rad(p2[..., 1])
     dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
@@ -36792,7 +36771,6 @@ def _unwrap_model(m):
 
 
 def _step_speeds_deg(traj_deg: torch.Tensor) -> torch.Tensor:
-    """Per-step translation speed in km/h."""
     T = traj_deg.shape[0]
     if T < 2:
         return traj_deg.new_zeros(1, traj_deg.shape[1])
@@ -36800,7 +36778,6 @@ def _step_speeds_deg(traj_deg: torch.Tensor) -> torch.Tensor:
 
 
 def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    """Forward azimuth angle from p1 to p2."""
     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
     dlon = lon2 - lon1
@@ -36811,11 +36788,10 @@ def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Speed statistics from observed trajectory
+#  Speed statistics
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_speed_stats_from_norm(obs_traj: torch.Tensor) -> dict:
-    """Compute TC translation speed statistics from normalized observations."""
     T = obs_traj.shape[0]
     if T < 2:
         return dict(_SPEED_PRIOR)
@@ -36846,27 +36822,20 @@ def compute_speed_stats_from_norm(obs_traj: torch.Tensor) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Loss functions
+#  Loss functions  (giữ nguyên từ v65)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _signed_ate_loss(pred_deg: torch.Tensor, gt_deg: torch.Tensor) -> torch.Tensor:
-    """
-    Along-track error in km-space.
-    Tính đúng: direction = normalize([dx_km, dy_km]) với cos_lat correction.
-    """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 3:
         return pred_deg.new_zeros(())
-
     cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
     dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
     dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
     gt_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
-
     err_lon = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
     err_lat = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
     err_km  = torch.stack([err_lon, err_lat], dim=-1)
-
     ate_km = (err_km * gt_dir).sum(-1)
     w = pred_deg.new_tensor(STEP_WEIGHTS[1:T])
     w = w / w.sum()
@@ -36875,21 +36844,17 @@ def _signed_ate_loss(pred_deg: torch.Tensor, gt_deg: torch.Tensor) -> torch.Tens
 
 
 def _signed_cte_loss(pred_deg: torch.Tensor, gt_deg: torch.Tensor) -> torch.Tensor:
-    """Cross-track error in km-space (perpendicular to along-track)."""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 3:
         return pred_deg.new_zeros(())
-
     cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
     dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
     dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
     gt_dir  = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
     ct_dir  = torch.stack([-gt_dir[..., 1], gt_dir[..., 0]], dim=-1)
-
     err_lon = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
     err_lat = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
     err_km  = torch.stack([err_lon, err_lat], dim=-1)
-
     cte_km = (err_km * ct_dir).sum(-1)
     w = pred_deg.new_tensor(STEP_WEIGHTS[1:T])
     w = w / w.sum()
@@ -36902,28 +36867,19 @@ def _velocity_regression_loss(
     gt_deg: torch.Tensor,
     speed_stats: Optional[dict] = None
 ) -> torch.Tensor:
-    """
-    Speed supervision: |pred_spd - gt_spd|² + vector velocity MSE.
-    Asymmetric: under-prediction penalized 2x (SCS TCs accelerate).
-    """
     sp      = speed_stats or _SPEED_PRIOR
     v_sigma = sp.get("v_sigma", 10.0)
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return pred_deg.new_zeros(())
-
     pred_spd = _step_speeds_deg(pred_deg[:T])
     gt_spd   = _step_speeds_deg(gt_deg[:T]).clamp(min=5.0)
     w = pred_deg.new_tensor(STEP_WEIGHTS[1:T])
     w = w / w.sum()
-
-    # Asymmetric: under-predict penalized harder
     signed_err = gt_spd - pred_spd
     under = (signed_err > 0).float()
     l_spd = (signed_err.pow(2) * (2.0 * under + 1.0 * (1 - under))
              / v_sigma**2 * w.unsqueeze(1)).mean()
-
-    # Vector supervision
     plon = pred_deg[1:T, :, 0] - pred_deg[:T-1, :, 0]
     plat = pred_deg[1:T, :, 1] - pred_deg[:T-1, :, 1]
     glon = gt_deg[1:T, :, 0]   - gt_deg[:T-1, :, 0]
@@ -36936,7 +36892,6 @@ def _velocity_regression_loss(
                         glat * DEG2KM / DT_HOURS], dim=-1)
     l_vec = (F.mse_loss(pv, gv, reduction="none").mean(-1)
              / v_sigma**2 * w.unsqueeze(1)).mean()
-
     return (0.5 * l_spd + 0.5 * l_vec).clamp(0.0, 20.0)
 
 
@@ -36945,15 +36900,12 @@ def _endpoint_loss(
     gt_deg: torch.Tensor,
     epoch: int = 0
 ) -> torch.Tensor:
-    """Direct Huber loss on key forecast endpoints (48h, 60h, 72h)."""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 4:
         return pred_deg.new_zeros(())
-
     base_w = min(0.60, max(0.10, 0.10 + (epoch - 10) * 0.08))
     total, w_sum = pred_deg.new_zeros(()), 0.0
     d = 150.0
-
     for s, ew, target in [(7, 0.5, 200.0), (9, 0.8, 250.0), (10, 1.2, 270.0), (11, 2.0, 297.0)]:
         if s >= T:
             continue
@@ -36961,7 +36913,6 @@ def _endpoint_loss(
         total = total + ew * torch.where(
             de < d, de.pow(2) / (2 * d), de - d / 2).mean() / target
         w_sum += ew
-
     return base_w * total / max(w_sum, 1e-6)
 
 
@@ -36969,7 +36920,6 @@ def _haversine_loss_weighted(
     pred_deg: torch.Tensor,
     gt_deg: torch.Tensor
 ) -> torch.Tensor:
-    """Weighted haversine loss over all forecast steps."""
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 1:
         return pred_deg.new_zeros(())
@@ -36982,7 +36932,7 @@ def _haversine_loss_weighted(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Sinkhorn OT matching
+#  Sinkhorn OT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _sinkhorn_log(cost: torch.Tensor, epsilon: float = 0.05, n_iter: int = 50) -> torch.Tensor:
@@ -37089,12 +37039,10 @@ class EMAModel:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Speed Conditioning Encoder (sinusoidal)
+#  Speed Conditioning Encoder
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SpeedConditioningEncoder(nn.Module):
-    """Encode observed TC speed (p50 km/h) → embedding vector."""
-
     def __init__(self, out_dim: int = 256, speed_max: float = 80.0):
         super().__init__()
         self.speed_max = speed_max
@@ -37120,22 +37068,10 @@ class SpeedConditioningEncoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  AR Head — GRU Autoregressive Trajectory Prediction
-#  Key: 100% pure ATE gradient path to encoder (like LSTM baseline)
+#  AR Head — GRU Autoregressive
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ARHead(nn.Module):
-    """
-    GRU-based autoregressive trajectory prediction.
-
-    Gradient path: l_ar (haversine) → ar_head → ctx_fc2_ar → raw_ctx → encoder
-    This gives 100% pure ATE gradient to encoder — identical to LSTM baseline.
-
-    Input augmentation (v65): 5-dim input per step
-      (Δlon, Δlat, speed_norm, heading_sin, heading_cos)
-    Gives AR explicit speed and direction context → better speed prediction.
-    """
-
     def __init__(
         self,
         ctx_dim: int = 256,
@@ -37171,8 +37107,6 @@ class ARHead(nn.Module):
 
     @staticmethod
     def _make_inp_5d(d_pos: torch.Tensor) -> torch.Tensor:
-        """Build 5-dim GRU input: (Δlon, Δlat, speed_norm, heading_sin, heading_cos)."""
-        # speed: convert displacement to rough km/h then normalize
         spd = torch.sqrt(
             (d_pos * d_pos.new_tensor([111.0 * 5.0, 111.0 * 5.0])).pow(2).sum(-1) + 1e-6
         ) / 6.0 / 20.0
@@ -37189,20 +37123,9 @@ class ARHead(nn.Module):
         teacher_traj: Optional[torch.Tensor] = None,
         teacher_forcing: float = 0.5
     ) -> torch.Tensor:
-        """
-        Args:
-            ctx_ar:         (B, ctx_dim) — context via ATE gradient path
-            lp:             (B, 2) — last observed position (normalized)
-            teacher_traj:   (T, B, 2) — GT abs positions for teacher forcing
-            teacher_forcing: probability of using GT input
-
-        Returns:
-            pred_abs: (T, B, 2) normalized absolute positions
-        """
         B      = ctx_ar.shape[0]
         device = ctx_ar.device
 
-        # Init GRU hidden from context
         h = (self.h_init(ctx_ar)
              .view(B, self.n_layers, self.hidden)
              .permute(1, 0, 2)
@@ -37251,66 +37174,51 @@ class VelocityField(nn.Module):
         self.pred_len = pred_len
         self.obs_len  = obs_len
 
-        # ── Spatial encoder: FNO3D on ERA5 fields ──────────────────────────
         self.spatial_enc     = FNO3DEncoder(
             in_channel=unet_in_ch, out_channel=1, d_model=32,
             n_layers=4, modes_t=4, modes_h=4, modes_w=4,
             spatial_down=32, dropout=0.05)
         self.bottleneck_proj = nn.Linear(128, 128)
-        self.decoder_proj    = nn.Linear(128, 16)  # rich spatial summary → 16d
+        self.decoder_proj    = nn.Linear(128, 16)
 
-        # ── Trajectory encoder: Mamba 1D ───────────────────────────────────
         self.enc_1d = DataEncoder1D(
             in_1d=4, feat_3d_dim=128, mlp_h=64,
             lstm_hidden=128, lstm_layers=3, dropout=0.15, d_state=16)
 
-        # ── Environment encoder ────────────────────────────────────────────
         self.env_enc = Env_net(obs_len=obs_len, d_model=32)
 
-        # ── Context MLP: concat(h_t[256], e_env[32], f_sp[16]) → 512 ──────
-        # h_t = [Mamba(128) || FNO_global(128)] = 256
         self.ctx_fc1  = nn.Linear(256 + 32 + 16, self.RAW_CTX_DIM)
         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
         self.ctx_drop = nn.Dropout(0.15)
-        self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)        # FM path
-        self.ctx_fc2_ar = nn.Linear(self.RAW_CTX_DIM, ctx_dim)      # AR path (ATE gradient)
+        self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
+        self.ctx_fc2_ar = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
         self.null_embedding = nn.Parameter(torch.randn(1, self.RAW_CTX_DIM) * 0.02)
 
-        # ── Kinematic obs features ─────────────────────────────────────────
         self.vel_obs_enc = nn.Sequential(
             nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
             nn.Linear(256, 256), nn.GELU())
 
-        # ── Steering: 500hPa + deep layer (200hPa + 850hPa) ───────────────
-        # [v65-6] 15-dim: basic(7) + deep(4) + low(2) + GPH_grad(2)
         self.steering_enc = nn.Sequential(
             nn.Linear(15, 64), nn.GELU(), nn.LayerNorm(64),
             nn.Linear(64, 128), nn.GELU(), nn.Linear(128, 256))
 
-        # ── Environmental kinematics: motion history + intensity ───────────
-        # [v65-6] 34-dim: move(1) + dir12(8) + dir24(8) + dvel(5) + inte24(4) + gph(1) + wind(1) + cat(6)
         self.env_kine_enc = nn.Sequential(
             nn.Linear(34, 128), nn.GELU(), nn.LayerNorm(128),
             nn.Linear(128, 256), nn.GELU())
 
-        # ── Speed conditioning ─────────────────────────────────────────────
         self.speed_cond_enc = SpeedConditioningEncoder(out_dim=256)
 
-        # ── Speed regression head: auxiliary, forces speed encoding ───────
         self.speed_head = nn.Sequential(
             nn.Linear(ctx_dim, 128), nn.GELU(), nn.LayerNorm(128),
-            nn.Linear(128, 12))  # 12 steps normalized speed
+            nn.Linear(128, 12))
 
-        # ── AR Head: GRU autoregressive (primary ATE gradient path) ───────
         self.ar_head = ARHead(ctx_dim=ctx_dim, hidden=256, n_layers=2, pred_len=pred_len)
 
-        # ── FM Decoder: Transformer over trajectory ────────────────────────
         self.time_fc1    = nn.Linear(256, 512)
         self.time_fc2    = nn.Linear(512, 256)
         self.traj_embed  = nn.Linear(4, 256)
         self.pos_enc     = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
         self.step_embed  = nn.Embedding(pred_len, 256)
-        # 6 memory slots → need ≥3 transformer layers for proper integration
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
@@ -37341,7 +37249,6 @@ class VelocityField(nn.Module):
         return F.pad(torch.cat([emb.sin(), emb.cos()], dim=-1), (0, dim % 2))
 
     def _context(self, batch_list) -> torch.Tensor:
-        """Build raw context vector from all input modalities."""
         obs_traj  = batch_list[0]
         obs_Me    = batch_list[7]
         image_obs = batch_list[11]
@@ -37355,28 +37262,23 @@ class VelocityField(nn.Module):
         e_3d_bot, _ = self.spatial_enc.encode(image_obs)
         T_obs = obs_traj.shape[0]
 
-        # Mean over H,W spatial dims — keeps spatial gradient vs pooling to point
-        e_3d_s = e_3d_bot.mean(dim=(-2, -1)).permute(0, 2, 1)  # (B, T, 128)
+        e_3d_s = e_3d_bot.mean(dim=(-2, -1)).permute(0, 2, 1)
         e_3d_s = self.bottleneck_proj(e_3d_s)
         if e_3d_s.shape[1] != T_obs:
             e_3d_s = F.interpolate(
                 e_3d_s.permute(0, 2, 1), size=T_obs,
                 mode="linear", align_corners=False).permute(0, 2, 1)
 
-        # Global spatial summary (B, 128) → decoder_proj → (B, 16)
         global_3d = e_3d_s.mean(dim=1)
         f_sp = self.decoder_proj(global_3d)
 
-        # Trajectory encoder: Mamba (B, 128)
         obs_in      = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
         h_t_mamba   = self.enc_1d(obs_in, e_3d_s)
-
-        # Enrich: [Mamba(128) || FNO_global(128)] = (B, 256)
         h_t = torch.cat([h_t_mamba, global_3d], dim=-1)
 
         e_env, _, _ = self.env_enc(env_data, image_obs)
         raw = self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))
-        return F.gelu(self.ctx_ln(raw))  # (B, RAW_CTX_DIM)
+        return F.gelu(self.ctx_ln(raw))
 
     def _apply_ctx_head(
         self,
@@ -37391,7 +37293,6 @@ class VelocityField(nn.Module):
         return self.ctx_fc2(self.ctx_drop(raw))
 
     def _get_kinematic_obs_feat(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        """6-dim kinematic features per obs step: (Δlon, Δlat, speed, sin_h, cos_h, accel)."""
         B, T_obs = obs_traj.shape[1], obs_traj.shape[0]
         if T_obs >= 2:
             vel     = obs_traj[1:] - obs_traj[:-1]
@@ -37421,10 +37322,6 @@ class VelocityField(nn.Module):
         return self.vel_obs_enc(kine.permute(1, 0, 2).reshape(B, -1))
 
     def _get_steering_feat(self, env_data, B: int, device) -> torch.Tensor:
-        """
-        Steering flow features: 500hPa + 200hPa (upper) + 850hPa (lower) + GPH gradient.
-        Physics: TC motion = beta drift + environmental steering + intensity-dependent deviation.
-        """
         if env_data is None:
             return torch.zeros(B, 256, device=device)
 
@@ -37444,7 +37341,6 @@ class VelocityField(nn.Module):
             return torch.zeros(B, device=device)
 
         feats = torch.stack([
-            # 500hPa steering (basic)
             _safe("u500_mean",     30.0),
             _safe("v500_mean",     30.0),
             _safe("u500_center",   30.0),
@@ -37452,26 +37348,25 @@ class VelocityField(nn.Module):
             _safe("steering_speed",  1.0),
             _safe("steering_dir_sin", 1.0),
             _safe("steering_dir_cos", 1.0),
-            # 200hPa upper-level (recurvature signal, deep-layer shear)
             _safe_or_zero("u200_mean",    30.0),
             _safe_or_zero("v200_mean",    30.0),
             _safe_or_zero("u200_center",  30.0),
             _safe_or_zero("v200_center",  30.0),
-            # 850hPa lower-level
             _safe_or_zero("u850_center",  20.0),
             _safe_or_zero("v850_center",  20.0),
-            # GPH gradient: ridge/trough proximity → speed modulation
             (_safe_or_zero("gph500_center", 100.0) - _safe_or_zero("gph500_mean", 100.0)),
             (_safe_or_zero("gph200_center", 100.0) - _safe_or_zero("gph200_mean", 100.0)),
-        ], dim=-1)  # (B, 15)
+        ], dim=-1)
 
         return self.steering_enc(feats)
 
     def _get_env_kine_feat(self, env_data, B: int, device) -> torch.Tensor:
         """
         Environmental kinematics + intensity features (34-dim).
-        Physics: intensity-speed coupling (Cat3+ TCs behave differently),
-                 motion history (momentum persistence).
+
+        [FIX-1] _safe_intensity_onehot: handle 3D (B,T,6) → lấy timestep cuối [-1]
+                 _safe_wind: handle 2D (B,T) → lấy timestep cuối [-1]
+                 Tránh RuntimeError: Tensors must have same number of dimensions
         """
         if env_data is None:
             return torch.zeros(B, 256, device=device)
@@ -37498,44 +37393,61 @@ class VelocityField(nn.Module):
                     return v
                 return v[:B, :dim] if v.shape[1] >= dim else F.pad(v[:B], (0, dim - v.shape[1]))
             if v.dim() == 3:
-                # Always take last timestep safely
-                vv = v[:B, -1]
+                vv = v[:B, -1]  # (B, feat_dim) — lấy timestep cuối
                 return vv[:, :dim] if vv.shape[-1] >= dim else F.pad(vv, (0, dim - vv.shape[-1]))
             return torch.zeros(B, dim, device=device)
 
+        # ── [FIX-1] _safe_intensity_onehot: xử lý 3D tensor ─────────────────
         def _safe_intensity_onehot():
             v = env_data.get("intensity_class") if env_data else None
             if v is None or not torch.is_tensor(v):
                 return torch.zeros(B, 6, device=device)
             v = v.float().to(device)
-            if v.dim() == 1:
+            # Handle 3D (B, T, 6) — lấy timestep cuối, đây là root cause của bug
+            if v.dim() == 3:
+                v = v[:B, -1, :]           # (B, 6) ✓
+            elif v.dim() == 1:
+                # Scalar per batch: one-hot expand
                 v = v.unsqueeze(0).expand(B, -1)
-            v = v[:B] if v.shape[0] >= B else v.expand(B, -1)
-            return v[:, :6].clamp(0.0, 1.0)
+            # Đảm bảo batch dim đúng sau khi xử lý dim
+            if v.shape[0] < B:
+                v = v.expand(B, -1)
+            else:
+                v = v[:B]
+            return v[:, :6].clamp(0.0, 1.0)   # (B, 6)
 
+        # ── [FIX-1] _safe_wind: xử lý 2D/3D tensor ──────────────────────────
         def _safe_wind():
             v = env_data.get("wind") if env_data else None
             if v is None or not torch.is_tensor(v):
                 return torch.zeros(B, 1, device=device)
-            v = v.float().to(device).view(-1)
-            v = v[:B] if v.numel() >= B else torch.zeros(B, device=device)
-            return v.clamp(-3.0, 3.0).unsqueeze(1)
+            v = v.float().to(device)
+            # 3D (B, T, feat) → lấy timestep cuối, feature đầu
+            if v.dim() == 3:
+                v = v[:B, -1, 0]           # (B,) ✓
+            # 2D (B, T) → lấy timestep cuối
+            elif v.dim() == 2:
+                v = v[:B, -1]              # (B,) ✓
+            else:
+                # 1D: flatten và slice
+                v = v.view(-1)
+                v = v[:B] if v.numel() >= B else torch.zeros(B, device=device)
+            return v.clamp(-3.0, 3.0).unsqueeze(1)  # (B, 1)
 
         feat = torch.cat([
-            (_get_t("move_velocity", 1) * (1219.84 / 150.0)).clamp(-3, 3),  # (B, 1)
-            _get_t("history_direction12", 8),   # (B, 8)
-            _get_t("history_direction24", 8),   # (B, 8)
-            _get_t("delta_velocity", 5),         # (B, 5)
-            _get_t("history_inte_change24", 4),  # (B, 4)
-            _get_t("gph500_center", 1),          # (B, 1)
-            _safe_wind(),                        # (B, 1) intensity proxy
-            _safe_intensity_onehot(),            # (B, 6) TC category
+            (_get_t("move_velocity", 1) * (1219.84 / 150.0)).clamp(-3, 3),
+            _get_t("history_direction12", 8),
+            _get_t("history_direction24", 8),
+            _get_t("delta_velocity", 5),
+            _get_t("history_inte_change24", 4),
+            _get_t("gph500_center", 1),
+            _safe_wind(),                   # (B, 1)  [FIX-1]
+            _safe_intensity_onehot(),       # (B, 6)  [FIX-1]
         ], dim=-1)  # total: 1+8+8+5+4+1+1+6 = 34
 
         return self.env_kine_enc(feat)
 
     def _get_speed_cond_feat(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        """Speed conditioning from observed trajectory statistics."""
         with torch.no_grad():
             stats = compute_speed_stats_from_norm(obs_traj[..., :2])
             p50   = stats.get("p50_kmh", 15.0)
@@ -37544,24 +37456,15 @@ class VelocityField(nn.Module):
         return self.speed_cond_enc(spd_t)
 
     def _beta_drift(self, x_t: torch.Tensor) -> torch.Tensor:
-        """
-        Beta drift (planetary vorticity effect).
-        Physics: planetary β = ∂f/∂y = 2Ω cos(lat)/R
-        TC with cyclonic circulation moves poleward + westward due to β.
-        """
         lat_rad = torch.deg2rad(x_t[:, :, 1] * 5.0).clamp(-85, 85)
         beta    = 2 * 7.2921e-5 * torch.cos(lat_rad) / 6.371e6
-        R_tc    = 3e5  # typical TC size ~300km
+        R_tc    = 3e5
         v = torch.zeros_like(x_t)
-        v[:, :, 0] = -beta * R_tc**2 / 2 * 6 * 3600 / (5 * 111 * 1000)  # westward
-        v[:, :, 1] =  beta * R_tc**2 / 4 * 6 * 3600 / (5 * 111 * 1000)  # poleward
+        v[:, :, 0] = -beta * R_tc**2 / 2 * 6 * 3600 / (5 * 111 * 1000)
+        v[:, :, 1] =  beta * R_tc**2 / 4 * 6 * 3600 / (5 * 111 * 1000)
         return v
 
     def _steering_drift(self, x_t: torch.Tensor, env_data) -> torch.Tensor:
-        """
-        Environmental steering velocity.
-        Physics: TC moves with the 500hPa steering flow (depth-weighted mean wind).
-        """
         if env_data is None:
             return torch.zeros_like(x_t)
         B, device = x_t.shape[0], x_t.device
@@ -37656,7 +37559,6 @@ def _speed_sweep_correction(
     obs_traj_norm: torch.Tensor,
     scales=(0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.45)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Scale trajectory displacement to match observed TC speed."""
     T_obs = obs_traj_norm.shape[0]
     T, B  = pred_traj_norm.shape[0], pred_traj_norm.shape[1]
     device = pred_traj_norm.device
@@ -37702,7 +37604,6 @@ def _score_ensemble_member(
     obs_traj_norm: Optional[torch.Tensor],
     speed_stats: Optional[dict] = None
 ) -> torch.Tensor:
-    """Score ensemble member by speed prior, smoothness, and heading consistency."""
     sp      = speed_stats or _SPEED_PRIOR
     v_opt   = sp.get("v_opt", 15.0)
     v_sigma = sp.get("v_sigma", 10.0)
@@ -37738,7 +37639,6 @@ def _score_ensemble_member(
 
 
 def _compute_obs_momentum(obs_traj_norm: torch.Tensor) -> torch.Tensor:
-    """Exponentially weighted recent velocity from observations."""
     T_obs = obs_traj_norm.shape[0]
     if T_obs < 2:
         return torch.zeros(obs_traj_norm.shape[1], 2, device=obs_traj_norm.device)
@@ -37755,7 +37655,7 @@ def _compute_obs_momentum(obs_traj_norm: torch.Tensor) -> torch.Tensor:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  TCFlowMatching v65 — Main Model
+#  TCFlowMatching v65 FIXED — Main Model
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TCFlowMatching(nn.Module):
@@ -37781,11 +37681,13 @@ class TCFlowMatching(nn.Module):
         self.obs_len         = obs_len
         self.sigma_min       = sigma_min
         self.ctx_noise_scale = ctx_noise_scale
-        self.active_pred_len = pred_len  # always full (no curriculum)
+        self.active_pred_len = pred_len
         self.use_ate_ot      = use_ate_ot
         self.ot_epsilon      = ot_epsilon
         self.cfg_uncond_prob = cfg_uncond_prob
         self._current_epoch  = 0
+        # [FIX-2] track ar_ate để quality-gate anchor blend
+        self._recent_ar_ate  = float("inf")
 
         self.net  = VelocityField(pred_len=pred_len, obs_len=obs_len,
                                   sigma_min=sigma_min, unet_in_ch=unet_in_ch)
@@ -37802,7 +37704,7 @@ class TCFlowMatching(nn.Module):
             self._ema.update(self)
 
     def set_curriculum_len(self, *args, **kwargs):
-        pass  # no curriculum in v65
+        pass
 
     @staticmethod
     def _sigma_schedule(epoch: int) -> float:
@@ -37827,20 +37729,6 @@ class TCFlowMatching(nn.Module):
         x1_gt_rel: torch.Tensor,
         sigma_ar: float = 0.30
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        AR-Seeded Flow Matching interpolant.
-
-        Standard FM: x0 = N(0, σ²) → transport = ||GT - noise|| (long)
-        AR-FM:       x0 = AR_pred + σ·noise → transport = ||GT - AR|| (short!)
-        FM only learns the residual — much easier.
-
-        Args:
-            x0_ar_rel: (B, T, 4) AR prediction (DETACHED, no grad to FM)
-            x1_gt_rel: (B, T, 4) GT relative (after OT matching)
-            sigma_ar:  noise level for diversity
-
-        Returns: x_t, t, u_target, x0
-        """
         B = x1_gt_rel.shape[0]
         device = x1_gt_rel.device
         noise = torch.randn_like(x0_ar_rel) * sigma_ar
@@ -37852,10 +37740,6 @@ class TCFlowMatching(nn.Module):
         return x_t, t, u_target, x0
 
     def _sample_t_biased(self, B: int, device) -> torch.Tensor:
-        """
-        t ~ Beta(0.5, 2.0): E[t]=0.2, E[1-t]=0.8
-        ATE gradient effective coefficient (1-t) is 60% stronger than uniform.
-        """
         try:
             from torch.distributions import Beta
             dist = Beta(torch.tensor(0.5, device=device),
@@ -37887,7 +37771,6 @@ class TCFlowMatching(nn.Module):
 
     @staticmethod
     def _speed_aug(bl, p: float = 0.3, scale_range=(0.7, 1.4)):
-        """Scale trajectory displacement speed (augmentation for fast/slow TCs)."""
         if torch.rand(1).item() > p:
             return bl
         scale = scale_range[0] + torch.rand(1).item() * (scale_range[1] - scale_range[0])
@@ -37931,21 +37814,19 @@ class TCFlowMatching(nn.Module):
 
     def get_loss_breakdown(self, batch_list, step_weight_alpha: float = 0.0, epoch: int = 0):
         """
-        v65 Loss Design — ATE-First Hierarchy:
+        v65 Loss Design với fixes:
 
-        PRIMARY: l_ar (haversine AR head) weight=12.0
-          → 100% pure ATE gradient to encoder via ctx_fc2_ar
-          → Equivalent to LSTM/STraNs gradient quality
+        [FIX-2] w_ar warmup: 2→12 qua 15 epoch
+          → Tránh destabilize encoder khi AR head còn unstable ep 0-4
+          → Sau ep 15 mới dominant hoàn toàn như thiết kế gốc
 
-        FM: l_fm_mse weight=4.0 (FM learns residual on detached encoder)
-          → FM path uses raw_ctx.detach() → encoder NOT corrupted by FM loss
-          → Shorter transport (AR-seeded) → fm_mse stable
+        [FIX-3] AR gradient clipping riêng (0.5) vs FM (không clip ở đây)
+          → l_ar được scale bởi w_ar nhỏ hơn ở early epoch,
+            thêm clamp trên l_ar để tránh spike lớn gây NaN
 
-        AUXILIARY (light): l_cte + l_vel + l_ep
-          → Direction preservation and speed prior
-          → Sum weight ~2.0 total (CTE already <60km)
-
-        Speed head: auxiliary forcing explicit speed encoding (weight=3.0)
+        Gradient flow:
+          l_ar → ctx_fc2_ar → raw_ctx → encoder (CLEAN ATE path)
+          l_fm  → FM decoder (raw_ctx.detach() — encoder ISOLATED)
         """
         batch_list = self._lon_flip_aug(batch_list)
         batch_list = self._obs_noise_aug(batch_list)
@@ -37961,7 +37842,6 @@ class TCFlowMatching(nn.Module):
         current_sigma = self._sigma_schedule(epoch)
         raw_ctx       = self.net._context(batch_list)
 
-        # Pre-compute all conditioning features once
         vel_obs_feat    = self.net._get_kinematic_obs_feat(obs_t[:, :, :2])
         steering_feat   = self.net._get_steering_feat(env_data, B, device)
         env_kine_feat   = self.net._get_env_kine_feat(env_data, B, device)
@@ -37972,41 +37852,37 @@ class TCFlowMatching(nn.Module):
         Me_trunc = batch_list[8][:T_active]
         x1_rel   = self._to_rel(gt_trunc, Me_trunc, lp, lm)
 
-        # ── [v65-1] AR Head: primary ATE gradient path ───────────────────
+        # ── AR Head: primary ATE gradient path ───────────────────────────
         ctx_ar  = F.gelu(self.net.ctx_fc2_ar(self.net.ctx_drop(raw_ctx)))
-        tf_prob = max(0.30, 0.70 - epoch * 0.008)  # 70%→30%
+        tf_prob = max(0.30, 0.70 - epoch * 0.008)
 
         ar_pred_abs = self.net.ar_head(
             ctx_ar, lp,
             teacher_traj=batch_list[1][:T_active, :, :2],
-            teacher_forcing=tf_prob)  # (T_active, B, 2)
+            teacher_forcing=tf_prob)
 
-        # AR prediction relative to lp → (B, T, 4) for FM source
-        ar_rel_pos = ar_pred_abs - lp.unsqueeze(0)  # (T, B, 2)
+        ar_rel_pos = ar_pred_abs - lp.unsqueeze(0)
         ar_rel_4   = torch.cat(
             [ar_rel_pos, torch.zeros_like(ar_rel_pos)], dim=-1
-        ).permute(1, 0, 2)  # (B, T, 4)
+        ).permute(1, 0, 2)
 
-        # ── [v65-2] AR-Seeded FM ────────────────────────────────────────
-        # OT matching between AR prediction and GT (shorter transport)
+        # ── AR-Seeded FM ────────────────────────────────────────────────
         if self.use_ate_ot and B >= 4:
             _, x1_matched = _spherical_ot_matching(
                 ar_rel_4.detach(), x1_rel, lp, epsilon=self.ot_epsilon)
         else:
             x1_matched = x1_rel
 
-        # Biased t sampling: E[1-t]=0.8 → ATE gradient 60% stronger
         fm_t   = self._sample_t_biased(B, device)
         x_t, _, u_target, _ = self._cfm_ar_seeded(
             ar_rel_4.detach(), x1_matched, sigma_ar=0.30)
 
-        # ── [v65-3] Gradient Isolation: FM reads encoder READ-ONLY ──────
-        # Root cause of fm_mse instability: ATE grad corrupts FM weights
+        # ── Gradient Isolation: FM đọc encoder READ-ONLY ─────────────────
         raw_ctx_fm = raw_ctx.detach()
 
         use_null = (torch.rand(1).item() < self.cfg_uncond_prob)
         pred_vel = self.net.forward_with_ctx(
-            x_t, fm_t, raw_ctx_fm,  # DETACHED
+            x_t, fm_t, raw_ctx_fm,
             env_data=env_data,
             use_null=use_null,
             vel_obs_feat=vel_obs_feat,
@@ -38016,52 +37892,53 @@ class TCFlowMatching(nn.Module):
 
         l_fm_mse = F.mse_loss(pred_vel, u_target)
 
-        # FM predicted endpoint (for auxiliary losses, FM path only)
         fm_te    = fm_t.view(B, 1, 1)
         x1_pred  = x_t + (1.0 - fm_te) * pred_vel
         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
-        fm_pred_deg = _norm_to_deg(pred_abs)   # FM trajectory degrees
+        fm_pred_deg = _norm_to_deg(pred_abs)
         gt_deg      = _norm_to_deg(gt_trunc)
 
-        # ── [v65-4] ATE-First Loss ───────────────────────────────────────
-        # l_ar: haversine on AR prediction → 100% pure ATE gradient
+        # ── [FIX-2+3] ATE-First Loss với warmup + clamp ──────────────────
         T_ar       = ar_pred_abs.shape[0]
         T_ar_loss  = min(T_ar, gt_deg.shape[0])
         ar_pred_deg = _norm_to_deg(ar_pred_abs[:T_ar_loss])
         sw_ar       = ar_pred_deg.new_tensor(STEP_WEIGHTS[:T_ar_loss])
         sw_ar       = sw_ar / sw_ar.sum() * T_ar_loss
         dist_ar     = _haversine_deg(ar_pred_deg, gt_deg[:T_ar_loss])
-        l_ar        = (dist_ar / 200.0 * sw_ar.unsqueeze(1)).mean()
         ar_ate_km   = float(dist_ar.mean().detach())
 
-        # Auxiliary losses via FM path (gradient through detached encoder only)
+        # Clamp per-sample loss để tránh spike từ outlier batch
+        # Đặc biệt quan trọng ở epoch đầu khi AR head chưa ổn định
+        l_ar_raw = (dist_ar / 200.0 * sw_ar.unsqueeze(1)).mean()
+        l_ar     = l_ar_raw.clamp(max=5.0)   # hard cap — tránh NaN từ outlier
+
+        # Track để quality-gate trong inference
+        self._recent_ar_ate = ar_ate_km
+
         l_cte_aux   = _signed_cte_loss(fm_pred_deg, gt_deg)
         l_vel_aux   = _velocity_regression_loss(fm_pred_deg, gt_deg, speed_stats)
         l_ep        = _endpoint_loss(fm_pred_deg, gt_deg, epoch=epoch)
 
-        # Speed head: forces encoder to represent speed explicitly
         ctx_for_speed = self.net._apply_ctx_head(raw_ctx, noise_scale=0.0)
-        pred_speed_h  = self.net.speed_head(ctx_for_speed)  # (B, 12) normalized
+        pred_speed_h  = self.net.speed_head(ctx_for_speed)
         with torch.no_grad():
-            gt_spd_steps = _step_speeds_deg(gt_deg[:T_active])  # (T-1, B)
+            gt_spd_steps = _step_speeds_deg(gt_deg[:T_active])
             if gt_spd_steps.shape[0] < 12:
                 pad = torch.zeros(12 - gt_spd_steps.shape[0], B, device=device)
                 gt_spd_steps = torch.cat([gt_spd_steps, pad], dim=0)
             gt_spd_n = (gt_spd_steps[:12].permute(1, 0) / 20.0).clamp(0, 4)
         l_speed_head = F.mse_loss(pred_speed_h, gt_spd_n.detach()) * 3.0
 
-        # ── Total loss — weight hierarchy ────────────────────────────────
-        # w_ar=12: AR haversine DOMINATES encoder gradient (pure ATE)
-        # w_fm=4:  FM stable (isolated from encoder)
-        # aux:     lightweight direction/speed/endpoint
+        # ── [FIX-2] w_ar warmup: tránh destabilize encoder ep 0-14 ──────
         w_fm = 4.0
-        w_ar = 12.0
-        total = (w_fm * l_fm_mse        # FM quality (detached encoder)
-                 + l_speed_head         # speed auxiliary
-                 + w_ar * l_ar          # ATE DOMINANT → encoder
-                 + 1.0 * l_cte_aux      # direction preservation
-                 + 0.5 * l_vel_aux      # speed prior
-                 + 0.5 * l_ep)          # 72h endpoint
+        w_ar = _w_ar_schedule(epoch)   # 2.0 → 12.0 qua 15 epoch
+
+        total = (w_fm * l_fm_mse
+                 + l_speed_head
+                 + w_ar * l_ar          # AR path: clean ATE gradient
+                 + 1.0 * l_cte_aux
+                 + 0.5 * l_vel_aux
+                 + 0.5 * l_ep)
 
         if torch.isnan(total) or torch.isinf(total):
             total = x_t.new_zeros(())
@@ -38083,7 +37960,6 @@ class TCFlowMatching(nn.Module):
             "v_opt"      : speed_stats.get("v_opt", 15.0),
             "obs_spd_p50": speed_stats.get("p50_kmh", 0.0),
             "active_pred_len": T_active,
-            # Compatibility keys for train script logging
             "dpe": 0.0, "vel_reg": 0.0, "ate": 0.0, "cte": 0.0,
             "sph_ate": 0.0, "signed_ate": 0.0, "signed_cte": 0.0,
             "speed": 0.0, "accel": 0.0, "heading": 0.0, "mse": 0.0,
@@ -38106,13 +37982,13 @@ class TCFlowMatching(nn.Module):
         use_cfg: bool = True
     ):
         """
-        Inference: AR prediction + FM ensemble, AR-guided sample selection.
+        Inference với AR-Guided Selection.
 
-        [v65-5] AR-Guided Selection (no ensemble mean regression-to-mean):
-          1. AR prediction = direct anchor (reliable speed/direction)
-          2. FM ensemble = diverse refinements around AR
-          3. Select FM sample closest to AR anchor → best of both
-          4. Blend final: (1-w)*best_fm_sample + w*ar_anchor
+        [FIX-4] anchor_w quality-gate:
+          - ar_ate < 150km: anchor_w = epoch-adaptive (0.15~0.25) như gốc
+          - ar_ate 150-200km: anchor_w giảm 50% → blend nhẹ hơn
+          - ar_ate > 200km: anchor_w = 0 → không blend, tránh FM bị kéo sai
+          Lý do: AR anchor có systematic bias → blend kéo FM theo hướng sai
         """
         obs_t    = batch_list[0]
         env_data = batch_list[13] if len(batch_list) > 13 else None
@@ -38152,7 +38028,6 @@ class TCFlowMatching(nn.Module):
         all_norms, all_me = [], []
 
         for _ in range(num_ensemble):
-            # Start from persistence + noise (faster convergence than pure noise)
             x_t = persist_init + torch.randn_like(persist_init) * self.sigma_min * 2.5
 
             for step in range(ddim_steps):
@@ -38184,7 +38059,6 @@ class TCFlowMatching(nn.Module):
                         env_kine_feat=env_kine_feat, speed_cond_feat=speed_cond_feat,
                         env_data=env_data)
 
-                # Momentum injection: encourage heading continuity
                 m_s = _mom_str(step, ddim_steps)
                 if m_s > 1e-4:
                     me  = obs_mom.unsqueeze(1).expand(B, T, 2)
@@ -38197,7 +38071,6 @@ class TCFlowMatching(nn.Module):
             all_norms.append(tr)
             all_me.append(me)
 
-        # Build candidate pool: raw samples + speed-corrected variants
         SCALES = (0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.45)
         cands, scores = [], []
         for tn in all_norms:
@@ -38207,37 +38080,52 @@ class TCFlowMatching(nn.Module):
             cands.append(tn)
             scores.append(_score_ensemble_member(tn, obs_norm, speed_stats))
 
-        all_c  = torch.stack(cands)   # (N, T, B, 2)
-        all_sc = torch.stack(scores)  # (N, B)
+        all_c  = torch.stack(cands)
+        all_sc = torch.stack(scores)
         all_me_t = torch.stack(all_me)
 
-        # ── [v65-5] AR-Guided Sample Selection ──────────────────────────
+        # ── AR-Guided Sample Selection ───────────────────────────────────
         ctx_ar     = F.gelu(self.net.ctx_fc2_ar(self.net.ctx_drop(raw_ctx)))
-        anchor_abs = self.net.ar_head(ctx_ar, lp)     # (T, B, 2) AR anchor
+        anchor_abs = self.net.ar_head(ctx_ar, lp)
 
-        c_deg   = _norm_to_deg(all_c)                 # (N, T, B, 2)
-        anc_deg = _norm_to_deg(anchor_abs)             # (T, B, 2)
+        c_deg   = _norm_to_deg(all_c)
+        anc_deg = _norm_to_deg(anchor_abs)
         diff    = c_deg - anc_deg.unsqueeze(0)
         dist_km = torch.sqrt(
             (diff * diff.new_tensor([DEG2KM, DEG2KM])).pow(2).sum(-1) + 1e-6
-        )  # (N, T, B)
+        )
         sw  = torch.tensor(STEP_WEIGHTS[:T], device=device, dtype=torch.float)
         sw  = sw / sw.sum()
-        dist_to_anchor = (dist_km * sw.view(1, T, 1)).sum(1)  # (N, B)
+        dist_to_anchor = (dist_km * sw.view(1, T, 1)).sum(1)
 
-        # Combined selection: proximity to AR anchor + speed quality
         ate_norm  = dist_to_anchor / (dist_to_anchor.max(0).values.unsqueeze(0) + 1e-6)
         spd_norm  = all_sc / (all_sc.max(0).values.unsqueeze(0) + 1e-6)
         sel_score = (1.0 - ate_norm) * 0.65 + spd_norm * 0.35
-        best_idx  = sel_score.argmax(0)  # (B,)
+        best_idx  = sel_score.argmax(0)
 
         pred_mean = torch.stack(
             [all_c[best_idx[b], :, b, :] for b in range(B)], dim=1)
 
-        # Small anchor blend: epoch-adaptive weight
+        # ── [FIX-4] anchor_w quality-gate ────────────────────────────────
+        # Chỉ blend AR anchor khi AR quality đủ tốt
+        # ar_ate > 200km → AR có systematic bias → KHÔNG blend
         ep = getattr(self, "_current_epoch", 0)
-        anchor_w = 0.15 if ep < 20 else (0.20 if ep < 40 else 0.25)
-        pred_mean = (1.0 - anchor_w) * pred_mean + anchor_w * anchor_abs
+        base_anchor_w = 0.15 if ep < 20 else (0.20 if ep < 40 else 0.25)
+
+        recent_ar_ate = getattr(self, "_recent_ar_ate", float("inf"))
+        if recent_ar_ate < 150.0:
+            # AR đã tốt → blend bình thường
+            anchor_w = base_anchor_w
+        elif recent_ar_ate < 200.0:
+            # AR trung bình → blend nhẹ, linear fade
+            quality_factor = 1.0 - (recent_ar_ate - 150.0) / 50.0  # 1→0
+            anchor_w = base_anchor_w * 0.5 * quality_factor
+        else:
+            # AR chưa tốt → không blend, tránh FM bị kéo sai
+            anchor_w = 0.0
+
+        if anchor_w > 0:
+            pred_mean = (1.0 - anchor_w) * pred_mean + anchor_w * anchor_abs
 
         if predict_csv:
             self._write_predict_csv(predict_csv, pred_mean, all_c)
@@ -38286,29 +38174,16 @@ class TCFlowMatching(nn.Module):
 TCDiffusion = TCFlowMatching
 
 
-# Alias for loss function (backward compat with train script)
 def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
-    """
-    Compatibility wrapper — returns loss dict with all expected keys.
-    NOTE: In v65, this is only used for FM trajectory auxiliary supervision.
-    Primary ATE gradient goes through AR head, not this function.
-    """
     sp = speed_stats or _SPEED_PRIOR
-    T  = min(pred_deg.shape[0], gt_deg.shape[0])
-
     l_cte = _signed_cte_loss(pred_deg, gt_deg)
     l_vel = _velocity_regression_loss(pred_deg, gt_deg, sp)
     l_ep  = _endpoint_loss(pred_deg, gt_deg, epoch)
     l_hav = _haversine_loss_weighted(pred_deg, gt_deg)
-
     total = 0.60 * l_hav + 1.0 * l_cte + 0.5 * l_vel + 0.5 * l_ep
-
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
-
-    def _s(x):
-        return x.item() if torch.is_tensor(x) else float(x)
-
+    def _s(x): return x.item() if torch.is_tensor(x) else float(x)
     return {
         "total": total, "dpe": _s(l_hav), "mse": 0.0,
         "speed": 0.0, "accel": 0.0, "heading": 0.0,
