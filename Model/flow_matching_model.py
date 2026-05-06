@@ -41366,13 +41366,44 @@ import torch.nn.functional as F
 from Model.FNO3D_encoder import FNO3DEncoder
 from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 from Model.env_net_transformer_gphsplit import Env_net
-from Model.losses import _haversine_deg, _norm_to_deg, _haversine
+# ← KHÔNG import từ Model.losses — tất cả hàm coord/loss đều tự định nghĩa bên dưới
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 R_EARTH  = 6371.0
 DT_HOURS = 6.0
 DEG2KM   = 111.0
 _NORM_TO_DEG = 5.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Coordinate primitives — self-contained, không phụ thuộc Model.losses
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _norm_to_deg(t):
+    """Normalized coords → degrees.  lon: 0–1 → ~0–360°,  lat: 0–1 → ~-90–90°"""
+    return torch.stack([
+        (t[..., 0] * 50.0 + 1800.0) / 10.0,
+        (t[..., 1] * 50.0) / 10.0,
+    ], dim=-1)
+
+
+def _haversine_deg(p1, p2):
+    """Haversine distance (km) between two sets of (lon, lat) in degrees."""
+    lat1 = torch.deg2rad(p1[..., 1]); lat2 = torch.deg2rad(p2[..., 1])
+    dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
+    dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
+    a = (torch.sin(dlat / 2).pow(2) +
+         torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).pow(2))
+    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+
+
+def _haversine(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
+    """Scalar haversine — kept for backward compat if needed elsewhere."""
+    lat1 = math.radians(lat1_deg); lat2 = math.radians(lat2_deg)
+    dlat = math.radians(lat2_deg - lat1_deg)
+    dlon = math.radians(lon2_deg - lon1_deg)
+    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
+    return 2.0 * R_EARTH * math.asin(max(0.0, min(1.0, a**0.5)))
 
 # [FIX-4] Boost 12h (step1) and 24h (step3) — same pattern as v59
 # Step:  6h   12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
