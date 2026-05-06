@@ -41312,44 +41312,59 @@
 
 # # Backward compat
 # TCDiffusion = TCFlowMatching
-
 """
-flow_matching_model_v33fix.py — Pure FM + MSE + ATE/CTE Fix (CTE-boosted)
+flow_matching_model.py — TC-FlowMatching v60
+═══════════════════════════════════════════════════════════════════════════════
 
-═══════════════════════════════════════════════════════════════
-WHY v33 STUCK AT ~179 km ADE:
-═══════════════════════════════════════════════════════════════
-1. Val oscillates 179→197→184 → no EMA → bad checkpoint selection
-2. Loss = MSE + vel + heading only → no direct ATE/CTE constraint
-3. spread72 rising (38→72km) → ensemble mean gets pulled off-track
-4. Step weights flat → 12h/24h not emphasized enough
-5. No speed constraint → model free to drift along-track
+CHANGES vs v59 — CTE/ATE BREAKTHROUGH PACKAGE
+Goal: CTE<40 | ATE<130 | 12h<50 | 72h<320
 
-═══════════════════════════════════════════════════════════════
-FIXES IN v33-fix (CTE-boosted revision):
-═══════════════════════════════════════════════════════════════
-[FIX-1]  EMA decay=0.995 → stable val metric, better checkpoint
-[FIX-2]  Signed ATE loss → direct along-track control
-[FIX-3]  Signed CTE loss — BOOSTED:
-           • delta 80→40km (tighter Huber → stronger gradient for small CTE)
-           • w_cte 0.40→0.90 (nearly 2x vs ATE weight)
-           • active from ep20 (10 ep earlier than before)
-           • quadratic penalty for CTE > 30km (extra push)
-[FIX-3b] CTE-x1 loss (NEW): apply CTE penalty on x1_pred, same as ATE-x1
-           → direct CTE minimization on the denoised trajectory
-[FIX-3c] Multi-scale CTE (NEW): separate loss for 12h/24h/48h/72h CTE
-           → model learns CTE at each forecast horizon explicitly
-[FIX-4]  Step weights boost 12h/24h
-[FIX-5]  Speed head → ATE regularization via speed matching
-[FIX-6]  ATE-x1 loss → penalize x1_pred along-track error at high t
-[FIX-7]  Ensemble scoring: bias toward CTE-matched members (NEW)
-           → select ensemble members with smallest lateral spread
-[FIX-8]  Val reports ATE/CTE km metrics per forecast hour
+ROOT CAUSES (from ep0-49 log analysis):
+  BUG-1: _signed_cte_loss dùng per-step direction (noisy) cho cross-track
+         → gradient nhiễu, đặc biệt khi bão đổi hướng (turning)
+  BUG-2: _spherical_ate_cte_loss dùng bearing-diff (2 origin khác nhau)
+         → angle = bear_error - bear_along KHÔNG phải góc hình học thực
+         → loss không converge đúng; sửa thành km-space projection
+  BUG-3: _anisotropic_fm_loss: khi t<0.25, x_t≈noise thuần, along_dir
+         tính từ GT không khớp vel_err space → fm_mse spike đến 23
+  FLAW-4: CTE total weight << ATE: ~1.35 vs ~2.35 (ratio 57%)
+  FLAW-5: _persistence_blend 0.20 kéo pred về linear extrap → CTE cao
+           khi bão rẽ
 
-EXPECTED GAINS vs v33-fix (original):
-  CTE:  ~60-80 km → ~40-55 km  (main target)
-  ATE:  similar or slightly better
-  ADE:  165-172 → 158-168 km
+FIXES:
+  [FIX-v60-1] _signed_cte_loss: 2-step smoothed track direction
+              + Huber delta 80→50 (penalize harder)
+              + separate CTE-x1 loss (mirror của ate_x1)
+              Expected: CTE -10~15km
+
+  [FIX-v60-2] _spherical_ate_cte_loss: km-space vector projection
+              thay vì bearing diff; cte_t 100→60; cte_weight 2.5→4.0
+              Expected: CTE -8~12km, loss converge đúng
+
+  [FIX-v60-3] _anisotropic_fm_loss: t-gate (chỉ aniso khi t>0.25)
+              + ramp-up weight 0.25→0.60; cte_weight 1.0→1.5
+              Expected: fm_mse ổn định, CTE gradient đúng
+
+  [FIX-v60-4] compute_st_trans_loss: rebalance weights
+              signed_cte 0.40→1.00, signed_ate 0.70→0.45
+              sph_ate weight 0.30→0.35
+              Expected: CTE/ATE rebalance
+
+  [FIX-v60-5] _cte_x1pred_loss: new loss mirror của _ate_x1pred_loss
+              weight 0.50 trong total
+              Expected: CTE -5~8km
+
+  [FIX-v60-6] _persistence_blend: 0.20→0.06 (reduce lateral drag)
+              Expected: CTE -3~5km
+
+  [FIX-v60-7] _score_ensemble_member: thêm lateral score
+              penalize members có CTE cao so với obs direction
+              Expected: inference CTE -2~4km
+
+  [FIX-v60-8] get_loss_breakdown: thêm l_cte_x1, rebalance total
+              l_cte_x1 weight 0.50, l_ate_x1 giảm 0.80→0.60
+
+TARGETS: CTE<40 | ATE<130 | 12h<50 | 72h<320
 """
 from __future__ import annotations
 
@@ -41357,7 +41372,7 @@ import csv
 import math
 import os
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -41366,21 +41381,24 @@ import torch.nn.functional as F
 from Model.FNO3D_encoder import FNO3DEncoder
 from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 from Model.env_net_transformer_gphsplit import Env_net
-# ← KHÔNG import từ Model.losses — tất cả hàm coord/loss đều tự định nghĩa bên dưới
 
-# ─── Constants ───────────────────────────────────────────────────────────────
-R_EARTH  = 6371.0
-DT_HOURS = 6.0
-DEG2KM   = 111.0
+# ─────────────────────────────────────────────────────────────────────────────
+R_EARTH      = 6371.0
+DT_HOURS     = 6.0
+DEG2KM       = 111.0
 _NORM_TO_DEG = 5.0
+
+# [FIX-v59-1] Boost short-lead steps 1-4 significantly
+STEP_WEIGHTS = [2.0, 3.0, 4.0, 5.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
+
+_SPEED_PRIOR = {"v_opt": 15.0, "v_sigma": 10.0, "v_hard_cap": 35.0}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Coordinate primitives — self-contained, không phụ thuộc Model.losses
+#  Coordinate utilities
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _norm_to_deg(t):
-    """Normalized coords → degrees.  lon: 0–1 → ~0–360°,  lat: 0–1 → ~-90–90°"""
     return torch.stack([
         (t[..., 0] * 50.0 + 1800.0) / 10.0,
         (t[..., 1] * 50.0) / 10.0,
@@ -41388,7 +41406,6 @@ def _norm_to_deg(t):
 
 
 def _haversine_deg(p1, p2):
-    """Haversine distance (km) between two sets of (lon, lat) in degrees."""
     lat1 = torch.deg2rad(p1[..., 1]); lat2 = torch.deg2rad(p2[..., 1])
     dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
     dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
@@ -41397,43 +41414,11 @@ def _haversine_deg(p1, p2):
     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
 
 
-def _haversine(lat1_deg, lon1_deg, lat2_deg, lon2_deg):
-    """Scalar haversine — kept for backward compat if needed elsewhere."""
-    lat1 = math.radians(lat1_deg); lat2 = math.radians(lat2_deg)
-    dlat = math.radians(lat2_deg - lat1_deg)
-    dlon = math.radians(lon2_deg - lon1_deg)
-    a = math.sin(dlat / 2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2)**2
-    return 2.0 * R_EARTH * math.asin(max(0.0, min(1.0, a**0.5)))
-
-# [FIX-4] Boost 12h (step1) and 24h (step3) — same pattern as v59
-# Step:  6h   12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
-MSE_STEP_WEIGHTS = [
-    1.5,  # 6h
-    4.0,  # 12h  ← TARGET < 50km
-    2.0,  # 18h
-    3.5,  # 24h  ← TARGET < 100km
-    1.5,  # 30h
-    1.5,  # 36h
-    1.5,  # 42h
-    2.5,  # 48h  ← TARGET < 200km
-    1.0,  # 54h
-    1.0,  # 60h
-    1.5,  # 66h
-    2.5,  # 72h  ← TARGET < 300km
-]
-
-
-# ─── Coordinate utils ────────────────────────────────────────────────────────
-
-def _denorm_to_deg(t):
-    out = t.clone()
-    out[..., 0] = (t[..., 0] * 50.0 + 1800.0) / 10.0
-    out[..., 1] = (t[..., 1] * 50.0) / 10.0
-    return out
+def _unwrap_model(m):
+    return m._orig_mod if hasattr(m, "_orig_mod") else m
 
 
 def _step_speeds_deg(traj_deg):
-    """Compute per-step speeds in km/h from degree trajectory."""
     T = traj_deg.shape[0]
     if T < 2:
         return traj_deg.new_zeros(1, traj_deg.shape[1])
@@ -41441,7 +41426,6 @@ def _step_speeds_deg(traj_deg):
 
 
 def _forward_azimuth(p1, p2):
-    """Forward azimuth (bearing) from p1 to p2."""
     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
     dlon = lon2 - lon1
@@ -41452,243 +41436,122 @@ def _forward_azimuth(p1, p2):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  EMA — [FIX-1]
+#  Speed statistics
 # ═════════════════════════════════════════════════════════════════════════════
 
-class EMAModel:
-    """Exponential Moving Average of model weights for stable validation."""
-
-    def __init__(self, model, decay=0.995):
-        self.decay = decay
-        m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        self.shadow = {
-            k: v.detach().clone()
-            for k, v in m.state_dict().items()
-            if v.dtype.is_floating_point
-        }
-
-    def update(self, model):
-        m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        with torch.no_grad():
-            for k, v in m.state_dict().items():
-                if k in self.shadow:
-                    self.shadow[k].mul_(self.decay).add_(
-                        v.detach(), alpha=1 - self.decay)
-
-    def apply_to(self, model):
-        m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        backup, sd = {}, m.state_dict()
-        for k in self.shadow:
-            if k not in sd: continue
-            backup[k] = sd[k].detach().clone()
-            sd[k].copy_(self.shadow[k])
-        return backup
-
-    def restore(self, model, backup):
-        m = model._orig_mod if hasattr(model, "_orig_mod") else model
-        sd = m.state_dict()
-        for k, v in backup.items():
-            if k in sd: sd[k].copy_(v)
+def compute_speed_stats_from_norm(obs_traj):
+    T = obs_traj.shape[0]
+    if T < 2:
+        return dict(_SPEED_PRIOR)
+    with torch.no_grad():
+        lon_deg = (obs_traj[..., 0] * 50.0 + 1800.0) / 10.0
+        lat_deg = (obs_traj[..., 1] * 50.0) / 10.0
+        dlon    = lon_deg[1:] - lon_deg[:-1]
+        dlat    = lat_deg[1:] - lat_deg[:-1]
+        cos_lat = torch.cos(torch.deg2rad(
+            (lat_deg[:-1] + lat_deg[1:]) * 0.5)).clamp(1e-4)
+        speed   = torch.sqrt(
+            (dlon * cos_lat * DEG2KM)**2 + (dlat * DEG2KM)**2 + 1e-6
+        ) / DT_HOURS
+        sf = speed.flatten()
+        if sf.numel() < 4:
+            return dict(_SPEED_PRIOR)
+        mean_s = float(sf.mean())
+        std_s  = float(sf.std().clamp(min=1.0))
+        q      = torch.quantile(sf, torch.tensor([.50, .75, .95], device=sf.device))
+        p50, p95 = float(q[0]), float(q[2])
+    return {
+        "mean_kmh"  : mean_s,  "std_kmh"   : std_s,
+        "p50_kmh"   : p50,     "p95_kmh"   : p95,
+        "v_opt"     : max(p50, 5.0),
+        "v_sigma"   : max(std_s + 5.0, 5.0),
+        "v_hard_cap": float(torch.tensor(p95 * 1.8).clamp(25.0, 80.0)),
+    }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  Losses — [FIX-2,3,4,6]
+#  [FIX-v59-3] Anisotropic FM velocity loss — stabilized
 # ═════════════════════════════════════════════════════════════════════════════
 
-def mse_hav_loss(pred_norm, gt_norm, step_w=None):
+def _anisotropic_fm_loss(pred_vel, u_target, x_t_deg, gt_deg,
+                          ate_weight=1.5, cte_weight=1.5, fm_t=None):
     """
-    [FIX-4] Haversine MSE with boosted step weights for 12h/24h.
-    Uses Huber to avoid explosion from large errors.
+    [FIX-v60-3] t-gate + cte_weight tăng.
+
+    Bug cũ: khi t<0.25, x_t≈noise → along_dir tính từ GT không khớp
+            với vel_err space → spike fm_mse lên 23 ở ep34.
+
+    Fix:
+      - Nếu t_mean < 0.25: return iso_loss thuần (không tính aniso)
+      - Nếu 0.25 ≤ t_mean < 0.50: ramp-up aniso weight từ 0→max
+      - Nếu t_mean ≥ 0.50: full aniso
+      - cte_weight: 1.0→1.5 (CTE tăng trọng)
+      - ate_weight: 1.8→1.5 (ATE giảm nhẹ để rebalance)
     """
-    if step_w is None:
-        step_w = MSE_STEP_WEIGHTS
-    T = min(pred_norm.shape[0], gt_norm.shape[0])
-    pred_deg = _norm_to_deg(pred_norm[:T])
-    gt_deg   = _norm_to_deg(gt_norm[:T])
-    dist_km  = _haversine_deg(pred_deg, gt_deg)   # [T, B]
+    iso_loss = F.mse_loss(pred_vel, u_target)
 
-    w = pred_norm.new_tensor(step_w[:T])
-    w = w / w.sum() * T
+    # [FIX-v60-3] t-gate: chỉ aniso khi x_t có nghĩa
+    if fm_t is not None:
+        t_mean = float(fm_t.mean())
+        if t_mean < 0.20:
+            return iso_loss  # hoàn toàn noisy, dùng iso
+        # Ramp 0.20→0.50: alpha từ 0→0.60
+        aniso_alpha = min(0.60, (t_mean - 0.20) / 0.30 * 0.60)
+    else:
+        aniso_alpha = 0.60
 
-    delta = 300.0
-    huber = torch.where(dist_km < delta,
-                        dist_km.pow(2) / (2.0 * delta),
-                        dist_km - delta / 2.0)
-    return (huber * w.unsqueeze(1)).mean() / delta
+    B, T_pred = pred_vel.shape[0], pred_vel.shape[1]
+    T_gt = gt_deg.shape[0]
+    T = min(T_pred, T_gt - 1)
+    if T < 2:
+        return iso_loss
 
+    try:
+        gt_curr = gt_deg[:T, :, :].permute(1, 0, 2)
+        gt_next = gt_deg[1:T+1, :, :].permute(1, 0, 2)
 
-def _signed_ate_loss(pred_deg, gt_deg):
-    """
-    [FIX-2] Along-Track Error loss.
-    Project prediction error onto the GT motion direction.
-    Forces model to be accurate along the storm's path.
-    """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 3:
-        return pred_deg.new_zeros(())
-
-    cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
-    # GT motion direction (km-space)
-    dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
-    dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
-    along_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
-
-    # Prediction error in km-space
-    err_lon_km = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
-    err_lat_km = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
-    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
-
-    ate_km = (err_km * along_dir).sum(-1)   # [T-1, B]
-
-    w = pred_deg.new_tensor(MSE_STEP_WEIGHTS[1:T])
-    w = w / w.sum()
-
-    ate_loss = F.huber_loss(ate_km, torch.zeros_like(ate_km),
-                            delta=80.0, reduction="none")
-    return (ate_loss * w.unsqueeze(1)).mean() / 100.0
-
-
-def _get_cross_track_components(pred_deg, gt_deg):
-    """
-    Shared helper: compute CTE in km for each step.
-    Returns cte_km [T-1, B] and step weights.
-    """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 3:
-        return None, None, T
-
-    cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
-    dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
-    dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
-    along_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
-    cross_dir = torch.stack([-along_dir[..., 1], along_dir[..., 0]], dim=-1)
-
-    err_lon_km = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
-    err_lat_km = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
-    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
-
-    cte_km = (err_km * cross_dir).sum(-1)   # [T-1, B]
-    w = pred_deg.new_tensor(MSE_STEP_WEIGHTS[1:T])
-    w = w / w.sum()
-    return cte_km, w, T
-
-
-def _signed_cte_loss(pred_deg, gt_deg):
-    """
-    [FIX-3] Cross-Track Error loss — BOOSTED version.
-
-    Key changes vs original:
-    - delta 80→40 km: tighter Huber → stronger gradient for typical CTE (60-100km)
-    - Extra quadratic penalty for |CTE| > 30km: pushes model to reduce lateral bias
-    - Normalized by 50 (not 100) → larger gradient signal
-    """
-    cte_km, w, T = _get_cross_track_components(pred_deg, gt_deg)
-    if cte_km is None:
-        return pred_deg.new_zeros(())
-
-    # [FIX-3] Tighter Huber: delta 80→40 km
-    # At typical CTE=70km: old loss=70-40=30, new loss=70-20=50 → 67% stronger
-    cte_loss = F.huber_loss(cte_km, torch.zeros_like(cte_km),
-                            delta=40.0, reduction="none")
-
-    # [FIX-3] Extra quadratic penalty for large lateral deviations (> 30km)
-    # This specifically targets the "stuck at 60km" problem
-    extra = F.relu(cte_km.abs() - 30.0).pow(2) / 900.0   # normalized
-
-    return ((cte_loss + 0.5 * extra) * w.unsqueeze(1)).mean() / 50.0
-
-
-def _cte_x1pred_loss(x1_pred_deg, gt_deg, fm_t):
-    """
-    [FIX-3b] NEW: CTE loss on x1_pred (denoised trajectory).
-    Mirrors ATE-x1 but for cross-track direction.
-    At high t, the compensation weight forces strong CTE correction.
-
-    Why this helps:
-    - ATE-x1 pushes model to get along-track position right
-    - CTE-x1 pushes model to get lateral position right
-    - Together they constrain the full 2D error
-    """
-    T_pred = x1_pred_deg.shape[0]
-    T_gt   = gt_deg.shape[0]
-    T = min(T_pred, T_gt)
-    if T < 3:
-        return x1_pred_deg.new_zeros(())
-
-    # Compensation weight: stronger at high t
-    comp_w = (1.0 / (1.0 - fm_t.clamp(max=0.80))).clamp(max=6.0)
-
-    cte_km, w, _ = _get_cross_track_components(x1_pred_deg[:T], gt_deg[:T])
-    if cte_km is None:
-        return x1_pred_deg.new_zeros(())
-
-    cte_loss = F.huber_loss(cte_km, torch.zeros_like(cte_km),
-                            delta=40.0, reduction="none")
-    extra = F.relu(cte_km.abs() - 30.0).pow(2) / 900.0
-
-    return ((cte_loss + 0.5 * extra) * w.unsqueeze(1) * comp_w.unsqueeze(0)).mean() / 50.0
-
-
-def _multiscale_cte_loss(pred_deg, gt_deg):
-    """
-    [FIX-3c] NEW: Separate CTE loss at each forecast horizon.
-    Forces model to minimize CTE at 12h, 24h, 48h, 72h individually.
-
-    Standard CTE loss averages over all steps — this can mask poor performance
-    at specific horizons. Multi-scale separates them.
-
-    Target CTE by horizon (from v59 targets):
-      12h: <30km, 24h: <50km, 48h: <80km, 72h: <100km
-    """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 4:
-        return pred_deg.new_zeros(())
-
-    # step indices (0-based into pred_deg[1:]) for 12h/24h/48h/72h
-    # 12h=step1(idx0), 24h=step3(idx2), 48h=step7(idx6), 72h=step11(idx10)
-    horizons = [
-        (1,  30.0, 2.0),    # 12h: target 30km, weight 2.0
-        (3,  50.0, 1.5),    # 24h: target 50km, weight 1.5
-        (7,  80.0, 1.0),    # 48h: target 80km, weight 1.0
-        (11, 100.0, 1.5),   # 72h: target 100km, weight 1.5 (endpoint matters)
-    ]
-
-    total = pred_deg.new_zeros(())
-    w_sum = 0.0
-
-    for step_idx, target_km, hw in horizons:
-        if step_idx >= T - 1:
-            continue
-        # step_idx in pred_deg[1:] → actual step is step_idx+1
-        s = step_idx   # index into pred_deg[1:T]
-        t_val = s + 1  # actual T index
-
-        cos_lat = torch.cos(torch.deg2rad(gt_deg[t_val, :, 1])).clamp(1e-4)
-        dx_km = (gt_deg[t_val, :, 0] - gt_deg[t_val-1, :, 0]) * cos_lat * DEG2KM
-        dy_km = (gt_deg[t_val, :, 1] - gt_deg[t_val-1, :, 1]) * DEG2KM
-        along_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
+        cos_lat = torch.cos(torch.deg2rad(gt_curr[..., 1])).clamp(1e-4)
+        dx_km = (gt_next[..., 0] - gt_curr[..., 0]) * cos_lat * DEG2KM
+        dy_km = (gt_next[..., 1] - gt_curr[..., 1]) * DEG2KM
+        along_dir = F.normalize(
+            torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
         cross_dir = torch.stack([-along_dir[..., 1], along_dir[..., 0]], dim=-1)
 
-        err_lon = (pred_deg[t_val, :, 0] - gt_deg[t_val, :, 0]) * cos_lat * DEG2KM
-        err_lat = (pred_deg[t_val, :, 1] - gt_deg[t_val, :, 1]) * DEG2KM
-        err_km  = torch.stack([err_lon, err_lat], dim=-1)
+        vel_err = pred_vel[:, :T, :2] - u_target[:, :T, :2]
+        cos_lat_err = torch.cos(torch.deg2rad(x_t_deg[:, :T, 1])).clamp(1e-4)
+        vel_err_km = torch.stack([
+            vel_err[..., 0] * cos_lat_err * DEG2KM * _NORM_TO_DEG,
+            vel_err[..., 1] * DEG2KM * _NORM_TO_DEG,
+        ], dim=-1)
 
-        cte = (err_km * cross_dir).sum(-1)   # [B]
+        ate_err = (vel_err_km * along_dir).sum(-1)
+        cte_err = (vel_err_km * cross_dir).sum(-1)
 
-        # Huber with horizon-specific target as delta
-        loss = F.huber_loss(cte, torch.zeros_like(cte),
-                            delta=target_km, reduction="mean") / target_km
-        total = total + hw * loss
-        w_sum += hw
+        w = pred_vel.new_tensor(STEP_WEIGHTS[:T]).unsqueeze(0)
+        w = w / w.sum()
 
-    return total / max(w_sum, 1e-6)
+        l_ate = (ate_err.pow(2) * w).mean()
+        l_cte = (cte_err.pow(2) * w).mean()
 
+        # [FIX-v60-3] cte_weight 1.0→1.5
+        l_aniso = (ate_weight * l_ate + cte_weight * l_cte) / (DEG2KM * _NORM_TO_DEG)**2
+        l_other = F.mse_loss(pred_vel[:, :T, 2:], u_target[:, :T, 2:])
+
+        # Blend: aniso_alpha ramp-up + iso fallback
+        return aniso_alpha * l_aniso + (1.0 - aniso_alpha) * iso_loss + 0.1 * l_other
+
+    except Exception:
+        return iso_loss
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  [FIX-v59-4] Direct ATE loss on x1_pred — enhanced
+# ═════════════════════════════════════════════════════════════════════════════
 
 def _ate_x1pred_loss(x1_pred_deg, gt_deg, fm_t):
     """
-    [FIX-6] ATE loss on x1_pred (the denoised trajectory estimate).
-    Compensates for (1-t) attenuation — stronger correction at high t.
-    This directly penalizes the final trajectory prediction ATE.
+    [FIX-v59-4] comp_w max 4→6, clip t at 0.80 (was 0.75)
+    Stronger compensation for (1-t) attenuation at high t values.
     """
     T_pred = x1_pred_deg.shape[0]
     T_gt   = gt_deg.shape[0]
@@ -41696,10 +41559,11 @@ def _ate_x1pred_loss(x1_pred_deg, gt_deg, fm_t):
     if T < 3:
         return x1_pred_deg.new_zeros(())
 
-    # Compensation weight: stronger at high t (near end of diffusion)
+    # [FIX-v59-4] Extended clip from 0.75→0.80, max weight 4→6
     comp_w = (1.0 / (1.0 - fm_t.clamp(max=0.80))).clamp(max=6.0)
 
     cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
+
     dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
     dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
     along_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
@@ -41708,60 +41572,84 @@ def _ate_x1pred_loss(x1_pred_deg, gt_deg, fm_t):
     err_lat_km = (x1_pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
     err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
 
-    ate_km = (err_km * along_dir).sum(-1)   # [T-1, B]
+    ate_km = (err_km * along_dir).sum(-1)
 
-    w = x1_pred_deg.new_tensor(MSE_STEP_WEIGHTS[1:T])
-    w = w / w.sum()
+    step_w = x1_pred_deg.new_tensor(STEP_WEIGHTS[1:T])
+    step_w = step_w / step_w.sum()
 
-    ate_loss = F.huber_loss(ate_km, torch.zeros_like(ate_km),
-                            delta=80.0, reduction="none")
-    return (ate_loss * w.unsqueeze(1) * comp_w.unsqueeze(0)).mean() / 100.0
+    ate_loss = F.huber_loss(
+        ate_km, torch.zeros_like(ate_km),
+        delta=80.0, reduction="none"
+    )
+
+    loss = (ate_loss * step_w.unsqueeze(1) * comp_w.unsqueeze(0)).mean()
+    return loss / 100.0
 
 
-def compute_ate_cte_km(pred_deg, gt_deg):
+def _cte_x1pred_loss(x1_pred_deg, gt_deg, fm_t):
     """
-    [FIX-8] Compute ATE and CTE in km for validation metric reporting.
-    Returns dict with ate_mean_km, cte_mean_km, and per-step values.
+    [FIX-v60-5] Mirror của _ate_x1pred_loss cho cross-track.
+
+    Logic giống ATE-x1 nhưng project lên cross-track direction.
+    Cũng dùng (1-t) compensation và smoothed direction.
     """
-    T = min(pred_deg.shape[0], gt_deg.shape[0])
-    if T < 2:
-        return {"ate_mean_km": 0.0, "cte_mean_km": 0.0}
+    T_pred = x1_pred_deg.shape[0]
+    T_gt   = gt_deg.shape[0]
+    T = min(T_pred, T_gt)
+    if T < 3:
+        return x1_pred_deg.new_zeros(())
 
-    # Bearing-based decomposition (v59 approach)
-    bear_along = _forward_azimuth(gt_deg[:T-1], gt_deg[1:T])
-    bear_error = _forward_azimuth(gt_deg[1:T], pred_deg[1:T])
-    total_err  = _haversine_deg(pred_deg[1:T], gt_deg[1:T])
+    comp_w = (1.0 / (1.0 - fm_t.clamp(max=0.80))).clamp(max=6.0)
 
-    angle = bear_error - bear_along
-    ate   = total_err * torch.cos(angle)   # + = ahead of track
-    cte   = total_err * torch.sin(angle)   # + = right of track
+    cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
 
-    return {
-        "ate_mean_km": float(ate.abs().mean()),
-        "cte_mean_km": float(cte.abs().mean()),
-        "ate_per_step": ate.abs().mean(-1).tolist(),   # [T-1]
-        "cte_per_step": cte.abs().mean(-1).tolist(),   # [T-1]
-    }
+    # Smoothed cross-track direction (2-step)
+    if T >= 4:
+        dx_km = (gt_deg[2:T, :, 0] - gt_deg[:T-2, :, 0]) * cos_lat[:T-2] * DEG2KM
+        dy_km = (gt_deg[2:T, :, 1] - gt_deg[:T-2, :, 1]) * DEG2KM
+        dx1 = (gt_deg[1:2, :, 0] - gt_deg[0:1, :, 0]) * cos_lat[0:1] * DEG2KM
+        dy1 = (gt_deg[1:2, :, 1] - gt_deg[0:1, :, 1]) * DEG2KM
+        dx_km = torch.cat([dx1, dx_km], dim=0)
+        dy_km = torch.cat([dy1, dy_km], dim=0)
+    else:
+        dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
+        dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
+
+    along_dir = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
+    cross_dir = torch.stack([-along_dir[..., 1], along_dir[..., 0]], dim=-1)
+
+    err_lon_km = (x1_pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
+    err_lat_km = (x1_pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
+    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
+
+    cte_km = (err_km * cross_dir).sum(-1)
+
+    step_w = x1_pred_deg.new_tensor(STEP_WEIGHTS[1:T])
+    step_w = step_w / step_w.sum()
+
+    # delta nhỏ hơn ATE: 60km vì CTE thường nhỏ hơn ATE
+    cte_loss = F.huber_loss(
+        cte_km, torch.zeros_like(cte_km),
+        delta=60.0, reduction="none"
+    )
+    loss = (cte_loss * step_w.unsqueeze(1) * comp_w.unsqueeze(0)).mean()
+    return loss / 100.0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  SpeedHead — [FIX-5] lightweight version for ATE regularization
+#  SpeedHead — unchanged from v58
 # ═════════════════════════════════════════════════════════════════════════════
 
 class SpeedHead(nn.Module):
-    """
-    [FIX-5] Lightweight speed predictor.
-    Predicts expected speed per step from context → used to:
-    1. Regularize ATE (speed = along-track progress)
-    2. Score ensemble members during inference
-    """
     def __init__(self, ctx_dim=256, obs_feat_dim=256, pred_len=12):
         super().__init__()
         self.pred_len = pred_len
         self.fc = nn.Sequential(
-            nn.Linear(ctx_dim + obs_feat_dim, 256), nn.GELU(),
+            nn.Linear(ctx_dim + obs_feat_dim, 256),
+            nn.GELU(),
             nn.LayerNorm(256),
-            nn.Linear(256, 128), nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
             nn.Linear(128, pred_len),
         )
         with torch.no_grad():
@@ -41769,88 +41657,576 @@ class SpeedHead(nn.Module):
             nn.init.zeros_(self.fc[-1].bias)
 
     def forward(self, ctx, vel_obs_feat):
-        return F.softplus(self.fc(torch.cat([ctx, vel_obs_feat], dim=-1))) * 3.0 + 2.0
+        h = torch.cat([ctx, vel_obs_feat], dim=-1)
+        speed_pred = self.fc(h)
+        return F.softplus(speed_pred) * 3.0 + 2.0
 
 
-def _speed_head_loss(speed_pred, gt_deg):
-    """Speed head loss: match predicted speed to GT per-step speed."""
-    T = min(speed_pred.shape[1] + 1, gt_deg.shape[0])
+def _speed_head_loss(speed_pred, pred_deg, gt_deg, speed_stats=None):
+    sp = speed_stats or _SPEED_PRIOR
+    v_sigma = sp.get("v_sigma", 10.0)
+    T_gt = gt_deg.shape[0]
+    pred_len = speed_pred.shape[1]
+    T = min(pred_len + 1, T_gt)
     if T < 2:
         return speed_pred.new_zeros(())
 
-    gt_spd = _step_speeds_deg(gt_deg[:T]).permute(1, 0)   # [B, T-1]
-    n = min(speed_pred.shape[1], gt_spd.shape[1])
+    gt_spd = _step_speeds_deg(gt_deg[:T])
+    gt_spd = gt_spd.permute(1, 0)
+    n = min(pred_len, gt_spd.shape[1])
+
+    speed_pred_n = speed_pred[:, :n]
     gt_spd_n = gt_spd[:, :n].clamp(min=2.0)
 
-    w = speed_pred.new_tensor(MSE_STEP_WEIGHTS[1:n+1])
+    w = speed_pred.new_tensor(STEP_WEIGHTS[1:n+1])
     w = w / w.sum()
 
-    # Normalized MSE — don't over-penalize slow vs fast storms
-    v_sigma = gt_spd_n.std().clamp(min=5.0)
-    loss = (F.mse_loss(speed_pred[:, :n], gt_spd_n, reduction="none") / v_sigma**2)
+    loss = (F.mse_loss(speed_pred_n, gt_spd_n, reduction='none') / v_sigma**2)
     return (loss * w.unsqueeze(0)).mean()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  VelocityField — extends v33 with SpeedHead + step_embed
+#  Spherical ATE/CTE loss — [FIX-v59-5] cte_weight 2.0→2.5
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _spherical_ate_cte_loss(pred_deg, gt_deg, ate_weight=2.0, cte_weight=4.0):
+    """
+    [FIX-v60-2] km-space vector projection thay vì bearing-diff.
+
+    Bug cũ: angle = bear_error - bear_along
+            bear_error  = azimuth từ gt[i] → pred[i]
+            bear_along  = azimuth từ gt[i-1] → gt[i]
+            → 2 azimuth có origin KHÁC NHAU → hiệu không phải góc hình học
+
+    Fix: project error vector (pred-gt) lên along/cross track trong km-space.
+         Đây là cách đúng về mặt hình học.
+
+    cte_t: 100→60 để penalize hard hơn
+    cte_weight: 2.5→4.0 để push CTE mạnh hơn
+    """
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        zero = pred_deg.new_zeros(())
+        return {"ate": zero, "cte": zero, "ate_cte_total": zero,
+                "ate_mean_km": 0.0, "cte_mean_km": 0.0}
+
+    # Smoothed track direction: dùng 2-step nếu có thể để giảm noise
+    cos_lat_track = torch.cos(torch.deg2rad(gt_deg[:T-1, :, 1])).clamp(1e-4)
+    if T >= 4:
+        # gt[i-1]→gt[i+1]: 2-step direction — ít noise hơn nhiều
+        dx_a = (gt_deg[2:T, :, 0] - gt_deg[:T-2, :, 0]) * cos_lat_track[:T-2] * DEG2KM
+        dy_a = (gt_deg[2:T, :, 1] - gt_deg[:T-2, :, 1]) * DEG2KM
+        # pad first step với 1-step direction
+        dx1 = (gt_deg[1:2, :, 0] - gt_deg[0:1, :, 0]) * cos_lat_track[0:1] * DEG2KM
+        dy1 = (gt_deg[1:2, :, 1] - gt_deg[0:1, :, 1]) * DEG2KM
+        dx_a = torch.cat([dx1, dx_a], dim=0)
+        dy_a = torch.cat([dy1, dy_a], dim=0)
+    else:
+        dx_a = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat_track * DEG2KM
+        dy_a = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
+
+    # Normalise along-track và tính cross-track
+    along_dir = F.normalize(torch.stack([dx_a, dy_a], dim=-1), dim=-1, eps=1e-6)
+    cross_dir = torch.stack([-along_dir[..., 1], along_dir[..., 0]], dim=-1)
+
+    # Error vector tại prediction steps [1:T] trong km-space
+    cos_lat_e = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
+    err_lon_km = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat_e * DEG2KM
+    err_lat_km = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
+    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)  # [T-1, B, 2]
+
+    # Project: dot product với along/cross track direction
+    ate = (err_km * along_dir).sum(-1)   # [T-1, B]
+    cte = (err_km * cross_dir).sum(-1)   # [T-1, B]
+
+    w = pred_deg.new_tensor(STEP_WEIGHTS[1:T])
+    w = w / w.sum() * (T - 1)
+
+    # [FIX-v60-2] cte_t 100→60: huber kink thấp hơn → gradient mạnh hơn với lỗi nhỏ
+    ate_t = 200.0; cte_t = 60.0
+    ate_loss = (torch.where(ate.abs() < ate_t,
+                            ate.pow(2) / (2*ate_t),
+                            ate.abs() - ate_t/2) * w.unsqueeze(1)).mean() / ate_t
+    cte_loss = (torch.where(cte.abs() < cte_t,
+                            cte.pow(2) / (2*cte_t),
+                            cte.abs() - cte_t/2) * w.unsqueeze(1)).mean() / cte_t
+
+    total = ate_weight * ate_loss + cte_weight * cte_loss
+    return {"ate": ate_loss, "cte": cte_loss, "ate_cte_total": total,
+            "ate_mean_km": float(ate.abs().mean()),
+            "cte_mean_km": float(cte.abs().mean())}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Velocity regression loss
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _velocity_regression_loss(pred_deg, gt_deg, speed_stats=None):
+    sp      = speed_stats or _SPEED_PRIOR
+    v_sigma = sp.get("v_sigma", 10.0)
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        return pred_deg.new_zeros(())
+
+    pred_spd = _step_speeds_deg(pred_deg[:T])
+    gt_spd   = _step_speeds_deg(gt_deg[:T])
+    w = pred_deg.new_tensor(STEP_WEIGHTS[1:T]); w = w / w.sum()
+
+    gt_spd_clamped = gt_spd.clamp(min=5.0)
+    l_abs = ((pred_spd - gt_spd_clamped).pow(2) / v_sigma**2
+             * w.unsqueeze(1)).mean()
+
+    plon = pred_deg[1:T, :, 0] - pred_deg[:T-1, :, 0]
+    plat = pred_deg[1:T, :, 1] - pred_deg[:T-1, :, 1]
+    glon = gt_deg[1:T, :, 0]   - gt_deg[:T-1, :, 0]
+    glat = gt_deg[1:T, :, 1]   - gt_deg[:T-1, :, 1]
+    cos  = torch.cos(torch.deg2rad(
+        (pred_deg[:T-1,:,1] + pred_deg[1:T,:,1]) * 0.5)).clamp(1e-4)
+    pv_km = torch.stack([plon*cos*DEG2KM/DT_HOURS, plat*DEG2KM/DT_HOURS], -1)
+    gv_km = torch.stack([glon*cos*DEG2KM/DT_HOURS, glat*DEG2KM/DT_HOURS], -1)
+    l_vec = (F.mse_loss(pv_km, gv_km, reduction="none").mean(-1)
+             / v_sigma**2 * w.unsqueeze(1)).mean()
+
+    return (0.5*l_abs + 0.5*l_vec).clamp(0.0, 20.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Signed ATE/CTE losses
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _signed_ate_loss(pred_deg, gt_deg):
+    """ATE loss — per-step direction OK cho ATE (along-track ít noise hơn CTE)."""
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 3:
+        return pred_deg.new_zeros(())
+
+    cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
+    dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
+    dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
+    gt_dir_km_n = F.normalize(
+        torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
+
+    err_lon_km = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
+    err_lat_km = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
+    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
+
+    ate_km = (err_km * gt_dir_km_n).sum(-1)
+    w = pred_deg.new_tensor(STEP_WEIGHTS[1:T]); w = w / w.sum()
+
+    ate_loss = F.huber_loss(ate_km, torch.zeros_like(ate_km),
+                             delta=80.0, reduction="none")
+    return (ate_loss * w.unsqueeze(1)).mean() / 100.0
+
+
+def _signed_cte_loss(pred_deg, gt_deg):
+    """
+    [FIX-v60-1] CTE loss với smoothed 2-step track direction.
+
+    Bug cũ: dùng gt[i-1]→gt[i] làm along-track cho step i
+            → với bão đổi hướng, direction này rất noisy
+            → cross-track = perpendicular của noisy direction → loss nhiễu
+
+    Fix: dùng gt[i-1]→gt[i+1] (2-step) làm along-track cho step i
+         → smoother direction → clean cross-track signal
+         + Huber delta 80→50: penalize lateral errors mạnh hơn
+    """
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 3:
+        return pred_deg.new_zeros(())
+
+    cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T, :, 1])).clamp(1e-4)
+
+    # [FIX-v60-1] Smoothed along-track direction
+    if T >= 4:
+        # gt[i-1]→gt[i+1] cho steps 1..T-2 (2 bước trước-sau)
+        dx_smooth = (gt_deg[2:T, :, 0] - gt_deg[:T-2, :, 0]) * cos_lat[:T-2] * DEG2KM
+        dy_smooth = (gt_deg[2:T, :, 1] - gt_deg[:T-2, :, 1]) * DEG2KM
+        # Step đầu tiên: dùng 1-step vì không có step trước
+        dx_first = (gt_deg[1:2, :, 0] - gt_deg[0:1, :, 0]) * cos_lat[0:1] * DEG2KM
+        dy_first = (gt_deg[1:2, :, 1] - gt_deg[0:1, :, 1]) * DEG2KM
+        dx_km = torch.cat([dx_first, dx_smooth], dim=0)  # [T-1, B]
+        dy_km = torch.cat([dy_first, dy_smooth], dim=0)
+    else:
+        dx_km = (gt_deg[1:T, :, 0] - gt_deg[:T-1, :, 0]) * cos_lat * DEG2KM
+        dy_km = (gt_deg[1:T, :, 1] - gt_deg[:T-1, :, 1]) * DEG2KM
+
+    gt_dir_km_n = F.normalize(torch.stack([dx_km, dy_km], dim=-1), dim=-1, eps=1e-6)
+    ct_dir_km_n = torch.stack([-gt_dir_km_n[..., 1], gt_dir_km_n[..., 0]], dim=-1)
+
+    err_lon_km = (pred_deg[1:T, :, 0] - gt_deg[1:T, :, 0]) * cos_lat * DEG2KM
+    err_lat_km = (pred_deg[1:T, :, 1] - gt_deg[1:T, :, 1]) * DEG2KM
+    err_km = torch.stack([err_lon_km, err_lat_km], dim=-1)
+
+    cte_km = (err_km * ct_dir_km_n).sum(-1)
+    w = pred_deg.new_tensor(STEP_WEIGHTS[1:T]); w = w / w.sum()
+
+    # [FIX-v60-1] delta 80→50: penalize CTE errors ≥50km mạnh hơn
+    cte_loss = F.huber_loss(cte_km, torch.zeros_like(cte_km),
+                             delta=50.0, reduction="none")
+    return (cte_loss * w.unsqueeze(1)).mean() / 100.0
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Direct endpoint loss
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _direct_endpoint_loss(pred_deg, gt_deg, epoch=0):
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 4:
+        return pred_deg.new_zeros(())
+
+    base_w = min(0.50, max(0.10, 0.10 + (epoch - 15) * 0.08))
+    total = pred_deg.new_zeros(())
+    w_sum = 0.0
+
+    for s, w, target_km in [(7, 0.3, 200.0), (9, 0.5, 250.0), (11, 1.5, 297.0)]:
+        if s >= T: continue
+        dist = _haversine_deg(pred_deg[s], gt_deg[s]).mean()
+        total = total + w * dist / target_km
+        w_sum += w
+
+    return base_w * total / max(w_sum, 1e-6)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  [FIX-v59-5,7] compute_st_trans_loss — enhanced CTE + adjusted weights
+# ═════════════════════════════════════════════════════════════════════════════
+
+def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
+    """
+    v60 loss — CTE breakthrough version.
+
+    CHANGES vs v59:
+      [FIX-v60-2] _spherical_ate_cte_loss: km-space projection, cte_weight 2.5→4.0
+      [FIX-v60-4] signed_cte 0.40→1.00 (major boost)
+      [FIX-v60-4] signed_ate 0.70→0.45 (rebalance)
+      [FIX-v60-4] sph_ate weight 0.30→0.35
+    """
+    sp         = speed_stats or _SPEED_PRIOR
+    v_opt      = sp.get("v_opt",      15.0)
+    v_sigma    = sp.get("v_sigma",    10.0)
+    v_hard_cap = sp.get("v_hard_cap", 35.0)
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        return {"total": pred_deg.new_zeros(()), "dpe": 0.0, "vel_reg": 0.0}
+
+    # DPE (Huber)
+    w    = pred_deg.new_tensor(STEP_WEIGHTS[:T]); w = w / w.sum() * T
+    dist = _haversine_deg(pred_deg[:T], gt_deg[:T])
+    d    = 200.0
+    l_dpe = ((torch.where(dist < d, dist.pow(2)/(2*d), dist - d/2))
+             * w.unsqueeze(1)).mean() / d
+
+    # MSE (stability)
+    l_mse = F.mse_loss(pred_deg[:T], gt_deg[:T])
+
+    # Speed prior
+    pred_spd = _step_speeds_deg(pred_deg[:T])
+    l_speed  = (0.7 * ((pred_spd - v_opt) / v_sigma).pow(2).mean() +
+                0.3 * F.relu(pred_spd - v_hard_cap).pow(2).mean() / v_hard_cap**2
+                ) if pred_spd.shape[0] > 0 else pred_deg.new_zeros(())
+
+    # Accel
+    l_accel = (((pred_spd[1:] - pred_spd[:-1]).abs() / DT_HOURS).pow(2).mean()
+               / max(v_sigma * 0.5, 3.0)**2
+               ) if pred_spd.shape[0] >= 2 else pred_deg.new_zeros(())
+
+    # Heading (km-space)
+    if T >= 3:
+        cos_lat_h = torch.cos(torch.deg2rad(
+            (gt_deg[:T-1,:,1] + gt_deg[1:T,:,1]) * 0.5)).clamp(1e-4)
+        pv_raw = pred_deg[1:T] - pred_deg[:T-1]
+        gv_raw = gt_deg[1:T]   - gt_deg[:T-1]
+        pv_km = torch.stack([pv_raw[...,0]*cos_lat_h*DEG2KM, pv_raw[...,1]*DEG2KM], dim=-1)
+        gv_km = torch.stack([gv_raw[...,0]*cos_lat_h*DEG2KM, gv_raw[...,1]*DEG2KM], dim=-1)
+        l_heading = (1.0 - (
+            F.normalize(pv_km.reshape(-1, 2), dim=-1, eps=1e-6) *
+            F.normalize(gv_km.reshape(-1, 2), dim=-1, eps=1e-6)
+        ).sum(-1)).mean().clamp(0.0, 2.0)
+    else:
+        l_heading = pred_deg.new_zeros(())
+
+    # Velocity regression
+    l_vel_reg = _velocity_regression_loss(pred_deg, gt_deg, speed_stats)
+
+    # [FIX-v60-2] km-space projection; cte_weight 2.5→4.0
+    ate_d     = _spherical_ate_cte_loss(pred_deg[:T], gt_deg[:T],
+                                        ate_weight=2.0, cte_weight=4.0)
+    l_sph_ate = ate_d["ate_cte_total"]
+
+    # Endpoint Huber
+    d2 = 150.0
+    ep_total, ep_w = pred_deg.new_zeros(()), 0.0
+    for s, ew in [(7, 0.5), (9, 0.8), (10, 1.2), (11, 2.0)]:
+        if s >= T: continue
+        de = _haversine_deg(pred_deg[s], gt_deg[s])
+        ep_total = ep_total + ew * torch.where(de < d2, de.pow(2)/(2*d2), de - d2/2).mean() / d2
+        ep_w += ew
+    l_endpoint = ep_total / max(ep_w, 1e-6)
+
+    l_signed_ate = _signed_ate_loss(pred_deg, gt_deg)
+    l_signed_cte = _signed_cte_loss(pred_deg, gt_deg)
+    l_direct_ep  = _direct_endpoint_loss(pred_deg, gt_deg, epoch=epoch)
+
+    # [FIX-v60-4] Rebalanced: signed_cte 0.40→1.00, signed_ate 0.70→0.45
+    total = (0.60 * l_dpe
+         + 0.02 * l_mse
+         + 0.05 * l_speed
+         + 0.01 * l_accel
+         + 0.20 * l_heading
+         + 0.70 * l_vel_reg
+         + 0.18 * l_sph_ate     # 0.35→0.18: hạ dominant term xuống
+         + 0.10 * l_endpoint    # 0.15→0.10
+         + 0.45 * l_signed_ate  # 0.70→0.35: hạ ATE để rebalance
+         + 1.20 * l_signed_cte  # 1.00→1.20: tăng CTE dedicated
+         + 0.50 * l_direct_ep)
+
+    if torch.isnan(total) or torch.isinf(total):
+        total = pred_deg.new_zeros(())
+
+    def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+    return dict(
+        total       = total,
+        dpe         = _s(l_dpe),
+        mse         = _s(l_mse),
+        speed       = _s(l_speed),
+        accel       = _s(l_accel),
+        heading     = _s(l_heading),
+        vel_reg     = _s(l_vel_reg),
+        ate         = _s(ate_d["ate"]),
+        cte         = _s(ate_d["cte"]),
+        sph_ate     = _s(l_sph_ate),
+        endpoint    = _s(l_endpoint),
+        signed_ate  = _s(l_signed_ate),
+        signed_cte  = _s(l_signed_cte),
+        direct_ep   = _s(l_direct_ep),
+        ate_mean_km = ate_d.get("ate_mean_km", 0.0),
+        cte_mean_km = ate_d.get("cte_mean_km", 0.0),
+        speed_match=0.0, acc_kmh2=0.0, aux_fno=0.0, sigma=0.0,
+        fm_mse=0.0, multi_marg=0.0, rollout_ate=0.0, rollout_w=0.0,
+    )
+
+
+compute_ate_focused_loss = compute_st_trans_loss
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Sinkhorn OT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _sinkhorn_log(cost, epsilon=0.05, n_iter=50):
+    B      = cost.shape[0]
+    device = cost.device
+    log_a  = -math.log(B) * torch.ones(B, device=device)
+    log_b  = -math.log(B) * torch.ones(B, device=device)
+    log_K  = -cost / epsilon
+    log_u  = torch.zeros(B, device=device)
+    log_v  = torch.zeros(B, device=device)
+    for _ in range(n_iter):
+        log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
+        log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
+    return (log_K + log_u.unsqueeze(1) + log_v.unsqueeze(0)).exp().clamp(0.0)
+
+
+def _geodesic_ot_cost(x0_rel, x1_rel, lp):
+    B = x0_rel.shape[0]
+
+    def _abs_deg(rel):
+        return _norm_to_deg(lp.unsqueeze(1) + rel[:, :, :2])
+
+    x0d = _abs_deg(x0_rel); x1d = _abs_deg(x1_rel)
+    x0e = x0d.unsqueeze(1).expand(B, B, -1, -1).reshape(B*B, -1, 2)
+    x1e = x1d.unsqueeze(0).expand(B, B, -1, -1).reshape(B*B, -1, 2)
+    pos_cost = _haversine_deg(x0e, x1e).reshape(B, B, -1).mean(-1) / 500.0
+
+    spd0 = _step_speeds_deg(x0d.permute(1,0,2)).permute(1,0).mean(-1)
+    spd1 = _step_speeds_deg(x1d.permute(1,0,2)).permute(1,0).mean(-1)
+    speed_cost = (spd0.unsqueeze(1) - spd1.unsqueeze(0)).abs() / 20.0
+
+    def _mean_bearing(td):
+        b = _forward_azimuth(td[:, :-1, :], td[:, 1:, :])
+        return torch.atan2(b.sin().mean(-1), b.cos().mean(-1))
+    h0 = _mean_bearing(x0d); h1 = _mean_bearing(x1d)
+    dh = (h0.unsqueeze(1) - h1.unsqueeze(0) + math.pi) % (2*math.pi) - math.pi
+    dir_cost = dh.abs() / math.pi
+
+    return 1.0*pos_cost + 0.5*speed_cost + 0.3*dir_cost
+
+
+def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
+    B = x0_batch.shape[0]
+    if B < 4:
+        return x0_batch, x1_batch
+    try:
+        cost = _geodesic_ot_cost(x0_batch, x1_batch, lp)
+        with torch.no_grad():
+            pi = _sinkhorn_log(cost, epsilon=epsilon)
+        flat = pi.reshape(-1).clamp(0.0)
+        s    = flat.sum()
+        if not torch.isfinite(s) or s < 1e-10:
+            return x0_batch, x1_batch
+        idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
+        col = idx % B
+        return x0_batch[col], x1_batch[col]
+    except Exception:
+        return x0_batch, x1_batch
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Linear interpolant
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _slerp_interpolant(x0, x1, t, lp=None):
+    B  = x0.shape[0]; te = t.view(B, 1, 1)
+    if lp is not None and x0.shape[-1] >= 2:
+        abs0 = lp.unsqueeze(1) + x0[:, :, :2]
+        abs1 = lp.unsqueeze(1) + x1[:, :, :2]
+    else:
+        abs0 = x0[:, :, :2]; abs1 = x1[:, :, :2]
+    abs0_deg = _norm_to_deg(abs0); abs1_deg = _norm_to_deg(abs1)
+    lat0 = torch.deg2rad(abs0_deg[..., 1]); lat1 = torch.deg2rad(abs1_deg[..., 1])
+    dlon = torch.deg2rad(abs1_deg[..., 0] - abs0_deg[..., 0])
+    dlat = lat1 - lat0
+    a    = (torch.sin(dlat/2).pow(2)
+            + torch.cos(lat0) * torch.cos(lat1) * torch.sin(dlon/2).pow(2))
+    omega     = 2.0 * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
+    sin_omega = torch.sin(omega).clamp(1e-6)
+    linear    = omega < 1e-4
+    te_sq     = te.squeeze(1)
+    coeff0 = torch.where(linear, 1.0 - te_sq,
+                         torch.sin((1-te_sq)*omega) / sin_omega)
+    coeff1 = torch.where(linear, te_sq,
+                         torch.sin(te_sq*omega) / sin_omega)
+    return coeff0.unsqueeze(-1)*x0 + coeff1.unsqueeze(-1)*x1
+
+
+def _slerp_velocity_target(x0, x1, t, lp=None):
+    B  = x0.shape[0]; te = t.view(B, 1, 1)
+    if lp is not None and x0.shape[-1] >= 2:
+        abs0 = lp.unsqueeze(1) + x0[:, :, :2]
+        abs1 = lp.unsqueeze(1) + x1[:, :, :2]
+    else:
+        abs0 = x0[:, :, :2]; abs1 = x1[:, :, :2]
+    abs0_deg = _norm_to_deg(abs0); abs1_deg = _norm_to_deg(abs1)
+    lat0 = torch.deg2rad(abs0_deg[..., 1]); lat1 = torch.deg2rad(abs1_deg[..., 1])
+    dlon = torch.deg2rad(abs1_deg[..., 0] - abs0_deg[..., 0])
+    dlat = lat1 - lat0
+    a    = (torch.sin(dlat/2).pow(2)
+            + torch.cos(lat0) * torch.cos(lat1) * torch.sin(dlon/2).pow(2))
+    omega     = 2.0 * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
+    sin_omega = torch.sin(omega).clamp(1e-6)
+    oos       = omega / sin_omega
+    linear    = omega < 1e-4
+    te_sq     = te.squeeze(1)
+    coeff0 = torch.where(linear, -torch.ones_like(te_sq),
+                         -torch.cos((1-te_sq)*omega)*oos)
+    coeff1 = torch.where(linear,  torch.ones_like(te_sq),
+                          torch.cos(te_sq*omega)*oos)
+    return coeff0.unsqueeze(-1)*x0 + coeff1.unsqueeze(-1)*x1
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  EMA — decay 0.995
+# ═════════════════════════════════════════════════════════════════════════════
+
+class EMAModel:
+    def __init__(self, model, decay=0.995):
+        self.decay  = decay
+        m = _unwrap_model(model)
+        self.shadow = {k: v.detach().clone()
+                       for k, v in m.state_dict().items()
+                       if v.dtype.is_floating_point}
+
+    def update(self, model):
+        m = _unwrap_model(model)
+        with torch.no_grad():
+            for k, v in m.state_dict().items():
+                if k in self.shadow:
+                    self.shadow[k].mul_(self.decay).add_(
+                        v.detach(), alpha=1 - self.decay)
+
+    def apply_to(self, model):
+        m = _unwrap_model(model)
+        backup, sd = {}, m.state_dict()
+        for k in self.shadow:
+            if k not in sd: continue
+            backup[k] = sd[k].detach().clone()
+            sd[k].copy_(self.shadow[k])
+        return backup
+
+    def restore(self, model, backup):
+        m = _unwrap_model(model)
+        sd = m.state_dict()
+        for k, v in backup.items():
+            if k in sd: sd[k].copy_(v)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  VelocityField — [FIX-v59-6] dropout 0.10→0.15
 # ═════════════════════════════════════════════════════════════════════════════
 
 class VelocityField(nn.Module):
     RAW_CTX_DIM = 512
 
-    def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, sigma_min=0.02,
-                 unet_in_ch=13, **kwargs):
+    def __init__(self, pred_len=12, obs_len=8, ctx_dim=256,
+                 sigma_min=0.02, unet_in_ch=13, **kwargs):
         super().__init__()
         self.pred_len = pred_len
         self.obs_len  = obs_len
+        self.ctx_dim  = ctx_dim
 
-        # ── Encoders (unchanged from v33) ─────────────────────────────────
-        self.spatial_enc = FNO3DEncoder(
+        self.spatial_enc     = FNO3DEncoder(
             in_channel=unet_in_ch, out_channel=1, d_model=32,
             n_layers=4, modes_t=4, modes_h=4, modes_w=4,
             spatial_down=32, dropout=0.05)
         self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
         self.bottleneck_proj = nn.Linear(128, 128)
         self.decoder_proj    = nn.Linear(1, 16)
-
-        self.enc_1d = DataEncoder1D(
+        self.enc_1d          = DataEncoder1D(
             in_1d=4, feat_3d_dim=128, mlp_h=64,
             lstm_hidden=128, lstm_layers=3, dropout=0.1, d_state=16)
-        self.env_enc = Env_net(obs_len=obs_len, d_model=32)
+        self.env_enc         = Env_net(obs_len=obs_len, d_model=32)
 
-        # ── Context projection ────────────────────────────────────────────
         self.ctx_fc1  = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
-        self.ctx_drop = nn.Dropout(0.12)   # slightly higher than v33 for regularization
+        # [FIX-v59-6] Increased dropout for regularization
+        self.ctx_drop = nn.Dropout(0.15)
         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
 
-        # ── Velocity obs encoder (v33 style) ──────────────────────────────
+        self.null_embedding = nn.Parameter(torch.randn(1, self.RAW_CTX_DIM) * 0.02)
+
         self.vel_obs_enc = nn.Sequential(
-            nn.Linear(obs_len * 2, 256), nn.GELU(),
-            nn.LayerNorm(256),
+            nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
             nn.Linear(256, 256), nn.GELU())
 
-        # ── FM Decoder ────────────────────────────────────────────────────
+        self.steering_enc = nn.Sequential(
+            nn.Linear(7, 64), nn.GELU(), nn.LayerNorm(64),
+            nn.Linear(64, 128), nn.GELU(), nn.Linear(128, 256))
+
+        self.env_kine_enc = nn.Sequential(
+            nn.Linear(14, 64), nn.GELU(), nn.LayerNorm(64),
+            nn.Linear(64, 256), nn.GELU())
+
         self.time_fc1   = nn.Linear(256, 512)
         self.time_fc2   = nn.Linear(512, 256)
         self.traj_embed = nn.Linear(4, 256)
         self.pos_enc    = nn.Parameter(torch.randn(1, pred_len, 256) * 0.02)
-        self.step_embed = nn.Embedding(pred_len, 256)   # step-aware decoding
-
+        self.step_embed = nn.Embedding(pred_len, 256)
         self.transformer = nn.TransformerDecoder(
             nn.TransformerDecoderLayer(
                 d_model=256, nhead=8, dim_feedforward=1024,
                 dropout=0.10, activation="gelu", batch_first=True),
-            num_layers=5)
-
+            num_layers=2)
         self.out_fc1 = nn.Linear(256, 512)
         self.out_fc2 = nn.Linear(512, 4)
 
-        self.step_scale    = nn.Parameter(torch.ones(pred_len) * 0.5)
-        self.physics_scale = nn.Parameter(torch.ones(4) * 0.3)
+        self.step_scale     = nn.Parameter(torch.ones(pred_len) * 0.5)
+        self.physics_scale  = nn.Parameter(torch.ones(4) * 1.5)
+        self.steering_scale = nn.Parameter(torch.ones(4) * 1.0)
 
-        # [FIX-5] SpeedHead
-        self.speed_head = SpeedHead(ctx_dim=ctx_dim, obs_feat_dim=256, pred_len=pred_len)
+        # SpeedHead for ensemble reweighting
+        self.speed_head = SpeedHead(ctx_dim=ctx_dim, obs_feat_dim=256,
+                                    pred_len=pred_len)
 
         self._init_weights()
 
@@ -41859,13 +42235,12 @@ class VelocityField(nn.Module):
             for name, m in self.named_modules():
                 if isinstance(m, nn.Linear) and "out_fc" in name:
                     nn.init.xavier_uniform_(m.weight, gain=0.1)
-                    if m.bias is not None:
-                        nn.init.zeros_(m.bias)
+                    if m.bias is not None: nn.init.zeros_(m.bias)
 
     def _time_emb(self, t, dim=256):
         half = dim // 2
         freq = torch.exp(torch.arange(half, dtype=torch.float32, device=t.device)
-                         * (-math.log(10000.0) / max(half - 1, 1)))
+                         * (-math.log(10000.0) / max(half-1, 1)))
         emb  = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
         return F.pad(torch.cat([emb.sin(), emb.cos()], dim=-1), (0, dim % 2))
 
@@ -41874,150 +42249,375 @@ class VelocityField(nn.Module):
         obs_Me    = batch_list[7]
         image_obs = batch_list[11]
         env_data  = batch_list[13]
-
-        if image_obs.dim() == 4:
-            image_obs = image_obs.unsqueeze(2)
+        if image_obs.dim() == 4: image_obs = image_obs.unsqueeze(2)
         if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
             image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
 
         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
         T_obs = obs_traj.shape[0]
-
-        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0,2,1)
         e_3d_s = self.bottleneck_proj(e_3d_s)
         if e_3d_s.shape[1] != T_obs:
-            e_3d_s = F.interpolate(e_3d_s.permute(0, 2, 1), size=T_obs,
-                                   mode="linear", align_corners=False).permute(0, 2, 1)
+            e_3d_s = F.interpolate(e_3d_s.permute(0,2,1), size=T_obs,
+                                    mode="linear", align_corners=False).permute(0,2,1)
 
         e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
         t_w = torch.softmax(torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
-                            device=e_3d_dec_t.device) * 0.5, dim=0)
+                                          device=e_3d_dec_t.device)*0.5, dim=0)
         f_sp = self.decoder_proj((e_3d_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
 
-        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1, 0, 2)
+        obs_in = torch.cat([obs_traj, obs_Me], dim=2).permute(1,0,2)
         h_t    = self.enc_1d(obs_in, e_3d_s)
         e_env, _, _ = self.env_enc(env_data, image_obs)
-
         return F.gelu(self.ctx_ln(self.ctx_fc1(
             torch.cat([h_t, e_env, f_sp], dim=-1))))
 
-    def _apply_ctx_head(self, raw, noise_scale=0.0):
-        if noise_scale > 0.0:
+    def _apply_ctx_head(self, raw, noise_scale=0.0, use_null=False):
+        if use_null:
+            raw = self.null_embedding.expand(raw.shape[0], -1)
+        elif noise_scale > 0.0:
             raw = raw + torch.randn_like(raw) * noise_scale
         return self.ctx_fc2(self.ctx_drop(raw))
 
-    def _get_vel_obs_feat(self, obs_traj):
-        B = obs_traj.shape[1]
-        T_obs = obs_traj.shape[0]
+    def _get_kinematic_obs_feat(self, obs_traj):
+        B, T_obs = obs_traj.shape[1], obs_traj.shape[0]
         if T_obs >= 2:
-            vels = obs_traj[1:] - obs_traj[:-1]
+            vel     = obs_traj[1:] - obs_traj[:-1]
+            lat_mid = obs_traj[:-1, :, 1] * _NORM_TO_DEG
+            cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+            dx_km   = vel[:,:,0] * cos_lat * DEG2KM * _NORM_TO_DEG
+            dy_km   = vel[:,:,1]             * DEG2KM * _NORM_TO_DEG
+            speed   = torch.sqrt(dx_km**2 + dy_km**2 + 1e-6) / DT_HOURS
+            heading = torch.atan2(vel[:,:,1], vel[:,:,0])
+            speed_n = (speed / 20.0).clamp(-3.0, 3.0)
+            if T_obs >= 3:
+                dspd  = speed[1:] - speed[:-1]
+                accel = torch.cat([obs_traj.new_zeros(1,B),
+                                   (dspd/10.0).clamp(-3.0,3.0)], 0)
+            else:
+                accel = obs_traj.new_zeros(T_obs-1, B)
+            kine = torch.stack([vel[:,:,0], vel[:,:,1], speed_n,
+                                 heading.sin(), heading.cos(), accel], dim=-1)
         else:
-            vels = torch.zeros(1, B, 2, device=obs_traj.device)
-        if vels.shape[0] < self.obs_len:
-            pad  = torch.zeros(self.obs_len - vels.shape[0], B, 2,
-                               device=obs_traj.device)
-            vels = torch.cat([pad, vels], dim=0)
+            kine = obs_traj.new_zeros(self.obs_len, B, 6)
+        if kine.shape[0] < self.obs_len:
+            kine = torch.cat([obs_traj.new_zeros(
+                self.obs_len-kine.shape[0], B, 6), kine], 0)
         else:
-            vels = vels[-self.obs_len:]
-        return self.vel_obs_enc(vels.permute(1, 0, 2).reshape(B, -1))
+            kine = kine[-self.obs_len:]
+        return self.vel_obs_enc(kine.permute(1,0,2).reshape(B, -1))
+
+    def _get_vel_obs_feat(self, obs_traj):
+        return self._get_kinematic_obs_feat(obs_traj)
+
+    def _get_steering_feat(self, env_data, B, device):
+        if env_data is None: return torch.zeros(B, 256, device=device)
+        def _safe(k, norm=1.0):
+            v = env_data.get(k)
+            if v is None or not torch.is_tensor(v):
+                return torch.full((B,), 0.0, device=device)
+            v = v.float().to(device)
+            while v.dim() > 1: v = v.mean(-1)
+            v = v.view(-1)[:B] if v.numel() >= B else torch.full((B,), 0.0, device=device)
+            return (v / norm).clamp(-3.0, 3.0)
+        return self.steering_enc(torch.stack([
+            _safe("u500_mean",    30.0),
+            _safe("v500_mean",    30.0),
+            _safe("u500_center",  30.0),
+            _safe("v500_center",  30.0),
+            _safe("steering_speed",  1.0),
+            _safe("steering_dir_sin",1.0),
+            _safe("steering_dir_cos",1.0),
+        ], dim=-1))
+
+    def _get_env_kine_feat(self, env_data, B, device):
+        if env_data is None: return torch.zeros(B, 256, device=device)
+        def _get_t(key, dim):
+            v = env_data.get(key)
+            if v is None: return torch.zeros(B, dim, device=device)
+            if not torch.is_tensor(v):
+                try: v = torch.tensor(v, dtype=torch.float, device=device)
+                except: return torch.zeros(B, dim, device=device)
+            v = v.float().to(device)
+            if v.dim() == 0:
+                return (v.expand(B, dim) if dim == 1
+                        else torch.zeros(B, dim, device=device))
+            if v.dim() == 1:
+                if v.shape[0] == dim: return v.unsqueeze(0).expand(B, dim)
+                if v.shape[0] == B:
+                    return (v.unsqueeze(1).expand(B, dim) if dim == 1
+                            else torch.zeros(B, dim, device=device))
+            if v.dim() == 2:
+                if v.shape == (B, dim): return v
+                return (v[:B, :dim] if v.shape[1] >= dim
+                        else F.pad(v[:B], (0, dim-v.shape[1])))
+            if v.dim() == 3:
+                vv = v[-1] if v.shape[1] == B else v[:B, -1]
+                return (vv[:, :dim] if vv.shape[-1] >= dim
+                        else F.pad(vv, (0, dim-vv.shape[-1])))
+            return torch.zeros(B, dim, device=device)
+        feat = torch.cat([_get_t("move_velocity",1),
+                          _get_t("history_direction24",8),
+                          _get_t("delta_velocity",5)], dim=-1)
+        return self.env_kine_enc(feat)
 
     def _beta_drift(self, x_t):
-        lat_rad = torch.deg2rad(x_t[:, :, 1] * 5.0).clamp(-85, 85)
-        beta    = 2 * 7.2921e-5 * torch.cos(lat_rad) / 6.371e6
+        lat_rad = torch.deg2rad(x_t[:,:,1]*5.0).clamp(-85,85)
+        beta    = 2*7.2921e-5*torch.cos(lat_rad)/6.371e6
         R_tc    = 3e5
         v = torch.zeros_like(x_t)
-        v[:, :, 0] = -beta * R_tc**2 / 2 * 6 * 3600 / (5 * 111 * 1000)
-        v[:, :, 1] =  beta * R_tc**2 / 4 * 6 * 3600 / (5 * 111 * 1000)
+        v[:,:,0] = -beta*R_tc**2/2*6*3600/(5*111*1000)
+        v[:,:,1] =  beta*R_tc**2/4*6*3600/(5*111*1000)
         return v
 
-    def _decode(self, x_t, t, ctx, vel_obs_feat=None):
+    def _steering_drift(self, x_t, env_data):
+        if env_data is None: return torch.zeros_like(x_t)
+        B, device = x_t.shape[0], x_t.device
+        def _sm(k):
+            v = env_data.get(k)
+            if v is None or not torch.is_tensor(v):
+                return torch.zeros(B, device=device)
+            v = v.float().to(device)
+            while v.dim() > 1: v = v.mean(-1)
+            return v.view(-1)[:B] if v.numel() >= B else torch.zeros(B, device=device)
+        u   = _sm("u500_center"); vv = _sm("v500_center")
+        cos = torch.cos(torch.deg2rad(x_t[:,:,1]*5.0)).clamp(1e-3)
+        out = torch.zeros_like(x_t)
+        out[:,:,0] = u.unsqueeze(1)*30.0*21600.0/(111.0*1000.0*cos)
+        out[:,:,1] = vv.unsqueeze(1)*30.0*21600.0/(111.0*1000.0)
+        return out
+
+    def _decode(self, x_t, t, ctx, vel_obs_feat=None, steering_feat=None,
+                env_kine_feat=None, env_data=None):
         B = x_t.shape[0]
         t_emb = F.gelu(self.time_fc1(self._time_emb(t)))
         t_emb = self.time_fc2(t_emb)
-        T_seq = min(x_t.size(1), self.pos_enc.shape[1])
-
-        step_idx = torch.arange(T_seq, device=x_t.device).unsqueeze(0).expand(B, -1)
-        s_emb = self.step_embed(step_idx)
-
-        x_emb = (self.traj_embed(x_t[:, :T_seq])
-                 + self.pos_enc[:, :T_seq]
+        T_seq    = min(x_t.size(1), self.pos_enc.shape[1])
+        step_idx = torch.arange(T_seq, device=x_t.device).unsqueeze(0).expand(B,-1)
+        x_emb = (self.traj_embed(x_t[:,:T_seq])
+                 + self.pos_enc[:,:T_seq]
                  + t_emb.unsqueeze(1)
-                 + s_emb)
-
+                 + self.step_embed(step_idx))
         mem = [t_emb.unsqueeze(1), ctx.unsqueeze(1)]
-        if vel_obs_feat is not None:
-            mem.append(vel_obs_feat.unsqueeze(1))
-
+        if vel_obs_feat  is not None: mem.append(vel_obs_feat.unsqueeze(1))
+        if steering_feat is not None: mem.append(steering_feat.unsqueeze(1))
+        if env_kine_feat is not None: mem.append(env_kine_feat.unsqueeze(1))
         decoded  = self.transformer(x_emb, torch.cat(mem, dim=1))
         v_neural = self.out_fc2(F.gelu(self.out_fc1(decoded)))
-
-        scale    = torch.sigmoid(self.step_scale[:T_seq]).view(1, T_seq, 1) * 2.0
+        scale    = torch.sigmoid(self.step_scale[:T_seq]).view(1,T_seq,1) * 2.0
         v_neural = v_neural * scale
-
         with torch.no_grad():
-            v_phys = self._beta_drift(x_t[:, :T_seq])
+            v_phys  = self._beta_drift(x_t[:,:T_seq])
+            v_steer = self._steering_drift(x_t[:,:T_seq], env_data)
+        return (v_neural
+                + torch.sigmoid(self.physics_scale)*v_phys
+                + torch.sigmoid(self.steering_scale)*v_steer)
 
-        return v_neural + torch.sigmoid(self.physics_scale) * v_phys
-
-    def forward_with_ctx(self, x_t, t, raw_ctx, noise_scale=0.0, vel_obs_feat=None):
-        ctx = self._apply_ctx_head(raw_ctx, noise_scale)
-        return self._decode(x_t, t, ctx, vel_obs_feat)
+    def forward_with_ctx(self, x_t, t, raw_ctx, noise_scale=0.0,
+                          vel_obs_feat=None, steering_feat=None,
+                          env_kine_feat=None, env_data=None, use_null=False):
+        ctx = self._apply_ctx_head(raw_ctx, noise_scale, use_null=use_null)
+        return self._decode(x_t, t, ctx,
+                            vel_obs_feat=vel_obs_feat,
+                            steering_feat=steering_feat,
+                            env_kine_feat=env_kine_feat,
+                            env_data=env_data)
 
     def predict_speed(self, raw_ctx, vel_obs_feat):
-        ctx = self._apply_ctx_head(raw_ctx, noise_scale=0.0)
+        ctx = self._apply_ctx_head(raw_ctx, noise_scale=0.0, use_null=False)
         return self.speed_head(ctx, vel_obs_feat)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TCFlowMatching v33-fix
+#  Inference helpers
+# ═════════════════════════════════════════════════════════════════════════════
+
+@torch.no_grad()
+def _speed_sweep_correction(pred_traj_norm, obs_traj_norm,
+                             scales=(0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.45)):
+    T_obs = obs_traj_norm.shape[0]
+    T, B  = pred_traj_norm.shape[0], pred_traj_norm.shape[1]
+    device = pred_traj_norm.device
+    if T_obs < 2:
+        return pred_traj_norm, torch.ones(B, device=device)
+
+    obs_spd_all = _step_speeds_deg(_norm_to_deg(obs_traj_norm))
+    n_obs = obs_spd_all.shape[0]
+    if n_obs >= 3:
+        alpha = 0.65
+        w = torch.tensor([alpha*(1-alpha)**i for i in range(n_obs)],
+                          dtype=torch.float, device=device).flip(0)
+        obs_spd = (obs_spd_all * (w/w.sum()).unsqueeze(1)).sum(0)
+    elif n_obs == 2:
+        obs_spd = 0.65*obs_spd_all[-1] + 0.35*obs_spd_all[-2]
+    else:
+        obs_spd = obs_spd_all[-1]
+    obs_spd = obs_spd.clamp(min=2.0)
+
+    anchor    = obs_traj_norm[-1].unsqueeze(0)
+    disp      = pred_traj_norm - anchor
+    t_idx     = torch.arange(T, dtype=torch.float, device=device)
+    best_sc   = torch.full((B,), -1e9, device=device)
+    best_traj = pred_traj_norm
+
+    for s in scales:
+        decay_exp = 1.0 - (t_idx / max(T-1, 1)) * 0.7
+        scale_t   = torch.full((T,), s, device=device) ** decay_exp
+        cand      = anchor + disp * scale_t.view(T,1,1)
+        full_deg  = torch.cat([_norm_to_deg(anchor), _norm_to_deg(cand)], dim=0)
+        n_c       = min(4, T)
+        cand_spd  = _step_speeds_deg(full_deg[:n_c+1]).mean(0)
+        score     = torch.exp(-((cand_spd - obs_spd)/obs_spd).pow(2)*4.0)
+        better    = score > best_sc
+        best_traj = torch.where(better.view(1,B,1).expand_as(cand),
+                                cand, best_traj)
+        best_sc   = torch.where(better, score, best_sc)
+
+    return best_traj, best_sc
+
+
+@torch.no_grad()
+def _persistence_blend(model_pred_norm, obs_traj_norm, blend_strength=0.20):
+    T_obs = obs_traj_norm.shape[0]
+    T     = model_pred_norm.shape[0]
+    B, device = model_pred_norm.shape[1], model_pred_norm.device
+    if T_obs < 2:
+        return model_pred_norm
+    vels = obs_traj_norm[1:] - obs_traj_norm[:-1]
+    n_v  = vels.shape[0]
+    if n_v >= 3:
+        alpha = 0.7
+        w  = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+                           dtype=torch.float, device=device).flip(0)
+        ev = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+    elif n_v == 2:
+        ev = 0.7*vels[-1] + 0.3*vels[-2]
+    else:
+        ev = vels[-1]
+    steps   = torch.arange(1, T+1, dtype=torch.float, device=device)
+    persist = (obs_traj_norm[-1].unsqueeze(0)
+               + ev.unsqueeze(0) * steps.view(T,1,1))
+    obs_spd_all = _step_speeds_deg(_norm_to_deg(obs_traj_norm))
+    if obs_spd_all.shape[0] >= 2:
+        spd_cv  = obs_spd_all.std(0) / obs_spd_all.mean(0).clamp(min=1.0)
+        alpha_b = (blend_strength
+                   * torch.sigmoid(-(spd_cv-0.3)*5.0)).unsqueeze(0).unsqueeze(-1)
+    else:
+        alpha_b = blend_strength * 0.5
+    return (1.0 - alpha_b)*model_pred_norm + alpha_b*persist
+
+
+def _score_ensemble_member(traj_norm, obs_traj_norm, speed_stats=None,
+                            speed_head_pred=None):
+    """
+    [FIX-v60-7] Thêm lateral score: penalize members có lateral deviation cao
+    so với obs heading. Giúp inference chọn member ít CTE hơn.
+    """
+    sp      = speed_stats or _SPEED_PRIOR
+    v_opt   = sp.get("v_opt", 15.0)
+    v_sigma = sp.get("v_sigma", 10.0)
+    v_cap   = sp.get("v_hard_cap", 35.0)
+    B, device = traj_norm.shape[1], traj_norm.device
+
+    spd = _step_speeds_deg(_norm_to_deg(traj_norm))
+    dtd = _norm_to_deg(traj_norm[1:]) - _norm_to_deg(traj_norm[:-1])
+    prior_sc  = torch.exp(-(((spd-v_opt)/v_sigma).pow(2)
+                             + F.relu(spd-v_cap)*2.0).mean(0)*0.5)
+    smooth_sc = (torch.exp(-(dtd[1:]-dtd[:-1]).norm(dim=-1).mean(0)*5.0)
+                 if dtd.shape[0] >= 2 else torch.ones(B, device=device))
+
+    if obs_traj_norm is not None and obs_traj_norm.shape[0] >= 2:
+        obs_v = obs_traj_norm[-1] - obs_traj_norm[-2]
+        if obs_traj_norm.shape[0] >= 3:
+            obs_v = 0.7*obs_v + 0.3*(obs_traj_norm[-2]-obs_traj_norm[-3])
+        obs_hn  = F.normalize(obs_v, dim=-1, eps=1e-6)
+        n_h     = min(3, traj_norm.shape[0]-1)
+        pv_m    = ((traj_norm[1:1+n_h]-traj_norm[:n_h]).mean(0)
+                   if n_h >= 1 else obs_v)
+        pred_hn = F.normalize(pv_m, dim=-1, eps=1e-6)
+        head_sc = torch.exp(((obs_hn*pred_hn).sum(-1)-1.0)*3.0)
+
+        obs_ref = _step_speeds_deg(_norm_to_deg(obs_traj_norm))[
+            -min(3, obs_traj_norm.shape[0]-1):].mean(0)
+        spd_sc  = torch.exp(-((spd[:min(4,spd.shape[0])].mean(0) - obs_ref)
+                               / obs_ref.clamp(min=5.0)).pow(2)*3.0)
+
+        # [FIX-v60-7] Lateral score: penalize trajectories với high lateral deviation
+        # Tính cross-track deviation của pred so với obs heading
+        if traj_norm.shape[0] >= 2 and obs_traj_norm.shape[0] >= 1:
+            obs_pos_last = obs_traj_norm[-1]  # [B, 2]
+            # Along-track direction từ obs
+            obs_along = F.normalize(obs_v, dim=-1, eps=1e-6)          # [B, 2]
+            obs_cross = torch.stack([-obs_along[:, 1], obs_along[:, 0]], dim=-1)  # [B, 2]
+            # Displacement của pred từ obs position
+            pred_disp = (traj_norm[:min(4, traj_norm.shape[0])] - obs_pos_last.unsqueeze(0))
+            # Mean cross-track displacement trong 4 steps đầu (24h)
+            lateral   = (pred_disp * obs_cross.unsqueeze(0)).sum(-1).abs().mean(0)  # [B]
+            # Score: penalize nặng lateral > 0.1 (trong normalized units ≈ ~50km)
+            lateral_sc = torch.exp(-(lateral / 0.08).pow(2))
+        else:
+            lateral_sc = torch.ones(B, device=device)
+    else:
+        head_sc = spd_sc = lateral_sc = torch.ones(B, device=device)
+
+    # [FIX-v60-7] Thêm lateral_sc với weight 0.20, giảm head_sc từ 0.35→0.25
+    base_score = (head_sc.pow(0.25) * spd_sc.pow(0.25)
+                  * prior_sc.pow(0.15) * smooth_sc.pow(0.15)
+                  * lateral_sc.pow(0.20))  # new CTE component
+
+    if speed_head_pred is not None:
+        n = min(speed_head_pred.shape[1], spd.shape[0])
+        if n > 0:
+            pred_spd_t = speed_head_pred[:, :n].T
+            spd_match = torch.exp(
+                -((spd[:n] - pred_spd_t) / v_sigma).pow(2).mean(0) * 3.0
+            )
+            return base_score.pow(0.45) * spd_match.pow(0.55)
+
+    return base_score
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  TCFlowMatching v59
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TCFlowMatching(nn.Module):
-    """
-    v33-fix: Pure FM + MSE + ATE/CTE losses + EMA.
-
-    Training phases:
-      Phase 1 (ep  0-14): MSE only, sigma=0.15
-      Phase 2 (ep 15-39): MSE + vel + heading, sigma decays 0.15→0.04
-      Phase 3 (ep 40+  ): MSE + vel + heading + ATE + CTE, sigma=0.035
-        → ATE/CTE losses only active from ep40 to avoid destabilizing early
-        → Can move to ep30 if model converges faster
-    """
 
     def __init__(self, pred_len=12, obs_len=8, sigma_min=0.02,
-                 n_train_ens=4, unet_in_ch=13,
-                 ctx_noise_scale=0.002, initial_sample_sigma=0.03,
+                 n_train_ens=4, unet_in_ch=13, ctx_noise_scale=0.01,
+                 initial_sample_sigma=0.03, teacher_forcing=True,
                  use_ema=True, ema_decay=0.995,
+                 use_ate_ot=True, ot_epsilon=0.05,
+                 use_slerp=False,
+                 cfg_guidance_scale=1.5, cfg_uncond_prob=0.1,
                  **kwargs):
         super().__init__()
-        self.pred_len            = pred_len
-        self.obs_len             = obs_len
-        self.sigma_min           = sigma_min
-        self.n_train_ens         = n_train_ens
-        self.ctx_noise_scale     = ctx_noise_scale
-        self.initial_sample_sigma = initial_sample_sigma
-        self.active_pred_len     = pred_len
-        self.use_ema             = use_ema
+        self.pred_len           = pred_len
+        self.obs_len            = obs_len
+        self.sigma_min          = sigma_min
+        self.ctx_noise_scale    = ctx_noise_scale
+        self.active_pred_len    = pred_len
+        self.use_ate_ot         = use_ate_ot
+        self.ot_epsilon         = ot_epsilon
+        self.use_slerp          = use_slerp
+        self.cfg_guidance_scale = cfg_guidance_scale
+        self.cfg_uncond_prob    = cfg_uncond_prob
 
-        self.net = VelocityField(
-            pred_len=pred_len, obs_len=obs_len,
-            sigma_min=sigma_min, unet_in_ch=unet_in_ch)
-
-        # [FIX-1] EMA
-        self._ema = None
-        if use_ema:
-            self._ema = EMAModel(self, decay=ema_decay)
+        self.net     = VelocityField(pred_len=pred_len, obs_len=obs_len,
+                                     sigma_min=sigma_min, unet_in_ch=unet_in_ch,
+                                     ctx_dim=256)
+        self.use_ema  = use_ema
+        self.ema_decay = ema_decay
+        self._ema     = None
 
     def init_ema(self):
-        if self.use_ema and self._ema is None:
-            self._ema = EMAModel(self, decay=0.995)
+        if self.use_ema:
+            self._ema = EMAModel(self, decay=self.ema_decay)
 
     def ema_update(self):
-        if self._ema is not None:
-            self._ema.update(self)
+        if self._ema is not None: self._ema.update(self)
 
-    def set_curriculum_len(self, *a, **kw):
-        pass
+    def set_curriculum_len(self, *a, **kw): pass
 
     @staticmethod
     def _to_rel(traj, Me, lp, lm):
@@ -42027,358 +42627,313 @@ class TCFlowMatching(nn.Module):
     @staticmethod
     def _to_abs(rel, lp, lm):
         d = rel.permute(1, 0, 2)
-        return lp.unsqueeze(0) + d[:, :, :2], lm.unsqueeze(0) + d[:, :, 2:]
+        return lp.unsqueeze(0) + d[:,:,:2], lm.unsqueeze(0) + d[:,:,2:]
+
+    def _cfm_noisy(self, x1, sigma_min=None, lp=None):
+        if sigma_min is None: sigma_min = self.sigma_min
+        B = x1.shape[0]; device = x1.device
+        x0 = torch.randn_like(x1) * sigma_min
+        t  = torch.rand(B, device=device)
+        if self.use_slerp and x1.shape[-1] >= 2:
+            x_t      = _slerp_interpolant(x0, x1, t, lp=lp)
+            u_target = _slerp_velocity_target(x0, x1, t, lp=lp)
+        else:
+            te       = t.view(B, 1, 1)
+            x_t      = (1.0 - te)*x0 + te*x1
+            u_target = x1 - x0
+        return x_t, t, u_target
+
+    _cfm_noisy_slerp = _cfm_noisy
+
+    @staticmethod
+    def _lon_flip_aug(bl, p=0.3):
+        if torch.rand(1).item() > p: return bl
+        bl = list(bl)
+        for i in [0, 1, 2, 3]:
+            if torch.is_tensor(bl[i]) and bl[i].shape[-1] >= 1:
+                t = bl[i].clone(); t[..., 0] = -t[..., 0]; bl[i] = t
+        return bl
+
+    @staticmethod
+    def _obs_noise_aug(bl, sigma=0.005):
+        if torch.rand(1).item() > 0.5: return bl
+        bl = list(bl)
+        if torch.is_tensor(bl[0]):
+            bl[0] = bl[0] + torch.randn_like(bl[0]) * sigma
+        return bl
+
+    def _persistence_forecast_rel(self, obs_traj, lp, lm, pred_len):
+        B, device = obs_traj.shape[1], obs_traj.device
+        if obs_traj.shape[0] >= 3:
+            vels  = obs_traj[1:] - obs_traj[:-1]
+            n_v   = vels.shape[0]
+            alpha = 0.7
+            w     = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+                                  dtype=torch.float, device=device).flip(0)
+            lv    = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+        elif obs_traj.shape[0] >= 2:
+            lv = obs_traj[-1, :, :2] - obs_traj[-2, :, :2]
+        else:
+            lv = obs_traj.new_zeros(B, 2)
+        steps    = torch.arange(1, pred_len+1, device=device).float()
+        pred_abs = (obs_traj[-1, :, :2].unsqueeze(1)
+                    + lv.unsqueeze(1) * steps.view(1,-1,1))
+        pred_abs = pred_abs.permute(1, 0, 2)
+        pred_rel_pos = pred_abs - lp.unsqueeze(0)
+        pred_rel     = torch.cat([pred_rel_pos,
+                                   torch.zeros_like(pred_rel_pos)], dim=-1)
+        return pred_rel.permute(1, 0, 2)
+
+    def _compute_obs_momentum(self, obs_traj_norm):
+        T_obs = obs_traj_norm.shape[0]
+        if T_obs < 2:
+            return torch.zeros(obs_traj_norm.shape[1], 2,
+                               device=obs_traj_norm.device)
+        vels = obs_traj_norm[1:] - obs_traj_norm[:-1]
+        n_v  = vels.shape[0]
+        if n_v >= 3:
+            alpha = 0.65
+            w = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+                              dtype=torch.float,
+                              device=obs_traj_norm.device).flip(0)
+            return (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+        elif n_v == 2:
+            return 0.65*vels[-1] + 0.35*vels[-2]
+        return vels[-1]
 
     @staticmethod
     def _sigma_schedule(epoch):
-        """[FIX-1] Sigma schedule — matches v59 floor at 0.035."""
-        if epoch < 15:  return 0.15
-        if epoch < 40:
-            t = (epoch - 15) / 25.0
-            return max(0.15 - t * (0.15 - 0.04), 0.04)
-        return 0.035
+        """[FIX-v59-6] Increased floor from 0.030→0.035 for regularization"""
+        if epoch < 2:   return 0.10
+        if epoch < 10:  return 0.10 - (epoch-2)/8.0 * (0.10 - 0.04)
+        if epoch < 20:  return max(0.04 - (epoch-10)/10.0 * 0.01, 0.035)
+        return 0.035  # [FIX-v59-6] was 0.030
 
-    def _cfm_noisy(self, x1, sigma_min=None):
-        if sigma_min is None: sigma_min = self.sigma_min
-        B, device = x1.shape[0], x1.device
-        x0 = torch.randn_like(x1) * sigma_min
-        t  = torch.rand(B, device=device)
-        te = t.view(B, 1, 1)
-        x_t = te * x1 + (1.0 - te * (1.0 - sigma_min)) * x0
-        denom = (1.0 - (1.0 - sigma_min) * te).clamp(min=1e-5)
-        return x_t, t, te, denom
-
-    @staticmethod
-    def _lon_flip_aug(batch_list, p=0.3):
-        if torch.rand(1).item() > p:
-            return batch_list
-        aug = list(batch_list)
-        for idx in [0, 1, 2, 3]:
-            if torch.is_tensor(aug[idx]) and aug[idx].shape[-1] >= 1:
-                t = aug[idx].clone(); t[..., 0] = -t[..., 0]; aug[idx] = t
-        return aug
-
-    # ─── Training ────────────────────────────────────────────────────────────
-
-    def get_loss(self, batch_list, step_weight_alpha=0.0, epoch=0):
-        return self.get_loss_breakdown(batch_list, step_weight_alpha, epoch)["total"]
+    def get_loss(self, batch_list, epoch=0, **kwargs):
+        return self.get_loss_breakdown(batch_list, epoch=epoch)["total"]
 
     def get_loss_breakdown(self, batch_list, step_weight_alpha=0.0, epoch=0):
-        """
-        Loss breakdown with ATE/CTE from ep40+.
-
-        Returns dict with keys: total, mse_hav, velocity, heading,
-          ate, cte, ate_x1, speed_head, sigma, ate_mean_km, cte_mean_km
-        """
         batch_list = self._lon_flip_aug(batch_list)
+        batch_list = self._obs_noise_aug(batch_list, sigma=0.005)
 
-        traj_gt = batch_list[1]   # [T, B, 2]
-        Me_gt   = batch_list[8]   # [T, B, 2]
-        obs_t   = batch_list[0]   # [T_obs, B, 2]
-        obs_Me  = batch_list[7]
-        lp, lm  = obs_t[-1], obs_Me[-1]
+        obs_t    = batch_list[0]
+        env_data = batch_list[13] if len(batch_list) > 13 else None
+        lp, lm   = obs_t[-1], batch_list[7][-1]
+        B, device = obs_t.shape[1], obs_t.device
 
+        speed_stats   = compute_speed_stats_from_norm(obs_t[..., :2])
         current_sigma = self._sigma_schedule(epoch)
+        raw_ctx       = self.net._context(batch_list)
 
-        # ── Encode ──────────────────────────────────────────────────────
-        raw_ctx      = self.net._context(batch_list)
-        vel_obs_feat = self.net._get_vel_obs_feat(obs_t)
+        x1_rel = self._to_rel(batch_list[1], batch_list[8], lp, lm)
 
-        # ── FM forward ──────────────────────────────────────────────────
-        x1 = self._to_rel(traj_gt, Me_gt, lp, lm)   # [B, T, 4]
-        x_t, t, te, denom = self._cfm_noisy(x1, sigma_min=current_sigma)
+        if self.use_ate_ot and B >= 4:
+            noise_base = torch.randn_like(x1_rel) * current_sigma
+            noise_matched, x1_matched = _spherical_ot_matching(
+                noise_base, x1_rel, lp, epsilon=self.ot_epsilon)
+        else:
+            noise_matched = torch.randn_like(x1_rel) * current_sigma
+            x1_matched    = x1_rel
+
+        x_t, fm_t, u_target = self._cfm_noisy(
+            x1_matched, sigma_min=current_sigma, lp=lp)
+
+        use_null = (torch.rand(1).item() < self.cfg_uncond_prob)
+        vel_obs_feat = self.net._get_kinematic_obs_feat(obs_t[:, :, :2])
 
         pred_vel = self.net.forward_with_ctx(
-            x_t, t, raw_ctx, vel_obs_feat=vel_obs_feat)
-
-        # Recover x1_pred for direct losses
-        x1_pred = x_t + denom * pred_vel
-        pred_abs, _ = self._to_abs(x1_pred, lp, lm)   # [12, B, 2] normalized
-
-        # ── Loss 1: MSE Haversine [FIX-4 step weights] ──────────────────
-        l_mse = mse_hav_loss(pred_abs, traj_gt)
-
-        # ── To degree for trajectory losses ─────────────────────────────
-        pred_deg = _denorm_to_deg(pred_abs)    # [T, B, 2]
-        gt_deg   = _denorm_to_deg(traj_gt)
-
-        # ── Loss 2: Velocity ─────────────────────────────────────────────
-        if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
-            T_min  = min(pred_deg.shape[0], gt_deg.shape[0])
-            v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
-            v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
-            l_vel  = F.smooth_l1_loss(v_pred, v_gt)
-        else:
-            l_vel = pred_abs.new_zeros(())
-
-        # ── Loss 3: Heading consistency ──────────────────────────────────
-        if pred_deg.shape[0] >= 2 and gt_deg.shape[0] >= 2:
-            T_min  = min(pred_deg.shape[0], gt_deg.shape[0])
-            v_pred = pred_deg[1:T_min] - pred_deg[:T_min-1]
-            v_gt   = gt_deg[1:T_min]   - gt_deg[:T_min-1]
-            vp_n   = v_pred.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            vg_n   = v_gt.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            cos_sim = ((v_pred / vp_n) * (v_gt / vg_n)).sum(-1)
-            l_head  = F.relu(-cos_sim).pow(2).mean()
-        else:
-            l_head = pred_abs.new_zeros(())
-
-        # ── Loss 4: Signed ATE [FIX-2, active ep25+] ────────────────────
-        ate_start_epoch = 25
-        if epoch >= ate_start_epoch:
-            l_ate = _signed_ate_loss(pred_deg, gt_deg)
-        else:
-            l_ate = pred_abs.new_zeros(())
-
-        # ── Loss 5: Signed CTE [FIX-3, BOOSTED, active ep20+] ────────────
-        # Earlier activation (ep20 vs ep30) + stronger weight than ATE
-        cte_start_epoch = 20
-        if epoch >= cte_start_epoch:
-            l_cte = _signed_cte_loss(pred_deg, gt_deg)
-        else:
-            l_cte = pred_abs.new_zeros(())
-
-        # ── Loss 5b: Multi-scale CTE [FIX-3c, active ep20+] ─────────────
-        if epoch >= cte_start_epoch:
-            l_cte_ms = _multiscale_cte_loss(pred_deg, gt_deg)
-        else:
-            l_cte_ms = pred_abs.new_zeros(())
-
-        # ── Loss 6: ATE-x1 [FIX-6, active ep25+] ────────────────────────
-        if epoch >= 25:
-            l_ate_x1 = _ate_x1pred_loss(pred_deg, gt_deg, t)
-        else:
-            l_ate_x1 = pred_abs.new_zeros(())
-
-        # ── Loss 6b: CTE-x1 [FIX-3b, active ep20+] ──────────────────────
-        if epoch >= cte_start_epoch:
-            l_cte_x1 = _cte_x1pred_loss(pred_deg, gt_deg, t)
-        else:
-            l_cte_x1 = pred_abs.new_zeros(())
-
-        # ── Loss 7: Speed head [FIX-5, always active] ───────────────────
-        ctx_for_speed = self.net._apply_ctx_head(raw_ctx)
-        speed_pred = self.net.speed_head(ctx_for_speed, vel_obs_feat)
-        l_speed_head = _speed_head_loss(speed_pred, gt_deg)
-
-        # ── ATE/CTE metrics for logging [FIX-8] ─────────────────────────
-        with torch.no_grad():
-            atc_metrics = compute_ate_cte_km(pred_deg, gt_deg)
-
-        # ── Phase-aware loss weights ─────────────────────────────────────
-        # CTE weights intentionally HIGHER than ATE to force lateral correction
-        if epoch < 15:
-            # Phase 1: pure MSE + speed head
-            w_vel, w_head, w_ate, w_cte, w_atex1 = 0.0, 0.0, 0.0, 0.0, 0.0
-            w_cte_ms, w_cte_x1 = 0.0, 0.0
-            w_speed_head = 0.30
-        elif epoch < 20:
-            # Phase 2a: MSE + vel + heading
-            t_ph = (epoch - 15) / 5.0
-            w_vel, w_head   = t_ph * 0.30, t_ph * 0.20
-            w_ate, w_cte    = 0.0, 0.0
-            w_cte_ms        = 0.0
-            w_atex1         = 0.0
-            w_cte_x1        = 0.0
-            w_speed_head    = 0.40
-        elif epoch < 25:
-            # Phase 2b: Add CTE losses early (ep20+)
-            t_ph = (epoch - 20) / 5.0
-            w_vel, w_head   = 0.30, 0.20
-            w_ate           = 0.0
-            w_cte           = t_ph * 0.90   # CTE ramps fast
-            w_cte_ms        = t_ph * 0.60
-            w_atex1         = 0.0
-            w_cte_x1        = t_ph * 0.80
-            w_speed_head    = 0.45
-        elif epoch < 35:
-            # Phase 3: Add ATE + full CTE suite
-            t_ph = (epoch - 25) / 10.0
-            w_vel, w_head   = 0.30, 0.20
-            w_ate           = t_ph * 0.50
-            w_cte           = 0.90           # full CTE weight
-            w_cte_ms        = 0.60
-            w_atex1         = t_ph * 0.80
-            w_cte_x1        = 0.80
-            w_speed_head    = 0.50
-        else:
-            # Phase 4: Full loss — CTE dominant over ATE
-            w_vel, w_head   = 0.30, 0.20
-            w_ate           = 0.50
-            w_cte           = 0.90   # [FIX-3] 0.40→0.90
-            w_cte_ms        = 0.60   # [FIX-3c] new
-            w_atex1         = 0.80
-            w_cte_x1        = 0.80   # [FIX-3b] new
-            w_speed_head    = 0.60
-
-        total = (l_mse
-                 + w_vel        * l_vel
-                 + w_head       * l_head
-                 + w_ate        * l_ate
-                 + w_cte        * l_cte
-                 + w_cte_ms     * l_cte_ms
-                 + w_atex1      * l_ate_x1
-                 + w_cte_x1     * l_cte_x1
-                 + w_speed_head * l_speed_head)
-
-        # Ensemble consistency (ep40+, same as v33)
-        if epoch >= 40 and self.n_train_ens >= 2:
-            x_t2, t2, te2, denom2 = self._cfm_noisy(x1, sigma_min=current_sigma)
-            pv2 = self.net.forward_with_ctx(x_t2, t2, raw_ctx, vel_obs_feat=vel_obs_feat)
-            x1p2 = x_t2 + denom2 * pv2
-            pa2, _ = self._to_abs(x1p2, lp, lm)
-            total  = total + 0.25 * mse_hav_loss(pa2, traj_gt)
-
-        if torch.isnan(total) or torch.isinf(total):
-            total = lp.new_zeros(())
-
-        def _f(x):
-            return x.item() if torch.is_tensor(x) else float(x)
-
-        return dict(
-            total       = total,
-            mse_hav     = _f(l_mse),
-            velocity    = _f(l_vel),
-            heading     = _f(l_head),
-            ate         = _f(l_ate),
-            cte         = _f(l_cte),
-            cte_ms      = _f(l_cte_ms),
-            ate_x1      = _f(l_ate_x1),
-            cte_x1      = _f(l_cte_x1),
-            speed_head  = _f(l_speed_head),
-            sigma       = current_sigma,
-            ate_mean_km = atc_metrics["ate_mean_km"],
-            cte_mean_km = atc_metrics["cte_mean_km"],
-            # backward compat
-            fm=0.0, short_range=0.0, cont=0.0, pinn=0.0,
-            spread=0.0, continuity=0.0, step=0.0, disp=0.0,
+            x_t, fm_t, raw_ctx, env_data=env_data, use_null=use_null,
+            vel_obs_feat  = vel_obs_feat,
+            steering_feat = self.net._get_steering_feat(env_data, B, device),
+            env_kine_feat = self.net._get_env_kine_feat(env_data, B, device),
         )
 
-    # ─── Inference ───────────────────────────────────────────────────────────
+        # [FIX-v59-3] Anisotropic FM loss with stabilized weights
+        x_t_abs, _ = self._to_abs(x_t, lp, lm)
+        x_t_deg = _norm_to_deg(x_t_abs)
+        gt_deg_for_fm = _norm_to_deg(batch_list[1])
+
+        if not use_null:
+            l_fm = _anisotropic_fm_loss(
+                pred_vel, u_target, x_t_deg, gt_deg_for_fm,
+                ate_weight=1.5, cte_weight=1.5,
+                fm_t=fm_t)   # [FIX-v60-3] pass fm_t for t-gating
+        else:
+            l_fm = F.mse_loss(pred_vel, u_target)
+
+        # x1_pred for ATE-x1 + CTE-x1 loss
+        fm_te    = fm_t.view(B, 1, 1)
+        x1_pred  = x_t + (1.0 - fm_te) * pred_vel
+        pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+        pred_deg    = _norm_to_deg(pred_abs)
+        gt_deg      = gt_deg_for_fm
+
+        l_ate_x1 = _ate_x1pred_loss(pred_deg, gt_deg, fm_t)
+        # [FIX-v60-5] New CTE-x1 loss
+        l_cte_x1 = _cte_x1pred_loss(pred_deg, gt_deg, fm_t)
+
+        # Standard trajectory losses
+        loss_dict = compute_st_trans_loss(
+            pred_deg, gt_deg, epoch=epoch, speed_stats=speed_stats)
+
+        if not use_null:
+            ctx_for_speed = self.net._apply_ctx_head(raw_ctx)
+            speed_pred = self.net.speed_head(ctx_for_speed, vel_obs_feat)
+            l_speed_head = _speed_head_loss(speed_pred, pred_deg, gt_deg, speed_stats)
+        else:
+            l_speed_head = x_t.new_zeros(())
+
+        # [FIX-v60-8] Total: thêm l_cte_x1(0.50), l_ate_x1 0.80→0.60
+        total = (l_fm
+                 + 2.0 * loss_dict["total"]
+                 + 0.60 * l_ate_x1        # 0.80→0.60 [FIX-v60-8]
+                 + 0.50 * l_cte_x1        # new [FIX-v60-5]
+                 + 0.60 * l_speed_head)
+
+        if torch.isnan(total) or torch.isinf(total):
+            total = x_t.new_zeros(())
+
+        d = dict(loss_dict)
+        d.update({
+            "total"        : total,
+            "fm_mse"       : l_fm.item(),
+            "ate_x1"       : l_ate_x1.item() if torch.is_tensor(l_ate_x1) else 0.0,
+            "cte_x1"       : l_cte_x1.item() if torch.is_tensor(l_cte_x1) else 0.0,
+            "speed_head_l" : l_speed_head.item() if torch.is_tensor(l_speed_head) else 0.0,
+            "sigma"        : current_sigma,
+            "v_opt"        : speed_stats.get("v_opt", 15.0),
+            "obs_spd_p50"  : speed_stats.get("p50_kmh", 0.0),
+        })
+        return d
 
     @torch.no_grad()
-    def sample(self, batch_list, num_ensemble=50, ddim_steps=20, predict_csv=None):
-        """
-        [FIX-7] Ensemble scoring now biases toward speed-matched members.
-        SpeedHead prediction used to rank ensemble → reduces spread.
-        """
-        obs_t  = batch_list[0]
-        lp     = obs_t[-1]
-        lm     = batch_list[7][-1]
-        B      = lp.shape[0]
-        device = lp.device
-        T      = self.pred_len
-        dt     = 1.0 / max(ddim_steps, 1)
+    def sample(self, batch_list, num_ensemble=50, ddim_steps=20,
+               predict_csv=None, importance_weight=True, use_cfg=True):
+        obs_t    = batch_list[0]
+        env_data = batch_list[13] if len(batch_list) > 13 else None
+        lp       = obs_t[-1]; lm = batch_list[7][-1]
+        B        = lp.shape[0]; device = lp.device
+        T        = self.pred_len; dt = 1.0 / max(ddim_steps, 1)
 
         raw_ctx       = self.net._context(batch_list)
-        vel_obs_feat  = self.net._get_vel_obs_feat(obs_t)
+        vel_obs_feat  = self.net._get_kinematic_obs_feat(obs_t[:, :, :2])
+        steering_feat = self.net._get_steering_feat(env_data, B, device)
+        env_kine_feat = self.net._get_env_kine_feat(env_data, B, device)
+        speed_stats   = compute_speed_stats_from_norm(obs_t[..., :2])
+        persist_init  = self._persistence_forecast_rel(obs_t, lp, lm, T)
+        obs_norm      = obs_t[:, :, :2]
 
-        # Get speed head prediction for scoring
+        # Get speed head prediction for ensemble scoring
         try:
             speed_head_pred = self.net.predict_speed(raw_ctx, vel_obs_feat)
         except Exception:
             speed_head_pred = None
 
-        all_trajs, all_me = [], []
-        for _ in range(num_ensemble):
-            x_t = torch.randn(B, T, 4, device=device) * self.initial_sample_sigma
-            for step in range(ddim_steps):
-                t_b = torch.full((B,), step * dt, device=device)
-                ns  = self.ctx_noise_scale if step < 3 else 0.0
-                vel = self.net.forward_with_ctx(
-                    x_t, t_b, raw_ctx,
-                    noise_scale=ns, vel_obs_feat=vel_obs_feat)
-                x_t = x_t + dt * vel
+        if obs_t.shape[0] >= 2:
+            obs_h_n = F.normalize(
+                obs_t[-1,:,:2] - obs_t[-2,:,:2], dim=-1, eps=1e-6)
+        else:
+            obs_h_n = None
 
-            x_t = self._physics_correct(x_t, lp, lm)
-            x_t = x_t.clamp(-3.0, 3.0)
+        obs_mom = self._compute_obs_momentum(obs_norm)
+        if obs_t.shape[0] >= 3:
+            vv    = obs_t[1:,:,:2] - obs_t[:-1,:,:2]
+            heads = F.normalize(vv, dim=-1, eps=1e-6)
+            cos_s = (heads[1:]*heads[:-1]).sum(-1).mean(0)
+            mom_gate = torch.sigmoid((cos_s-0.5)*8.0)
+        else:
+            mom_gate = torch.ones(B, device=device)
+
+        def _mom_str(s, tot):
+            return 0.08 * 0.5 * (1.0 + math.cos(math.pi*s/max(tot,1)))
+
+        all_norms, all_me = [], []
+
+        for _ in range(num_ensemble):
+            x_t = persist_init + torch.randn_like(persist_init) * self.sigma_min * 2.5
+
+            for step in range(ddim_steps):
+                t_b = torch.full((B,), step*dt, device=device)
+                ns  = self.ctx_noise_scale * 2.0 if step < 3 else 0.0
+
+                if use_cfg and step > 0:
+                    v_cond   = self.net.forward_with_ctx(
+                        x_t, t_b, raw_ctx, noise_scale=ns,
+                        vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
+                        env_kine_feat=env_kine_feat, env_data=env_data,
+                        use_null=False)
+                    v_uncond = self.net.forward_with_ctx(
+                        x_t, t_b, raw_ctx, noise_scale=0.0,
+                        vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
+                        env_kine_feat=env_kine_feat, env_data=env_data,
+                        use_null=True)
+                    if obs_h_n is not None:
+                        pred_h = F.normalize(
+                            v_cond[:,0,:2].detach(), dim=-1, eps=1e-6)
+                        cos_a  = (obs_h_n * pred_h).sum(-1).clamp(-1.0, 1.0)
+                        gs     = (0.8 + 0.7*(cos_a+1.0)*0.5).view(B,1,1)
+                        vel    = v_uncond + gs * (v_cond - v_uncond)
+                    else:
+                        vel = v_uncond + 1.5 * (v_cond - v_uncond)
+                else:
+                    vel = self.net.forward_with_ctx(
+                        x_t, t_b, raw_ctx, noise_scale=ns,
+                        vel_obs_feat=vel_obs_feat, steering_feat=steering_feat,
+                        env_kine_feat=env_kine_feat, env_data=env_data)
+
+                m_s = _mom_str(step, ddim_steps)
+                if m_s > 1e-4:
+                    me  = obs_mom.unsqueeze(1).expand(B, T, 2)
+                    mf  = torch.cat([me, torch.zeros(B, T, 2, device=device)], -1)
+                    vel = vel + m_s * mom_gate.view(B,1,1) * mf
+
+                x_t = (x_t + dt*vel).clamp(-3.0, 3.0)
+
             tr, me = self._to_abs(x_t, lp, lm)
-            all_trajs.append(tr)
+            all_norms.append(tr)
             all_me.append(me)
 
-        # [FIX-7] Score ensemble members using speed head + CTE lateral spread
-        if speed_head_pred is not None:
-            scores = []
-            for tr in all_trajs:
-                tr_deg  = _denorm_to_deg(tr)
-                tr_spd  = _step_speeds_deg(tr_deg).permute(1, 0)   # [B, T-1]
-                n       = min(speed_head_pred.shape[1], tr_spd.shape[1])
-                v_sigma = max(float(tr_spd[:, :n].std()), 5.0)
+        SCALES = (0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.45)
+        cands, scores = [], []
+        for tn in all_norms:
+            bt, bsc = _speed_sweep_correction(tn, obs_norm, SCALES)
+            cands.append(bt)
+            scores.append(_score_ensemble_member(bt, obs_norm, speed_stats,
+                                                  speed_head_pred=speed_head_pred))
+            cands.append(tn)
+            scores.append(_score_ensemble_member(tn, obs_norm, speed_stats,
+                                                  speed_head_pred=speed_head_pred))
 
-                # Speed match score (ATE proxy)
-                spd_err = ((tr_spd[:, :n] - speed_head_pred[:, :n]) / v_sigma).pow(2).mean(1)
-                spd_score = torch.exp(-spd_err * 2.0)   # [B]
+        all_c  = torch.stack(cands)
+        all_sc = torch.stack(scores)
+        all_me_t = torch.stack(all_me)
 
-                # [FIX-7] CTE lateral consistency score
-                # Members that stay close to the median lateral position are preferred
-                # This reduces cross-track spread of the ensemble
-                if len(all_trajs) > 1:
-                    all_stack = torch.stack(all_trajs)   # [S, T, B, 2]
-                    median_tr = all_stack.median(0).values   # [T, B, 2]
-                    median_deg = _denorm_to_deg(median_tr)
-                    cte_km_vals, _, _ = _get_cross_track_components(tr_deg, median_deg)
-                    if cte_km_vals is not None:
-                        cte_spread = cte_km_vals.abs().mean(0)   # [B]
-                        cte_score  = torch.exp(-cte_spread / 50.0)   # [B]
-                    else:
-                        cte_score = torch.ones(B, device=device)
-                else:
-                    cte_score = torch.ones(B, device=device)
+        k = max(1, int(all_c.shape[0] * 0.35))
+        _, idx = all_sc.topk(k, dim=0)
+        pred_mean = torch.stack([
+            all_c[idx[:,b],:,b,:].median(0).values for b in range(B)
+        ], dim=1)
 
-                # Combined: 45% speed, 55% CTE lateral consistency
-                scores.append(spd_score.pow(0.45) * cte_score.pow(0.55))
-
-            scores_t = torch.stack(scores)   # [S, B]
-
-            # Weighted mean — top 35% by score
-            k = max(1, int(num_ensemble * 0.35))
-            _, idx = scores_t.topk(k, dim=0)
-            pred_mean = torch.stack([
-                torch.stack([all_trajs[idx[j, b]][:, b, :] for j in range(k)]).median(0).values
-                for b in range(B)
-            ], dim=1)
-        else:
-            all_t_stack = torch.stack(all_trajs)   # [S, T, B, 2]
-            pred_mean   = all_t_stack.mean(0)
-
-        all_t_stack = torch.stack(all_trajs)
+        pred_mean = _persistence_blend(pred_mean, obs_norm, blend_strength=0.06)
 
         if predict_csv:
-            self._write_predict_csv(predict_csv, pred_mean, all_t_stack)
-        return pred_mean, torch.stack(all_me).mean(0), all_t_stack
+            self._write_predict_csv(predict_csv, pred_mean, all_c)
+        return pred_mean, all_me_t.mean(0), all_c
 
-    def _physics_correct(self, x_pred, last_pos, last_Me, n_steps=3, lr=0.001):
-        """Speed constraint: TCs can't move > 600 km/6h."""
-        with torch.enable_grad():
-            x   = x_pred.detach().requires_grad_(True)
-            opt = torch.optim.Adam([x], lr=lr, betas=(0.9, 0.99))
-            for _ in range(n_steps):
-                opt.zero_grad()
-                pred_abs, _ = self._to_abs(x, last_pos, last_Me)
-                pred_deg = _denorm_to_deg(pred_abs)
-                dt_deg   = pred_deg[1:] - pred_deg[:-1]
-                lat_rad  = torch.deg2rad(pred_deg[:-1, :, 1])
-                cos_lat  = torch.cos(lat_rad).clamp(min=1e-4)
-                speed    = torch.sqrt(
-                    (dt_deg[:, :, 0] * cos_lat * 111.0).pow(2)
-                    + (dt_deg[:, :, 1] * 111.0).pow(2))
-                loss = F.relu(speed - 600.0).pow(2).mean()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_([x], 0.05)
-                opt.step()
-        return x.detach()
+    def _score_sample(self, traj, speed_stats=None):
+        return _score_ensemble_member(traj, None, speed_stats)
 
     @staticmethod
     def _write_predict_csv(csv_path, traj_mean, all_trajs):
         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
         T, B, _ = traj_mean.shape
-        mlon = ((traj_mean[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
-        mlat = ((traj_mean[..., 1] * 50.0) / 10.0).cpu().numpy()
-        alon = ((all_trajs[..., 0] * 50.0 + 1800.0) / 10.0).cpu().numpy()
-        alat = ((all_trajs[..., 1] * 50.0) / 10.0).cpu().numpy()
-        fields = ["timestamp", "batch_idx", "step_idx", "lead_h",
-                  "lon_mean_deg", "lat_mean_deg",
-                  "lon_std_deg",  "lat_std_deg", "ens_spread_km"]
+        mlon = ((traj_mean[...,0]*50.0+1800.0)/10.0).cpu().numpy()
+        mlat = ((traj_mean[...,1]*50.0)/10.0).cpu().numpy()
+        alon = ((all_trajs[...,0]*50.0+1800.0)/10.0).cpu().numpy()
+        alat = ((all_trajs[...,1]*50.0)/10.0).cpu().numpy()
+        fields = ["timestamp","batch_idx","step_idx","lead_h",
+                  "lon_mean_deg","lat_mean_deg",
+                  "lon_std_deg","lat_std_deg","ens_spread_km"]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         write_hdr = not os.path.exists(csv_path)
         with open(csv_path, "a", newline="") as fh:
@@ -42386,19 +42941,19 @@ class TCFlowMatching(nn.Module):
             if write_hdr: w.writeheader()
             for b in range(B):
                 for k in range(T):
-                    dlat   = alat[:, k, b] - mlat[k, b]
-                    dlon   = ((alon[:, k, b] - mlon[k, b])
-                              * math.cos(math.radians(float(mlat[k, b]))))
-                    spread = float(((dlat**2 + dlon**2)**0.5).mean() * 111.0)
+                    dlat   = alat[:,k,b] - mlat[k,b]
+                    dlon   = ((alon[:,k,b] - mlon[k,b])
+                              * math.cos(math.radians(float(mlat[k,b]))))
+                    spread = float(((dlat**2+dlon**2)**0.5).mean() * DEG2KM)
                     w.writerow({
                         "timestamp"    : ts,
                         "batch_idx"    : b,
                         "step_idx"     : k,
-                        "lead_h"       : (k + 1) * 6,
-                        "lon_mean_deg" : f"{mlon[k, b]:.4f}",
-                        "lat_mean_deg" : f"{mlat[k, b]:.4f}",
-                        "lon_std_deg"  : f"{alon[:, k, b].std():.4f}",
-                        "lat_std_deg"  : f"{alat[:, k, b].std():.4f}",
+                        "lead_h"       : (k+1)*6,
+                        "lon_mean_deg" : f"{mlon[k,b]:.4f}",
+                        "lat_mean_deg" : f"{mlat[k,b]:.4f}",
+                        "lon_std_deg"  : f"{alon[:,k,b].std():.4f}",
+                        "lat_std_deg"  : f"{alat[:,k,b].std():.4f}",
                         "ens_spread_km": f"{spread:.2f}",
                     })
 
