@@ -41469,7 +41469,21 @@ def compute_speed_stats_from_norm(obs_traj):
         "v_hard_cap": float(torch.tensor(p95 * 1.8).clamp(25.0, 80.0)),
     }
 
-
+def _short_lead_loss(pred_deg, gt_deg):
+    """Loss chỉ cho 12h và 24h — không bị dilute bởi 72h."""
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 4: return pred_deg.new_zeros(())
+    
+    loss = pred_deg.new_zeros(())
+    # 12h = step 1 (index 1)
+    if T > 1:
+        d12 = _haversine_deg(pred_deg[1], gt_deg[1]).mean()
+        loss = loss + 2.0 * F.huber_loss(d12, d12.new_zeros(()), delta=50.0) / 50.0
+    # 24h = step 3 (index 3)
+    if T > 3:
+        d24 = _haversine_deg(pred_deg[3], gt_deg[3]).mean()
+        loss = loss + 1.0 * F.huber_loss(d24, d24.new_zeros(()), delta=80.0) / 80.0
+    return loss
 # ═════════════════════════════════════════════════════════════════════════════
 #  [FIX-v59-3] Anisotropic FM velocity loss — stabilized
 # ═════════════════════════════════════════════════════════════════════════════
@@ -41662,6 +41676,21 @@ class SpeedHead(nn.Module):
         speed_pred = self.fc(h)
         return F.softplus(speed_pred) * 3.0 + 2.0
 
+def _short_lead_loss(pred_deg, gt_deg):
+    """Loss chỉ cho 12h và 24h — không bị dilute bởi 72h."""
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 4: return pred_deg.new_zeros(())
+    
+    loss = pred_deg.new_zeros(())
+    # 12h = step 1 (index 1)
+    if T > 1:
+        d12 = _haversine_deg(pred_deg[1], gt_deg[1]).mean()
+        loss = loss + 2.0 * F.huber_loss(d12, d12.new_zeros(()), delta=50.0) / 50.0
+    # 24h = step 3 (index 3)
+    if T > 3:
+        d24 = _haversine_deg(pred_deg[3], gt_deg[3]).mean()
+        loss = loss + 1.0 * F.huber_loss(d24, d24.new_zeros(()), delta=80.0) / 80.0
+    return loss
 
 def _speed_head_loss(speed_pred, pred_deg, gt_deg, speed_stats=None):
     sp = speed_stats or _SPEED_PRIOR
@@ -41968,6 +41997,7 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
     l_signed_ate = _signed_ate_loss(pred_deg, gt_deg)
     l_signed_cte = _signed_cte_loss(pred_deg, gt_deg)
     l_direct_ep  = _direct_endpoint_loss(pred_deg, gt_deg, epoch=epoch)
+    l_short_lead = _short_lead_loss(pred_deg, gt_deg)
 
     # [FIX-v60-4] Rebalanced: signed_cte 0.40→1.00, signed_ate 0.70→0.45
     total = (0.60 * l_dpe
@@ -41980,7 +42010,8 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
          + 0.10 * l_endpoint    # 0.15→0.10
          + 0.45 * l_signed_ate  # 0.70→0.35: hạ ATE để rebalance
          + 1.20 * l_signed_cte  # 1.00→1.20: tăng CTE dedicated
-         + 0.50 * l_direct_ep)
+         + 0.50 * l_direct_ep
+         + 0.80 * l_short_lead)
 
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
