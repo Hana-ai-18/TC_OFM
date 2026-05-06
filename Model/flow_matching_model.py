@@ -43519,6 +43519,21 @@ def _short_lead_loss(pred_deg, gt_deg):
 # ══════════════════════════════════════════════════════════════════════════════
 #  [FIX-ATE-4] compute_st_trans_loss — signed_ate weight 0.40 → 0.70
 # ══════════════════════════════════════════════════════════════════════════════
+def _short_lead_loss(pred_deg, gt_deg):
+    """Loss chỉ cho 12h và 24h — không bị dilute bởi 72h."""
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 4: return pred_deg.new_zeros(())
+    
+    loss = pred_deg.new_zeros(())
+    # 12h = step 1 (index 1)
+    if T > 1:
+        d12 = _haversine_deg(pred_deg[1], gt_deg[1]).mean()
+        loss = loss + 2.0 * F.huber_loss(d12, d12.new_zeros(()), delta=50.0) / 50.0
+    # 24h = step 3 (index 3)
+    if T > 3:
+        d24 = _haversine_deg(pred_deg[3], gt_deg[3]).mean()
+        loss = loss + 1.0 * F.huber_loss(d24, d24.new_zeros(()), delta=80.0) / 80.0
+    return loss
 
 def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
     """
@@ -43602,6 +43617,9 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
     # Direct endpoint (scheduled)
     l_direct_ep = _direct_endpoint_loss(pred_deg, gt_deg, epoch=epoch)
 
+    # Short lead loss
+    l_short_lead = _short_lead_loss(pred_deg, gt_deg)
+
     # Total — [FIX-ATE-4] vel_reg 0.60→0.70, signed_ate 0.40→0.70
     total = (0.60 * l_dpe
          + 0.02 * l_mse
@@ -43614,7 +43632,7 @@ def compute_st_trans_loss(pred_deg, gt_deg, epoch=0, speed_stats=None):
          + 0.55 * l_signed_ate  # 0.70→0.35: hạ ATE để rebalance
          + 1.0 * l_signed_cte  # 1.00→1.20: tăng CTE dedicated
          + 0.50 * l_direct_ep
-         )
+         + 0.80 * l_short_lead)
     
     if torch.isnan(total) or torch.isinf(total):
         total = pred_deg.new_zeros(())
