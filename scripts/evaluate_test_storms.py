@@ -1079,3 +1079,16 @@ if __name__ == "__main__":
         print()
 
     main(args)
+
+#     # Đánh giá cả 3 models
+# python /kaggle/working/TC_FM/scripts/evaluate_models.py \
+#     --dataset_root /kaggle/input/datasets/kaggle1234uitvn/tc-ofm \
+#     --fm_ckpt     /kaggle/working/TC_FM/runs/v59/best_model.pth \
+#     --lstm_ckpt   /kaggle/working/TC_FM/runs/lstm/best_model.pth \
+#     --sttrans_ckpt /kaggle/working/TC_FM/runs/sttrans/best_model.pth \
+#     --output_dir  /kaggle/working/TC_FM/results/test_eval \
+#     --fm_ensemble 30 \
+#     --fm_ode_steps 20
+
+# # Chỉ đánh giá FM
+# python .../evaluate_models.py --eval_models fm --fm_ckpt .../best_model.pth ...
