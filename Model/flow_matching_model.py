@@ -41389,8 +41389,9 @@ DEG2KM       = 111.0
 _NORM_TO_DEG = 5.0
 
 # [FIX-v59-1] Boost short-lead steps 1-4 significantly
-STEP_WEIGHTS = [2.0, 3.0, 4.0, 5.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
-
+# STEP_WEIGHTS = [2.0, 3.0, 4.0, 5.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
+STEP_WEIGHTS = [2.0, 6.0, 6.0, 5.0, 4.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0]
+#                    ^^^  step1=12h tăng 3→8, step2=18h giảm 4→6
 _SPEED_PRIOR = {"v_opt": 15.0, "v_sigma": 10.0, "v_hard_cap": 35.0}
 
 
