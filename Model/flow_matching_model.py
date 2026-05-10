@@ -50711,7 +50711,7 @@ _NORM_TO_DEG = 5.0
 # Index 1 = 6h, Index 2 = 12h, ..., Index 11 = 66h, Index 12 = 72h
 # Tổng 12 bước dự đoán: index 1..12
 # NOTE: array có 13 phần tử để index 1-12 map đúng lead time
-STEP_WEIGHTS = [0.0, 2.0, 4.0, 3.5, 4.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.5, 9.0, 11.0]
+STEP_WEIGHTS = [0.0, 4.0, 4.0, 3.5, 4.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.5, 9.0, 11.0]
 # Index:         0    1    2    3    4    5    6    7    8    9   10   11   12
 # Lead time:    --   6h  12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
 
