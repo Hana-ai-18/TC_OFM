@@ -1434,13 +1434,19 @@ def load_lstm_model(ckpt_path: str, device, args):
 
         ckpt = torch.load(ckpt_path, map_location=device)
 
-        # Thử cả hai key phổ biến
-        if "model_state_dict" in ckpt:
+        # Thử tất cả key phổ biến — theo thứ tự ưu tiên
+        # train_paper_baseline.py lưu key "model_state"
+        if "model_state" in ckpt:
+            state = ckpt["model_state"]
+        elif "model_state_dict" in ckpt:
             state = ckpt["model_state_dict"]
         elif "state_dict" in ckpt:
             state = ckpt["state_dict"]
         else:
-            state = ckpt   # ckpt chính là state_dict
+            # Fallback cuối: in keys để debug
+            print(f"    ⚠  Checkpoint keys: {list(ckpt.keys())}")
+            raise KeyError("Không tìm thấy model weights key. "
+                           "Thêm 'model_state' / 'model_state_dict' / 'state_dict'.")
 
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:    print(f"    LSTM missing keys  : {len(missing)}")
@@ -1478,12 +1484,18 @@ def load_sttrans_model(ckpt_path: str, device, args):
 
         ckpt = torch.load(ckpt_path, map_location=device)
 
-        if "model_state_dict" in ckpt:
+        # Thử tất cả key phổ biến — theo thứ tự ưu tiên
+        # train_st_trans.py lưu key "model_state"
+        if "model_state" in ckpt:
+            state = ckpt["model_state"]
+        elif "model_state_dict" in ckpt:
             state = ckpt["model_state_dict"]
         elif "state_dict" in ckpt:
             state = ckpt["state_dict"]
         else:
-            state = ckpt
+            print(f"    ⚠  Checkpoint keys: {list(ckpt.keys())}")
+            raise KeyError("Không tìm thấy model weights key. "
+                           "Thêm 'model_state' / 'model_state_dict' / 'state_dict'.")
 
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing:    print(f"    STTrans missing keys  : {len(missing)}")
