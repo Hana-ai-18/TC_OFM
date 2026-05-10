@@ -49108,25 +49108,9 @@ ROOT CAUSE THẬT SỰ CỦA VAL STUCK:
 ═══════════════════════════════════
 
 [RC-1] GRADIENT CONFLICT từ 8+ loss terms
-  v62 có: l_dpe + l_vel_reg + l_sph_atecte + l_endpoint + l_direct_ep
-          + l_fm + l_fm_dpe + l_fm_ep + l_speed_head
-  → Các gradient triệt tiêu nhau → model không converge thêm được
-  → Đây là lý do val CTE stuck ở 54km từ epoch 30-45
-
 [RC-2] CTE gradient quá yếu trong l_sph_atecte
-  ate_weight=4.0 vs cte_weight=0.80 → CTE gradient yếu hơn ATE 5x
-  Huber threshold cte_t=100km → gradient rất nhỏ khi CTE ở vùng 50-80km
-  → Model không có đủ signal để push CTE xuống dưới 54km
-
 [RC-3] l_fm_dpe và l_fm_ep phụ thuộc fm_t
-  l_fm_dpe: chỉ active khi fm_t < 0.5 → ~50% batches gradient = 0
-  l_fm_ep:  chỉ active khi fm_t < 0.3 → ~70% batches gradient = 0
-  → 72h endpoint signal thực tế rất yếu dù weight cao
-
 [RC-4] l_vel_reg (weight 0.70) conflict với CTE
-  Velocity regression match speed vector → khi trajectory curve (recurving storms)
-  l_vel_reg kéo prediction theo hướng quan sát → CTE tăng
-  → Bỏ l_vel_reg để CTE gradient không bị counteracted
 
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -49134,44 +49118,44 @@ THIẾT KẾ v63 — RADICAL SIMPLIFICATION:
 ════════════════════════════════════════
 
 [v63-1] STEP_WEIGHTS: smooth, tăng 12h-66h, giảm spike 72h
-  v62: [2.0,2.5,2.5,3.0,3.0,3.5,4.0,4.5,5.0,6.0,7.0,12.0] sum=55.0
-  v63: [2.0,4.0,3.5,4.0,3.5,4.0,4.5,5.0,6.0,7.5,9.0,11.0] sum=64.0
-  → 12h: 4.5%→6.2%, 24h: 5.5%→6.2%, 72h: 21.8%→17.2% (smooth hơn)
-  → 66h tăng mạnh nhất (7.0→9.0) để push long-lead trước 72h
-
 [v63-2] compute_st_trans_loss: CHỈ 4 terms thay vì 8+
-  GIỮ: l_dpe (1.00), l_cte_pure (1.50), l_ate_pure (0.60), l_72h_ep (0.80)
-  BỎ HOÀN TOÀN: l_vel_reg, l_heading, l_mse, l_speed, l_accel, l_signed_*
-  
-  l_cte_pure: Huber threshold 60km (thay vì 100km) → sharper gradient
-              vùng 50-80km sẽ có gradient lớn hơn nhiều → val CTE giảm
-  l_72h_ep:   endpoint dedicated cho step 7-11 với threshold 100km
-              weight 3.0 tại step 11 → 72h signal dominant
-  l_ate_pure: support ATE nhưng không áp đảo CTE (0.60 < 1.50)
-
 [v63-3] 72h Rollout loss — ALWAYS active, không phụ thuộc fm_t
-  Rollout nhanh qua 3 DDIM steps (t=0.0→0.33→0.67→1.0)
-  Bước 1,2: torch.no_grad() (không backprop để tiết kiệm memory)
-  Bước 3: backprop qua step này để có gradient tại endpoint
-  Loss: haversine tại step 9,10,11 → 100% batches có 72h gradient
-  Weight: 0.80 trong total loss
-
-[v63-4] Bỏ l_fm_dpe, giữ l_fm_ep nhưng relax threshold fm_t<0.4 (thay vì 0.3)
-  → 60% batches (thay vì 30%) có FM endpoint gradient
-
-[v63-5] Inference: bỏ momentum injection hoàn toàn trong 4 DDIM steps đầu
-  Momentum add bias cho short-lead → 12h/24h sai
-  Bỏ momentum khi step < 4 → 12h/24h cải thiện
+[v63-4] Bỏ l_fm_dpe, giữ l_fm_ep nhưng relax threshold fm_t<0.4
+[v63-5] Inference: bỏ momentum injection trong 4 DDIM steps đầu
 
 ═══════════════════════════════════════════════════════════════════════════════
 
+BUG FIXES vs v63 ORIGINAL:
+════════════════════════════
+
+[FIX-1] Rollout t-values: 0.10/0.43/0.76 → 0.00/0.33/0.66
+  v63 original: x_r bắt đầu từ x_t (t≈fm_t), nhưng rollout dùng t=0.10/0.43/0.76
+  Mismatch: sau 0.33+0.33=0.66 steps, x_r ≈ t=1.0 nhưng t_r3=0.76 → sai
+  Fix: dùng t=0.00/0.33/0.66 để x_t và t nhất quán với nhau
+
+[FIX-2] CTE/ATE double normalization:
+  v63 original: w = w/w.sum() * (T-1) rồi .mean() → double normalize
+  Fix: weighted sum chuẩn: (huber * w).sum() / (w.sum() * B)
+  Không nhân *(T-1) và không .mean()
+
+[FIX-3] fm_ep gradient spike khi ít samples active:
+  v63 original: w_denom = early_w.sum() → nếu chỉ 1 sample active, loss spike
+  Fix: w_denom = early_w.sum().clamp(min=0.1)
+
+[FIX-4] Rollout loss scale mismatch:
+  v63 original: dist/300.0 → inconsistent với CTE Huber threshold 60km
+  Fix: dist/100.0 → consistent với endpoint Huber threshold 100km
+
+[FIX-5] DPE penalize step 0 (vị trí hiện tại):
+  v63 original: STEP_WEIGHTS[:T] và pred_deg[:T] bao gồm step 0
+  Nếu pred_deg[0] = gt_deg[0] (current pos), penalize step 0 là lãng phí
+  Fix: bắt đầu từ step 1 trong DPE, consistent với CTE/ATE
+
 EXPECTED RESULTS (val → test):
   val CTE: 54 → ~35-42km | test CTE: 75 → ~52-60km (beat STTrans=59)
-  val 72h: 330 → ~230-260km | test 72h: 472 → ~350-390km (gần STTrans=423)
+  val 72h: 330 → ~230-260km | test 72h: 472 → ~350-390km
   val ATE: 140 → ~110-125km | test ATE: 224 → ~170-195km
   val ADE: 177 → ~148-158km | test ADE: 236 → ~198-210km
-
-TARGETS: val CTE<42 | val 72h<260 | val ADE<160 | test beat STTrans ở CTE và 48h
 """
 from __future__ import annotations
 
@@ -49196,17 +49180,13 @@ DEG2KM       = 111.0
 _NORM_TO_DEG = 5.0
 
 # [v63-1] STEP_WEIGHTS: smooth exponential, không spike
-# v62: [2.0,2.5,2.5,3.0,3.0,3.5,4.0,4.5,5.0,6.0,7.0,12.0] sum=55.0
-# v63: [2.0,4.0,3.5,4.0,3.5,4.0,4.5,5.0,6.0,7.5,9.0,11.0] sum=64.0
-#
-# Thay đổi key:
-#   12h (step1):  2.5→4.0  (+60%)  → val 12h/24h giảm
-#   18h (step2):  2.5→3.5  (+40%)  → smooth
-#   24h (step3):  3.0→4.0  (+33%)  → val 24h giảm
-#   66h (step10): 7.0→9.0  (+29%)  → push long-lead trước 72h
-#   72h (step11): 12.0→11.0 (-8%)  → giảm spike, stable training
-#   54h (step8):  5.0→6.0  (+20%)  → support long-lead
-STEP_WEIGHTS = [2.0, 4.0, 3.5, 4.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.5, 9.0, 11.0]
+# Index 0 = step 0 (current pos, không dùng trong loss)
+# Index 1 = 6h, Index 2 = 12h, ..., Index 11 = 66h, Index 12 = 72h
+# Tổng 12 bước dự đoán: index 1..12
+# NOTE: array có 13 phần tử để index 1-12 map đúng lead time
+STEP_WEIGHTS = [0.0, 2.0, 4.0, 3.5, 4.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.5, 9.0, 11.0]
+# Index:         0    1    2    3    4    5    6    7    8    9   10   11   12
+# Lead time:    --   6h  12h  18h  24h  30h  36h  42h  48h  54h  60h  66h  72h
 
 _SPEED_PRIOR = {"v_opt": 15.0, "v_sigma": 10.0, "v_hard_cap": 35.0}
 
@@ -49326,72 +49306,78 @@ def _speed_head_loss(speed_pred: torch.Tensor, gt_deg: torch.Tensor,
     v_sigma = sp.get("v_sigma", 10.0)
     T_gt    = gt_deg.shape[0]
     pred_len = speed_pred.shape[1]
+    # [FIX-5] gt_deg bắt đầu từ step 0; speed tính từ step 0→1, 1→2, ...
+    # nên gt_spd có T_gt-1 bước, map với pred_len bước của speed_head
     T = min(pred_len + 1, T_gt)
     if T < 2:
         return speed_pred.new_zeros(())
-    gt_spd = _step_speeds_deg(gt_deg[:T]).permute(1, 0)
+    gt_spd = _step_speeds_deg(gt_deg[:T]).permute(1, 0)  # [B, T-1]
     n      = min(pred_len, gt_spd.shape[1])
-    w      = speed_pred.new_tensor(STEP_WEIGHTS[1:n + 1]); w = w / w.sum()
-    loss   = F.mse_loss(speed_pred[:, :n],
-                        gt_spd[:, :n].clamp(min=2.0),
-                        reduction='none') / v_sigma**2
+    # Dùng STEP_WEIGHTS index 1..n (6h..n*6h), bỏ index 0
+    w = speed_pred.new_tensor(STEP_WEIGHTS[1:n + 1])
+    w = w / w.sum()
+    loss = F.mse_loss(speed_pred[:, :n],
+                      gt_spd[:, :n].clamp(min=2.0),
+                      reduction='none') / v_sigma**2
     return (loss * w.unsqueeze(0)).mean()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  [v63-2] compute_st_trans_loss — RADICAL SIMPLIFICATION
 #  CHỈ 4 terms: l_dpe + l_cte_pure + l_ate_pure + l_72h_ep
-#  Lý do: 8+ terms trong v62 gây gradient conflict → val stuck
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _pure_cte_ate_loss(pred_deg: torch.Tensor,
                        gt_deg: torch.Tensor) -> dict:
     """
-    [v63-2] CTE/ATE loss thuần túy, tách riêng để không conflict nhau.
+    [v63-2][FIX-2] CTE/ATE loss thuần túy.
 
-    Key changes vs v62 _spherical_ate_cte_loss:
-    - CTE Huber threshold: 100km → 60km (sharper gradient ở vùng 50-80km)
-    - ATE Huber threshold: 200km → 150km (tighter)
-    - Tính riêng l_cte và l_ate để caller có thể weight độc lập
-    - Không gộp chung ate_weight/cte_weight vào đây
+    FIX-2: Bỏ double normalization.
+    v63 original: w = w/w.sum() * (T-1) rồi * w.unsqueeze(1)).mean()
+    → .mean() chia cho (T-1)*B → double normalize.
+    Fix: weighted sum chuẩn = (huber * w).sum() / (w.sum() * B)
 
-    Lý do cte_t=60km:
-    val CTE hiện tại ~54km. Với Huber delta=100: gradient = cte/100 rất nhỏ
-    ở vùng này. Với delta=60: gradient = 1 (linear region) khi cte>60 →
-    model bị penalize mạnh hơn → val CTE giảm.
+    pred_deg, gt_deg: [T, B, 2] — bắt đầu từ step 0 (current pos)
+    CTE/ATE tính từ step 1 trở đi (bỏ current pos).
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         z = pred_deg.new_zeros(())
         return {"cte": z, "ate": z, "cte_mean_km": 0.0, "ate_mean_km": 0.0}
 
+    # bear_along: hướng gt từ step i → i+1, shape [T-1, B]
     bear_along = _forward_azimuth(gt_deg[:T-1], gt_deg[1:T])
+    # bear_error: hướng từ gt[i+1] → pred[i+1], shape [T-1, B]
     bear_error = _forward_azimuth(gt_deg[1:T],  pred_deg[1:T])
-    total_err  = _haversine_deg(pred_deg[1:T],  gt_deg[1:T])
+    total_err  = _haversine_deg(pred_deg[1:T],  gt_deg[1:T])  # [T-1, B]
 
     angle = bear_error - bear_along
-    cte   = total_err * torch.sin(angle)   # cross-track
-    ate   = total_err * torch.cos(angle)   # along-track
+    cte   = total_err * torch.sin(angle)   # cross-track [T-1, B]
+    ate   = total_err * torch.cos(angle)   # along-track [T-1, B]
 
-    w = pred_deg.new_tensor(STEP_WEIGHTS[1:T])
-    w = w / w.sum() * (T - 1)
+    # [FIX-2] Weight từ STEP_WEIGHTS index 1..T-1 (6h...(T-1)*6h)
+    # Không nhân *(T-1), dùng weighted sum / (w.sum() * B) thay vì .mean()
+    w   = pred_deg.new_tensor(STEP_WEIGHTS[1:T])  # [T-1]
+    B   = pred_deg.shape[1]
 
-    # [v63-2] CTE: Huber delta=60km — sharper than v62's 100km
-    # Vùng 50-80km sẽ có gradient = 1 (linear) thay vì cte/100 (nhỏ)
+    # [v63-2] CTE: Huber delta=60km — sharper gradient ở vùng 50-80km
     cte_t = 60.0
-    l_cte = (torch.where(
+    huber_cte = torch.where(
         cte.abs() < cte_t,
-        cte.pow(2) / (2 * cte_t),
-        cte.abs() - cte_t / 2
-    ) * w.unsqueeze(1)).mean() / cte_t
+        cte.pow(2) / (2.0 * cte_t),
+        cte.abs() - cte_t / 2.0
+    )  # [T-1, B]
+    # Weighted sum chuẩn: sum over T-1 và B, normalize bằng w.sum()*B*cte_t
+    l_cte = (huber_cte * w.unsqueeze(1)).sum() / (w.sum() * B * cte_t)
 
     # [v63-2] ATE: Huber delta=150km
     ate_t = 150.0
-    l_ate = (torch.where(
+    huber_ate = torch.where(
         ate.abs() < ate_t,
-        ate.pow(2) / (2 * ate_t),
-        ate.abs() - ate_t / 2
-    ) * w.unsqueeze(1)).mean() / ate_t
+        ate.pow(2) / (2.0 * ate_t),
+        ate.abs() - ate_t / 2.0
+    )  # [T-1, B]
+    l_ate = (huber_ate * w.unsqueeze(1)).sum() / (w.sum() * B * ate_t)
 
     return {
         "cte"        : l_cte,
@@ -49405,30 +49391,34 @@ def _dedicated_72h_endpoint_loss(pred_deg: torch.Tensor,
                                   gt_deg: torch.Tensor) -> torch.Tensor:
     """
     [v63-2] Endpoint loss chuyên biệt cho 48h-72h.
-    Tách riêng khỏi l_cte/l_ate để có gradient độc lập.
 
-    Huber threshold 100km (thay vì 150km trong v62) → sharper.
-    Weight phân bổ: step7(42h)=0.3, step8(48h)=0.6, step9(54h)=1.0,
-                    step10(60h)=1.5, step11(72h)=3.0
-    Tổng weight dominated bởi 72h → model học endpoint 72h.
+    pred_deg, gt_deg: [T, B, 2] — T có thể là 12 hoặc 13 tùy pred_len
+    Step index: 1=6h, 2=12h, ..., 8=48h, 9=54h, 10=60h, 11=66h, 12=72h
+    (Nếu pred_len=12 thì T=13, step 12 = 72h)
+
+    Huber threshold 100km. Normalize một lần ở cuối bằng w_sum.
+    Không chia /d trong loop (tránh double scale).
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 4:
         return pred_deg.new_zeros(())
 
-    d = 100.0  # Huber threshold — sharper hơn v62's 150km
-    total, w_sum = pred_deg.new_zeros(()), 0.0
+    d = 100.0  # Huber threshold km
+    total = pred_deg.new_zeros(())
+    w_sum = 0.0
 
     # step indices và weights: focus mạnh vào 66h-72h
-    for s, ew in [(7, 0.3), (8, 0.6), (9, 1.0), (10, 1.5), (11, 3.0)]:
+    # step 7=42h, 8=48h, 9=54h, 10=60h, 11=66h, 12=72h
+    for s, ew in [(7, 0.3), (8, 0.6), (9, 1.0), (10, 1.5), (11, 2.0), (12, 3.0)]:
         if s >= T:
             continue
-        de = _haversine_deg(pred_deg[s], gt_deg[s])
-        total = total + ew * torch.where(
-            de < d, de.pow(2) / (2 * d), de - d / 2).mean() / d
+        de = _haversine_deg(pred_deg[s], gt_deg[s])  # [B]
+        huber = torch.where(de < d, de.pow(2) / (2.0 * d), de - d / 2.0)
+        total = total + ew * huber.mean()
         w_sum += ew
 
-    return total / max(w_sum, 1e-6)
+    # Normalize một lần ở đây, không chia /d trong loop
+    return total / (max(w_sum, 1e-6) * d)
 
 
 def compute_st_trans_loss(pred_deg: torch.Tensor,
@@ -49436,43 +49426,39 @@ def compute_st_trans_loss(pred_deg: torch.Tensor,
                            epoch: int = 0,
                            speed_stats: Optional[dict] = None) -> dict:
     """
-    [v63] SIMPLIFIED LOSS — chỉ 4 terms để tránh gradient conflict.
+    [v63][FIX-5] SIMPLIFIED LOSS — chỉ 4 terms.
 
-    THAY ĐỔI vs v62:
-      BỎ HOÀN TOÀN: l_vel_reg (0.70), l_heading (0.20), l_mse (0.02),
-                     l_speed (0.05), l_accel (0.01), l_signed_ate, l_signed_cte
-      GIỮ VÀ REBALANCE: l_dpe, CTE, ATE (tách riêng), endpoint 72h
+    FIX-5: DPE bắt đầu từ step 1 (bỏ step 0 = current pos).
+    v63 original dùng pred_deg[:T] và STEP_WEIGHTS[:T] bao gồm index 0
+    → penalize current position không cần thiết.
+    Fix: dùng pred_deg[1:T] và STEP_WEIGHTS[1:T].
 
-    TẠI SAO BỎ l_vel_reg (0.70)?
-      l_vel_reg match speed vector theo obs. Với turning/recurving storms,
-      obs velocity có hướng khác trajectory tương lai → l_vel_reg
-      counteract CTE gradient → val CTE không giảm được.
-
-    TẠI SAO CTE dominant (1.50 > ATE 0.60)?
-      val CTE=54 thua mục tiêu, val ATE=140 cũng thua nhưng ít critical hơn.
-      CTE là metric mà FM đang thua STTrans nhiều nhất (75 vs 59 = 27% thua).
-
-    TOTAL:
-      1.00 * l_dpe    — core position, giữ model on-track
-      1.50 * l_cte    — CTE dominant, Huber 60km (sharper)
-      0.60 * l_ate    — ATE support, không áp đảo CTE
-      0.80 * l_ep72h  — 72h endpoint dedicated
+    pred_deg, gt_deg: [T, B, 2] — T = pred_len + 1 nếu bao gồm current pos
+                                    hoặc T = pred_len nếu chỉ có future steps
+    Cả DPE, CTE, ATE đều bỏ index 0.
     """
     T = min(pred_deg.shape[0], gt_deg.shape[0])
     if T < 2:
         return {"total": pred_deg.new_zeros(()), "dpe": 0.0,
                 "cte": 0.0, "ate": 0.0, "ep72h": 0.0}
 
-    # ── [1] DPE — Huber position loss, weighted ────────────────────────────
-    w    = pred_deg.new_tensor(STEP_WEIGHTS[:T]); w = w / w.sum() * T
-    dist = _haversine_deg(pred_deg[:T], gt_deg[:T])
-    d    = 200.0
-    l_dpe = ((torch.where(dist < d,
-                          dist.pow(2) / (2 * d),
-                          dist - d / 2))
-             * w.unsqueeze(1)).mean() / d
+    B = pred_deg.shape[1]
+
+    # ── [1] DPE — Huber position loss, từ step 1 (bỏ current pos) ─────────
+    # [FIX-5] Dùng index 1..T-1, không bao gồm index 0
+    w_dpe = pred_deg.new_tensor(STEP_WEIGHTS[1:T])  # [T-1]
+    dist  = _haversine_deg(pred_deg[1:T], gt_deg[1:T])  # [T-1, B]
+    d_dpe = 200.0
+    huber_dpe = torch.where(
+        dist < d_dpe,
+        dist.pow(2) / (2.0 * d_dpe),
+        dist - d_dpe / 2.0
+    )  # [T-1, B]
+    # Weighted mean chuẩn
+    l_dpe = (huber_dpe * w_dpe.unsqueeze(1)).sum() / (w_dpe.sum() * B * d_dpe)
 
     # ── [2] CTE và ATE — tách riêng, CTE dominant ─────────────────────────
+    # _pure_cte_ate_loss đã handle bỏ step 0 (tính từ step 1)
     cte_ate  = _pure_cte_ate_loss(pred_deg[:T], gt_deg[:T])
     l_cte    = cte_ate["cte"]
     l_ate    = cte_ate["ate"]
@@ -49515,37 +49501,44 @@ compute_ate_focused_loss = compute_st_trans_loss
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  [v63-4] FM-based endpoint loss — relaxed threshold fm_t<0.4
+#  [v63-4][FIX-3] FM-based endpoint loss — relaxed threshold fm_t<0.4
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _fm_endpoint_loss(x1_pred_deg: torch.Tensor,
                       gt_deg: torch.Tensor,
                       fm_t: torch.Tensor) -> torch.Tensor:
     """
-    [v63-4] Relaxed threshold: fm_t < 0.4 (thay vì 0.3 trong v62).
+    [v63-4] Relaxed threshold: fm_t < 0.4.
     → 60% batches active (thay vì 30%) → 72h gradient mạnh hơn 2x.
 
-    Focus: step 9 (54h) = 0.8, step 10 (60h) = 1.2, step 11 (72h) = 2.5
-    Threshold Huber: 150km (giống v62)
+    [FIX-3] Clamp w_denom min=0.1 để tránh gradient spike khi ít samples
+    active. v63 original dùng clamp(min=1e-6) → nếu chỉ 1 sample có
+    fm_t<0.4 thì w_denom rất nhỏ → loss/gradient spike.
+
+    Focus: step 9 (54h)=0.8, step 10 (60h)=1.2, step 11 (66h)=2.0, step 12 (72h)=2.5
     """
     T_pred = x1_pred_deg.shape[0]
     T_gt   = gt_deg.shape[0]
 
-    # [v63-4] Relaxed: 0.4 thay vì 0.3
+    # [v63-4] early_w: weight cho mỗi sample trong batch, shape [B]
     early_w = (0.4 - fm_t).clamp(min=0.0) / 0.4
-    w_denom = early_w.sum().clamp(min=1e-6)
-    if w_denom < 1e-5:
+    # [FIX-3] Clamp min=0.1 thay vì 1e-6 để tránh spike
+    w_denom = early_w.sum().clamp(min=0.1)
+
+    # Nếu không có sample nào active, return 0
+    if float(early_w.max()) < 1e-5:
         return x1_pred_deg.new_zeros(())
 
     total = x1_pred_deg.new_zeros(())
     w_sum = 0.0
-    d     = 150.0
+    d     = 150.0  # Huber threshold km
 
-    for s, ew in [(9, 0.8), (10, 1.2), (11, 2.5)]:
+    for s, ew in [(9, 0.8), (10, 1.2), (11, 2.0), (12, 2.5)]:
         if s >= min(T_pred, T_gt):
             continue
-        dist = _haversine_deg(x1_pred_deg[s], gt_deg[s])
-        h    = torch.where(dist < d, dist.pow(2) / (2 * d), dist - d / 2)
+        dist = _haversine_deg(x1_pred_deg[s], gt_deg[s])  # [B]
+        h    = torch.where(dist < d, dist.pow(2) / (2.0 * d), dist - d / 2.0)
+        # Weighted average qua batch dimension
         total = total + ew * (h * early_w).sum() / (w_denom * d)
         w_sum += ew
 
@@ -49553,7 +49546,7 @@ def _fm_endpoint_loss(x1_pred_deg: torch.Tensor,
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  [v63-3] 72h Rollout loss — ALWAYS active, không phụ thuộc fm_t
+#  [v63-3][FIX-1][FIX-4] 72h Rollout loss — ALWAYS active
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _rollout_72h_loss(x_rolled_deg: torch.Tensor,
@@ -49563,23 +49556,26 @@ def _rollout_72h_loss(x_rolled_deg: torch.Tensor,
     x_rolled_deg: trajectory dự đoán sau rollout [T, B, 2]
     gt_deg: ground truth [T, B, 2]
 
-    Tập trung vào 48h-72h (step 7-11).
-    Gradient luôn tồn tại vì không phụ thuộc fm_t.
+    [FIX-4] Normalize bằng 100.0 thay vì 300.0.
+    v63 original dùng /300.0 → scale mismatch với CTE Huber threshold 60km
+    và endpoint threshold 100km (5x difference).
+    Fix: /100.0 → consistent với endpoint loss scale.
 
-    Dùng Haversine thuần túy (không Huber) để gradient mạnh nhất.
+    Tập trung vào 48h-72h (step 8-12).
     """
     T = min(x_rolled_deg.shape[0], gt_deg.shape[0])
     if T < 8:
         return x_rolled_deg.new_zeros(())
 
-    total, w_sum = x_rolled_deg.new_zeros(()), 0.0
+    total = x_rolled_deg.new_zeros(())
+    w_sum = 0.0
 
-    for s, ew in [(7, 0.5), (8, 0.8), (9, 1.2), (10, 1.8), (11, 3.0)]:
+    for s, ew in [(8, 0.5), (9, 0.8), (10, 1.2), (11, 1.8), (12, 3.0)]:
         if s >= T:
             continue
-        # Haversine trực tiếp, không Huber — gradient không bị flatten
         dist  = _haversine_deg(x_rolled_deg[s], gt_deg[s]).mean()
-        total = total + ew * dist / 300.0
+        # [FIX-4] /100.0 thay vì /300.0 → consistent scale
+        total = total + ew * dist / 100.0
         w_sum += ew
 
     return total / max(w_sum, 1e-6)
@@ -50089,10 +50085,8 @@ def _persistence_blend(model_pred_norm: torch.Tensor,
                         obs_traj_norm: torch.Tensor,
                         blend_strength: float = 0.06) -> torch.Tensor:
     """
-    [v63] blend_strength giảm xuống 0.06 (v62: 0.08).
-    Áp dụng blend khác nhau theo lead time:
-    - step 0-3 (6h-24h): blend_strength * 0.5 → ít bias hơn cho short lead
-    - step 4-11 (30h-72h): blend_strength đầy đủ
+    [v63] blend_strength=0.06.
+    Lead-time adaptive: step 0-3 (6h-24h) dùng half strength.
     """
     T_obs   = obs_traj_norm.shape[0]
     T       = model_pred_norm.shape[0]
@@ -50116,7 +50110,7 @@ def _persistence_blend(model_pred_norm: torch.Tensor,
     persist = (obs_traj_norm[-1].unsqueeze(0)
                + ev.unsqueeze(0) * steps.view(T, 1, 1))
 
-    # [v63-5] Lead-time adaptive blend: short lead ít bias hơn
+    # Lead-time adaptive blend: short lead ít bias hơn
     alpha_b = torch.full((T,), blend_strength, dtype=torch.float, device=device)
     alpha_b[:min(4, T)] = blend_strength * 0.5  # 6h-24h: half strength
 
@@ -50129,10 +50123,6 @@ def _score_ensemble_member(traj_norm: torch.Tensor,
                             speed_stats: Optional[dict] = None,
                             speed_head_pred: Optional[torch.Tensor] = None
                             ) -> torch.Tensor:
-    """
-    [v63] Giữ nguyên từ v62: bỏ heading score, chỉ dùng speed + physics + smooth.
-    spd_sc.pow(0.40) * prior_sc.pow(0.40) * smooth_sc.pow(0.20)
-    """
     sp      = speed_stats or _SPEED_PRIOR
     v_opt   = sp.get("v_opt", 15.0)
     v_sigma = sp.get("v_sigma", 10.0)
@@ -50364,49 +50354,63 @@ class TCFlowMatching(nn.Module):
         loss_dict = compute_st_trans_loss(
             pred_deg, gt_deg, epoch=epoch, speed_stats=speed_stats)
 
-        # ── [v63-4] FM endpoint loss — relaxed threshold 0.4 ──────────────
+        # ── [v63-4][FIX-3] FM endpoint loss — relaxed threshold 0.4 ───────
         l_fm_ep = _fm_endpoint_loss(pred_deg, gt_deg, fm_t)
 
-        # ── [v63-3] 72h Rollout loss — ALWAYS active ──────────────────────
-        # 3-step DDIM rollout. Detach context để không backprop qua encoder.
-        # Bước 1,2: no_grad; bước 3: backprop để có gradient endpoint 72h.
+        # ── [v63-3][FIX-1] 72h Rollout loss — ALWAYS active ───────────────
+        #
+        # [FIX-1] t-values được sửa: 0.00 → 0.33 → 0.66 → 1.00
+        # v63 original dùng 0.10/0.43/0.76 không khớp với x_r state.
+        # Sau step 1 (dt=0.33): x_r ≈ t=0.33
+        # Sau step 2 (dt=0.33): x_r ≈ t=0.66
+        # Step 3 bắt đầu từ t=0.66, kết thúc t=1.0 (dt=0.34)
+        #
+        # Dùng raw_ctx.detach() cho steps 1,2 và raw_ctx cho step 3.
+        # x_r được detach ban đầu → gradient chỉ flow qua v_r3 → raw_ctx.
         raw_ctx_det = raw_ctx.detach()
-        x_r = x_t.detach().clone()
+        vel_obs_det = vel_obs_feat.detach()
+        steer_det   = steer_feat.detach()
+        kine_det    = kine_feat.detach()
 
-        # Step 1: t=0.1 → 0.43 (no_grad)
+        # Bắt đầu từ noise nhỏ (t=0), không từ x_t của training
+        # để rollout independent với fm_t
+        x_r = torch.randn_like(x_t) * current_sigma
+
+        # Step 1: t=0.00 → 0.33 (no_grad)
         with torch.no_grad():
-            t_r1 = torch.full((B,), 0.10, device=device)
+            t_r1 = torch.full((B,), 0.00, device=device)
             v_r1 = self.net.forward_with_ctx(
                 x_r, t_r1, raw_ctx_det,
-                vel_obs_feat=vel_obs_feat.detach(),
-                steering_feat=steer_feat.detach(),
-                env_kine_feat=kine_feat.detach(),
+                vel_obs_feat=vel_obs_det,
+                steering_feat=steer_det,
+                env_kine_feat=kine_det,
                 env_data=env_data)
             x_r = (x_r + 0.33 * v_r1).clamp(-3.0, 3.0)
 
-        # Step 2: t=0.43 → 0.76 (no_grad)
+        # Step 2: t=0.33 → 0.66 (no_grad)
         with torch.no_grad():
-            t_r2 = torch.full((B,), 0.43, device=device)
+            t_r2 = torch.full((B,), 0.33, device=device)
             v_r2 = self.net.forward_with_ctx(
                 x_r, t_r2, raw_ctx_det,
-                vel_obs_feat=vel_obs_feat.detach(),
-                steering_feat=steer_feat.detach(),
-                env_kine_feat=kine_feat.detach(),
+                vel_obs_feat=vel_obs_det,
+                steering_feat=steer_det,
+                env_kine_feat=kine_det,
                 env_data=env_data)
             x_r = (x_r + 0.33 * v_r2).clamp(-3.0, 3.0)
 
-        # Step 3: t=0.76 → 1.0 (backprop — gradient đi qua bước này)
-        t_r3 = torch.full((B,), 0.76, device=device)
+        # Step 3: t=0.66 → 1.00 (backprop qua v_r3 và raw_ctx)
+        t_r3 = torch.full((B,), 0.66, device=device)
         v_r3 = self.net.forward_with_ctx(
-            x_r, t_r3, raw_ctx,          # dùng raw_ctx (không detach) để backprop
-            vel_obs_feat=vel_obs_feat,
+            x_r, t_r3, raw_ctx,          # raw_ctx không detach → backprop
+            vel_obs_feat=vel_obs_feat,    # vel_obs_feat không detach → backprop
             steering_feat=steer_feat,
             env_kine_feat=kine_feat,
             env_data=env_data)
-        x_r_final = (x_r + 0.24 * v_r3).clamp(-3.0, 3.0)  # 0.24 = 1.0 - 0.76
+        x_r_final = (x_r + 0.34 * v_r3).clamp(-3.0, 3.0)  # 0.34 = 1.0 - 0.66
 
         roll_abs, _ = self._to_abs(x_r_final, lp, lm)
         roll_deg    = _norm_to_deg(roll_abs)
+        # [FIX-4] _rollout_72h_loss dùng /100.0 thay vì /300.0
         l_roll_72h  = _rollout_72h_loss(roll_deg, gt_deg)
 
         # ── Speed head loss ────────────────────────────────────────────────
@@ -50418,10 +50422,10 @@ class TCFlowMatching(nn.Module):
             l_speed_head  = x_t.new_zeros(())
 
         # ── [v63] TOTAL LOSS ───────────────────────────────────────────────
-        # 1.20 * l_fm           FM velocity (giảm từ 1.5 → nhường cho position)
+        # 1.20 * l_fm           FM velocity
         # 2.50 * loss_dict      v63 simplified (4 terms: dpe+cte+ate+ep72h)
-        # 0.80 * l_roll_72h     rollout 72h — always active (key fix!)
-        # 0.30 * l_fm_ep        FM endpoint t<0.4 (relaxed từ 0.3)
+        # 0.80 * l_roll_72h     rollout 72h — always active
+        # 0.30 * l_fm_ep        FM endpoint t<0.4
         # 0.40 * l_speed_head   speed head
         total = (1.20 * l_fm
                  + 2.50 * loss_dict["total"]
@@ -50486,8 +50490,7 @@ class TCFlowMatching(nn.Module):
             mom_gate = torch.ones(B, device=device)
 
         def _mom_str(s, tot):
-            # [v63-5] Momentum strength: bắt đầu từ step 4 (24h) thay vì step 0
-            # Tránh bias ở 12h/24h
+            # [v63-5] Momentum chỉ active từ step 4 (24h) trở đi
             if s < 4:
                 return 0.0
             return 0.06 * 0.5 * (1.0 + math.cos(math.pi * s / max(tot, 1)))
@@ -50566,7 +50569,6 @@ class TCFlowMatching(nn.Module):
             all_c[idx[:, b], :, b, :].median(0).values for b in range(B)
         ], dim=1)
 
-        # [v63] Persistence blend với lead-time adaptive strength
         pred_mean = _persistence_blend(pred_mean, obs_norm, blend_strength=0.06)
 
         if predict_csv:
