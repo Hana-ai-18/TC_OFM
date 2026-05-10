@@ -52022,7 +52022,7 @@ class TCFlowMatching(nn.Module):
         return d
 
     @torch.no_grad()
-    def sample(self, batch_list, num_ensemble=50, ddim_steps=20,
+    def sample(self, batch_list, num_ensemble=80, ddim_steps=20,
                predict_csv=None, importance_weight=True, use_cfg=True):
         obs_t    = batch_list[0]
         env_data = batch_list[13] if len(batch_list) > 13 else None
@@ -52111,10 +52111,10 @@ class TCFlowMatching(nn.Module):
         SCALES = (0.65, 0.80, 0.90, 1.00, 1.10, 1.25, 1.45)
         cands, scores = [], []
         for tn in all_norms:
-            bt, bsc = _speed_sweep_correction(tn, obs_norm, SCALES)
-            cands.append(bt)
-            scores.append(_score_ensemble_member(bt, obs_norm, speed_stats,
-                                                  speed_head_pred=speed_head_pred))
+            # bt, bsc = _speed_sweep_correction(tn, obs_norm, SCALES)
+            # cands.append(bt)
+            # scores.append(_score_ensemble_member(bt, obs_norm, speed_stats,
+            #                                       speed_head_pred=speed_head_pred))
             cands.append(tn)
             scores.append(_score_ensemble_member(tn, obs_norm, speed_stats,
                                                   speed_head_pred=speed_head_pred))
@@ -52130,8 +52130,8 @@ class TCFlowMatching(nn.Module):
         ], dim=1)
 
         # pred_mean = _persistence_blend(pred_mean, obs_norm, blend_strength=0.20)
-        pred_mean = _persistence_blend(pred_mean, obs_norm, blend_strength=0.10)  # 0.20→0.10
-            
+        pred_mean = _persistence_blend(pred_mean, obs_norm, blend_strength=0.05)  # 0.20→0.10
+
         if predict_csv:
             self._write_predict_csv(predict_csv, pred_mean, all_c)
         return pred_mean, all_me_t.mean(0), all_c
