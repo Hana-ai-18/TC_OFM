@@ -18309,7 +18309,7 @@
 #     main(args)
 
 """
-scripts/train_flowmatching_v61.py
+scripts/train_flowmatching.py
 ═══════════════════════════════════════════════════════════════════════════════
 
 TC-FlowMatching v61-A — TRAIN FROM SCRATCH (paper-grade, reproducible)
@@ -19319,9 +19319,9 @@ def main(args):
                     f"  tot={bd['total'].item():.3f}"
                     f"  dpe={bd.get('dpe',      0):.3f}"
                     f"  vel={bd.get('vel_reg',  0):.4f}"
-                    f"  lr={bd.get('long_range', 0):.4f}"
-                    f"  cs={bd.get('cte_smooth', 0):.4f}"
-                    f"  ab={bd.get('ate_bias', 0):.4f}"     # NEW v61-A
+                    f"  sc={bd.get('signed_cte',0):.4f}"
+                    f"  at={bd.get('ate',0):.4f}"
+                    f"  sa={bd.get('signed_ate',0):.4f}"     # NEW v61-A
                     f"  cte={bd.get('cte_mean_km', 0):.1f}km"
                     f"  ep={bd.get('endpoint',  0):.4f}"
                     f"  fm={bd.get('fm_mse',   0):.4f}"
@@ -19678,3 +19678,6 @@ if __name__ == "__main__":
     np.random.seed(42); torch.manual_seed(42)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
     main(args)
+
+
+
