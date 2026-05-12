@@ -19205,7 +19205,32 @@ class MultiplexedBestSaver:
             self.early_stop = True
  
     # update_per_metric giữ nguyên từ bản cũ (không cần sửa)
- 
+    def update_per_metric(self, r, model, out_dir, epoch,
+                      optimizer, scheduler, tl, vl, saver_ref=None):
+        ade = r.get("ADE", float("inf"))
+        h72 = r.get("72h", float("inf"))
+        ate = r.get("ATE_mean", ade * 0.46 if np.isfinite(ade) else float("inf"))
+        cte = r.get("CTE_mean", ade * 0.53 if np.isfinite(ade) else float("inf"))
+        h12 = r.get("12h", float("inf"))
+        h24 = r.get("24h", float("inf"))
+        h48 = r.get("48h", float("inf"))
+
+        for v, attr, fname, extra in [
+            (ade, "best_ade", "best_ade.pth", {"ade": ade}),
+            (h72, "best_72h", "best_72h.pth", {"h72": h72}),
+            (ate, "best_ate", "best_ate.pth", {"ate": ate, "cte": cte}),
+            (cte, "best_cte", "best_cte.pth", {"ate": ate, "cte": cte}),
+        ]:
+            if np.isfinite(v) and v < getattr(self, attr):
+                setattr(self, attr, v)
+                _save_checkpoint(
+                    os.path.join(out_dir, fname),
+                    epoch, model, optimizer, scheduler,
+                    saver_ref or self, tl, vl, extra)
+
+        for v, attr in [(h48, "best_48h"), (h24, "best_24h"), (h12, "best_12h")]:
+            if np.isfinite(v) and v < getattr(self, attr):
+                setattr(self, attr, v)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Args
