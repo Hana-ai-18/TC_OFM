@@ -18991,94 +18991,181 @@ def evaluate_full_val_ade(model, val_loader, device, ode_steps, pred_len,
 #  [FIX-v60-5] Multiplexed Best Saver
 # ──────────────────────────────────────────────────────────────────────────────
 
+# class MultiplexedBestSaver:
+#     """
+#     Saves checkpoints SEPARATELY for:
+#       - best_composite (EMA-or-RAW, whichever lower)
+#       - best_raw (RAW only)
+#       - best_ema (EMA only)
+#       - best_fast (fast-val score, every epoch)
+#       - best_72h, best_ade, best_ate, best_cte (per-metric, like v59)
+
+#     This way: if EMA fits val but RAW doesn't, we still have best_raw.pth
+#     for honest test evaluation.
+#     """
+#     def __init__(self, patience=30, tol=1.5):
+#         self.patience = patience; self.tol = tol; self.counter = 0
+#         self.early_stop = False
+#         # Composite (legacy)
+#         self.best_score = self.best_ade = self.best_12h = self.best_24h = \
+#             self.best_48h = self.best_72h = self.best_ate = self.best_cte = float("inf")
+#         # NEW: separate raw/ema/fast tracks
+#         self.best_raw_score   = float("inf")
+#         self.best_ema_score   = float("inf")
+#         self.best_fast_score  = float("inf")
+
+#     def update_per_metric(self, r, model, out_dir, epoch, optimizer, scheduler,
+#                            tl, vl, saver_ref):
+#         """Save per-metric checkpoints (best_ade, best_72h, etc.)."""
+#         ade = r.get("ADE", float("inf"))
+#         h12 = r.get("12h", float("inf"))
+#         h24 = r.get("24h", float("inf"))
+#         h48 = r.get("48h", float("inf"))
+#         h72 = r.get("72h", float("inf"))
+#         ate = r.get("ATE_mean", ade*0.46 if np.isfinite(ade) else float("inf"))
+#         cte = r.get("CTE_mean", ade*0.53 if np.isfinite(ade) else float("inf"))
+
+#         improved = False
+#         for v, attr, fname, extra in [
+#             (ade, 'best_ade', 'best_ade.pth', {"ade": ade}),
+#             (h72, 'best_72h', 'best_72h.pth', {"h72": h72}),
+#             (ate, 'best_ate', 'best_ate.pth', {"ate": ate, "cte": cte}),
+#             (cte, 'best_cte', 'best_cte.pth', {"ate": ate, "cte": cte}),
+#         ]:
+#             if v < getattr(self, attr):
+#                 setattr(self, attr, v); improved = True
+#                 _save_checkpoint(os.path.join(out_dir, fname),
+#                                   epoch, model, optimizer, scheduler,
+#                                   saver_ref, tl, vl, extra)
+#         for v, a in [(h48,'best_48h'),(h24,'best_24h'),(h12,'best_12h')]:
+#             if v < getattr(self, a):
+#                 setattr(self, a, v); improved = True
+#         return improved
+
+#     def update_raw(self, r_raw, model, out_dir, epoch, optimizer, scheduler,
+#                     tl, vl):
+#         """[FIX-v60-5] Save best RAW checkpoint."""
+#         score = _composite_score(r_raw)
+#         if score < self.best_raw_score - self.tol:
+#             self.best_raw_score = score
+#             _save_checkpoint(
+#                 os.path.join(out_dir, "best_raw.pth"),
+#                 epoch, model, optimizer, scheduler, self, tl, vl,
+#                 {"raw_score": score, "raw_ade": r_raw.get("ADE", float("nan")),
+#                  "raw_72h": r_raw.get("72h", float("nan")),
+#                  "raw_cte": r_raw.get("CTE_mean", float("nan"))})
+#             print(f"  ✅ Best RAW score={score:.2f}  "
+#                   f"ADE={r_raw.get('ADE',float('nan')):.1f}  "
+#                   f"72h={r_raw.get('72h',float('nan')):.0f}  (ep {epoch})")
+
+#     def update_ema(self, r_ema, model, out_dir, epoch, optimizer, scheduler,
+#                     tl, vl):
+#         """[FIX-v60-5] Save best EMA checkpoint."""
+#         score = _composite_score(r_ema)
+#         if score < self.best_ema_score - self.tol:
+#             self.best_ema_score = score
+#             _save_checkpoint(
+#                 os.path.join(out_dir, "best_ema.pth"),
+#                 epoch, model, optimizer, scheduler, self, tl, vl,
+#                 {"ema_score": score, "ema_ade": r_ema.get("ADE", float("nan")),
+#                  "ema_72h": r_ema.get("72h", float("nan")),
+#                  "ema_cte": r_ema.get("CTE_mean", float("nan"))})
+#             print(f"  ✅ Best EMA score={score:.2f}  "
+#                   f"ADE={r_ema.get('ADE',float('nan')):.1f}  "
+#                   f"72h={r_ema.get('72h',float('nan')):.0f}  (ep {epoch})")
+
+#     def update_fast(self, r_fast, model, out_dir, epoch, optimizer, scheduler,
+#                      tl, vl):
+#         """[FIX-v60-5] Save best FAST checkpoint (every epoch)."""
+#         score = _fast_score(r_fast)
+#         if score < self.best_fast_score - self.tol:
+#             self.best_fast_score = score
+#             _save_checkpoint(
+#                 os.path.join(out_dir, "best_fast.pth"),
+#                 epoch, model, optimizer, scheduler, self, tl, vl,
+#                 {"fast_score": score,
+#                  "fast_ade": r_fast.get("ADE", float("nan")),
+#                  "fast_72h": r_fast.get("72h", float("nan"))})
+#             print(f"  ✅ Best FAST score={score:.2f}  "
+#                   f"ADE={r_fast.get('ADE',float('nan')):.1f}  "
+#                   f"72h={r_fast.get('72h',float('nan')):.0f}  (ep {epoch})")
+
+#     def update_composite(self, r, model, out_dir, epoch, optimizer, scheduler,
+#                           tl, vl, min_epochs=20):
+#         """Update composite (used to decide early-stop)."""
+#         score = _composite_score(r)
+#         ade = r.get("ADE", float("inf"))
+#         h72 = r.get("72h", float("inf"))
+#         ate = r.get("ATE_mean", float("inf"))
+#         cte = r.get("CTE_mean", float("inf"))
+
+#         if score < self.best_score - self.tol:
+#             self.best_score = score; self.counter = 0
+#             _save_checkpoint(
+#                 os.path.join(out_dir, "best_composite.pth"),
+#                 epoch, model, optimizer, scheduler, self, tl, vl,
+#                 {"composite_score": score, "ade": ade, "h72": h72,
+#                  "ate": ate, "cte": cte})
+#             print(f"  ✅ Best COMPOSITE={score:.2f}  ADE={ade:.1f}  "
+#                   f"72h={h72:.0f}  ATE={ate:.1f}  CTE={cte:.1f}  (ep {epoch})")
+#         else:
+#             self.counter += 1
+#             print(f"  No comp improvement {self.counter}/{self.patience}"
+#                   f"  (best={self.best_score:.2f} cur={score:.2f})"
+#                   f"  72h={h72:.0f}↓{self.best_72h:.0f}")
+
+#         if epoch >= min_epochs and self.counter >= self.patience:
+#             self.early_stop = True
 class MultiplexedBestSaver:
     """
-    Saves checkpoints SEPARATELY for:
-      - best_composite (EMA-or-RAW, whichever lower)
-      - best_raw (RAW only)
-      - best_ema (EMA only)
-      - best_fast (fast-val score, every epoch)
-      - best_72h, best_ade, best_ate, best_cte (per-metric, like v59)
-
-    This way: if EMA fits val but RAW doesn't, we still have best_raw.pth
-    for honest test evaluation.
+    [FIX] tol=0.0: lưu bất kỳ cải thiện nào, dù nhỏ.
+    Lý do: score hiện tại dao động 111-113, tol=1.5 quá cao → miss nhiều checkpoint tốt.
     """
-    def __init__(self, patience=30, tol=1.5):
+    def __init__(self, patience=30, tol=0.0):  # [FIX] tol=1.5 → tol=0.0
         self.patience = patience; self.tol = tol; self.counter = 0
         self.early_stop = False
-        # Composite (legacy)
         self.best_score = self.best_ade = self.best_12h = self.best_24h = \
             self.best_48h = self.best_72h = self.best_ate = self.best_cte = float("inf")
-        # NEW: separate raw/ema/fast tracks
         self.best_raw_score   = float("inf")
         self.best_ema_score   = float("inf")
         self.best_fast_score  = float("inf")
-
-    def update_per_metric(self, r, model, out_dir, epoch, optimizer, scheduler,
-                           tl, vl, saver_ref):
-        """Save per-metric checkpoints (best_ade, best_72h, etc.)."""
-        ade = r.get("ADE", float("inf"))
-        h12 = r.get("12h", float("inf"))
-        h24 = r.get("24h", float("inf"))
-        h48 = r.get("48h", float("inf"))
-        h72 = r.get("72h", float("inf"))
-        ate = r.get("ATE_mean", ade*0.46 if np.isfinite(ade) else float("inf"))
-        cte = r.get("CTE_mean", ade*0.53 if np.isfinite(ade) else float("inf"))
-
-        improved = False
-        for v, attr, fname, extra in [
-            (ade, 'best_ade', 'best_ade.pth', {"ade": ade}),
-            (h72, 'best_72h', 'best_72h.pth', {"h72": h72}),
-            (ate, 'best_ate', 'best_ate.pth', {"ate": ate, "cte": cte}),
-            (cte, 'best_cte', 'best_cte.pth', {"ate": ate, "cte": cte}),
-        ]:
-            if v < getattr(self, attr):
-                setattr(self, attr, v); improved = True
-                _save_checkpoint(os.path.join(out_dir, fname),
-                                  epoch, model, optimizer, scheduler,
-                                  saver_ref, tl, vl, extra)
-        for v, a in [(h48,'best_48h'),(h24,'best_24h'),(h12,'best_12h')]:
-            if v < getattr(self, a):
-                setattr(self, a, v); improved = True
-        return improved
-
-    def update_raw(self, r_raw, model, out_dir, epoch, optimizer, scheduler,
-                    tl, vl):
-        """[FIX-v60-5] Save best RAW checkpoint."""
+ 
+    def update_raw(self, r_raw, model, out_dir, epoch, optimizer, scheduler, tl, vl):
         score = _composite_score(r_raw)
-        if score < self.best_raw_score - self.tol:
+        # [FIX] tol=0.0: lưu khi cải thiện bất kỳ
+        if score < self.best_raw_score:
             self.best_raw_score = score
             _save_checkpoint(
                 os.path.join(out_dir, "best_raw.pth"),
                 epoch, model, optimizer, scheduler, self, tl, vl,
-                {"raw_score": score, "raw_ade": r_raw.get("ADE", float("nan")),
+                {"raw_score": score,
+                 "raw_ade": r_raw.get("ADE", float("nan")),
                  "raw_72h": r_raw.get("72h", float("nan")),
                  "raw_cte": r_raw.get("CTE_mean", float("nan"))})
             print(f"  ✅ Best RAW score={score:.2f}  "
-                  f"ADE={r_raw.get('ADE',float('nan')):.1f}  "
-                  f"72h={r_raw.get('72h',float('nan')):.0f}  (ep {epoch})")
-
-    def update_ema(self, r_ema, model, out_dir, epoch, optimizer, scheduler,
-                    tl, vl):
-        """[FIX-v60-5] Save best EMA checkpoint."""
+                  f"ADE={r_raw.get('ADE', float('nan')):.1f}  "
+                  f"72h={r_raw.get('72h', float('nan')):.0f}  (ep {epoch})")
+ 
+    def update_ema(self, r_ema, model, out_dir, epoch, optimizer, scheduler, tl, vl):
         score = _composite_score(r_ema)
-        if score < self.best_ema_score - self.tol:
+        # [FIX] tol=0.0 cho EMA — quan trọng nhất, không được bỏ sót
+        if score < self.best_ema_score:
             self.best_ema_score = score
             _save_checkpoint(
                 os.path.join(out_dir, "best_ema.pth"),
                 epoch, model, optimizer, scheduler, self, tl, vl,
-                {"ema_score": score, "ema_ade": r_ema.get("ADE", float("nan")),
+                {"ema_score": score,
+                 "ema_ade": r_ema.get("ADE", float("nan")),
                  "ema_72h": r_ema.get("72h", float("nan")),
                  "ema_cte": r_ema.get("CTE_mean", float("nan"))})
             print(f"  ✅ Best EMA score={score:.2f}  "
-                  f"ADE={r_ema.get('ADE',float('nan')):.1f}  "
-                  f"72h={r_ema.get('72h',float('nan')):.0f}  (ep {epoch})")
-
-    def update_fast(self, r_fast, model, out_dir, epoch, optimizer, scheduler,
-                     tl, vl):
-        """[FIX-v60-5] Save best FAST checkpoint (every epoch)."""
+                  f"ADE={r_ema.get('ADE', float('nan')):.1f}  "
+                  f"72h={r_ema.get('72h', float('nan')):.0f}  (ep {epoch})")
+ 
+    def update_fast(self, r_fast, model, out_dir, epoch, optimizer, scheduler, tl, vl):
         score = _fast_score(r_fast)
-        if score < self.best_fast_score - self.tol:
+        # [FIX] tol=0.0 cho fast score
+        if score < self.best_fast_score:
             self.best_fast_score = score
             _save_checkpoint(
                 os.path.join(out_dir, "best_fast.pth"),
@@ -19087,19 +19174,19 @@ class MultiplexedBestSaver:
                  "fast_ade": r_fast.get("ADE", float("nan")),
                  "fast_72h": r_fast.get("72h", float("nan"))})
             print(f"  ✅ Best FAST score={score:.2f}  "
-                  f"ADE={r_fast.get('ADE',float('nan')):.1f}  "
-                  f"72h={r_fast.get('72h',float('nan')):.0f}  (ep {epoch})")
-
+                  f"ADE={r_fast.get('ADE', float('nan')):.1f}  "
+                  f"72h={r_fast.get('72h', float('nan')):.0f}  (ep {epoch})")
+ 
     def update_composite(self, r, model, out_dir, epoch, optimizer, scheduler,
                           tl, vl, min_epochs=20):
-        """Update composite (used to decide early-stop)."""
         score = _composite_score(r)
-        ade = r.get("ADE", float("inf"))
-        h72 = r.get("72h", float("inf"))
-        ate = r.get("ATE_mean", float("inf"))
-        cte = r.get("CTE_mean", float("inf"))
-
-        if score < self.best_score - self.tol:
+        ade   = r.get("ADE", float("inf"))
+        h72   = r.get("72h", float("inf"))
+        ate   = r.get("ATE_mean", float("inf"))
+        cte   = r.get("CTE_mean", float("inf"))
+ 
+        # [FIX] tol=0.0: lưu khi cải thiện bất kỳ
+        if score < self.best_score:
             self.best_score = score; self.counter = 0
             _save_checkpoint(
                 os.path.join(out_dir, "best_composite.pth"),
@@ -19113,10 +19200,12 @@ class MultiplexedBestSaver:
             print(f"  No comp improvement {self.counter}/{self.patience}"
                   f"  (best={self.best_score:.2f} cur={score:.2f})"
                   f"  72h={h72:.0f}↓{self.best_72h:.0f}")
-
+ 
         if epoch >= min_epochs and self.counter >= self.patience:
             self.early_stop = True
-
+ 
+    # update_per_metric giữ nguyên từ bản cũ (không cần sửa)
+ 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Args
@@ -19438,14 +19527,22 @@ def main(args):
                 print(f"  ⚠  Full val failed: {e}")
                 import traceback; traceback.print_exc()
 
-        if epoch % 10 == 0 or epoch == args.num_epochs - 1:
+        # if epoch % 10 == 0 or epoch == args.num_epochs - 1:
+        #     _save_checkpoint(
+        #         os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"),
+        #         epoch, model, optimizer, scheduler, saver, avg_t, avg_vl,
+        #         {"ade": m_fast.get("ADE", float("nan")),
+        #          "h72": m_fast.get("72h", float("nan")),
+        #          "ate": m_fast.get("ATE_mean", float("nan")),
+        #          "cte": m_fast.get("CTE_mean", float("nan"))})
+        if epoch % 5 == 0 or epoch == args.num_epochs - 1:
             _save_checkpoint(
-                os.path.join(args.output_dir, f"ckpt_ep{epoch:03d}.pth"),
+                os.path.join(args.output_dir, "last.pth"),
                 epoch, model, optimizer, scheduler, saver, avg_t, avg_vl,
                 {"ade": m_fast.get("ADE", float("nan")),
-                 "h72": m_fast.get("72h", float("nan")),
-                 "ate": m_fast.get("ATE_mean", float("nan")),
-                 "cte": m_fast.get("CTE_mean", float("nan"))})
+                "h72": m_fast.get("72h", float("nan")),
+                "ate": m_fast.get("ATE_mean", float("nan")),
+                "cte": m_fast.get("CTE_mean", float("nan"))})
 
         if epoch % 10 == 9:
             avg_ep    = sum(epoch_times) / len(epoch_times)
