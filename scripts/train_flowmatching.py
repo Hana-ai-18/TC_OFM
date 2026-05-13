@@ -19292,6 +19292,12 @@ def get_args():
     p.add_argument("--resume_epoch", default=None, type=int)
     p.add_argument("--eval_test_after_train", action="store_true", default=True)
     p.add_argument("--test_storm_csv", default=None, type=str)
+    p.add_argument(
+        "--sttrans_checkpoint",
+        type=str,
+        default=None,
+        help="Path to pretrained STTrans checkpoint for FMResidualCorrector."
+    )
     return p.parse_args()
 
 
@@ -19344,11 +19350,34 @@ def main(args):
     # ).to(device)
 
   
+    from pathlib import Path
+
+    if args.sttrans_checkpoint is None:
+        raise ValueError(
+            "You must provide --sttrans_checkpoint for FMResidualCorrector. "
+            "Example: --sttrans_checkpoint /kaggle/input/xxx/best_model_st_trans.pth"
+        )
+
+    sttrans_ckpt_path = Path(args.sttrans_checkpoint)
+
+    if not sttrans_ckpt_path.exists():
+        print(f"[ERROR] STTrans checkpoint not found: {sttrans_ckpt_path}")
+        print("[INFO] Available checkpoint-like files under /kaggle/input:")
+
+        for p in Path("/kaggle/input").rglob("*"):
+            if p.is_file() and p.suffix.lower() in [".pth", ".pt", ".ckpt"]:
+                print("  ", p)
+
+        raise FileNotFoundError(f"Cannot find STTrans checkpoint: {sttrans_ckpt_path}")
+
+    print(f"[INFO] Loading STTrans checkpoint from: {sttrans_ckpt_path}")
 
     model = FMResidualCorrector(
-        sttrans_checkpoint="/kaggle/input/private-data-source/best_model_st_trans.pth",
-        obs_len=args.obs_len, pred_len=args.pred_len,
-        ema_decay=args.ema_decay, device=device,
+        sttrans_checkpoint=str(sttrans_ckpt_path),
+        obs_len=args.obs_len,
+        pred_len=args.pred_len,
+        ema_decay=args.ema_decay,
+        device=device,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  params  : {n_params:,}")
