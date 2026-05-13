@@ -18511,8 +18511,8 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatching   # v60
-
+# from Model.flow_matching_model import TCFlowMatching   # v60
+from Model.flow_matching_model import FMResidualCorrector
 from Model.utils import get_cosine_schedule_with_warmup
 from utils.metrics import (
     StepErrorAccumulator, save_metrics_csv,
@@ -19335,14 +19335,21 @@ def main(args):
     print(f"  train : {len(train_dataset)} seq  ({len(train_loader)} batches)")
     print(f"  val   : {len(val_dataset)} seq")
 
-    model = TCFlowMatching(
-        pred_len=args.pred_len, obs_len=args.obs_len,
-        sigma_min=args.sigma_min, n_train_ens=args.n_train_ens,
-        ctx_noise_scale=args.ctx_noise_scale,
-        initial_sample_sigma=args.initial_sample_sigma,
-        use_ema=args.use_ema, ema_decay=args.ema_decay,
-    ).to(device)
+    # model = TCFlowMatching(
+    #     pred_len=args.pred_len, obs_len=args.obs_len,
+    #     sigma_min=args.sigma_min, n_train_ens=args.n_train_ens,
+    #     ctx_noise_scale=args.ctx_noise_scale,
+    #     initial_sample_sigma=args.initial_sample_sigma,
+    #     use_ema=args.use_ema, ema_decay=args.ema_decay,
+    # ).to(device)
 
+  
+
+    model = FMResidualCorrector(
+        sttrans_checkpoint="/kaggle/input/private-data-source/best_model_st_trans.pth",
+        obs_len=args.obs_len, pred_len=args.pred_len,
+        ema_decay=args.ema_decay, device=device,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  params  : {n_params:,}")
     model.init_ema()
