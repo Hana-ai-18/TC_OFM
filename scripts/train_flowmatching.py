@@ -19128,7 +19128,7 @@ class MultiplexedBestSaver:
     This way: if EMA fits val but RAW doesn't, we still have best_raw.pth
     for honest test evaluation.
     """
-    def __init__(self, patience=30, tol=1.5):
+    def __init__(self, patience=30, tol=0):
         self.patience = patience; self.tol = tol; self.counter = 0
         self.early_stop = False
         # Composite (legacy)
@@ -19385,7 +19385,7 @@ def main(args):
 
     optimizer = optim.AdamW(model.parameters(),
                              lr=args.g_learning_rate, weight_decay=args.weight_decay)
-    saver  = MultiplexedBestSaver(patience=args.patience, tol=1.5)
+    saver  = MultiplexedBestSaver(patience=args.patience)
     scaler = GradScaler("cuda", enabled=args.use_amp)
 
     steps_per_epoch = len(train_loader)
