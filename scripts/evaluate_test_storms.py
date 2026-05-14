@@ -3732,18 +3732,27 @@ def _import_residual_class():
 def _detect_ckpt_type(state: dict) -> str:
     """
     Detect loại model từ state dict keys.
-    
-    Returns: 'tcfm' | 'residual' | 'unknown'
+
+    FMResidualCorrector có ĐỒNG THỜI:
+      ctx_enc.* (ResidualContextEncoder) VÀ corr_net.* (CorrectionNet)
+    TCFlowMatching có: net.* (VelocityField)
+
+    KHÔNG dùng 'sttrans.*' để detect vì TCFlowMatching cũ cũng có thể
+    chứa STTrans reference bên trong (bị detect nhầm).
+
+    Returns: 'residual' | 'tcfm'
     """
-    keys = list(state.keys())
-    if any(k.startswith("sttrans.") for k in keys):
+    keys = set(state.keys())
+    has_ctx_enc  = any(k.startswith("ctx_enc.")  for k in keys)
+    has_corr_net = any(k.startswith("corr_net.") for k in keys)
+    has_gate     = any(k.startswith("gate.")     for k in keys)
+
+    # FMResidualCorrector: phải có ít nhất 2 trong 3 unique keys
+    if sum([has_ctx_enc, has_corr_net, has_gate]) >= 2:
         return "residual"
-    if any(k.startswith("net.") or k.startswith("_ema") for k in keys):
-        return "tcfm"
-    # Không có prefix rõ ràng — thử detect từ key patterns
-    if any("transformer" in k or "fno" in k or "mamba" in k for k in keys):
-        return "tcfm"
-    return "unknown"
+
+    # Mặc định: TCFlowMatching (safe default)
+    return "tcfm"
 
 
 def _detect_has_det_head(state: dict) -> bool:
