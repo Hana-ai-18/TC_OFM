@@ -3933,37 +3933,82 @@ def load_fm_model(ckpt_path: str, device, args):
 
 
 def _load_residual_model(ckpt, state, device, args, ep):
-    """Load FMResidualCorrector."""
+    """
+    Load FMResidualCorrector từ checkpoint.
+
+    KEY INSIGHT: BEST_V47.pth chứa sttrans.* weights (242 keys) bên trong
+    → KHÔNG cần --sttrans_ckpt riêng để load.
+    → Tạo model với dummy STTrans, rồi load_state_dict(strict=False)
+      sẽ load cả sttrans.* weights từ checkpoint.
+
+    Nếu FMResidualCorrector không import được, fallback:
+    → Load chỉ phần sttrans.* vào STTrans model và evaluate như STTrans.
+    """
     FMResidualCorrector = _import_residual_class()
-    if FMResidualCorrector is None:
-        print("  ❌ FMResidualCorrector class not found")
-        return None
 
-    # FMResidualCorrector cần sttrans_checkpoint để init
-    # Nhưng trong evaluate, chỉ cần load weights
-    # → Dùng dummy path, rồi load_state_dict
-    sttrans_ckpt = getattr(args, "sttrans_ckpt", None)
-    if not sttrans_ckpt or not os.path.exists(sttrans_ckpt):
-        print("  ❌ FMResidualCorrector cần --sttrans_ckpt để init")
-        return None
+    if FMResidualCorrector is not None:
+        # Approach A: load full FMResidualCorrector
+        # Tạo model với sttrans_checkpoint dummy (sẽ bị overwrite bởi state_dict)
+        # Trick: save sttrans weights tạm thời, init model, load state
+        try:
+            # Tạo temp file với sttrans weights để init
+            import tempfile
 
+            # Extract sttrans state dict từ checkpoint
+            sttrans_state = {k[len("sttrans."):]: v
+                             for k, v in state.items()
+                             if k.startswith("sttrans.")}
+
+            # Save temp checkpoint cho STTrans
+            with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as tf:
+                tmp_path = tf.name
+            torch.save({"model_state_dict": sttrans_state}, tmp_path)
+
+            model = FMResidualCorrector(
+                sttrans_checkpoint=tmp_path,
+                obs_len=args.obs_len, pred_len=args.pred_len,
+                device=str(device),
+            ).to(device)
+
+            os.unlink(tmp_path)  # cleanup
+
+            if hasattr(model, "init_ema"):
+                model.init_ema()
+
+            result = model.load_state_dict(state, strict=False)
+            n_miss = len(result.missing_keys)
+            n_unex = len(result.unexpected_keys)
+            if n_miss:  print(f"  Missing   : {n_miss}")
+            if n_unex:  print(f"  Unexpected: {n_unex}")
+
+            print(f"  ✅ FMResidualCorrector loaded (epoch={ep})")
+            return model
+
+        except Exception as e:
+            print(f"  ⚠ FMResidualCorrector full load failed: {e}")
+            print("  → Falling back to STTrans-only evaluation")
+
+    # Approach B: fallback — load chỉ STTrans part và evaluate như STTrans
+    print("  Loading sttrans.* weights as standalone STTrans...")
     try:
-        model = FMResidualCorrector(
-            sttrans_checkpoint=sttrans_ckpt,
-            obs_len=args.obs_len, pred_len=args.pred_len,
-            device=str(device),
-        ).to(device)
-        if hasattr(model, "init_ema"):
-            model.init_ema()
+        from Model.st_trans_model import STTrans
+        model = STTrans(obs_len=args.obs_len, pred_len=args.pred_len).to(device)
 
-        result = model.load_state_dict(state, strict=False)
-        if result.missing_keys:
-            print(f"  Missing: {len(result.missing_keys)}")
-        print(f"  ✅ FMResidualCorrector loaded (epoch={ep})")
+        # Extract sttrans.* prefix
+        sttrans_state = {k[len("sttrans."):]: v
+                         for k, v in state.items()
+                         if k.startswith("sttrans.")}
+
+        result = model.load_state_dict(sttrans_state, strict=False)
+        n_miss = len(result.missing_keys)
+        if n_miss: print(f"  STTrans missing: {n_miss}")
+
+        print(f"  ✅ STTrans base loaded from FMResidualCorrector ckpt (epoch={ep})")
+        print("  ⚠  Note: evaluating STTrans base only (not the corrector)")
         return model
-    except Exception as e:
-        print(f"  ❌ FMResidualCorrector load failed: {e}")
-        import traceback; traceback.print_exc()
+
+    except Exception as e2:
+        print(f"  ❌ Fallback STTrans load also failed: {e2}")
         return None
 
 
@@ -4023,20 +4068,45 @@ def load_sttrans_model(ckpt_path: str, device, args):
 @torch.no_grad()
 def infer_fm(model, batch_list, args, device):
     try:
-        ema = get_ema_obj(model); backup = None
-        if ema is not None:
-            try: backup = ema.apply_to(model)
-            except Exception: pass
         model.eval()
-        pred, _, _ = model.sample(
-            batch_list, num_ensemble=args.fm_ensemble,
-            ddim_steps=args.fm_ode_steps, importance_weight=True)
-        if backup is not None:
-            try: ema.restore(model, backup)
-            except Exception: pass
-        return pred
+
+        # FMResidualCorrector và TCFlowMatching đều có sample()
+        # STTrans fallback cũng có sample()
+        # → Dùng chung interface
+        if hasattr(model, "sample"):
+            # TCFlowMatching: cần EMA apply
+            ema = get_ema_obj(model); backup = None
+            if ema is not None:
+                try: backup = ema.apply_to(model)
+                except Exception: pass
+
+            # TCFlowMatching cần importance_weight, FMResidualCorrector ignore extra kwargs
+            try:
+                pred, _, _ = model.sample(
+                    batch_list,
+                    num_ensemble=args.fm_ensemble,
+                    ddim_steps=args.fm_ode_steps,
+                    importance_weight=True)
+            except TypeError:
+                # FMResidualCorrector/STTrans không có importance_weight
+                pred, _, _ = model.sample(batch_list,
+                                          num_ensemble=args.fm_ensemble)
+
+            if backup is not None:
+                try: ema.restore(model, backup)
+                except Exception: pass
+
+        else:
+            # Direct forward (old STTrans without sample())
+            pred = model(batch_list)
+            if pred.dim() == 3 and pred.shape[0] == batch_list[0].shape[1]:
+                pred = pred.permute(1, 0, 2)
+
+        return pred[..., :2] if pred.shape[-1] > 2 else pred
+
     except Exception as e:
         print(f"    FM inference error: {e}")
+        import traceback; traceback.print_exc()
         return None
 
 
