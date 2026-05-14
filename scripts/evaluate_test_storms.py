@@ -3792,8 +3792,24 @@ def load_fm_model(ckpt_path: str, device, args):
         state = _load_state_dict(ckpt)
         ep    = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
 
-        ckpt_type = _detect_ckpt_type(state)
-        print(f"  Checkpoint type: {ckpt_type}  (epoch={ep})")
+        # Debug: print key prefixes to help diagnose
+        from collections import Counter
+        prefix_counts = Counter(k.split(".")[0] for k in state.keys())
+        print(f"  Key prefixes: " +
+              ", ".join(f"{p}({n})" for p,n in
+                        sorted(prefix_counts.items(), key=lambda x:-x[1])[:8]))
+
+        # [FIX] --fm_type flag overrides auto-detection
+        forced = getattr(args, "fm_type", "auto")
+        if forced == "tcfm":
+            ckpt_type = "tcfm"
+            print(f"  Checkpoint type: tcfm (forced by --fm_type)")
+        elif forced == "residual":
+            ckpt_type = "residual"
+            print(f"  Checkpoint type: residual (forced by --fm_type)")
+        else:
+            ckpt_type = _detect_ckpt_type(state)
+            print(f"  Checkpoint type: {ckpt_type}  (epoch={ep})")
 
         # ── FMResidualCorrector ──────────────────────────────────────────
         if ckpt_type == "residual":
@@ -4244,6 +4260,9 @@ def get_args():
     p.add_argument("--sttrans_type",  default="sttrans", choices=["sttrans","sttrans_ar"])
     p.add_argument("--fm_ensemble",   default=30, type=int)
     p.add_argument("--fm_ode_steps",  default=20, type=int)
+    p.add_argument("--fm_type",       default="auto",
+                   choices=["auto","tcfm","residual"],
+                   help="Force FM model type: auto|tcfm|residual")
     p.add_argument("--output_dir",    default="results/test_eval")
     p.add_argument("--gpu_num",       default="0")
     p.add_argument("--eval_models",   default="all",
