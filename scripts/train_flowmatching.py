@@ -22050,7 +22050,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model_v63 import TCFlowMatchingV63
+from Model.flow_matching_model import TCFlowMatchingV63
 from Model.utils import get_cosine_schedule_with_warmup
 from utils.metrics import (
     StepErrorAccumulator, save_metrics_csv,
