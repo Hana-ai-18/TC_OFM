@@ -20967,7 +20967,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatching
+from Model.flow_matching_model import TCFlowMatchingV63
 from Model.utils import get_cosine_schedule_with_warmup
 from utils.metrics import (
     StepErrorAccumulator, save_metrics_csv,
@@ -21595,7 +21595,7 @@ def main(args):
     print(f"  train: {len(train_dataset)} seqs  ({len(train_loader)} batches)")
     print(f"  val  : {len(val_dataset)} seqs")
 
-    model = TCFlowMatching(
+    model = TCFlowMatchingV63(
         pred_len=args.pred_len, obs_len=args.obs_len,
         sigma_min=args.sigma_min, n_train_ens=1,
         ctx_noise_scale=args.ctx_noise_scale,
