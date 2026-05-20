@@ -23332,15 +23332,31 @@ def _phase_banner(epoch: int, phase: int, oracle_ade: float,
     labels = {1: "GENERATOR ONLY", 2: "SELECTOR WARMUP", 3: "FULL JOINT"}
     label  = labels[phase]
     bar    = "█" * phase + "░" * (3 - phase)
+
+    # Phase 1 loss weights
+    if phase == 1:
+        weight_info = "w_oracle=1.80  w_mean=0.10  w_all=0.05  consistency=OFF"
+    elif phase == 2:
+        try:
+            ep_frac = min((epoch - GEN_ONLY_EPOCHS) / max(SEL_WARM_EPOCHS - GEN_ONLY_EPOCHS, 1), 1.0)
+            wo = 1.80 - 0.80 * ep_frac; wm = 0.10 + 0.70 * ep_frac
+            weight_info = f"w_oracle={wo:.2f}  w_mean={wm:.2f}  (ramping)"
+        except Exception:
+            weight_info = "ramping weights"
+    else:
+        weight_info = "w_oracle=1.00  w_mean=0.80  w_all=0.60  (v63 full)"
+
     lines = [
         f"\n  ┌─── Phase {phase}/3  [{bar}]  {label}  (ep {epoch}) ───",
         f"  │  oracle_ADE={oracle_ade:.1f}km  "
         f"sel_acc_ema={sel_acc_ema:.2f}  rank_w={rank_w:.3f}  "
         f"tau={_get_tau(epoch):.0f}",
+        f"  │  {weight_info}",
     ]
     if phase == 1:
         ready = oracle_ade < GEN_READY_ADE
         lines.append(f"  │  Generator ready: {'✅' if ready else f'❌  (need oracle_ADE < {GEN_READY_ADE})'}")
+        lines.append(f"  │  Key signal: oracle drops fast ep0→10, gap>20km = modes diverse")
     elif phase == 2:
         sel_ready = sel_acc_ema > SEL_READY_ACC
         lines.append(f"  │  Selector ready:  {'✅' if sel_ready else f'❌  (need sel_acc_ema > {SEL_READY_ACC})'}")
@@ -24205,9 +24221,12 @@ def main(args):
                         f"  fm={bd.get('fm_mse',         0):.4f}"
                         f"  oracle={bd.get('oracle_ade', 0):.1f}km"
                         f"  mean={bd.get('mean_ade',    0):.1f}km"
-                        f"  gap={bd.get('selector_gap', 0):.1f}km"
+                        f"  gap={bd.get('selector_gap', 0):.1f}km"   # diversity signal
+                        f"  div={bd.get('diversity',    0):.4f}"      # anti-collapse
                         f"  cte={bd.get('cte_km',       0):.1f}km"
                         f"  oracle_ema={oracle_ade_ema:.1f}km"
+                        f"  w_ora={bd.get('w_oracle',   1.8):.2f}"   # phase weight
+                        f"  w_mean={bd.get('w_mean',    0.1):.2f}"
                         f"  lr={lr_gen:.2e}"
                     )
                 elif phase == 2:
