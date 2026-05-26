@@ -41,7 +41,7 @@ from torch.utils.data import DataLoader, Subset
 from Model.data.loader_training import data_loader
 
 # Import v65 model — alias đầy đủ
-from Model.flow_matching_model_v65 import TCFlowMatchingV65 as TCFlowMatchingV65
+from Model.flow_matching_model import TCFlowMatchingV65 as TCFlowMatchingV65
 
 try:
     from Model.utils import get_cosine_schedule_with_warmup
