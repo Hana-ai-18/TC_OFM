@@ -3590,7 +3590,9 @@ def get_args():
     p.add_argument("--pred_len",        default=12,    type=int)
     p.add_argument("--batch_size",      default=32,    type=int)
     p.add_argument("--num_epochs",      default=120,   type=int)
-    p.add_argument("--learning_rate",   default=1e-4,  type=float)
+    p.add_argument("--learning_rate",   dest="learning_rate", default=1e-4,  type=float)
+    p.add_argument("--g_learning_rate", dest="learning_rate", default=1e-4,  type=float,
+                    help="Alias for --learning_rate (for backward compatibility)")
     p.add_argument("--weight_decay",    default=1e-3,  type=float)
     p.add_argument("--warmup_epochs",   default=5,     type=int)
     p.add_argument("--grad_clip",       default=1.0,   type=float)
