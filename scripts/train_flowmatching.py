@@ -1457,6 +1457,7 @@
 #     if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
 #     main(args)
 
+
 """
 train_v68.py — TC-FlowMatching v68
 ════════════════════════════════════════════════════════════════════════
@@ -1750,8 +1751,8 @@ def main(args):
         cfg_guidance_scale=args.cfg_guidance_scale,selector_warmup=SW,
     ).to(dev)
     model.init_ema()
-    np=sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  params: {np:,}")
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  params: {n_params:,}")
 
     opt=optim.AdamW([
         {"params":_gen_params(model),"lr":args.g_learning_rate,"name":"generator"},
