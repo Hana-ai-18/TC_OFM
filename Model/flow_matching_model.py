@@ -4540,7 +4540,6 @@ BUG-9 [INFO] oracle_km log dùng noisy pred:
   oracle_ade_km giảm monotone → oracle selection đúng
   lw_dpe/lw_fm trong [1.0, 4.0] → DPE mạnh nhưng không dominate
 """
-from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
