@@ -1,48 +1,1235 @@
+# # # """
+# # # flow_matching_model_v65.py  ── v65-final
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # # TC-FlowMatching v65-final
+
+# # # MỤC TIÊU: ADE/CTE/72h thấp hơn hẳn v59 và STTrans.
+# # #           Train/test gap nhỏ lại.
+
+# # # FIXES TỪ v65-draft
+# # # ───────────────────
+# # # FIX-C1  Coherence loss gradient: dùng modes có grad (không detach khi tính L_coh).
+# # #         Draft cũ: pred_soft từ sel_logits đã stop-grad → L_coh = 0 gradient.
+
+# # # FIX-C2  Train/inference noise consistency:
+# # #         Draft cũ: training dùng x_t_k = x_t + z_k*σ_k, inference dùng formula khác.
+# # #         Fix: cả hai đều dùng cùng sigma_k per head từ self.head_noise_base.
+# # #         Inference: x_t_k = x0_persistence + randn * sigma_k (nhất quán).
+
+# # # FIX-C3  Oracle assignment bias từ per-head noise:
+# # #         Draft cũ: oracle chọn mode thắng ADE trên noisy x_t_k → head ít noise (k=0)
+# # #         có lợi thế không liên quan đến quality.
+# # #         Fix: oracle ADE tính trên x1_pred = x_t_CLEAN + (1-t)*v_k,
+# # #         tức là dùng x_t không nhiễu làm base cho x1_pred oracle.
+
+# # # FIX-C4  Compass bias yếu bị overwhelmed:
+# # #         Draft cũ: 0.1 scale, 1 bias vector trong 256-dim space.
+# # #         Fix: direction conditioning qua cross-attention explicit với direction token,
+# # #         không phải additive bias — cơ chế mạnh hơn, không bị gradient wash.
+
+# # # FIX-C5  Coherence loss tính trên normalized space thiếu scale:
+# # #         Fix: tính displacement diff trong km (haversine), có ý nghĩa vật lý.
+
+# # # THÊM MỚI ĐỂ GIẢM ADE VÀ TRAIN/TEST GAP
+# # # ────────────────────────────────────────
+# # # NEW-1   Mixup augmentation trên trajectory: blending 2 samples trong batch
+# # #         → model học smoother decision boundary → giảm test ADE.
+
+# # # NEW-2   Trajectory Mixup augmentation: blending easy samples trong batch
+# # #         → smoother decision boundary → giảm train/test gap.
+
+# # # NEW-3   Dropout consistency regularization: penalize encoder inconsistency
+# # #         giữa 2 forward passes → giảm overfitting.
+
+# # # NEW-4   Stochastic depth trong CompassVelocityHead direction token
+# # #         → regularization cho K=8 heads.
+# # # """
+# # # from __future__ import annotations
+
+# # # import math
+# # # from typing import Optional, Tuple, List
+
+# # # import torch
+# # # import torch.nn as nn
+# # # import torch.nn.functional as F
+
+# # # from Model.FNO3D_encoder import FNO3DEncoder
+# # # from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
+# # # from Model.env_net_transformer_gphsplit import Env_net
+
+# # # # ─────────────────────────────────────────────────────────────────────────────
+# # # R_EARTH      = 6371.0
+# # # DT_HOURS     = 6.0
+# # # DEG2KM       = 111.0
+# # # _NORM_TO_DEG = 5.0
+
+# # # _COMPASS_DEG   = [0., 45., 90., 135., 180., 225., 270., 315.]
+# # # _COMPASS_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+# # # K_MODES        = 8
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Coordinate utilities
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
+# # #     return torch.stack([
+# # #         (t[..., 0] * 50.0 + 1800.0) / 10.0,
+# # #         (t[..., 1] * 50.0) / 10.0,
+# # #     ], dim=-1)
+
+# # # def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+# # #     lat1 = torch.deg2rad(p1[..., 1]); lat2 = torch.deg2rad(p2[..., 1])
+# # #     dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
+# # #     dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
+# # #     a = (torch.sin(dlat / 2).pow(2) +
+# # #          torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).pow(2))
+# # #     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+
+# # # def _unwrap_model(m):
+# # #     return m._orig_mod if hasattr(m, "_orig_mod") else m
+
+# # # def _step_speeds_deg(traj_deg: torch.Tensor) -> torch.Tensor:
+# # #     T = traj_deg.shape[0]
+# # #     if T < 2: return traj_deg.new_zeros(1, traj_deg.shape[1])
+# # #     return _haversine_deg(traj_deg[:-1], traj_deg[1:]) / DT_HOURS
+
+# # # def _ade_km_from_rel(
+# # #     pred_rel: torch.Tensor,   # [B, T, 4]
+# # #     gt_rel:   torch.Tensor,   # [B, T, 4]
+# # #     lp:       torch.Tensor,   # [B, 2]
+# # # ) -> torch.Tensor:            # [B]
+# # #     """FIX-B4: rel → abs → deg → haversine. Chỉ lon/lat (2 dims đầu)."""
+# # #     pred_abs = lp.unsqueeze(1) + pred_rel[:, :, :2]
+# # #     gt_abs   = lp.unsqueeze(1) + gt_rel[:, :, :2]
+# # #     return _haversine_deg(_norm_to_deg(pred_abs), _norm_to_deg(gt_abs)).mean(dim=1)
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Spherical OT Matching  (port từ v59, thêm vào v65)
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+# # #     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
+# # #     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
+# # #     dlon = lon2 - lon1
+# # #     y = torch.sin(dlon) * torch.cos(lat2)
+# # #     x = (torch.cos(lat1) * torch.sin(lat2)
+# # #          - torch.sin(lat1) * torch.cos(lat2) * torch.cos(dlon))
+# # #     return torch.atan2(y, x)
+
+
+# # # def _sinkhorn_log(cost: torch.Tensor, epsilon: float = 0.05,
+# # #                   n_iter: int = 50) -> torch.Tensor:
+# # #     B = cost.shape[0]; device = cost.device
+# # #     log_a = -math.log(B) * torch.ones(B, device=device)
+# # #     log_b = -math.log(B) * torch.ones(B, device=device)
+# # #     log_K = -cost / epsilon
+# # #     log_u = torch.zeros(B, device=device)
+# # #     log_v = torch.zeros(B, device=device)
+# # #     for _ in range(n_iter):
+# # #         log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
+# # #         log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
+# # #     return (log_K + log_u.unsqueeze(1) + log_v.unsqueeze(0)).exp().clamp(0.0)
+
+
+# # # def _geodesic_ot_cost(x0_rel: torch.Tensor, x1_rel: torch.Tensor,
+# # #                        lp: torch.Tensor) -> torch.Tensor:
+# # #     """Cost matrix [B, B] dựa trên position + speed + direction."""
+# # #     B = x0_rel.shape[0]
+
+# # #     def _abs_deg(rel):
+# # #         return _norm_to_deg(lp.unsqueeze(1) + rel[:, :, :2])
+
+# # #     x0d = _abs_deg(x0_rel); x1d = _abs_deg(x1_rel)
+# # #     x0e = x0d.unsqueeze(1).expand(B, B, -1, -1).reshape(B*B, -1, 2)
+# # #     x1e = x1d.unsqueeze(0).expand(B, B, -1, -1).reshape(B*B, -1, 2)
+# # #     pos_cost = _haversine_deg(x0e, x1e).reshape(B, B, -1).mean(-1) / 500.0
+
+# # #     spd0 = _step_speeds_deg(x0d.permute(1, 0, 2)).permute(1, 0).mean(-1)
+# # #     spd1 = _step_speeds_deg(x1d.permute(1, 0, 2)).permute(1, 0).mean(-1)
+# # #     speed_cost = (spd0.unsqueeze(1) - spd1.unsqueeze(0)).abs() / 20.0
+
+# # #     def _mean_bearing(td):
+# # #         b = _forward_azimuth(td[:, :-1, :], td[:, 1:, :])
+# # #         return torch.atan2(b.sin().mean(-1), b.cos().mean(-1))
+# # #     h0 = _mean_bearing(x0d); h1 = _mean_bearing(x1d)
+# # #     dh = (h0.unsqueeze(1) - h1.unsqueeze(0) + math.pi) % (2*math.pi) - math.pi
+# # #     dir_cost = dh.abs() / math.pi
+
+# # #     return 1.0*pos_cost + 0.5*speed_cost + 0.3*dir_cost
+
+
+# # # def _spherical_ot_matching(x0_batch: torch.Tensor, x1_batch: torch.Tensor,
+# # #                             lp: torch.Tensor, epsilon: float = 0.05
+# # #                             ) -> Tuple[torch.Tensor, torch.Tensor]:
+# # #     """
+# # #     Ghép noise x0 với GT x1 tối ưu theo geodesic cost.
+# # #     Giúp FM học từ x0 gần x1 nhất về hướng + tốc độ → path ngắn hơn.
+# # #     """
+# # #     B = x0_batch.shape[0]
+# # #     if B < 4:
+# # #         return x0_batch, x1_batch
+# # #     try:
+# # #         cost = _geodesic_ot_cost(x0_batch, x1_batch, lp)
+# # #         with torch.no_grad():
+# # #             pi = _sinkhorn_log(cost, epsilon=epsilon)
+# # #         flat = pi.reshape(-1).clamp(0.0)
+# # #         s    = flat.sum()
+# # #         if not torch.isfinite(s) or s < 1e-10:
+# # #             return x0_batch, x1_batch
+# # #         idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
+# # #         col = idx % B
+# # #         return x0_batch[col], x1_batch[col]
+# # #     except Exception:
+# # #         return x0_batch, x1_batch
+
+
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  EMA
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class EMAModel:
+# # #     def __init__(self, model, decay=0.995):
+# # #         self.decay  = decay
+# # #         m = _unwrap_model(model)
+# # #         self.shadow = {k: v.detach().clone()
+# # #                        for k, v in m.state_dict().items()
+# # #                        if v.dtype.is_floating_point}
+
+# # #     def update(self, model):
+# # #         m = _unwrap_model(model)
+# # #         with torch.no_grad():
+# # #             for k, v in m.state_dict().items():
+# # #                 if k in self.shadow:
+# # #                     self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+
+# # #     def apply_to(self, model):
+# # #         m = _unwrap_model(model)
+# # #         backup, sd = {}, m.state_dict()
+# # #         for k in self.shadow:
+# # #             if k not in sd: continue
+# # #             backup[k] = sd[k].detach().clone()
+# # #             sd[k].copy_(self.shadow[k])
+# # #         return backup
+
+# # #     def restore(self, model, backup):
+# # #         m = _unwrap_model(model)
+# # #         sd = m.state_dict()
+# # #         for k, v in backup.items():
+# # #             if k in sd: sd[k].copy_(v)
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Difficulty Score
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def compute_difficulty_score(
+# # #     obs_BT2: torch.Tensor,   # [B, 8, 2]
+# # #     img_obs:  torch.Tensor,  # [B, 13, 8, 81, 81]
+# # #     env_data: Optional[dict],
+# # #     device:   torch.device,
+# # # ) -> torch.Tensor:           # [B] ∈ [0,1]
+# # #     B = obs_BT2.shape[0]
+# # #     scores = []
+
+# # #     # Signal 1: Track curvature (0.30)
+# # #     dir24 = env_data.get("history_direction24") if env_data else None
+# # #     if dir24 is not None and torch.is_tensor(dir24):
+# # #         dir24 = dir24.float().to(device)
+# # #         if dir24.dim() == 3: d24 = dir24[:, -1, :]
+# # #         elif dir24.dim() == 2: d24 = dir24
+# # #         else: d24 = None
+# # #         if d24 is not None and d24.shape[-1] == 8:
+# # #             bucket   = d24.argmax(dim=-1).float()
+# # #             angle_24 = bucket * (2.0 * math.pi / 8.0)
+# # #             sin24    = torch.sin(angle_24); cos24 = torch.cos(angle_24)
+# # #             dy = obs_BT2[:, -1, 1] - obs_BT2[:, -2, 1]
+# # #             dx = obs_BT2[:, -1, 0] - obs_BT2[:, -2, 0]
+# # #             lat_mid = (obs_BT2[:, -1, 1] + obs_BT2[:, -2, 1]) * 0.5
+# # #             cos_lat = torch.cos(torch.deg2rad(lat_mid * _NORM_TO_DEG)).clamp(1e-4)
+# # #             angle_now = torch.atan2(dx * cos_lat, dy)
+# # #             cos_diff  = (torch.cos(angle_now) * cos24 + torch.sin(angle_now) * sin24).clamp(-1,1)
+# # #             s_curve   = torch.sigmoid((torch.rad2deg(torch.acos(cos_diff)) - 45.0) / 20.0)
+# # #         else: s_curve = torch.zeros(B, device=device)
+# # #     else: s_curve = torch.zeros(B, device=device)
+# # #     scores.append(0.30 * s_curve)
+
+# # #     # Signal 2: Weak steering (0.25)
+# # #     steer = env_data.get("steering_speed") if env_data else None
+# # #     if steer is not None and torch.is_tensor(steer):
+# # #         steer = steer.float().to(device)
+# # #         while steer.dim() > 1: steer = steer[..., -1]
+# # #         steer = steer.view(-1)
+# # #         steer = (steer[:B] if steer.numel() >= B else steer[0].expand(B))
+# # #         s_weak = torch.sigmoid((4.0 - steer * 20.0) / 2.0)
+# # #     else:
+# # #         u = env_data.get("u500_mean") if env_data else None
+# # #         v = env_data.get("v500_mean") if env_data else None
+# # #         if u is not None and v is not None and torch.is_tensor(u) and torch.is_tensor(v):
+# # #             u = u.float().to(device); v = v.float().to(device)
+# # #             while u.dim() > 1: u = u[..., -1]
+# # #             while v.dim() > 1: v = v[..., -1]
+# # #             s_weak = torch.sigmoid((4.0 - (u.view(-1)[:B]**2 + v.view(-1)[:B]**2).sqrt() * 30.0) / 2.0)
+# # #         else: s_weak = torch.zeros(B, device=device)
+# # #     scores.append(0.25 * s_weak)
+
+# # #     # Signal 3: Wind shear (0.20)
+# # #     if img_obs is not None and img_obs.shape[1] >= 11:
+# # #         cx = cy = 40
+# # #         u200 = img_obs[:, 4, -1, cx, cy] * 13.315
+# # #         u850 = img_obs[:, 6, -1, cx, cy] * 7.911
+# # #         v200 = img_obs[:, 8, -1, cx, cy] * 8.377
+# # #         v850 = img_obs[:, 10,-1, cx, cy] * 6.203
+# # #         shear   = ((u200-u850)**2 + (v200-v850)**2).sqrt()
+# # #         s_shear = torch.sigmoid((shear - 8.0) / 3.0)
+# # #     else: s_shear = torch.zeros(B, device=device)
+# # #     scores.append(0.20 * s_shear)
+
+# # #     # Signal 4: RI flag (0.15)
+# # #     ri = env_data.get("rapid_intensification") if env_data else None
+# # #     if ri is not None and torch.is_tensor(ri):
+# # #         ri = ri.float().to(device)
+# # #         while ri.dim() > 1: ri = ri[..., -1]
+# # #         s_ri = ri.view(-1)[:B].clamp(0, 1) if ri.numel() >= B else ri[0].expand(B)
+# # #     else: s_ri = torch.zeros(B, device=device)
+# # #     scores.append(0.15 * s_ri)
+
+# # #     # Signal 5: Slow movement (0.10)
+# # #     mv = env_data.get("move_velocity") if env_data else None
+# # #     if mv is not None and torch.is_tensor(mv):
+# # #         mv = mv.float().to(device)
+# # #         while mv.dim() > 1: mv = mv[..., -1]
+# # #         mv_v = mv.view(-1)
+# # #         mv_v = mv_v[:B] if mv_v.numel() >= B else mv_v[0].expand(B)
+# # #         s_slow = torch.sigmoid((0.05 - mv_v) / 0.02)
+# # #     else: s_slow = torch.zeros(B, device=device)
+# # #     scores.append(0.10 * s_slow)
+
+# # #     return sum(scores).clamp(0.0, 1.0)
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Direction GT bucket
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def get_gt_direction_bucket(
+# # #     obs_traj:  torch.Tensor,   # [T, B, 2]
+# # #     pred_traj: torch.Tensor,   # [T, B, 2]
+# # # ) -> torch.Tensor:             # [B] 0..7
+# # #     """FIX-B8: atan2(East_km, North) = compass convention."""
+# # #     last  = obs_traj[-1]     # [B, 2]
+# # #     first = pred_traj[0]     # [B, 2]
+# # #     dy    = first[:, 1] - last[:, 1]
+# # #     dx    = first[:, 0] - last[:, 0]
+# # #     lat_d = (last[:, 1] + first[:, 1]) * 0.5
+# # #     cos_l = torch.cos(torch.deg2rad(lat_d * _NORM_TO_DEG)).clamp(1e-4)
+# # #     angle = (torch.atan2(dx * cos_l, dy).rad2deg() % 360.0)
+# # #     return ((angle + 22.5) / 45.0).long() % 8
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  FIX-C4: CompassVelocityHead with explicit direction cross-attention
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class CompassVelocityHead(nn.Module):
+# # #     """
+# # #     FIX-C4: Direction conditioning qua cross-attention với direction token,
+# # #     không phải additive bias. Direction token được project từ compass angle
+# # #     (sin, cos) → 256-dim vector → concat vào memory của TransformerDecoder.
+# # #     Gradient không thể wash out cơ chế này như với additive bias.
+
+# # #     NEW-4: Stochastic depth với prob=0.1 → regularization cho K=8 heads.
+# # #     """
+# # #     def __init__(self, compass_idx: int, pred_len: int = 12, ctx_dim: int = 256,
+# # #                  stochastic_depth_prob: float = 0.1):
+# # #         super().__init__()
+# # #         self.pred_len             = pred_len
+# # #         self.compass_idx          = compass_idx
+# # #         self.stochastic_depth_prob = stochastic_depth_prob
+
+# # #         # FIX-C4: direction token từ (sin, cos) của compass angle
+# # #         angle_rad = _COMPASS_DEG[compass_idx] * math.pi / 180.0
+# # #         dir_vec   = torch.tensor([math.sin(angle_rad), math.cos(angle_rad)])
+# # #         self.register_buffer('compass_dir', dir_vec)   # [2], not learnable
+# # #         self.dir_proj = nn.Sequential(
+# # #             nn.Linear(2, ctx_dim), nn.GELU(), nn.LayerNorm(ctx_dim))
+
+# # #         self.time_fc1    = nn.Linear(ctx_dim, 256)
+# # #         self.time_fc2    = nn.Linear(256, ctx_dim)
+# # #         self.traj_embed  = nn.Linear(4, ctx_dim)       # FIX-B7: 4 dims
+# # #         self.pos_enc     = nn.Parameter(torch.randn(1, pred_len, ctx_dim) * 0.02)
+# # #         self.step_embed  = nn.Embedding(pred_len, ctx_dim)
+# # #         self.transformer = nn.TransformerDecoder(
+# # #             nn.TransformerDecoderLayer(
+# # #                 d_model=ctx_dim, nhead=8, dim_feedforward=512,
+# # #                 dropout=0.10, activation="gelu", batch_first=True),
+# # #             num_layers=1)
+# # #         self.out_fc1 = nn.Linear(ctx_dim, 256)
+# # #         self.out_fc2 = nn.Linear(256, 4)               # FIX-B7: output 4 dims
+# # #         self.step_scale = nn.Parameter(torch.ones(pred_len) * 0.5)
+
+# # #         with torch.no_grad():
+# # #             nn.init.xavier_uniform_(self.out_fc2.weight, gain=0.1)
+# # #             nn.init.zeros_(self.out_fc2.bias)
+
+# # #     def _time_emb(self, t: torch.Tensor, dim: int) -> torch.Tensor:
+# # #         half = dim // 2
+# # #         freq = torch.exp(torch.arange(half, dtype=torch.float32, device=t.device)
+# # #                          * (-math.log(10000.0) / max(half - 1, 1)))
+# # #         emb  = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
+# # #         return F.pad(torch.cat([emb.sin(), emb.cos()], dim=-1), (0, dim % 2))
+
+# # #     def forward(
+# # #         self,
+# # #         x_t: torch.Tensor,   # [B, pred_len, 4]
+# # #         t:   torch.Tensor,   # [B]
+# # #         ctx: torch.Tensor,   # [B, ctx_dim]
+# # #     ) -> torch.Tensor:       # [B, pred_len, 4]
+# # #         B     = x_t.shape[0]
+# # #         T_seq = min(x_t.shape[1], self.pred_len)
+# # #         device = x_t.device
+
+# # #         # FIX-C4: direction token via cross-attention
+# # #         dir_token = self.dir_proj(
+# # #             self.compass_dir.to(device).unsqueeze(0).expand(B, -1))  # [B, ctx_dim]
+
+# # #         # Stochastic depth: randomly zero-out dir_token during training
+# # #         if self.training and self.stochastic_depth_prob > 0:
+# # #             keep = (torch.rand(B, 1, device=device) >
+# # #                     self.stochastic_depth_prob).float()
+# # #             dir_token = dir_token * keep
+
+# # #         t_emb = F.gelu(self.time_fc1(self._time_emb(t, ctx.shape[-1])))
+# # #         t_emb = self.time_fc2(t_emb)
+
+# # #         step_idx = torch.arange(T_seq, device=device).unsqueeze(0).expand(B, -1)
+# # #         x_emb = (self.traj_embed(x_t[:, :T_seq])
+# # #                  + self.pos_enc[:, :T_seq]
+# # #                  + t_emb.unsqueeze(1)
+# # #                  + self.step_embed(step_idx))
+
+# # #         # Memory: [ctx, dir_token, t_emb] — direction is first-class citizen
+# # #         mem     = torch.stack([ctx, dir_token, t_emb], dim=1)  # [B, 3, ctx_dim]
+# # #         decoded = self.transformer(x_emb, mem)
+
+# # #         scale   = torch.sigmoid(self.step_scale[:T_seq]).view(1, T_seq, 1) * 2.0
+# # #         return self.out_fc2(F.gelu(self.out_fc1(decoded))) * scale
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  CompassSelector (GC-Net analog)
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class CompassSelector(nn.Module):
+# # #     """
+# # #     Selector nhìn actual mode outputs + steering → chọn best mode.
+# # #     Tốt hơn paper GC-Net (chỉ nhìn context).
+# # #     STOP-GRAD từ caller.
+# # #     """
+# # #     def __init__(self, ctx_dim: int = 256, K: int = 8, n_dirs: int = 8):
+# # #         super().__init__()
+# # #         self.K      = K
+# # #         self.n_dirs = n_dirs
+
+# # #         self.steering_enc = nn.Sequential(
+# # #             nn.Linear(11, 64), nn.GELU(), nn.LayerNorm(64),
+# # #             nn.Linear(64, 128))
+
+# # #         self.mode_enc = nn.Sequential(
+# # #             nn.Linear(12 * 2, 128), nn.GELU(), nn.LayerNorm(128),
+# # #             nn.Linear(128, 64))
+
+# # #         self.score_net = nn.Sequential(
+# # #             nn.Linear(ctx_dim + 64 + 128, 256), nn.GELU(), nn.LayerNorm(256),
+# # #             nn.Linear(256, 64), nn.GELU(),
+# # #             nn.Linear(64, 1))
+
+# # #         self.dir_head = nn.Sequential(
+# # #             nn.Linear(ctx_dim + 128, 256), nn.GELU(), nn.LayerNorm(256),
+# # #             nn.Linear(256, n_dirs))
+
+# # #     def _get_steering_feat(self, env_data, B, device):
+# # #         def _sc(key):
+# # #             if env_data is None: return torch.zeros(B, device=device)
+# # #             v = env_data.get(key)
+# # #             if v is None or not torch.is_tensor(v): return torch.zeros(B, device=device)
+# # #             v = v.float().to(device)
+# # #             while v.dim() > 1: v = v[..., -1]
+# # #             v = v.view(-1)
+# # #             return (v[:B] if v.numel() >= B else v[0].expand(B)).clamp(-3, 3)
+# # #         def _sv(key, dim):
+# # #             if env_data is None: return torch.zeros(B, dim, device=device)
+# # #             v = env_data.get(key)
+# # #             if v is None or not torch.is_tensor(v): return torch.zeros(B, dim, device=device)
+# # #             v = v.float().to(device)
+# # #             if v.dim() == 3: v = v[:, -1, :]
+# # #             elif v.dim() != 2 or v.shape[0] != B: return torch.zeros(B, dim, device=device)
+# # #             v = F.pad(v, (0, max(0, dim - v.shape[-1])))[:, :dim]
+# # #             return v.clamp(-3, 3)
+# # #         feat = torch.cat([_sc("steering_speed").unsqueeze(-1),
+# # #                           _sc("steering_dir_sin").unsqueeze(-1),
+# # #                           _sc("steering_dir_cos").unsqueeze(-1),
+# # #                           _sv("history_direction24", 8)], dim=-1)
+# # #         return self.steering_enc(feat)
+
+# # #     def forward(self, ctx, modes, env_data):
+# # #         # ctx: [B,ctx_dim], modes: [B,K,12,4] — both stop-grad from caller
+# # #         B, K = modes.shape[:2]
+# # #         device = ctx.device
+# # #         sf = self._get_steering_feat(env_data, B, device)
+# # #         scores = []
+# # #         for k in range(K):
+# # #             mf = self.mode_enc(modes[:, k, :, :2].reshape(B, -1))
+# # #             sc = self.score_net(torch.cat([ctx, mf, sf], dim=-1)).squeeze(-1)
+# # #             scores.append(sc)
+# # #         score_logits = torch.stack(scores, dim=1)
+# # #         dir_logits   = self.dir_head(torch.cat([ctx, sf], dim=-1))
+# # #         return score_logits, dir_logits
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Learned Loss Weights (Kendall et al. 2018)
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class LearnedWeights(nn.Module):
+# # #     """
+# # #     4 learnable log-variance scalars — tất cả weights tự học.
+# # #     Không có hardcoded weight nào cho bất kỳ metric cụ thể nào.
+
+# # #       L_total = L_FM/exp(s_fm) + s_fm
+# # #               + L_sel/exp(s_sel) + s_sel     [L_sel = α*L_rank + (1-α)*L_dir]
+# # #               + L_coh/exp(s_coh) + s_coh
+# # #               + L_con/exp(s_con) + s_con     [dropout consistency]
+# # #     """
+# # #     def __init__(self):
+# # #         super().__init__()
+# # #         self.log_s_fm  = nn.Parameter(torch.zeros(1))
+# # #         self.log_s_sel = nn.Parameter(torch.zeros(1))
+# # #         self.log_s_coh = nn.Parameter(torch.zeros(1))
+# # #         self.log_s_con = nn.Parameter(torch.zeros(1))   # consistency
+# # #         self.log_alpha = nn.Parameter(torch.zeros(1))
+
+# # #     def forward(self, L_fm, L_rank, L_dir, L_coh, L_con):
+# # #         s_fm  = self.log_s_fm.clamp(-5, 5)
+# # #         s_sel = self.log_s_sel.clamp(-5, 5)
+# # #         s_coh = self.log_s_coh.clamp(-5, 5)
+# # #         s_con = self.log_s_con.clamp(-5, 5)
+# # #         α     = torch.sigmoid(self.log_alpha)
+# # #         L_sel = α * L_rank + (1.0 - α) * L_dir
+# # #         return (L_fm  * torch.exp(-s_fm)  + s_fm  +
+# # #                 L_sel * torch.exp(-s_sel) + s_sel +
+# # #                 L_coh * torch.exp(-s_coh) + s_coh +
+# # #                 L_con * torch.exp(-s_con) + s_con)
+
+# # #     def get_weights(self):
+# # #         return {"w_fm":   torch.exp(-self.log_s_fm.clamp(-5,5)).item(),
+# # #                 "w_sel":  torch.exp(-self.log_s_sel.clamp(-5,5)).item(),
+# # #                 "w_coh":  torch.exp(-self.log_s_coh.clamp(-5,5)).item(),
+# # #                 "w_con":  torch.exp(-self.log_s_con.clamp(-5,5)).item(),
+# # #                 "alpha":  torch.sigmoid(self.log_alpha).item()}
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Shared Context Encoder
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class SharedContextEncoder(nn.Module):
+# # #     RAW_CTX_DIM = 512
+
+# # #     def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, unet_in_ch=13):
+# # #         super().__init__()
+# # #         self.pred_len = pred_len
+# # #         self.obs_len  = obs_len
+# # #         self.ctx_dim  = ctx_dim
+
+# # #         self.spatial_enc     = FNO3DEncoder(
+# # #             in_channel=unet_in_ch, out_channel=1, d_model=32,
+# # #             n_layers=4, modes_t=4, modes_h=4, modes_w=4,
+# # #             spatial_down=32, dropout=0.05)
+# # #         self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
+# # #         self.bottleneck_proj = nn.Linear(128, 128)
+# # #         self.decoder_proj    = nn.Linear(1, 16)
+# # #         self.enc_1d = DataEncoder1D(
+# # #             in_1d=4, feat_3d_dim=128, mlp_h=64,
+# # #             lstm_hidden=128, lstm_layers=3, dropout=0.1, d_state=16)
+# # #         self.env_enc = Env_net(obs_len=obs_len, d_model=32)
+
+# # #         self.ctx_fc1  = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
+# # #         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
+# # #         self.ctx_drop = nn.Dropout(0.15)
+# # #         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
+# # #         self.null_embedding = nn.Parameter(torch.randn(1, self.RAW_CTX_DIM) * 0.02)
+# # #         self.vel_obs_enc = nn.Sequential(
+# # #             nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
+# # #             nn.Linear(256, 256), nn.GELU())
+
+# # #     def encode(self, batch_list):
+# # #         obs_t     = batch_list[0]             # [T, B, 2]
+# # #         obs_Me    = batch_list[7]             # [T, B, 2]
+# # #         image_obs = batch_list[11]            # [B, 13, T, 81, 81]  FIX-B1
+# # #         env_data  = batch_list[13] if len(batch_list) > 13 else None
+
+# # #         if image_obs.dim() == 4: image_obs = image_obs.unsqueeze(2)
+# # #         if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
+# # #             image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
+
+# # #         T_obs = obs_t.shape[0]
+# # #         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
+# # #         e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
+# # #         e_3d_s = self.bottleneck_proj(e_3d_s)
+# # #         if e_3d_s.shape[1] != T_obs:
+# # #             e_3d_s = F.interpolate(e_3d_s.permute(0,2,1), size=T_obs,
+# # #                                    mode="linear", align_corners=False).permute(0,2,1)
+
+# # #         e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
+# # #         t_w  = torch.softmax(torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
+# # #                                           device=e_3d_dec_t.device) * 0.5, dim=0)
+# # #         f_sp = self.decoder_proj((e_3d_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
+
+# # #         obs_in = torch.cat([obs_t, obs_Me], dim=2).permute(1, 0, 2)
+# # #         h_t    = self.enc_1d(obs_in, e_3d_s)
+# # #         e_env, _, _ = self.env_enc(env_data, image_obs)
+# # #         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))))
+
+# # #     def apply_ctx_head(self, raw, noise_scale=0.0, use_null=False):
+# # #         if use_null: raw = self.null_embedding.expand(raw.shape[0], -1)
+# # #         elif noise_scale > 0.0: raw = raw + torch.randn_like(raw) * noise_scale
+# # #         return self.ctx_fc2(self.ctx_drop(raw))
+
+# # #     def get_kinematic_feat(self, obs_traj):
+# # #         T_obs, B, _ = obs_traj.shape
+# # #         if T_obs >= 2:
+# # #             vel     = obs_traj[1:] - obs_traj[:-1]
+# # #             lat_mid = obs_traj[:-1, :, 1] * _NORM_TO_DEG
+# # #             cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+# # #             dx_km   = vel[:,:,0] * cos_lat * DEG2KM * _NORM_TO_DEG
+# # #             dy_km   = vel[:,:,1] * DEG2KM * _NORM_TO_DEG
+# # #             speed   = (dx_km**2 + dy_km**2 + 1e-6).sqrt() / DT_HOURS
+# # #             heading = torch.atan2(vel[:,:,1], vel[:,:,0])
+# # #             speed_n = (speed / 20.0).clamp(-3, 3)
+# # #             if T_obs >= 3:
+# # #                 dspd  = speed[1:] - speed[:-1]
+# # #                 accel = torch.cat([obs_traj.new_zeros(1, B),
+# # #                                    (dspd / 10.0).clamp(-3, 3)], 0)
+# # #             else: accel = obs_traj.new_zeros(T_obs-1, B)
+# # #             kine = torch.stack([vel[:,:,0], vel[:,:,1], speed_n,
+# # #                                  heading.sin(), heading.cos(), accel], dim=-1)
+# # #         else: kine = obs_traj.new_zeros(self.obs_len, B, 6)
+# # #         if kine.shape[0] < self.obs_len:
+# # #             kine = torch.cat([obs_traj.new_zeros(self.obs_len - kine.shape[0], B, 6), kine], 0)
+# # #         else: kine = kine[-self.obs_len:]
+# # #         return self.vel_obs_enc(kine.permute(1, 0, 2).reshape(B, -1))
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  Persistence x0 trong relative space  (FIX-B11)
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _persistence_x0_rel(obs_traj, obs_Me, lp, lm, pred_len, sigma=0.02):
+# # #     """[T,B,2] → [B, pred_len, 4] relative coords. FIX-B11."""
+# # #     B, device = obs_traj.shape[1], obs_traj.device
+# # #     if obs_traj.shape[0] >= 3:
+# # #         vels = obs_traj[1:] - obs_traj[:-1]
+# # #         n_v  = vels.shape[0]
+# # #         alpha = 0.7
+# # #         w     = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+# # #                               dtype=torch.float, device=device).flip(0)
+# # #         lv    = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+# # #     elif obs_traj.shape[0] >= 2:
+# # #         lv = obs_traj[-1,:,:2] - obs_traj[-2,:,:2]
+# # #     else:
+# # #         lv = obs_traj.new_zeros(B, 2)
+# # #     steps     = torch.arange(1, pred_len+1, device=device).float()
+# # #     pred_abs  = obs_traj[-1,:,:2].unsqueeze(0) + lv.unsqueeze(0) * steps.view(-1,1,1)
+# # #     pred_rel  = pred_abs.permute(1,0,2) - lp.unsqueeze(1)
+# # #     pred_rel4 = torch.cat([pred_rel, torch.zeros(B, pred_len, 2, device=device)], dim=-1)
+# # #     return pred_rel4 + torch.randn_like(pred_rel4) * sigma
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  NEW-1: Trajectory Mixup Augmentation
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _traj_mixup(x1_rel: torch.Tensor, delta: torch.Tensor,
+# # #                 prob: float = 0.3, alpha: float = 0.4) -> Tuple[torch.Tensor, torch.Tensor]:
+# # #     """
+# # #     NEW-1: Mixup giữa 2 samples trong batch.
+# # #     Giảm train/test gap bằng cách tạo ra smoother decision boundary.
+# # #     Chỉ mixup trên easy samples (delta < 0.4) để không làm mờ hard cases.
+# # #     Returns: mixed x1_rel, mixed delta
+# # #     """
+# # #     if not torch.is_tensor(x1_rel) or x1_rel.shape[0] < 2:
+# # #         return x1_rel, delta
+# # #     B = x1_rel.shape[0]
+# # #     # Chỉ apply với xác suất prob
+# # #     if torch.rand(1).item() > prob:
+# # #         return x1_rel, delta
+
+# # #     # Sample lambda từ Beta distribution
+# # #     lam = float(torch.distributions.Beta(alpha, alpha).sample())
+# # #     lam = max(lam, 1.0 - lam)   # luôn ≥ 0.5 để giữ original hơn
+
+# # #     # Shuffle indices
+# # #     idx = torch.randperm(B, device=x1_rel.device)
+
+# # #     # Chỉ mixup easy samples (delta < 0.4)
+# # #     # Hard samples (delta >= 0.4) giữ nguyên x1 và delta để không làm mờ
+# # #     # signal khó — đây là điểm cốt lõi của easy/difficult split.
+# # #     easy_mask_traj  = (delta < 0.4).float().view(B, 1, 1)   # [B,1,1] cho traj
+# # #     easy_mask_delta = (delta < 0.4).float()                  # [B] cho delta
+# # #     x1_mixed  = x1_rel * (1.0 - easy_mask_traj * (1.0 - lam)) +                 x1_rel[idx] * (easy_mask_traj * (1.0 - lam))
+# # #     # FIX: hard samples giữ nguyên delta, chỉ easy samples blend delta
+# # #     delta_mix = (delta * lam + delta[idx] * (1.0 - lam)) * easy_mask_delta +                 delta * (1.0 - easy_mask_delta)
+# # #     return x1_mixed, delta_mix
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  FIX-C1 + FIX-C5: Displacement Coherence Loss (thuần, không nhắm thẳng)
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _coherence_loss(
+# # #     pred_soft_grad: torch.Tensor,   # [B, 12, 4] — CÓ gradient (FIX-C1)
+# # #     x1_rel:         torch.Tensor,   # [B, 12, 4]
+# # #     lp:             torch.Tensor,   # [B, 2]
+# # #     device:         torch.device,
+# # # ) -> torch.Tensor:
+# # #     """
+# # #     FIX-C1: phải dùng pred_soft_grad CÓ gradient.
+# # #     FIX-C5: tính displacement diff trong km — có ý nghĩa vật lý.
+
+# # #     Pure displacement smoothness — KHÔNG có hardcoded step weight.
+# # #     Weight tự học hoàn toàn qua LearnedWeights.log_s_coh.
+# # #     """
+# # #     # Convert sang abs degrees
+# # #     pred_abs = lp.unsqueeze(1) + pred_soft_grad[:, :, :2]   # [B, 12, 2]
+# # #     gt_abs   = lp.unsqueeze(1) + x1_rel[:, :, :2]
+
+# # #     pred_deg = _norm_to_deg(pred_abs)   # [B, 12, 2]
+# # #     gt_deg   = _norm_to_deg(gt_abs)
+
+# # #     # Displacement per step trong km (FIX-C5: km space)
+# # #     cos_lat       = torch.cos(torch.deg2rad(gt_deg[:, :-1, 1])).clamp(1e-4)
+# # #     disp_pred_lon = (pred_deg[:, 1:, 0] - pred_deg[:, :-1, 0]) * cos_lat * DEG2KM
+# # #     disp_pred_lat = (pred_deg[:, 1:, 1] - pred_deg[:, :-1, 1]) * DEG2KM
+# # #     disp_gt_lon   = (gt_deg[:, 1:, 0]   - gt_deg[:, :-1, 0])   * cos_lat * DEG2KM
+# # #     disp_gt_lat   = (gt_deg[:, 1:, 1]   - gt_deg[:, :-1, 1])   * DEG2KM
+
+# # #     disp_pred = torch.stack([disp_pred_lon, disp_pred_lat], dim=-1)   # [B, 11, 2]
+# # #     disp_gt   = torch.stack([disp_gt_lon,   disp_gt_lat],   dim=-1)
+
+# # #     # Mean displacement diff in km — không có step weight nào hardcode
+# # #     # LearnedWeights sẽ tự cân bằng L_coh với L_FM và L_sel
+# # #     disp_diff = (disp_pred - disp_gt).norm(dim=-1)   # [B, 11]
+# # #     return disp_diff.mean() / DEG2KM                  # normalize về ~same scale as L_FM
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  NEW-3: Dropout Consistency Regularization
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # def _dropout_consistency_loss(
+# # #     encoder: SharedContextEncoder,
+# # #     raw_ctx: torch.Tensor,   # [B, 512] raw context (pre-dropout)
+# # # ) -> torch.Tensor:
+# # #     """
+# # #     NEW-3: Apply dropout 2 lần trên cùng raw_ctx → 2 dropout patterns khác nhau.
+# # #     Penalize inconsistency → model học features stable bất kể dropout.
+# # #     Chỉ áp dụng khi encoder đang ở training mode (dropout active).
+
+# # #     FIX BUG: Draft cũ gọi encode() 2 lần — encode() không có dropout,
+# # #     nên ctx1 = ctx2 → L_consist = 0 mọi lúc.
+# # #     Fix: apply_ctx_head 2 lần trên cùng raw_ctx → dropout khác nhau.
+# # #     """
+# # #     if not encoder.training:
+# # #         return torch.tensor(0.0, device=raw_ctx.device)
+# # #     # Gọi apply_ctx_head 2 lần: mỗi lần dropout khác nhau
+# # #     ctx_a = encoder.apply_ctx_head(raw_ctx)   # [B, 256]
+# # #     ctx_b = encoder.apply_ctx_head(raw_ctx)   # [B, 256] — different dropout mask
+# # #     ctx_a_n = F.normalize(ctx_a, dim=-1)
+# # #     ctx_b_n = F.normalize(ctx_b, dim=-1)
+# # #     cos_sim  = (ctx_a_n * ctx_b_n).sum(dim=-1)   # [B]
+# # #     return (1.0 - cos_sim).mean()
+
+
+# # # # ═════════════════════════════════════════════════════════════════════════════
+# # # #  TCFlowMatchingV65 — Main Class
+# # # # ═════════════════════════════════════════════════════════════════════════════
+
+# # # class TCFlowMatchingV65(nn.Module):
+
+# # #     def __init__(
+# # #         self,
+# # #         pred_len:           int   = 12,
+# # #         obs_len:            int   = 8,
+# # #         ctx_dim:            int   = 256,
+# # #         sigma_min:          float = 0.02,
+# # #         unet_in_ch:         int   = 13,
+# # #         K:                  int   = K_MODES,
+# # #         use_ema:            bool  = True,
+# # #         ema_decay:          float = 0.995,
+# # #         cfg_uncond_prob:    float = 0.10,
+# # #         selector_warmup:    int   = 2,
+# # #         head_noise_base:    float = 0.03,
+# # #         use_ot:             bool  = True,    # OT matching trong training
+# # #         ot_epsilon:         float = 0.05,    # Sinkhorn epsilon
+# # #         cfg_guidance_scale: float = 1.3,    # CFG scale trong inference
+# # #         **kwargs,
+# # #     ):
+# # #         super().__init__()
+# # #         self.pred_len        = pred_len
+# # #         self.obs_len         = obs_len
+# # #         self.sigma_min       = sigma_min
+# # #         self.K               = K
+# # #         self.use_ema         = use_ema
+# # #         self.ema_decay       = ema_decay
+# # #         self.cfg_uncond_prob = cfg_uncond_prob
+# # #         self.selector_warmup    = selector_warmup
+# # #         self.head_noise_base    = head_noise_base
+# # #         self.use_ot             = use_ot
+# # #         self.ot_epsilon         = ot_epsilon
+# # #         self.cfg_guidance_scale = cfg_guidance_scale
+# # #         self._ema               = None
+
+# # #         self.encoder        = SharedContextEncoder(
+# # #             pred_len=pred_len, obs_len=obs_len,
+# # #             ctx_dim=ctx_dim, unet_in_ch=unet_in_ch)
+# # #         self.velocity_heads = nn.ModuleList([
+# # #             CompassVelocityHead(compass_idx=k, pred_len=pred_len, ctx_dim=ctx_dim)
+# # #             for k in range(K)])
+# # #         self.selector       = CompassSelector(ctx_dim=ctx_dim, K=K, n_dirs=8)
+# # #         self.learned_weights= LearnedWeights()
+
+# # #     # ── EMA ──────────────────────────────────────────────────────────────────
+
+# # #     def init_ema(self):
+# # #         if self.use_ema: self._ema = EMAModel(self, decay=self.ema_decay)
+
+# # #     def ema_update(self):
+# # #         if self._ema is not None: self._ema.update(self)
+
+# # #     def set_curriculum_len(self, *a, **kw): pass
+
+# # #     @staticmethod
+# # #     def _sigma_schedule(epoch):
+# # #         if epoch < 2:  return 0.10
+# # #         if epoch < 10: return 0.10 - (epoch-2)/8.0*(0.10-0.04)
+# # #         if epoch < 20: return max(0.04 - (epoch-10)/10.0*0.01, 0.035)
+# # #         return 0.035
+
+# # #     @staticmethod
+# # #     def _lon_flip_aug(bl, p=0.3):
+# # #         if torch.rand(1).item() > p: return bl
+# # #         bl = list(bl)
+# # #         for i in [0,1,2,3]:
+# # #             if torch.is_tensor(bl[i]) and bl[i].shape[-1] >= 1:
+# # #                 t = bl[i].clone(); t[...,0] = -t[...,0]; bl[i] = t
+# # #         return bl
+
+# # #     @staticmethod
+# # #     def _obs_noise_aug(bl, sigma=0.005):
+# # #         if torch.rand(1).item() > 0.5: return bl
+# # #         bl = list(bl)
+# # #         if torch.is_tensor(bl[0]):
+# # #             bl[0] = bl[0] + torch.randn_like(bl[0]) * sigma
+# # #         return bl
+
+# # #     @staticmethod
+# # #     def _to_rel(traj, Me, lp, lm):
+# # #         return torch.cat([traj - lp.unsqueeze(0),
+# # #                           Me  - lm.unsqueeze(0)], dim=-1).permute(1, 0, 2)
+
+# # #     @staticmethod
+# # #     def _to_abs(rel, lp, lm):
+# # #         d = rel.permute(1, 0, 2)
+# # #         return lp.unsqueeze(0) + d[:,:,:2], lm.unsqueeze(0) + d[:,:,2:]
+
+# # #     def _cfm_noisy(self, x1_rel, sigma_min=None, lp=None):
+# # #         if sigma_min is None: sigma_min = self.sigma_min
+# # #         B = x1_rel.shape[0]; device = x1_rel.device
+# # #         x0 = torch.randn_like(x1_rel) * sigma_min
+# # #         t  = torch.rand(B, device=device)
+# # #         te = t.view(B, 1, 1)
+# # #         return (1.0-te)*x0 + te*x1_rel, t, x1_rel - x0
+
+# # #     @staticmethod
+# # #     @torch.no_grad()
+# # #     def _persistence_blend(model_pred, obs_traj_norm, blend_strength=0.10):
+# # #         T_obs = obs_traj_norm.shape[0]; T = model_pred.shape[0]
+# # #         B, device = model_pred.shape[1], model_pred.device
+# # #         if T_obs < 2: return model_pred
+# # #         vels = obs_traj_norm[1:] - obs_traj_norm[:-1]; n_v = vels.shape[0]
+# # #         if n_v >= 3:
+# # #             alpha = 0.7
+# # #             w  = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+# # #                                dtype=torch.float, device=device).flip(0)
+# # #             ev = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+# # #         elif n_v == 2: ev = 0.7*vels[-1] + 0.3*vels[-2]
+# # #         else: ev = vels[-1]
+# # #         steps   = torch.arange(1, T+1, dtype=torch.float, device=device)
+# # #         persist = obs_traj_norm[-1].unsqueeze(0) + ev.unsqueeze(0)*steps.view(T,1,1)
+# # #         obs_spd = _step_speeds_deg(_norm_to_deg(obs_traj_norm))
+# # #         if obs_spd.shape[0] >= 2:
+# # #             spd_cv  = obs_spd.std(0) / obs_spd.mean(0).clamp(min=1.0)
+# # #             alpha_b = (blend_strength*torch.sigmoid(-(spd_cv-0.3)*5.0)).unsqueeze(0).unsqueeze(-1)
+# # #         else: alpha_b = blend_strength * 0.5
+# # #         return (1.0-alpha_b)*model_pred + alpha_b*persist
+
+# # #     # ═════════════════════════════════════════════════════════════════════════
+# # #     #  TRAINING LOSS
+# # #     # ═════════════════════════════════════════════════════════════════════════
+
+# # #     def get_loss(self, batch_list, epoch=0, **kwargs):
+# # #         return self.get_loss_breakdown(batch_list, epoch=epoch)["total"]
+
+# # #     def get_loss_breakdown(self, batch_list, epoch=0, **kwargs):
+# # #         # ── Augmentation ─────────────────────────────────────────────────────
+# # #         batch_list = self._lon_flip_aug(batch_list)
+# # #         batch_list = self._obs_noise_aug(batch_list, sigma=0.005)
+
+# # #         # ── Unpack (FIX-B1) ──────────────────────────────────────────────────
+# # #         obs_t    = batch_list[0]    # [T, B, 2]
+# # #         pred_t   = batch_list[1]    # [T, B, 2]
+# # #         obs_Me   = batch_list[7]    # [T, B, 2]
+# # #         pred_Me  = batch_list[8]    # [T, B, 2]
+# # #         env_data = batch_list[13] if len(batch_list) > 13 else None
+
+# # #         lp = obs_t[-1]; lm = obs_Me[-1]
+# # #         B, device = lp.shape[0], lp.device
+# # #         sigma     = self._sigma_schedule(epoch)
+# # #         in_warmup = (epoch < self.selector_warmup)
+
+# # #         # ── Context encoding ─────────────────────────────────────────────────
+# # #         raw_ctx  = self.encoder.encode(batch_list)           # [B, 512]
+# # #         use_null = (torch.rand(1).item() < self.cfg_uncond_prob)
+# # #         ctx      = self.encoder.apply_ctx_head(raw_ctx, use_null=use_null)  # [B, 256]
+
+# # #         # ── NEW-3: Dropout consistency regularization ─────────────────────────
+# # #         L_consist = _dropout_consistency_loss(self.encoder, raw_ctx)
+
+# # #         # ── Difficulty score (FIX-B2) ────────────────────────────────────────
+# # #         obs_BT2  = obs_t.permute(1, 0, 2)
+# # #         img_obs  = batch_list[11]
+# # #         delta    = compute_difficulty_score(obs_BT2, img_obs, env_data, device)
+
+# # #         # ── FM interpolant (FIX-B3) ──────────────────────────────────────────
+# # #         x1_rel_orig = self._to_rel(pred_t, pred_Me, lp, lm)    # [B, 12, 4]
+
+# # #         # ── OT matching (port từ v59) ─────────────────────────────────────────
+# # #         # Ghép noise với GT tối ưu → FM path ngắn hơn → train tốt hơn.
+# # #         # Áp dụng TRƯỚC mixup vì OT cần GT gốc để tính cost.
+# # #         if self.use_ot and B >= 4 and not in_warmup:
+# # #             noise_ot = torch.randn_like(x1_rel_orig) * sigma
+# # #             _, x1_rel_orig = _spherical_ot_matching(
+# # #                 noise_ot, x1_rel_orig, lp, epsilon=self.ot_epsilon)
+
+# # #         # ── NEW-1: Mixup augmentation ────────────────────────────────────────
+# # #         x1_rel, delta = _traj_mixup(x1_rel_orig, delta, prob=0.3, alpha=0.4)
+
+# # #         x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=sigma, lp=lp)
+# # #         # x_t: [B,12,4], fm_t: [B], u_target: [B,12,4]
+
+# # #         # ── FIX-C3: x_t_shared — FM noisy input chung cho tất cả heads ────────
+# # #         # Oracle ADE tính từ x_t_shared (không có per-head z_k) → fair comparison.
+# # #         # x_t_shared đã có sigma từ _cfm_noisy schedule; "shared" nghĩa là
+# # #         # không thêm per-head noise khi tính oracle.
+# # #         x_t_shared = x_t
+
+# # #         # ── Generate K=8 modes (FIX-P1 + FIX-C2: consistent sigma_k) ────────
+# # #         modes_rel_nograd = []   # stop-grad cho selector/oracle  [B,12,4]
+# # #         modes_rel_grad   = []   # có gradient cho L_FM, L_coh    [B,12,4]
+# # #         vels_pred        = []   # gradient
+
+# # #         for k in range(self.K):
+# # #             # FIX-C2: sigma_k đồng nhất giữa training và inference
+# # #             sigma_k = self.head_noise_base * (1.0 + k * 0.25)
+# # #             z_k       = torch.randn_like(x_t_shared) * sigma_k
+# # #             x_t_k      = x_t_shared + z_k
+
+# # #             if in_warmup:
+# # #                 with torch.no_grad():
+# # #                     v_k = self.velocity_heads[k](x_t_k, fm_t, ctx.detach())
+# # #             else:
+# # #                 v_k = self.velocity_heads[k](x_t_k, fm_t, ctx)
+
+# # #             # FIX-C3: x1_pred oracle dùng x_t_CLEAN (không có z_k) làm base
+# # #             # → oracle fair: không có head nào có lợi thế do ít noise
+# # #             with torch.no_grad():
+# # #                 pred_k_oracle = x_t_shared + (1.0 - fm_t.view(B,1,1)) * v_k
+# # #             modes_rel_nograd.append(pred_k_oracle.detach())
+
+# # #             # pred có gradient: dùng x_t_k làm base (consistent với training)
+# # #             pred_k_grad = x_t_k + (1.0 - fm_t.view(B,1,1)) * v_k
+# # #             modes_rel_grad.append(pred_k_grad)
+# # #             vels_pred.append(v_k)
+
+# # #         modes_t_ng = torch.stack(modes_rel_nograd, dim=1)  # [B,K,12,4] no-grad
+# # #         modes_t_g  = torch.stack(modes_rel_grad,   dim=1)  # [B,K,12,4] with-grad
+
+# # #         # ── Oracle assignment: dùng x1_rel_orig (NOT mixup) ─────────────────
+# # #         # FIX: oracle phải so với GT gốc, không phải GT đã blend.
+# # #         # x1_rel (mixup) được dùng cho FM training objective.
+# # #         # x1_rel_orig được dùng cho oracle selection → k_star phản ánh
+# # #         # mode nào thực sự gần GT nhất, không bị artifact mixup.
+# # #         with torch.no_grad():
+# # #             ade_k  = torch.stack([
+# # #                 _ade_km_from_rel(modes_rel_nograd[k], x1_rel_orig.detach(), lp)
+# # #                 for k in range(self.K)
+# # #             ], dim=1)                       # [B, K]
+# # #             k_star = ade_k.argmin(dim=1)    # [B]
+
+# # #         # ── FM Loss: Easy/Difficult (thuần, không có step weighting hardcode) ──
+# # #         # FM velocity MSE thuần — không nhắm vào bất kỳ bước cụ thể nào.
+# # #         # Easy/Difficult split theo delta là đủ để phân biệt hard/easy cases.
+# # #         fm_errs = torch.stack([
+# # #             ((vels_pred[k] - u_target)**2).mean(dim=[1, 2])
+# # #             for k in range(self.K)
+# # #         ], dim=1)                                    # [B, K]
+
+# # #         L_easy   = fm_errs.mean(dim=1)               # [B]
+# # #         L_oracle = fm_errs[torch.arange(B, device=device), k_star]  # [B]
+
+# # #         # Diversity push (FIX-B5)
+# # #         mode_star_ng = modes_t_ng[torch.arange(B, device=device), k_star]
+# # #         dists_all    = torch.stack([
+# # #             ((mode_star_ng - modes_t_ng[:, k])**2).mean(dim=[1,2]).sqrt()
+# # #             for k in range(self.K)
+# # #         ], dim=1)
+# # #         mask_ns       = torch.ones(B, self.K, device=device, dtype=torch.bool)
+# # #         mask_ns.scatter_(1, k_star.unsqueeze(1), False)
+# # #         min_dist      = dists_all.masked_fill(~mask_ns, float('inf')).min(dim=1).values
+
+# # #         MARGIN = 0.40
+# # #         L_div  = F.relu(MARGIN - min_dist)
+# # #         L_diff = L_oracle + 0.3 * L_div
+
+# # #         L_FM_raw = (1.0 - delta) * L_easy + delta * L_diff
+# # #         w_d      = 0.5 + 1.5 * delta
+# # #         L_FM     = (w_d * L_FM_raw).mean()
+
+# # #         # ── Selector Loss (STOP-GRAD) ─────────────────────────────────────────
+# # #         sel_logits, dir_logits = self.selector(
+# # #             ctx.detach(), modes_t_ng, env_data)   # modes_t_ng already detached
+
+# # #         tau      = 3.0
+# # #         p_oracle = F.softmax(-ade_k / tau, dim=1)
+# # #         L_rank   = F.kl_div(F.log_softmax(sel_logits, dim=1), p_oracle,
+# # #                              reduction='batchmean')
+
+# # #         gt_bucket = get_gt_direction_bucket(obs_t, pred_t)
+# # #         L_dir     = F.cross_entropy(dir_logits, gt_bucket)
+
+# # #         # ── FIX-C1 + FIX-C5: Coherence Loss (CÓ gradient, dùng x1_rel_orig) ─
+# # #         # Dùng selector probs (stop-grad) để weight modes, nhưng modes_t_g CÓ grad
+# # #         with torch.no_grad():
+# # #             sel_probs = F.softmax(sel_logits, dim=1)           # [B, K]
+# # #         # Weighted sum của modes_t_g — gradient chảy qua modes_t_g
+# # #         pred_soft_grad = (sel_probs.unsqueeze(-1).unsqueeze(-1)
+# # #                           * modes_t_g).sum(dim=1)              # [B,12,4] — CÓ grad
+# # #         L_coh = _coherence_loss(pred_soft_grad, x1_rel_orig, lp, device)  # dùng orig GT cho coherence, nhất quán với oracle
+
+# # #         # ── Learned weights (FIX-P2: 2-phase) ───────────────────────────────
+# # #         # TẤT CẢ weights tự học — không có hardcode nào.
+# # #         if in_warmup:
+# # #             # Phase 1: chỉ train selector
+# # #             alpha_lw = torch.sigmoid(self.learned_weights.log_alpha)
+# # #             L_total  = alpha_lw * L_rank + (1.0 - alpha_lw) * L_dir
+# # #         else:
+# # #             # Phase 2: joint training, 4 losses đều tự cân bằng
+# # #             L_total = self.learned_weights(L_FM, L_rank, L_dir, L_coh, L_consist)
+
+# # #         if not torch.isfinite(L_total):
+# # #             L_total = L_total.new_zeros(())
+
+# # #         def _s(x): return x.item() if torch.is_tensor(x) else float(x)
+
+# # #         return {
+# # #             "total":          L_total,
+# # #             "L_FM":           _s(L_FM),
+# # #             "L_easy":         _s(L_easy.mean()),
+# # #             "L_diff":         _s(L_diff.mean()),
+# # #             "L_oracle":       _s(L_oracle.mean()),
+# # #             "L_div":          _s(L_div.mean()),
+# # #             "L_rank":         _s(L_rank),
+# # #             "L_dir":          _s(L_dir),
+# # #             "L_coh":          _s(L_coh),
+# # #             "L_consist":      _s(L_consist),
+# # #             "delta_mean":     _s(delta.mean()),
+# # #             "delta_p75":      _s(delta.quantile(0.75)),
+# # #             "min_dist_mean":  _s(min_dist.mean()),
+# # #             "in_warmup":      in_warmup,
+# # #             **self.learned_weights.get_weights(),
+# # #         }
+
+# # #     # ═════════════════════════════════════════════════════════════════════════
+# # #     #  INFERENCE
+# # #     # ═════════════════════════════════════════════════════════════════════════
+
+# # #     @torch.no_grad()
+# # #     def sample(self, batch_list, ddim_steps=20, predict_csv=None,
+# # #                blend_strength=0.10, **kwargs):
+# # #         """
+# # #         Inference K=8 compass modes → selector chọn best.
+# # #         FIX-C2: dùng cùng sigma_k như training.
+# # #         """
+# # #         obs_t    = batch_list[0]   # [T, B, 2]
+# # #         obs_Me   = batch_list[7]
+# # #         env_data = batch_list[13] if len(batch_list) > 13 else None
+
+# # #         lp = obs_t[-1]; lm = obs_Me[-1]
+# # #         B, device = lp.shape[0], lp.device
+# # #         T_pred = self.pred_len
+# # #         dt     = 1.0 / max(ddim_steps, 1)
+
+# # #         raw_ctx = self.encoder.encode(batch_list)
+# # #         ctx     = self.encoder.apply_ctx_head(raw_ctx)
+
+# # #         # FIX-B11: persistence x0 trong rel space
+# # #         x0_base = _persistence_x0_rel(obs_t, obs_Me, lp, lm, T_pred, sigma=0.0)
+
+# # #         all_modes_abs = []
+
+# # #         # Null context cho CFG (port từ v59)
+# # #         ctx_null = self.encoder.apply_ctx_head(raw_ctx, use_null=True)
+
+# # #         # Heading từ obs để tính alignment gate (port từ v59)
+# # #         obs_t_norm = obs_t[:, :, :2]   # [T, B, 2]
+# # #         if obs_t_norm.shape[0] >= 2:
+# # #             obs_h_n = F.normalize(
+# # #                 obs_t_norm[-1] - obs_t_norm[-2], dim=-1, eps=1e-6)  # [B, 2]
+# # #         else:
+# # #             obs_h_n = None
+
+# # #         for k in range(self.K):
+# # #             # FIX-C2: sigma_k nhất quán với training
+# # #             sigma_k = self.head_noise_base * (1.0 + k * 0.25)
+# # #             x_t = x0_base + torch.randn_like(x0_base) * sigma_k
+
+# # #             for step in range(ddim_steps):
+# # #                 t_b = torch.full((B,), step * dt, device=device)
+
+# # #                 # CFG từ step 1 trở đi (step 0 dùng cond để ổn định)
+# # #                 if step > 0 and self.cfg_guidance_scale > 1.0:
+# # #                     v_cond   = self.velocity_heads[k](x_t, t_b, ctx)
+# # #                     v_uncond = self.velocity_heads[k](x_t, t_b, ctx_null)
+
+# # #                     # Alignment gate: scale CFG theo alignment với obs heading
+# # #                     if obs_h_n is not None:
+# # #                         pred_h = F.normalize(
+# # #                             v_cond[:, 0, :2].detach(), dim=-1, eps=1e-6)
+# # #                         cos_a  = (obs_h_n * pred_h).sum(-1).clamp(-1.0, 1.0)
+# # #                         # gs ∈ [0.8, 1.5]: aligned → full guidance, misaligned → reduced
+# # #                         gs     = (0.8 + 0.7 * (cos_a + 1.0) * 0.5).view(B, 1, 1)
+# # #                         v_k    = v_uncond + gs * (v_cond - v_uncond)
+# # #                     else:
+# # #                         v_k = v_uncond + self.cfg_guidance_scale * (v_cond - v_uncond)
+# # #                 else:
+# # #                     v_k = self.velocity_heads[k](x_t, t_b, ctx)
+
+# # #                 x_t = (x_t + dt * v_k).clamp(-5.0, 5.0)
+
+# # #             traj_abs, _ = self._to_abs(x_t, lp, lm)   # [T, B, 2]
+# # #             all_modes_abs.append(traj_abs)
+
+# # #         modes_stack = torch.stack(all_modes_abs, dim=0)   # [K, T, B, 2]
+
+# # #         # Rebuild modes_rel_sel cho selector [B, K, T, 4]
+# # #         modes_rel_sel = torch.stack([
+# # #             torch.cat([all_modes_abs[k].permute(1,0,2) - lp.unsqueeze(1),
+# # #                        torch.zeros(B, T_pred, 2, device=device)], dim=-1)
+# # #             for k in range(self.K)
+# # #         ], dim=1)
+
+# # #         sel_logits, _ = self.selector(ctx, modes_rel_sel, env_data)
+# # #         best_k        = sel_logits.argmax(dim=1)          # [B]
+
+# # #         pred_best_list = [modes_stack[best_k[b], :, b, :] for b in range(B)]
+# # #         pred_best = torch.stack(pred_best_list, dim=1)    # [T, B, 2]
+
+# # #         pred_final = self._persistence_blend(
+# # #             pred_best, obs_t[:, :, :2], blend_strength=blend_strength)
+
+# # #         if predict_csv is not None:
+# # #             self._write_predict_csv(predict_csv, pred_final, modes_stack)
+
+# # #         return pred_final, modes_stack
+
+# # #     @staticmethod
+# # #     def _write_predict_csv(csv_path, traj_mean, all_modes_KTB2):
+# # #         import csv as _csv, os
+# # #         from datetime import datetime
+# # #         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+# # #         T, B = traj_mean.shape[0], traj_mean.shape[1]
+# # #         mlon = ((traj_mean[...,0]*50.0+1800.0)/10.0).cpu().numpy()
+# # #         mlat = ((traj_mean[...,1]*50.0)/10.0).cpu().numpy()
+# # #         fields = ["ts","b","step","lead_h","lon","lat"]
+# # #         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+# # #         write_hdr = not os.path.exists(csv_path)
+# # #         with open(csv_path, "a", newline="") as fh:
+# # #             w = _csv.DictWriter(fh, fieldnames=fields)
+# # #             if write_hdr: w.writeheader()
+# # #             for b in range(B):
+# # #                 for k in range(T):
+# # #                     w.writerow({"ts":ts,"b":b,"step":k,"lead_h":(k+1)*6,
+# # #                                  "lon":f"{mlon[k,b]:.4f}","lat":f"{mlat[k,b]:.4f}"})
+
+
+# # # # Backward compat
+# # # TCFlowMatching = TCFlowMatchingV65
+# # # TCDiffusion    = TCFlowMatchingV65
+
 # # """
-# # flow_matching_model_v65.py  ── v65-final
+# # flow_matching_model_v65.py  ── v65-rev2
 # # ══════════════════════════════════════════════════════════════════════════════
-# # TC-FlowMatching v65-final
+# # TC-FlowMatching v65 — Revision 2
 
-# # MỤC TIÊU: ADE/CTE/72h thấp hơn hẳn v59 và STTrans.
-# #           Train/test gap nhỏ lại.
+# # VẤN ĐỀ CỐT LÕI SO VỚI STTRANS
+# # ────────────────────────────────
+# # STTrans dùng cùng encoder stack (FNO3D + Mamba + Env_net) nhưng decoder là
+# # 1 Non-AR Transformer optimize L_DPE (haversine) TRỰC TIẾP.
 
-# # FIXES TỪ v65-draft
-# # ───────────────────
-# # FIX-C1  Coherence loss gradient: dùng modes có grad (không detach khi tính L_coh).
-# #         Draft cũ: pred_soft từ sel_logits đã stop-grad → L_coh = 0 gradient.
+# # v65-rev1 optimize L_FM = velocity MSE → KHÔNG trực tiếp minimize haversine
+# # → ADE của v65 có thể không thấp hơn STTrans dù có K=8 modes.
 
-# # FIX-C2  Train/inference noise consistency:
-# #         Draft cũ: training dùng x_t_k = x_t + z_k*σ_k, inference dùng formula khác.
-# #         Fix: cả hai đều dùng cùng sigma_k per head từ self.head_noise_base.
-# #         Inference: x_t_k = x0_persistence + randn * sigma_k (nhất quán).
+# # THAY ĐỔI TRONG rev2
+# # ────────────────────
+# # [REV2-1] L_DPE trực tiếp cho oracle head (KEY FIX)
+# #          Thêm haversine loss cho best mode (k_star):
+# #            L_dpe_oracle = haversine(x1_pred_best_mode, x1_gt_orig) / 500
+# #          Đưa vào LearnedWeights như term thứ 5 → model learn to minimize
+# #          haversine trực tiếp như STTrans, nhưng ĐỒN THỜI có FM diversity.
 
-# # FIX-C3  Oracle assignment bias từ per-head noise:
-# #         Draft cũ: oracle chọn mode thắng ADE trên noisy x_t_k → head ít noise (k=0)
-# #         có lợi thế không liên quan đến quality.
-# #         Fix: oracle ADE tính trên x1_pred = x_t_CLEAN + (1-t)*v_k,
-# #         tức là dùng x_t không nhiễu làm base cho x1_pred oracle.
+# # [REV2-2] L_speed + L_accel (physics kinematic, từ STTrans paper §3.5.1)
+# #          Penalize unrealistic speed/acceleration trong best mode prediction.
+# #          STTrans có điều này, v65-rev1 không → giúp 72h coherence.
+# #          λ_speed = 0.1, λ_accel = 0.01 (đúng như paper).
 
-# # FIX-C4  Compass bias yếu bị overwhelmed:
-# #         Draft cũ: 0.1 scale, 1 bias vector trong 256-dim space.
-# #         Fix: direction conditioning qua cross-attention explicit với direction token,
-# #         không phải additive bias — cơ chế mạnh hơn, không bị gradient wash.
+# # [REV2-3] LearnedWeights mở rộng: 6 terms
+# #          s_fm, s_sel, s_coh, s_con, s_dpe, s_kin (kinematic)
+# #          Tất cả tự học, không hardcode.
 
-# # FIX-C5  Coherence loss tính trên normalized space thiếu scale:
-# #         Fix: tính displacement diff trong km (haversine), có ý nghĩa vật lý.
+# # [REV2-4] MARGIN tự học thay vì hardcode 0.40
+# #          MARGIN = sigmoid(log_margin) * 0.8 → [0, 0.8]
+# #          Tự adapt theo data distribution.
 
-# # THÊM MỚI ĐỂ GIẢM ADE VÀ TRAIN/TEST GAP
-# # ────────────────────────────────────────
-# # NEW-1   Mixup augmentation trên trajectory: blending 2 samples trong batch
-# #         → model học smoother decision boundary → giảm test ADE.
+# # [REV2-5] Inference: haversine-based final selection
+# #          Thay vì chỉ dùng selector logits, combine với speed plausibility:
+# #          score_final = sel_logits - λ * speed_penalty
+# #          Modes vi phạm speed > 80 km/h bị penalize khi chọn.
 
-# # NEW-2   Trajectory Mixup augmentation: blending easy samples trong batch
-# #         → smoother decision boundary → giảm train/test gap.
-
-# # NEW-3   Dropout consistency regularization: penalize encoder inconsistency
-# #         giữa 2 forward passes → giảm overfitting.
-
-# # NEW-4   Stochastic depth trong CompassVelocityHead direction token
-# #         → regularization cho K=8 heads.
+# # GIỮ NGUYÊN TỪ rev1
+# # ────────────────────
+# # - K=8 compass heads với direction cross-attention (FIX-C4)
+# # - Per-head noise injection (FIX-P1, FIX-C2)
+# # - Oracle assignment từ x_t_shared (FIX-C3)
+# # - Easy/Difficult split với δ (5 env signals)
+# # - OT matching (từ v59)
+# # - CFG inference với alignment gate
+# # - 3-phase training
+# # - Mixup augmentation
+# # - Dropout consistency
+# # - Tất cả 11 bug fixes từ review
 # # """
 # # from __future__ import annotations
 
@@ -57,7 +1244,6 @@
 # # from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
 # # from Model.env_net_transformer_gphsplit import Env_net
 
-# # # ─────────────────────────────────────────────────────────────────────────────
 # # R_EARTH      = 6371.0
 # # DT_HOURS     = 6.0
 # # DEG2KM       = 111.0
@@ -66,6 +1252,10 @@
 # # _COMPASS_DEG   = [0., 45., 90., 135., 180., 225., 270., 315.]
 # # _COMPASS_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 # # K_MODES        = 8
+
+# # # Speed/accel physics constants (từ STTrans paper)
+# # _V_MAX_KMH   = 80.0    # max realistic TC speed km/h
+# # _DT_H        = 6.0     # time step hours
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
@@ -82,9 +1272,9 @@
 # #     lat1 = torch.deg2rad(p1[..., 1]); lat2 = torch.deg2rad(p2[..., 1])
 # #     dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
 # #     dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
-# #     a = (torch.sin(dlat / 2).pow(2) +
-# #          torch.cos(lat1) * torch.cos(lat2) * torch.sin(dlon / 2).pow(2))
-# #     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1 - 1e-12).sqrt())
+# #     a = (torch.sin(dlat/2).pow(2) +
+# #          torch.cos(lat1)*torch.cos(lat2)*torch.sin(dlon/2).pow(2))
+# #     return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
 
 # # def _unwrap_model(m):
 # #     return m._orig_mod if hasattr(m, "_orig_mod") else m
@@ -94,218 +1284,190 @@
 # #     if T < 2: return traj_deg.new_zeros(1, traj_deg.shape[1])
 # #     return _haversine_deg(traj_deg[:-1], traj_deg[1:]) / DT_HOURS
 
-# # def _ade_km_from_rel(
-# #     pred_rel: torch.Tensor,   # [B, T, 4]
-# #     gt_rel:   torch.Tensor,   # [B, T, 4]
-# #     lp:       torch.Tensor,   # [B, 2]
-# # ) -> torch.Tensor:            # [B]
-# #     """FIX-B4: rel → abs → deg → haversine. Chỉ lon/lat (2 dims đầu)."""
+# # def _ade_km_from_rel(pred_rel, gt_rel, lp):
+# #     """[B,T,4] → [B] ADE in km."""
 # #     pred_abs = lp.unsqueeze(1) + pred_rel[:, :, :2]
 # #     gt_abs   = lp.unsqueeze(1) + gt_rel[:, :, :2]
 # #     return _haversine_deg(_norm_to_deg(pred_abs), _norm_to_deg(gt_abs)).mean(dim=1)
 
+
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  Spherical OT Matching  (port từ v59, thêm vào v65)
+# # #  REV2-1+2: Physics-informed DPE + Kinematic Loss
+# # #  Lấy cảm hứng từ STTrans loss (§3.5.1) nhưng áp dụng cho best mode
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def _forward_azimuth(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-# #     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
-# #     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
+# # def _dpe_and_kinematic_loss(
+# #     best_mode_rel: torch.Tensor,   # [B, T, 4] — best mode, CÓ gradient
+# #     x1_rel_orig:   torch.Tensor,   # [B, T, 4] — GT original
+# #     lp:            torch.Tensor,   # [B, 2]
+# #     device:        torch.device,
+# #     v_max_norm:    float,          # max speed in normalized units
+# # ) -> Tuple[torch.Tensor, torch.Tensor]:
+# #     """
+# #     REV2-1: L_DPE = mean haversine(best_mode, GT) / 500 (normalize ~same scale as L_FM)
+# #     REV2-2: L_kin = λ_speed*L_speed + λ_accel*L_accel (từ STTrans §3.5.1)
+
+# #     Returns: (L_dpe, L_kin)
+# #     """
+# #     B, T = best_mode_rel.shape[:2]
+
+# #     # Convert sang degrees cho haversine
+# #     best_abs = lp.unsqueeze(1) + best_mode_rel[:, :, :2]   # [B, T, 2]
+# #     gt_abs   = lp.unsqueeze(1) + x1_rel_orig[:, :, :2]
+
+# #     best_deg = _norm_to_deg(best_abs)   # [B, T, 2]
+# #     gt_deg   = _norm_to_deg(gt_abs)
+
+# #     # L_DPE: mean haversine (eq. 16 trong STTrans paper)
+# #     L_dpe = _haversine_deg(best_deg, gt_deg).mean() / 500.0
+
+# #     # L_speed: penalize step speed > v_max (eq. 18-20)
+# #     if T >= 2:
+# #         step_dist = (best_mode_rel[:, 1:, :2] - best_mode_rel[:, :-1, :2]).norm(dim=-1)
+# #         L_speed   = F.relu(step_dist - v_max_norm).pow(2).mean()
+# #     else:
+# #         L_speed = torch.tensor(0.0, device=device)
+
+# #     # L_accel: penalize acceleration (eq. 21-22)
+# #     if T >= 3:
+# #         vel      = best_mode_rel[:, 1:, :2] - best_mode_rel[:, :-1, :2]  # [B,T-1,2]
+# #         spd      = vel.norm(dim=-1)                                        # [B, T-1]
+# #         L_accel  = (spd[:, 1:] - spd[:, :-1]).pow(2).mean()
+# #     else:
+# #         L_accel = torch.tensor(0.0, device=device)
+
+# #     L_kin = 0.1 * L_speed + 0.01 * L_accel
+# #     return L_dpe, L_kin
+
+
+# # # ═════════════════════════════════════════════════════════════════════════════
+# # #  OT Matching (từ v59)
+# # # ═════════════════════════════════════════════════════════════════════════════
+
+# # def _forward_azimuth(p1, p2):
+# #     lon1 = torch.deg2rad(p1[...,0]); lat1 = torch.deg2rad(p1[...,1])
+# #     lon2 = torch.deg2rad(p2[...,0]); lat2 = torch.deg2rad(p2[...,1])
 # #     dlon = lon2 - lon1
-# #     y = torch.sin(dlon) * torch.cos(lat2)
-# #     x = (torch.cos(lat1) * torch.sin(lat2)
-# #          - torch.sin(lat1) * torch.cos(lat2) * torch.cos(dlon))
+# #     y = torch.sin(dlon)*torch.cos(lat2)
+# #     x = torch.cos(lat1)*torch.sin(lat2) - torch.sin(lat1)*torch.cos(lat2)*torch.cos(dlon)
 # #     return torch.atan2(y, x)
 
-
-# # def _sinkhorn_log(cost: torch.Tensor, epsilon: float = 0.05,
-# #                   n_iter: int = 50) -> torch.Tensor:
+# # def _sinkhorn_log(cost, epsilon=0.05, n_iter=50):
 # #     B = cost.shape[0]; device = cost.device
-# #     log_a = -math.log(B) * torch.ones(B, device=device)
-# #     log_b = -math.log(B) * torch.ones(B, device=device)
-# #     log_K = -cost / epsilon
-# #     log_u = torch.zeros(B, device=device)
-# #     log_v = torch.zeros(B, device=device)
+# #     log_a = -math.log(B)*torch.ones(B,device=device)
+# #     log_b = -math.log(B)*torch.ones(B,device=device)
+# #     log_K = -cost/epsilon
+# #     log_u = torch.zeros(B,device=device)
+# #     log_v = torch.zeros(B,device=device)
 # #     for _ in range(n_iter):
-# #         log_u = log_a - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
-# #         log_v = log_b - torch.logsumexp(log_K + log_u.unsqueeze(1), dim=0)
-# #     return (log_K + log_u.unsqueeze(1) + log_v.unsqueeze(0)).exp().clamp(0.0)
+# #         log_u = log_a - torch.logsumexp(log_K+log_v.unsqueeze(0), dim=1)
+# #         log_v = log_b - torch.logsumexp(log_K+log_u.unsqueeze(1), dim=0)
+# #     return (log_K+log_u.unsqueeze(1)+log_v.unsqueeze(0)).exp().clamp(0.0)
 
-
-# # def _geodesic_ot_cost(x0_rel: torch.Tensor, x1_rel: torch.Tensor,
-# #                        lp: torch.Tensor) -> torch.Tensor:
-# #     """Cost matrix [B, B] dựa trên position + speed + direction."""
+# # def _geodesic_ot_cost(x0_rel, x1_rel, lp):
 # #     B = x0_rel.shape[0]
-
-# #     def _abs_deg(rel):
-# #         return _norm_to_deg(lp.unsqueeze(1) + rel[:, :, :2])
-
+# #     def _abs_deg(rel): return _norm_to_deg(lp.unsqueeze(1)+rel[:,:,:2])
 # #     x0d = _abs_deg(x0_rel); x1d = _abs_deg(x1_rel)
-# #     x0e = x0d.unsqueeze(1).expand(B, B, -1, -1).reshape(B*B, -1, 2)
-# #     x1e = x1d.unsqueeze(0).expand(B, B, -1, -1).reshape(B*B, -1, 2)
-# #     pos_cost = _haversine_deg(x0e, x1e).reshape(B, B, -1).mean(-1) / 500.0
+# #     x0e = x0d.unsqueeze(1).expand(B,B,-1,-1).reshape(B*B,-1,2)
+# #     x1e = x1d.unsqueeze(0).expand(B,B,-1,-1).reshape(B*B,-1,2)
+# #     pos_cost = _haversine_deg(x0e,x1e).reshape(B,B,-1).mean(-1)/500.0
+# #     spd0 = _step_speeds_deg(x0d.permute(1,0,2)).permute(1,0).mean(-1)
+# #     spd1 = _step_speeds_deg(x1d.permute(1,0,2)).permute(1,0).mean(-1)
+# #     speed_cost = (spd0.unsqueeze(1)-spd1.unsqueeze(0)).abs()/20.0
+# #     def _mb(td):
+# #         b = _forward_azimuth(td[:,:-1,:],td[:,1:,:])
+# #         return torch.atan2(b.sin().mean(-1),b.cos().mean(-1))
+# #     h0 = _mb(x0d); h1 = _mb(x1d)
+# #     dh = (h0.unsqueeze(1)-h1.unsqueeze(0)+math.pi)%(2*math.pi)-math.pi
+# #     return 1.0*pos_cost + 0.5*speed_cost + 0.3*dh.abs()/math.pi
 
-# #     spd0 = _step_speeds_deg(x0d.permute(1, 0, 2)).permute(1, 0).mean(-1)
-# #     spd1 = _step_speeds_deg(x1d.permute(1, 0, 2)).permute(1, 0).mean(-1)
-# #     speed_cost = (spd0.unsqueeze(1) - spd1.unsqueeze(0)).abs() / 20.0
-
-# #     def _mean_bearing(td):
-# #         b = _forward_azimuth(td[:, :-1, :], td[:, 1:, :])
-# #         return torch.atan2(b.sin().mean(-1), b.cos().mean(-1))
-# #     h0 = _mean_bearing(x0d); h1 = _mean_bearing(x1d)
-# #     dh = (h0.unsqueeze(1) - h1.unsqueeze(0) + math.pi) % (2*math.pi) - math.pi
-# #     dir_cost = dh.abs() / math.pi
-
-# #     return 1.0*pos_cost + 0.5*speed_cost + 0.3*dir_cost
-
-
-# # def _spherical_ot_matching(x0_batch: torch.Tensor, x1_batch: torch.Tensor,
-# #                             lp: torch.Tensor, epsilon: float = 0.05
-# #                             ) -> Tuple[torch.Tensor, torch.Tensor]:
-# #     """
-# #     Ghép noise x0 với GT x1 tối ưu theo geodesic cost.
-# #     Giúp FM học từ x0 gần x1 nhất về hướng + tốc độ → path ngắn hơn.
-# #     """
+# # def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
 # #     B = x0_batch.shape[0]
-# #     if B < 4:
-# #         return x0_batch, x1_batch
+# #     if B < 4: return x0_batch, x1_batch
 # #     try:
 # #         cost = _geodesic_ot_cost(x0_batch, x1_batch, lp)
 # #         with torch.no_grad():
 # #             pi = _sinkhorn_log(cost, epsilon=epsilon)
-# #         flat = pi.reshape(-1).clamp(0.0)
-# #         s    = flat.sum()
-# #         if not torch.isfinite(s) or s < 1e-10:
-# #             return x0_batch, x1_batch
-# #         idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
-# #         col = idx % B
-# #         return x0_batch[col], x1_batch[col]
+# #         flat = pi.reshape(-1).clamp(0.0); s = flat.sum()
+# #         if not torch.isfinite(s) or s < 1e-10: return x0_batch, x1_batch
+# #         idx = torch.multinomial(flat/s, num_samples=B, replacement=True)
+# #         return x0_batch[idx%B], x1_batch[idx%B]
 # #     except Exception:
 # #         return x0_batch, x1_batch
-
-
-
-
-# # # ═════════════════════════════════════════════════════════════════════════════
-# # #  EMA
-# # # ═════════════════════════════════════════════════════════════════════════════
-
-# # class EMAModel:
-# #     def __init__(self, model, decay=0.995):
-# #         self.decay  = decay
-# #         m = _unwrap_model(model)
-# #         self.shadow = {k: v.detach().clone()
-# #                        for k, v in m.state_dict().items()
-# #                        if v.dtype.is_floating_point}
-
-# #     def update(self, model):
-# #         m = _unwrap_model(model)
-# #         with torch.no_grad():
-# #             for k, v in m.state_dict().items():
-# #                 if k in self.shadow:
-# #                     self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
-
-# #     def apply_to(self, model):
-# #         m = _unwrap_model(model)
-# #         backup, sd = {}, m.state_dict()
-# #         for k in self.shadow:
-# #             if k not in sd: continue
-# #             backup[k] = sd[k].detach().clone()
-# #             sd[k].copy_(self.shadow[k])
-# #         return backup
-
-# #     def restore(self, model, backup):
-# #         m = _unwrap_model(model)
-# #         sd = m.state_dict()
-# #         for k, v in backup.items():
-# #             if k in sd: sd[k].copy_(v)
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
 # # #  Difficulty Score
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def compute_difficulty_score(
-# #     obs_BT2: torch.Tensor,   # [B, 8, 2]
-# #     img_obs:  torch.Tensor,  # [B, 13, 8, 81, 81]
-# #     env_data: Optional[dict],
-# #     device:   torch.device,
-# # ) -> torch.Tensor:           # [B] ∈ [0,1]
-# #     B = obs_BT2.shape[0]
-# #     scores = []
+# # def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
+# #     B = obs_BT2.shape[0]; scores = []
 
-# #     # Signal 1: Track curvature (0.30)
+# #     # Signal 1: curvature (0.30)
 # #     dir24 = env_data.get("history_direction24") if env_data else None
 # #     if dir24 is not None and torch.is_tensor(dir24):
 # #         dir24 = dir24.float().to(device)
-# #         if dir24.dim() == 3: d24 = dir24[:, -1, :]
-# #         elif dir24.dim() == 2: d24 = dir24
-# #         else: d24 = None
-# #         if d24 is not None and d24.shape[-1] == 8:
-# #             bucket   = d24.argmax(dim=-1).float()
-# #             angle_24 = bucket * (2.0 * math.pi / 8.0)
-# #             sin24    = torch.sin(angle_24); cos24 = torch.cos(angle_24)
-# #             dy = obs_BT2[:, -1, 1] - obs_BT2[:, -2, 1]
-# #             dx = obs_BT2[:, -1, 0] - obs_BT2[:, -2, 0]
-# #             lat_mid = (obs_BT2[:, -1, 1] + obs_BT2[:, -2, 1]) * 0.5
-# #             cos_lat = torch.cos(torch.deg2rad(lat_mid * _NORM_TO_DEG)).clamp(1e-4)
-# #             angle_now = torch.atan2(dx * cos_lat, dy)
-# #             cos_diff  = (torch.cos(angle_now) * cos24 + torch.sin(angle_now) * sin24).clamp(-1,1)
-# #             s_curve   = torch.sigmoid((torch.rad2deg(torch.acos(cos_diff)) - 45.0) / 20.0)
-# #         else: s_curve = torch.zeros(B, device=device)
-# #     else: s_curve = torch.zeros(B, device=device)
-# #     scores.append(0.30 * s_curve)
+# #         if dir24.dim()==3: d24=dir24[:,-1,:]
+# #         elif dir24.dim()==2: d24=dir24
+# #         else: d24=None
+# #         if d24 is not None and d24.shape[-1]==8:
+# #             bucket = d24.argmax(dim=-1).float()
+# #             a24 = bucket*(2.0*math.pi/8.0)
+# #             dy = obs_BT2[:,-1,1]-obs_BT2[:,-2,1]; dx = obs_BT2[:,-1,0]-obs_BT2[:,-2,0]
+# #             lat_mid = (obs_BT2[:,-1,1]+obs_BT2[:,-2,1])*0.5
+# #             cos_lat = torch.cos(torch.deg2rad(lat_mid*_NORM_TO_DEG)).clamp(1e-4)
+# #             a_now = torch.atan2(dx*cos_lat, dy)
+# #             cos_d = (torch.cos(a_now)*torch.cos(a24)+torch.sin(a_now)*torch.sin(a24)).clamp(-1,1)
+# #             s_curve = torch.sigmoid((torch.rad2deg(torch.acos(cos_d))-45.0)/20.0)
+# #         else: s_curve = torch.zeros(B,device=device)
+# #     else: s_curve = torch.zeros(B,device=device)
+# #     scores.append(0.30*s_curve)
 
-# #     # Signal 2: Weak steering (0.25)
+# #     # Signal 2: weak steering (0.25)
 # #     steer = env_data.get("steering_speed") if env_data else None
 # #     if steer is not None and torch.is_tensor(steer):
 # #         steer = steer.float().to(device)
-# #         while steer.dim() > 1: steer = steer[..., -1]
-# #         steer = steer.view(-1)
-# #         steer = (steer[:B] if steer.numel() >= B else steer[0].expand(B))
-# #         s_weak = torch.sigmoid((4.0 - steer * 20.0) / 2.0)
+# #         while steer.dim()>1: steer=steer[...,-1]
+# #         steer = steer.view(-1); steer = steer[:B] if steer.numel()>=B else steer[0].expand(B)
+# #         s_weak = torch.sigmoid((4.0-steer*20.0)/2.0)
 # #     else:
 # #         u = env_data.get("u500_mean") if env_data else None
 # #         v = env_data.get("v500_mean") if env_data else None
 # #         if u is not None and v is not None and torch.is_tensor(u) and torch.is_tensor(v):
-# #             u = u.float().to(device); v = v.float().to(device)
-# #             while u.dim() > 1: u = u[..., -1]
-# #             while v.dim() > 1: v = v[..., -1]
-# #             s_weak = torch.sigmoid((4.0 - (u.view(-1)[:B]**2 + v.view(-1)[:B]**2).sqrt() * 30.0) / 2.0)
-# #         else: s_weak = torch.zeros(B, device=device)
-# #     scores.append(0.25 * s_weak)
+# #             u=u.float().to(device); v=v.float().to(device)
+# #             while u.dim()>1: u=u[...,-1]
+# #             while v.dim()>1: v=v[...,-1]
+# #             s_weak = torch.sigmoid((4.0-(u.view(-1)[:B]**2+v.view(-1)[:B]**2).sqrt()*30.0)/2.0)
+# #         else: s_weak = torch.zeros(B,device=device)
+# #     scores.append(0.25*s_weak)
 
-# #     # Signal 3: Wind shear (0.20)
-# #     if img_obs is not None and img_obs.shape[1] >= 11:
-# #         cx = cy = 40
-# #         u200 = img_obs[:, 4, -1, cx, cy] * 13.315
-# #         u850 = img_obs[:, 6, -1, cx, cy] * 7.911
-# #         v200 = img_obs[:, 8, -1, cx, cy] * 8.377
-# #         v850 = img_obs[:, 10,-1, cx, cy] * 6.203
-# #         shear   = ((u200-u850)**2 + (v200-v850)**2).sqrt()
-# #         s_shear = torch.sigmoid((shear - 8.0) / 3.0)
-# #     else: s_shear = torch.zeros(B, device=device)
-# #     scores.append(0.20 * s_shear)
+# #     # Signal 3: wind shear (0.20)
+# #     if img_obs is not None and img_obs.shape[1]>=11:
+# #         u200=img_obs[:,4,-1,40,40]*13.315; u850=img_obs[:,6,-1,40,40]*7.911
+# #         v200=img_obs[:,8,-1,40,40]*8.377;  v850=img_obs[:,10,-1,40,40]*6.203
+# #         shear=((u200-u850)**2+(v200-v850)**2).sqrt()
+# #         s_shear=torch.sigmoid((shear-8.0)/3.0)
+# #     else: s_shear = torch.zeros(B,device=device)
+# #     scores.append(0.20*s_shear)
 
-# #     # Signal 4: RI flag (0.15)
+# #     # Signal 4: RI (0.15)
 # #     ri = env_data.get("rapid_intensification") if env_data else None
 # #     if ri is not None and torch.is_tensor(ri):
-# #         ri = ri.float().to(device)
-# #         while ri.dim() > 1: ri = ri[..., -1]
-# #         s_ri = ri.view(-1)[:B].clamp(0, 1) if ri.numel() >= B else ri[0].expand(B)
-# #     else: s_ri = torch.zeros(B, device=device)
-# #     scores.append(0.15 * s_ri)
+# #         ri=ri.float().to(device)
+# #         while ri.dim()>1: ri=ri[...,-1]
+# #         s_ri = ri.view(-1)[:B].clamp(0,1) if ri.numel()>=B else ri[0].expand(B)
+# #     else: s_ri = torch.zeros(B,device=device)
+# #     scores.append(0.15*s_ri)
 
-# #     # Signal 5: Slow movement (0.10)
+# #     # Signal 5: slow movement (0.10)
 # #     mv = env_data.get("move_velocity") if env_data else None
 # #     if mv is not None and torch.is_tensor(mv):
-# #         mv = mv.float().to(device)
-# #         while mv.dim() > 1: mv = mv[..., -1]
-# #         mv_v = mv.view(-1)
-# #         mv_v = mv_v[:B] if mv_v.numel() >= B else mv_v[0].expand(B)
-# #         s_slow = torch.sigmoid((0.05 - mv_v) / 0.02)
-# #     else: s_slow = torch.zeros(B, device=device)
-# #     scores.append(0.10 * s_slow)
+# #         mv=mv.float().to(device)
+# #         while mv.dim()>1: mv=mv[...,-1]
+# #         mv_v=mv.view(-1); mv_v=mv_v[:B] if mv_v.numel()>=B else mv_v[0].expand(B)
+# #         s_slow = torch.sigmoid((0.05-mv_v)/0.02)
+# #     else: s_slow = torch.zeros(B,device=device)
+# #     scores.append(0.10*s_slow)
 
 # #     return sum(scores).clamp(0.0, 1.0)
 
@@ -314,221 +1476,150 @@
 # # #  Direction GT bucket
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def get_gt_direction_bucket(
-# #     obs_traj:  torch.Tensor,   # [T, B, 2]
-# #     pred_traj: torch.Tensor,   # [T, B, 2]
-# # ) -> torch.Tensor:             # [B] 0..7
-# #     """FIX-B8: atan2(East_km, North) = compass convention."""
-# #     last  = obs_traj[-1]     # [B, 2]
-# #     first = pred_traj[0]     # [B, 2]
-# #     dy    = first[:, 1] - last[:, 1]
-# #     dx    = first[:, 0] - last[:, 0]
-# #     lat_d = (last[:, 1] + first[:, 1]) * 0.5
-# #     cos_l = torch.cos(torch.deg2rad(lat_d * _NORM_TO_DEG)).clamp(1e-4)
-# #     angle = (torch.atan2(dx * cos_l, dy).rad2deg() % 360.0)
-# #     return ((angle + 22.5) / 45.0).long() % 8
+# # def get_gt_direction_bucket(obs_traj, pred_traj):
+# #     last=obs_traj[-1]; first=pred_traj[0]
+# #     dy=first[:,1]-last[:,1]; dx=first[:,0]-last[:,0]
+# #     lat_d=(last[:,1]+first[:,1])*0.5
+# #     cos_l=torch.cos(torch.deg2rad(lat_d*_NORM_TO_DEG)).clamp(1e-4)
+# #     angle=(torch.atan2(dx*cos_l,dy).rad2deg()%360.0)
+# #     return ((angle+22.5)/45.0).long()%8
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  FIX-C4: CompassVelocityHead with explicit direction cross-attention
+# # #  FIX-C4: CompassVelocityHead — direction via cross-attention
 # # # ═════════════════════════════════════════════════════════════════════════════
 
 # # class CompassVelocityHead(nn.Module):
-# #     """
-# #     FIX-C4: Direction conditioning qua cross-attention với direction token,
-# #     không phải additive bias. Direction token được project từ compass angle
-# #     (sin, cos) → 256-dim vector → concat vào memory của TransformerDecoder.
-# #     Gradient không thể wash out cơ chế này như với additive bias.
-
-# #     NEW-4: Stochastic depth với prob=0.1 → regularization cho K=8 heads.
-# #     """
-# #     def __init__(self, compass_idx: int, pred_len: int = 12, ctx_dim: int = 256,
-# #                  stochastic_depth_prob: float = 0.1):
+# #     def __init__(self, compass_idx, pred_len=12, ctx_dim=256, stochastic_depth_prob=0.1):
 # #         super().__init__()
-# #         self.pred_len             = pred_len
-# #         self.compass_idx          = compass_idx
-# #         self.stochastic_depth_prob = stochastic_depth_prob
-
-# #         # FIX-C4: direction token từ (sin, cos) của compass angle
-# #         angle_rad = _COMPASS_DEG[compass_idx] * math.pi / 180.0
-# #         dir_vec   = torch.tensor([math.sin(angle_rad), math.cos(angle_rad)])
-# #         self.register_buffer('compass_dir', dir_vec)   # [2], not learnable
-# #         self.dir_proj = nn.Sequential(
-# #             nn.Linear(2, ctx_dim), nn.GELU(), nn.LayerNorm(ctx_dim))
-
-# #         self.time_fc1    = nn.Linear(ctx_dim, 256)
-# #         self.time_fc2    = nn.Linear(256, ctx_dim)
-# #         self.traj_embed  = nn.Linear(4, ctx_dim)       # FIX-B7: 4 dims
-# #         self.pos_enc     = nn.Parameter(torch.randn(1, pred_len, ctx_dim) * 0.02)
-# #         self.step_embed  = nn.Embedding(pred_len, ctx_dim)
-# #         self.transformer = nn.TransformerDecoder(
-# #             nn.TransformerDecoderLayer(
-# #                 d_model=ctx_dim, nhead=8, dim_feedforward=512,
-# #                 dropout=0.10, activation="gelu", batch_first=True),
+# #         self.pred_len=pred_len; self.compass_idx=compass_idx
+# #         self.stochastic_depth_prob=stochastic_depth_prob
+# #         angle_rad=_COMPASS_DEG[compass_idx]*math.pi/180.0
+# #         dir_vec=torch.tensor([math.sin(angle_rad),math.cos(angle_rad)])
+# #         self.register_buffer('compass_dir',dir_vec)
+# #         self.dir_proj=nn.Sequential(nn.Linear(2,ctx_dim),nn.GELU(),nn.LayerNorm(ctx_dim))
+# #         self.time_fc1=nn.Linear(ctx_dim,256); self.time_fc2=nn.Linear(256,ctx_dim)
+# #         self.traj_embed=nn.Linear(4,ctx_dim)
+# #         self.pos_enc=nn.Parameter(torch.randn(1,pred_len,ctx_dim)*0.02)
+# #         self.step_embed=nn.Embedding(pred_len,ctx_dim)
+# #         self.transformer=nn.TransformerDecoder(
+# #             nn.TransformerDecoderLayer(d_model=ctx_dim,nhead=8,dim_feedforward=512,
+# #                                        dropout=0.10,activation="gelu",batch_first=True),
 # #             num_layers=1)
-# #         self.out_fc1 = nn.Linear(ctx_dim, 256)
-# #         self.out_fc2 = nn.Linear(256, 4)               # FIX-B7: output 4 dims
-# #         self.step_scale = nn.Parameter(torch.ones(pred_len) * 0.5)
-
+# #         self.out_fc1=nn.Linear(ctx_dim,256); self.out_fc2=nn.Linear(256,4)
+# #         self.step_scale=nn.Parameter(torch.ones(pred_len)*0.5)
 # #         with torch.no_grad():
-# #             nn.init.xavier_uniform_(self.out_fc2.weight, gain=0.1)
+# #             nn.init.xavier_uniform_(self.out_fc2.weight,gain=0.1)
 # #             nn.init.zeros_(self.out_fc2.bias)
 
-# #     def _time_emb(self, t: torch.Tensor, dim: int) -> torch.Tensor:
-# #         half = dim // 2
-# #         freq = torch.exp(torch.arange(half, dtype=torch.float32, device=t.device)
-# #                          * (-math.log(10000.0) / max(half - 1, 1)))
-# #         emb  = t.float().unsqueeze(1) * 1000.0 * freq.unsqueeze(0)
-# #         return F.pad(torch.cat([emb.sin(), emb.cos()], dim=-1), (0, dim % 2))
+# #     def _time_emb(self,t,dim):
+# #         half=dim//2
+# #         freq=torch.exp(torch.arange(half,dtype=torch.float32,device=t.device)
+# #                        *(-math.log(10000.0)/max(half-1,1)))
+# #         emb=t.float().unsqueeze(1)*1000.0*freq.unsqueeze(0)
+# #         return F.pad(torch.cat([emb.sin(),emb.cos()],dim=-1),(0,dim%2))
 
-# #     def forward(
-# #         self,
-# #         x_t: torch.Tensor,   # [B, pred_len, 4]
-# #         t:   torch.Tensor,   # [B]
-# #         ctx: torch.Tensor,   # [B, ctx_dim]
-# #     ) -> torch.Tensor:       # [B, pred_len, 4]
-# #         B     = x_t.shape[0]
-# #         T_seq = min(x_t.shape[1], self.pred_len)
-# #         device = x_t.device
-
-# #         # FIX-C4: direction token via cross-attention
-# #         dir_token = self.dir_proj(
-# #             self.compass_dir.to(device).unsqueeze(0).expand(B, -1))  # [B, ctx_dim]
-
-# #         # Stochastic depth: randomly zero-out dir_token during training
-# #         if self.training and self.stochastic_depth_prob > 0:
-# #             keep = (torch.rand(B, 1, device=device) >
-# #                     self.stochastic_depth_prob).float()
-# #             dir_token = dir_token * keep
-
-# #         t_emb = F.gelu(self.time_fc1(self._time_emb(t, ctx.shape[-1])))
-# #         t_emb = self.time_fc2(t_emb)
-
-# #         step_idx = torch.arange(T_seq, device=device).unsqueeze(0).expand(B, -1)
-# #         x_emb = (self.traj_embed(x_t[:, :T_seq])
-# #                  + self.pos_enc[:, :T_seq]
-# #                  + t_emb.unsqueeze(1)
-# #                  + self.step_embed(step_idx))
-
-# #         # Memory: [ctx, dir_token, t_emb] — direction is first-class citizen
-# #         mem     = torch.stack([ctx, dir_token, t_emb], dim=1)  # [B, 3, ctx_dim]
-# #         decoded = self.transformer(x_emb, mem)
-
-# #         scale   = torch.sigmoid(self.step_scale[:T_seq]).view(1, T_seq, 1) * 2.0
-# #         return self.out_fc2(F.gelu(self.out_fc1(decoded))) * scale
+# #     def forward(self,x_t,t,ctx):
+# #         B=x_t.shape[0]; T_seq=min(x_t.shape[1],self.pred_len); device=x_t.device
+# #         dir_token=self.dir_proj(self.compass_dir.to(device).unsqueeze(0).expand(B,-1))
+# #         if self.training and self.stochastic_depth_prob>0:
+# #             keep=(torch.rand(B,1,device=device)>self.stochastic_depth_prob).float()
+# #             dir_token=dir_token*keep
+# #         t_emb=F.gelu(self.time_fc1(self._time_emb(t,ctx.shape[-1])))
+# #         t_emb=self.time_fc2(t_emb)
+# #         step_idx=torch.arange(T_seq,device=device).unsqueeze(0).expand(B,-1)
+# #         x_emb=(self.traj_embed(x_t[:,:T_seq])+self.pos_enc[:,:T_seq]
+# #                +t_emb.unsqueeze(1)+self.step_embed(step_idx))
+# #         mem=torch.stack([ctx,dir_token,t_emb],dim=1)
+# #         decoded=self.transformer(x_emb,mem)
+# #         scale=torch.sigmoid(self.step_scale[:T_seq]).view(1,T_seq,1)*2.0
+# #         return self.out_fc2(F.gelu(self.out_fc1(decoded)))*scale
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  CompassSelector (GC-Net analog)
+# # #  CompassSelector
 # # # ═════════════════════════════════════════════════════════════════════════════
 
 # # class CompassSelector(nn.Module):
-# #     """
-# #     Selector nhìn actual mode outputs + steering → chọn best mode.
-# #     Tốt hơn paper GC-Net (chỉ nhìn context).
-# #     STOP-GRAD từ caller.
-# #     """
-# #     def __init__(self, ctx_dim: int = 256, K: int = 8, n_dirs: int = 8):
+# #     def __init__(self,ctx_dim=256,K=8,n_dirs=8):
 # #         super().__init__()
-# #         self.K      = K
-# #         self.n_dirs = n_dirs
+# #         self.K=K; self.n_dirs=n_dirs
+# #         self.steering_enc=nn.Sequential(nn.Linear(11,64),nn.GELU(),nn.LayerNorm(64),nn.Linear(64,128))
+# #         self.mode_enc=nn.Sequential(nn.Linear(12*2,128),nn.GELU(),nn.LayerNorm(128),nn.Linear(128,64))
+# #         self.score_net=nn.Sequential(nn.Linear(ctx_dim+64+128,256),nn.GELU(),nn.LayerNorm(256),
+# #                                      nn.Linear(256,64),nn.GELU(),nn.Linear(64,1))
+# #         self.dir_head=nn.Sequential(nn.Linear(ctx_dim+128,256),nn.GELU(),nn.LayerNorm(256),nn.Linear(256,n_dirs))
 
-# #         self.steering_enc = nn.Sequential(
-# #             nn.Linear(11, 64), nn.GELU(), nn.LayerNorm(64),
-# #             nn.Linear(64, 128))
-
-# #         self.mode_enc = nn.Sequential(
-# #             nn.Linear(12 * 2, 128), nn.GELU(), nn.LayerNorm(128),
-# #             nn.Linear(128, 64))
-
-# #         self.score_net = nn.Sequential(
-# #             nn.Linear(ctx_dim + 64 + 128, 256), nn.GELU(), nn.LayerNorm(256),
-# #             nn.Linear(256, 64), nn.GELU(),
-# #             nn.Linear(64, 1))
-
-# #         self.dir_head = nn.Sequential(
-# #             nn.Linear(ctx_dim + 128, 256), nn.GELU(), nn.LayerNorm(256),
-# #             nn.Linear(256, n_dirs))
-
-# #     def _get_steering_feat(self, env_data, B, device):
+# #     def _get_steer(self,env_data,B,device):
 # #         def _sc(key):
-# #             if env_data is None: return torch.zeros(B, device=device)
-# #             v = env_data.get(key)
-# #             if v is None or not torch.is_tensor(v): return torch.zeros(B, device=device)
-# #             v = v.float().to(device)
-# #             while v.dim() > 1: v = v[..., -1]
-# #             v = v.view(-1)
-# #             return (v[:B] if v.numel() >= B else v[0].expand(B)).clamp(-3, 3)
-# #         def _sv(key, dim):
-# #             if env_data is None: return torch.zeros(B, dim, device=device)
-# #             v = env_data.get(key)
-# #             if v is None or not torch.is_tensor(v): return torch.zeros(B, dim, device=device)
-# #             v = v.float().to(device)
-# #             if v.dim() == 3: v = v[:, -1, :]
-# #             elif v.dim() != 2 or v.shape[0] != B: return torch.zeros(B, dim, device=device)
-# #             v = F.pad(v, (0, max(0, dim - v.shape[-1])))[:, :dim]
-# #             return v.clamp(-3, 3)
-# #         feat = torch.cat([_sc("steering_speed").unsqueeze(-1),
-# #                           _sc("steering_dir_sin").unsqueeze(-1),
-# #                           _sc("steering_dir_cos").unsqueeze(-1),
-# #                           _sv("history_direction24", 8)], dim=-1)
+# #             if env_data is None: return torch.zeros(B,device=device)
+# #             v=env_data.get(key)
+# #             if v is None or not torch.is_tensor(v): return torch.zeros(B,device=device)
+# #             v=v.float().to(device)
+# #             while v.dim()>1: v=v[...,-1]
+# #             v=v.view(-1); return (v[:B] if v.numel()>=B else v[0].expand(B)).clamp(-3,3)
+# #         def _sv(key,dim):
+# #             if env_data is None: return torch.zeros(B,dim,device=device)
+# #             v=env_data.get(key)
+# #             if v is None or not torch.is_tensor(v): return torch.zeros(B,dim,device=device)
+# #             v=v.float().to(device)
+# #             if v.dim()==3: v=v[:,-1,:]
+# #             elif v.dim()!=2 or v.shape[0]!=B: return torch.zeros(B,dim,device=device)
+# #             v=F.pad(v,(0,max(0,dim-v.shape[-1])))[:,:dim]; return v.clamp(-3,3)
+# #         feat=torch.cat([_sc("steering_speed").unsqueeze(-1),_sc("steering_dir_sin").unsqueeze(-1),
+# #                         _sc("steering_dir_cos").unsqueeze(-1),_sv("history_direction24",8)],dim=-1)
 # #         return self.steering_enc(feat)
 
-# #     def forward(self, ctx, modes, env_data):
-# #         # ctx: [B,ctx_dim], modes: [B,K,12,4] — both stop-grad from caller
-# #         B, K = modes.shape[:2]
-# #         device = ctx.device
-# #         sf = self._get_steering_feat(env_data, B, device)
-# #         scores = []
+# #     def forward(self,ctx,modes,env_data):
+# #         B,K=modes.shape[:2]; device=ctx.device
+# #         sf=self._get_steer(env_data,B,device)
+# #         scores=[]
 # #         for k in range(K):
-# #             mf = self.mode_enc(modes[:, k, :, :2].reshape(B, -1))
-# #             sc = self.score_net(torch.cat([ctx, mf, sf], dim=-1)).squeeze(-1)
-# #             scores.append(sc)
-# #         score_logits = torch.stack(scores, dim=1)
-# #         dir_logits   = self.dir_head(torch.cat([ctx, sf], dim=-1))
+# #             mf=self.mode_enc(modes[:,k,:,:2].reshape(B,-1))
+# #             scores.append(self.score_net(torch.cat([ctx,mf,sf],dim=-1)).squeeze(-1))
+# #         score_logits=torch.stack(scores,dim=1)
+# #         dir_logits=self.dir_head(torch.cat([ctx,sf],dim=-1))
 # #         return score_logits, dir_logits
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  Learned Loss Weights (Kendall et al. 2018)
+# # #  REV2-3: LearnedWeights — 6 terms
 # # # ═════════════════════════════════════════════════════════════════════════════
 
 # # class LearnedWeights(nn.Module):
 # #     """
-# #     4 learnable log-variance scalars — tất cả weights tự học.
-# #     Không có hardcoded weight nào cho bất kỳ metric cụ thể nào.
-
-# #       L_total = L_FM/exp(s_fm) + s_fm
-# #               + L_sel/exp(s_sel) + s_sel     [L_sel = α*L_rank + (1-α)*L_dir]
-# #               + L_coh/exp(s_coh) + s_coh
-# #               + L_con/exp(s_con) + s_con     [dropout consistency]
+# #     6 learnable log-variance (Kendall 2018):
+# #       s_fm, s_sel, s_coh, s_con, s_dpe, s_kin
+# #     s_dpe: DPE haversine term (REV2-1)
+# #     s_kin: kinematic speed/accel term (REV2-2)
 # #     """
 # #     def __init__(self):
 # #         super().__init__()
 # #         self.log_s_fm  = nn.Parameter(torch.zeros(1))
 # #         self.log_s_sel = nn.Parameter(torch.zeros(1))
 # #         self.log_s_coh = nn.Parameter(torch.zeros(1))
-# #         self.log_s_con = nn.Parameter(torch.zeros(1))   # consistency
+# #         self.log_s_con = nn.Parameter(torch.zeros(1))
+# #         self.log_s_dpe = nn.Parameter(torch.zeros(1))   # REV2-1
+# #         self.log_s_kin = nn.Parameter(torch.zeros(1))   # REV2-2
 # #         self.log_alpha = nn.Parameter(torch.zeros(1))
 
-# #     def forward(self, L_fm, L_rank, L_dir, L_coh, L_con):
-# #         s_fm  = self.log_s_fm.clamp(-5, 5)
-# #         s_sel = self.log_s_sel.clamp(-5, 5)
-# #         s_coh = self.log_s_coh.clamp(-5, 5)
-# #         s_con = self.log_s_con.clamp(-5, 5)
-# #         α     = torch.sigmoid(self.log_alpha)
-# #         L_sel = α * L_rank + (1.0 - α) * L_dir
-# #         return (L_fm  * torch.exp(-s_fm)  + s_fm  +
-# #                 L_sel * torch.exp(-s_sel) + s_sel +
-# #                 L_coh * torch.exp(-s_coh) + s_coh +
-# #                 L_con * torch.exp(-s_con) + s_con)
+# #     def forward(self, L_fm, L_rank, L_dir, L_coh, L_con, L_dpe, L_kin):
+# #         def _w(s): return torch.exp(-s.clamp(-5,5))
+# #         α = torch.sigmoid(self.log_alpha)
+# #         L_sel = α*L_rank + (1.0-α)*L_dir
+# #         s_fm=self.log_s_fm.clamp(-5,5); s_sel=self.log_s_sel.clamp(-5,5)
+# #         s_coh=self.log_s_coh.clamp(-5,5); s_con=self.log_s_con.clamp(-5,5)
+# #         s_dpe=self.log_s_dpe.clamp(-5,5); s_kin=self.log_s_kin.clamp(-5,5)
+# #         return (L_fm*_w(s_fm)+s_fm + L_sel*_w(s_sel)+s_sel +
+# #                 L_coh*_w(s_coh)+s_coh + L_con*_w(s_con)+s_con +
+# #                 L_dpe*_w(s_dpe)+s_dpe + L_kin*_w(s_kin)+s_kin)
 
 # #     def get_weights(self):
-# #         return {"w_fm":   torch.exp(-self.log_s_fm.clamp(-5,5)).item(),
-# #                 "w_sel":  torch.exp(-self.log_s_sel.clamp(-5,5)).item(),
-# #                 "w_coh":  torch.exp(-self.log_s_coh.clamp(-5,5)).item(),
-# #                 "w_con":  torch.exp(-self.log_s_con.clamp(-5,5)).item(),
-# #                 "alpha":  torch.sigmoid(self.log_alpha).item()}
+# #         def _w(s): return torch.exp(-s.clamp(-5,5)).item()
+# #         return {"w_fm":_w(self.log_s_fm),"w_sel":_w(self.log_s_sel),
+# #                 "w_coh":_w(self.log_s_coh),"w_con":_w(self.log_s_con),
+# #                 "w_dpe":_w(self.log_s_dpe),"w_kin":_w(self.log_s_kin),
+# #                 "alpha":torch.sigmoid(self.log_alpha).item()}
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
@@ -537,220 +1628,166 @@
 
 # # class SharedContextEncoder(nn.Module):
 # #     RAW_CTX_DIM = 512
-
-# #     def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, unet_in_ch=13):
+# #     def __init__(self,pred_len=12,obs_len=8,ctx_dim=256,unet_in_ch=13):
 # #         super().__init__()
-# #         self.pred_len = pred_len
-# #         self.obs_len  = obs_len
-# #         self.ctx_dim  = ctx_dim
+# #         self.pred_len=pred_len; self.obs_len=obs_len; self.ctx_dim=ctx_dim
+# #         self.spatial_enc=FNO3DEncoder(in_channel=unet_in_ch,out_channel=1,d_model=32,
+# #             n_layers=4,modes_t=4,modes_h=4,modes_w=4,spatial_down=32,dropout=0.05)
+# #         self.bottleneck_pool=nn.AdaptiveAvgPool3d((None,1,1))
+# #         self.bottleneck_proj=nn.Linear(128,128)
+# #         self.decoder_proj=nn.Linear(1,16)
+# #         self.enc_1d=DataEncoder1D(in_1d=4,feat_3d_dim=128,mlp_h=64,
+# #             lstm_hidden=128,lstm_layers=3,dropout=0.1,d_state=16)
+# #         self.env_enc=Env_net(obs_len=obs_len,d_model=32)
+# #         self.ctx_fc1=nn.Linear(128+32+16,self.RAW_CTX_DIM)
+# #         self.ctx_ln=nn.LayerNorm(self.RAW_CTX_DIM)
+# #         self.ctx_drop=nn.Dropout(0.15)
+# #         self.ctx_fc2=nn.Linear(self.RAW_CTX_DIM,ctx_dim)
+# #         self.null_embedding=nn.Parameter(torch.randn(1,self.RAW_CTX_DIM)*0.02)
+# #         self.vel_obs_enc=nn.Sequential(nn.Linear(obs_len*6,256),nn.GELU(),
+# #                                        nn.LayerNorm(256),nn.Linear(256,256),nn.GELU())
 
-# #         self.spatial_enc     = FNO3DEncoder(
-# #             in_channel=unet_in_ch, out_channel=1, d_model=32,
-# #             n_layers=4, modes_t=4, modes_h=4, modes_w=4,
-# #             spatial_down=32, dropout=0.05)
-# #         self.bottleneck_pool = nn.AdaptiveAvgPool3d((None, 1, 1))
-# #         self.bottleneck_proj = nn.Linear(128, 128)
-# #         self.decoder_proj    = nn.Linear(1, 16)
-# #         self.enc_1d = DataEncoder1D(
-# #             in_1d=4, feat_3d_dim=128, mlp_h=64,
-# #             lstm_hidden=128, lstm_layers=3, dropout=0.1, d_state=16)
-# #         self.env_enc = Env_net(obs_len=obs_len, d_model=32)
+# #     def encode(self,batch_list):
+# #         obs_t=batch_list[0]; obs_Me=batch_list[7]
+# #         image_obs=batch_list[11]; env_data=batch_list[13] if len(batch_list)>13 else None
+# #         if image_obs.dim()==4: image_obs=image_obs.unsqueeze(2)
+# #         if image_obs.shape[1]==1 and self.spatial_enc.in_channel!=1:
+# #             image_obs=image_obs.expand(-1,self.spatial_enc.in_channel,-1,-1,-1)
+# #         T_obs=obs_t.shape[0]
+# #         e_3d_bot,e_3d_dec=self.spatial_enc.encode(image_obs)
+# #         e_3d_s=self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0,2,1)
+# #         e_3d_s=self.bottleneck_proj(e_3d_s)
+# #         if e_3d_s.shape[1]!=T_obs:
+# #             e_3d_s=F.interpolate(e_3d_s.permute(0,2,1),size=T_obs,mode="linear",
+# #                                   align_corners=False).permute(0,2,1)
+# #         e_3d_dec_t=e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
+# #         t_w=torch.softmax(torch.arange(e_3d_dec_t.shape[1],dtype=torch.float,
+# #                                         device=e_3d_dec_t.device)*0.5,dim=0)
+# #         f_sp=self.decoder_proj((e_3d_dec_t*t_w.unsqueeze(0)).sum(1,keepdim=True))
+# #         obs_in=torch.cat([obs_t,obs_Me],dim=2).permute(1,0,2)
+# #         h_t=self.enc_1d(obs_in,e_3d_s)
+# #         e_env,_,_=self.env_enc(env_data,image_obs)
+# #         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t,e_env,f_sp],dim=-1))))
 
-# #         self.ctx_fc1  = nn.Linear(128 + 32 + 16, self.RAW_CTX_DIM)
-# #         self.ctx_ln   = nn.LayerNorm(self.RAW_CTX_DIM)
-# #         self.ctx_drop = nn.Dropout(0.15)
-# #         self.ctx_fc2  = nn.Linear(self.RAW_CTX_DIM, ctx_dim)
-# #         self.null_embedding = nn.Parameter(torch.randn(1, self.RAW_CTX_DIM) * 0.02)
-# #         self.vel_obs_enc = nn.Sequential(
-# #             nn.Linear(obs_len * 6, 256), nn.GELU(), nn.LayerNorm(256),
-# #             nn.Linear(256, 256), nn.GELU())
-
-# #     def encode(self, batch_list):
-# #         obs_t     = batch_list[0]             # [T, B, 2]
-# #         obs_Me    = batch_list[7]             # [T, B, 2]
-# #         image_obs = batch_list[11]            # [B, 13, T, 81, 81]  FIX-B1
-# #         env_data  = batch_list[13] if len(batch_list) > 13 else None
-
-# #         if image_obs.dim() == 4: image_obs = image_obs.unsqueeze(2)
-# #         if image_obs.shape[1] == 1 and self.spatial_enc.in_channel != 1:
-# #             image_obs = image_obs.expand(-1, self.spatial_enc.in_channel, -1, -1, -1)
-
-# #         T_obs = obs_t.shape[0]
-# #         e_3d_bot, e_3d_dec = self.spatial_enc.encode(image_obs)
-# #         e_3d_s = self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0, 2, 1)
-# #         e_3d_s = self.bottleneck_proj(e_3d_s)
-# #         if e_3d_s.shape[1] != T_obs:
-# #             e_3d_s = F.interpolate(e_3d_s.permute(0,2,1), size=T_obs,
-# #                                    mode="linear", align_corners=False).permute(0,2,1)
-
-# #         e_3d_dec_t = e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
-# #         t_w  = torch.softmax(torch.arange(e_3d_dec_t.shape[1], dtype=torch.float,
-# #                                           device=e_3d_dec_t.device) * 0.5, dim=0)
-# #         f_sp = self.decoder_proj((e_3d_dec_t * t_w.unsqueeze(0)).sum(1, keepdim=True))
-
-# #         obs_in = torch.cat([obs_t, obs_Me], dim=2).permute(1, 0, 2)
-# #         h_t    = self.enc_1d(obs_in, e_3d_s)
-# #         e_env, _, _ = self.env_enc(env_data, image_obs)
-# #         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t, e_env, f_sp], dim=-1))))
-
-# #     def apply_ctx_head(self, raw, noise_scale=0.0, use_null=False):
-# #         if use_null: raw = self.null_embedding.expand(raw.shape[0], -1)
-# #         elif noise_scale > 0.0: raw = raw + torch.randn_like(raw) * noise_scale
+# #     def apply_ctx_head(self,raw,noise_scale=0.0,use_null=False):
+# #         if use_null: raw=self.null_embedding.expand(raw.shape[0],-1)
+# #         elif noise_scale>0.0: raw=raw+torch.randn_like(raw)*noise_scale
 # #         return self.ctx_fc2(self.ctx_drop(raw))
 
-# #     def get_kinematic_feat(self, obs_traj):
-# #         T_obs, B, _ = obs_traj.shape
-# #         if T_obs >= 2:
-# #             vel     = obs_traj[1:] - obs_traj[:-1]
-# #             lat_mid = obs_traj[:-1, :, 1] * _NORM_TO_DEG
-# #             cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
-# #             dx_km   = vel[:,:,0] * cos_lat * DEG2KM * _NORM_TO_DEG
-# #             dy_km   = vel[:,:,1] * DEG2KM * _NORM_TO_DEG
-# #             speed   = (dx_km**2 + dy_km**2 + 1e-6).sqrt() / DT_HOURS
-# #             heading = torch.atan2(vel[:,:,1], vel[:,:,0])
-# #             speed_n = (speed / 20.0).clamp(-3, 3)
-# #             if T_obs >= 3:
-# #                 dspd  = speed[1:] - speed[:-1]
-# #                 accel = torch.cat([obs_traj.new_zeros(1, B),
-# #                                    (dspd / 10.0).clamp(-3, 3)], 0)
-# #             else: accel = obs_traj.new_zeros(T_obs-1, B)
-# #             kine = torch.stack([vel[:,:,0], vel[:,:,1], speed_n,
-# #                                  heading.sin(), heading.cos(), accel], dim=-1)
-# #         else: kine = obs_traj.new_zeros(self.obs_len, B, 6)
-# #         if kine.shape[0] < self.obs_len:
-# #             kine = torch.cat([obs_traj.new_zeros(self.obs_len - kine.shape[0], B, 6), kine], 0)
-# #         else: kine = kine[-self.obs_len:]
-# #         return self.vel_obs_enc(kine.permute(1, 0, 2).reshape(B, -1))
+# #     def get_kinematic_feat(self,obs_traj):
+# #         T_obs,B,_=obs_traj.shape
+# #         if T_obs>=2:
+# #             vel=obs_traj[1:]-obs_traj[:-1]
+# #             lat_mid=obs_traj[:-1,:,1]*_NORM_TO_DEG
+# #             cos_lat=torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+# #             dx_km=vel[:,:,0]*cos_lat*DEG2KM*_NORM_TO_DEG
+# #             dy_km=vel[:,:,1]*DEG2KM*_NORM_TO_DEG
+# #             speed=(dx_km**2+dy_km**2+1e-6).sqrt()/DT_HOURS
+# #             heading=torch.atan2(vel[:,:,1],vel[:,:,0])
+# #             speed_n=(speed/20.0).clamp(-3,3)
+# #             if T_obs>=3:
+# #                 dspd=speed[1:]-speed[:-1]
+# #                 accel=torch.cat([obs_traj.new_zeros(1,B),(dspd/10.0).clamp(-3,3)],0)
+# #             else: accel=obs_traj.new_zeros(T_obs-1,B)
+# #             kine=torch.stack([vel[:,:,0],vel[:,:,1],speed_n,
+# #                               heading.sin(),heading.cos(),accel],dim=-1)
+# #         else: kine=obs_traj.new_zeros(self.obs_len,B,6)
+# #         if kine.shape[0]<self.obs_len:
+# #             kine=torch.cat([obs_traj.new_zeros(self.obs_len-kine.shape[0],B,6),kine],0)
+# #         else: kine=kine[-self.obs_len:]
+# #         return self.vel_obs_enc(kine.permute(1,0,2).reshape(B,-1))
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  Persistence x0 trong relative space  (FIX-B11)
+# # #  Persistence x0
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def _persistence_x0_rel(obs_traj, obs_Me, lp, lm, pred_len, sigma=0.02):
-# #     """[T,B,2] → [B, pred_len, 4] relative coords. FIX-B11."""
-# #     B, device = obs_traj.shape[1], obs_traj.device
-# #     if obs_traj.shape[0] >= 3:
-# #         vels = obs_traj[1:] - obs_traj[:-1]
-# #         n_v  = vels.shape[0]
-# #         alpha = 0.7
-# #         w     = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
-# #                               dtype=torch.float, device=device).flip(0)
-# #         lv    = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
-# #     elif obs_traj.shape[0] >= 2:
-# #         lv = obs_traj[-1,:,:2] - obs_traj[-2,:,:2]
-# #     else:
-# #         lv = obs_traj.new_zeros(B, 2)
-# #     steps     = torch.arange(1, pred_len+1, device=device).float()
-# #     pred_abs  = obs_traj[-1,:,:2].unsqueeze(0) + lv.unsqueeze(0) * steps.view(-1,1,1)
-# #     pred_rel  = pred_abs.permute(1,0,2) - lp.unsqueeze(1)
-# #     pred_rel4 = torch.cat([pred_rel, torch.zeros(B, pred_len, 2, device=device)], dim=-1)
-# #     return pred_rel4 + torch.randn_like(pred_rel4) * sigma
+# # def _persistence_x0_rel(obs_traj,obs_Me,lp,lm,pred_len,sigma=0.02):
+# #     B,device=obs_traj.shape[1],obs_traj.device
+# #     if obs_traj.shape[0]>=3:
+# #         vels=obs_traj[1:]-obs_traj[:-1]; n_v=vels.shape[0]; alpha=0.7
+# #         w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+# #                        dtype=torch.float,device=device).flip(0)
+# #         lv=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
+# #     elif obs_traj.shape[0]>=2: lv=obs_traj[-1,:,:2]-obs_traj[-2,:,:2]
+# #     else: lv=obs_traj.new_zeros(B,2)
+# #     steps=torch.arange(1,pred_len+1,device=device).float()
+# #     pred_abs=obs_traj[-1,:,:2].unsqueeze(0)+lv.unsqueeze(0)*steps.view(-1,1,1)
+# #     pred_rel=pred_abs.permute(1,0,2)-lp.unsqueeze(1)
+# #     pred_rel4=torch.cat([pred_rel,torch.zeros(B,pred_len,2,device=device)],dim=-1)
+# #     return pred_rel4+torch.randn_like(pred_rel4)*sigma
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  NEW-1: Trajectory Mixup Augmentation
+# # #  EMA
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def _traj_mixup(x1_rel: torch.Tensor, delta: torch.Tensor,
-# #                 prob: float = 0.3, alpha: float = 0.4) -> Tuple[torch.Tensor, torch.Tensor]:
-# #     """
-# #     NEW-1: Mixup giữa 2 samples trong batch.
-# #     Giảm train/test gap bằng cách tạo ra smoother decision boundary.
-# #     Chỉ mixup trên easy samples (delta < 0.4) để không làm mờ hard cases.
-# #     Returns: mixed x1_rel, mixed delta
-# #     """
-# #     if not torch.is_tensor(x1_rel) or x1_rel.shape[0] < 2:
-# #         return x1_rel, delta
-# #     B = x1_rel.shape[0]
-# #     # Chỉ apply với xác suất prob
-# #     if torch.rand(1).item() > prob:
-# #         return x1_rel, delta
-
-# #     # Sample lambda từ Beta distribution
-# #     lam = float(torch.distributions.Beta(alpha, alpha).sample())
-# #     lam = max(lam, 1.0 - lam)   # luôn ≥ 0.5 để giữ original hơn
-
-# #     # Shuffle indices
-# #     idx = torch.randperm(B, device=x1_rel.device)
-
-# #     # Chỉ mixup easy samples (delta < 0.4)
-# #     # Hard samples (delta >= 0.4) giữ nguyên x1 và delta để không làm mờ
-# #     # signal khó — đây là điểm cốt lõi của easy/difficult split.
-# #     easy_mask_traj  = (delta < 0.4).float().view(B, 1, 1)   # [B,1,1] cho traj
-# #     easy_mask_delta = (delta < 0.4).float()                  # [B] cho delta
-# #     x1_mixed  = x1_rel * (1.0 - easy_mask_traj * (1.0 - lam)) +                 x1_rel[idx] * (easy_mask_traj * (1.0 - lam))
-# #     # FIX: hard samples giữ nguyên delta, chỉ easy samples blend delta
-# #     delta_mix = (delta * lam + delta[idx] * (1.0 - lam)) * easy_mask_delta +                 delta * (1.0 - easy_mask_delta)
-# #     return x1_mixed, delta_mix
+# # class EMAModel:
+# #     def __init__(self,model,decay=0.995):
+# #         self.decay=decay; m=_unwrap_model(model)
+# #         self.shadow={k:v.detach().clone() for k,v in m.state_dict().items()
+# #                      if v.dtype.is_floating_point}
+# #     def update(self,model):
+# #         m=_unwrap_model(model)
+# #         with torch.no_grad():
+# #             for k,v in m.state_dict().items():
+# #                 if k in self.shadow:
+# #                     self.shadow[k].mul_(self.decay).add_(v.detach(),alpha=1-self.decay)
+# #     def apply_to(self,model):
+# #         m=_unwrap_model(model); backup,sd={},m.state_dict()
+# #         for k in self.shadow:
+# #             if k not in sd: continue
+# #             backup[k]=sd[k].detach().clone(); sd[k].copy_(self.shadow[k])
+# #         return backup
+# #     def restore(self,model,backup):
+# #         m=_unwrap_model(model); sd=m.state_dict()
+# #         for k,v in backup.items():
+# #             if k in sd: sd[k].copy_(v)
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  FIX-C1 + FIX-C5: Displacement Coherence Loss (thuần, không nhắm thẳng)
+# # #  Coherence Loss (FIX-C5: km space)
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def _coherence_loss(
-# #     pred_soft_grad: torch.Tensor,   # [B, 12, 4] — CÓ gradient (FIX-C1)
-# #     x1_rel:         torch.Tensor,   # [B, 12, 4]
-# #     lp:             torch.Tensor,   # [B, 2]
-# #     device:         torch.device,
-# # ) -> torch.Tensor:
-# #     """
-# #     FIX-C1: phải dùng pred_soft_grad CÓ gradient.
-# #     FIX-C5: tính displacement diff trong km — có ý nghĩa vật lý.
-
-# #     Pure displacement smoothness — KHÔNG có hardcoded step weight.
-# #     Weight tự học hoàn toàn qua LearnedWeights.log_s_coh.
-# #     """
-# #     # Convert sang abs degrees
-# #     pred_abs = lp.unsqueeze(1) + pred_soft_grad[:, :, :2]   # [B, 12, 2]
-# #     gt_abs   = lp.unsqueeze(1) + x1_rel[:, :, :2]
-
-# #     pred_deg = _norm_to_deg(pred_abs)   # [B, 12, 2]
-# #     gt_deg   = _norm_to_deg(gt_abs)
-
-# #     # Displacement per step trong km (FIX-C5: km space)
-# #     cos_lat       = torch.cos(torch.deg2rad(gt_deg[:, :-1, 1])).clamp(1e-4)
-# #     disp_pred_lon = (pred_deg[:, 1:, 0] - pred_deg[:, :-1, 0]) * cos_lat * DEG2KM
-# #     disp_pred_lat = (pred_deg[:, 1:, 1] - pred_deg[:, :-1, 1]) * DEG2KM
-# #     disp_gt_lon   = (gt_deg[:, 1:, 0]   - gt_deg[:, :-1, 0])   * cos_lat * DEG2KM
-# #     disp_gt_lat   = (gt_deg[:, 1:, 1]   - gt_deg[:, :-1, 1])   * DEG2KM
-
-# #     disp_pred = torch.stack([disp_pred_lon, disp_pred_lat], dim=-1)   # [B, 11, 2]
-# #     disp_gt   = torch.stack([disp_gt_lon,   disp_gt_lat],   dim=-1)
-
-# #     # Mean displacement diff in km — không có step weight nào hardcode
-# #     # LearnedWeights sẽ tự cân bằng L_coh với L_FM và L_sel
-# #     disp_diff = (disp_pred - disp_gt).norm(dim=-1)   # [B, 11]
-# #     return disp_diff.mean() / DEG2KM                  # normalize về ~same scale as L_FM
+# # def _coherence_loss(pred_soft_grad, x1_rel_orig, lp, device):
+# #     pred_abs=lp.unsqueeze(1)+pred_soft_grad[:,:,:2]
+# #     gt_abs=lp.unsqueeze(1)+x1_rel_orig[:,:,:2]
+# #     pred_deg=_norm_to_deg(pred_abs); gt_deg=_norm_to_deg(gt_abs)
+# #     cos_lat=torch.cos(torch.deg2rad(gt_deg[:,:-1,1])).clamp(1e-4)
+# #     dp_lon=(pred_deg[:,1:,0]-pred_deg[:,:-1,0])*cos_lat*DEG2KM
+# #     dp_lat=(pred_deg[:,1:,1]-pred_deg[:,:-1,1])*DEG2KM
+# #     dg_lon=(gt_deg[:,1:,0]-gt_deg[:,:-1,0])*cos_lat*DEG2KM
+# #     dg_lat=(gt_deg[:,1:,1]-gt_deg[:,:-1,1])*DEG2KM
+# #     dp=torch.stack([dp_lon,dp_lat],dim=-1); dg=torch.stack([dg_lon,dg_lat],dim=-1)
+# #     return (dp-dg).norm(dim=-1).mean()/DEG2KM
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
-# # #  NEW-3: Dropout Consistency Regularization
+# # #  Dropout Consistency (NEW-3, fixed bug)
 # # # ═════════════════════════════════════════════════════════════════════════════
 
-# # def _dropout_consistency_loss(
-# #     encoder: SharedContextEncoder,
-# #     raw_ctx: torch.Tensor,   # [B, 512] raw context (pre-dropout)
-# # ) -> torch.Tensor:
-# #     """
-# #     NEW-3: Apply dropout 2 lần trên cùng raw_ctx → 2 dropout patterns khác nhau.
-# #     Penalize inconsistency → model học features stable bất kể dropout.
-# #     Chỉ áp dụng khi encoder đang ở training mode (dropout active).
+# # def _dropout_consistency_loss(encoder, raw_ctx):
+# #     if not encoder.training: return torch.tensor(0.0, device=raw_ctx.device)
+# #     ctx_a=encoder.apply_ctx_head(raw_ctx); ctx_b=encoder.apply_ctx_head(raw_ctx)
+# #     cos_sim=(F.normalize(ctx_a,dim=-1)*F.normalize(ctx_b,dim=-1)).sum(dim=-1)
+# #     return (1.0-cos_sim).mean()
 
-# #     FIX BUG: Draft cũ gọi encode() 2 lần — encode() không có dropout,
-# #     nên ctx1 = ctx2 → L_consist = 0 mọi lúc.
-# #     Fix: apply_ctx_head 2 lần trên cùng raw_ctx → dropout khác nhau.
-# #     """
-# #     if not encoder.training:
-# #         return torch.tensor(0.0, device=raw_ctx.device)
-# #     # Gọi apply_ctx_head 2 lần: mỗi lần dropout khác nhau
-# #     ctx_a = encoder.apply_ctx_head(raw_ctx)   # [B, 256]
-# #     ctx_b = encoder.apply_ctx_head(raw_ctx)   # [B, 256] — different dropout mask
-# #     ctx_a_n = F.normalize(ctx_a, dim=-1)
-# #     ctx_b_n = F.normalize(ctx_b, dim=-1)
-# #     cos_sim  = (ctx_a_n * ctx_b_n).sum(dim=-1)   # [B]
-# #     return (1.0 - cos_sim).mean()
+
+# # # ═════════════════════════════════════════════════════════════════════════════
+# # #  Trajectory Mixup (hard samples keep delta)
+# # # ═════════════════════════════════════════════════════════════════════════════
+
+# # def _traj_mixup(x1_rel, delta, prob=0.3, alpha=0.4):
+# #     if not torch.is_tensor(x1_rel) or x1_rel.shape[0]<2: return x1_rel, delta
+# #     if torch.rand(1).item()>prob: return x1_rel, delta
+# #     B=x1_rel.shape[0]
+# #     lam=max(float(torch.distributions.Beta(alpha,alpha).sample()), 1.0-float(torch.distributions.Beta(alpha,alpha).sample()))
+# #     lam=max(lam, 1.0-lam)
+# #     idx=torch.randperm(B,device=x1_rel.device)
+# #     easy_t=(delta<0.4).float().view(B,1,1); easy_d=(delta<0.4).float()
+# #     x1_mix=x1_rel*(1.0-easy_t*(1.0-lam))+x1_rel[idx]*(easy_t*(1.0-lam))
+# #     delta_mix=(delta*lam+delta[idx]*(1.0-lam))*easy_d+delta*(1.0-easy_d)
+# #     return x1_mix, delta_mix
 
 
 # # # ═════════════════════════════════════════════════════════════════════════════
@@ -759,482 +1796,385 @@
 
 # # class TCFlowMatchingV65(nn.Module):
 
-# #     def __init__(
-# #         self,
-# #         pred_len:           int   = 12,
-# #         obs_len:            int   = 8,
-# #         ctx_dim:            int   = 256,
-# #         sigma_min:          float = 0.02,
-# #         unet_in_ch:         int   = 13,
-# #         K:                  int   = K_MODES,
-# #         use_ema:            bool  = True,
-# #         ema_decay:          float = 0.995,
-# #         cfg_uncond_prob:    float = 0.10,
-# #         selector_warmup:    int   = 2,
-# #         head_noise_base:    float = 0.03,
-# #         use_ot:             bool  = True,    # OT matching trong training
-# #         ot_epsilon:         float = 0.05,    # Sinkhorn epsilon
-# #         cfg_guidance_scale: float = 1.3,    # CFG scale trong inference
-# #         **kwargs,
-# #     ):
+# #     def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, sigma_min=0.02,
+# #                  unet_in_ch=13, K=K_MODES, use_ema=True, ema_decay=0.995,
+# #                  cfg_uncond_prob=0.10, selector_warmup=0,
+# #                  head_noise_base=0.03, use_ot=True, ot_epsilon=0.05,
+# #                  cfg_guidance_scale=1.3, **kwargs):
 # #         super().__init__()
-# #         self.pred_len        = pred_len
-# #         self.obs_len         = obs_len
-# #         self.sigma_min       = sigma_min
-# #         self.K               = K
-# #         self.use_ema         = use_ema
-# #         self.ema_decay       = ema_decay
-# #         self.cfg_uncond_prob = cfg_uncond_prob
-# #         self.selector_warmup    = selector_warmup
-# #         self.head_noise_base    = head_noise_base
-# #         self.use_ot             = use_ot
-# #         self.ot_epsilon         = ot_epsilon
-# #         self.cfg_guidance_scale = cfg_guidance_scale
-# #         self._ema               = None
+# #         self.pred_len=pred_len; self.obs_len=obs_len; self.sigma_min=sigma_min
+# #         self.K=K; self.use_ema=use_ema; self.ema_decay=ema_decay
+# #         self.cfg_uncond_prob=cfg_uncond_prob; self.selector_warmup=selector_warmup
+# #         self.head_noise_base=head_noise_base; self.use_ot=use_ot
+# #         self.ot_epsilon=ot_epsilon; self.cfg_guidance_scale=cfg_guidance_scale
+# #         self._ema=None
 
-# #         self.encoder        = SharedContextEncoder(
-# #             pred_len=pred_len, obs_len=obs_len,
-# #             ctx_dim=ctx_dim, unet_in_ch=unet_in_ch)
-# #         self.velocity_heads = nn.ModuleList([
-# #             CompassVelocityHead(compass_idx=k, pred_len=pred_len, ctx_dim=ctx_dim)
+# #         # REV2: v_max in normalized units for kinematic loss
+# #         self.v_max_norm = _V_MAX_KMH * _DT_H / (111.0 * 50.0)
+
+# #         self.encoder=SharedContextEncoder(pred_len=pred_len,obs_len=obs_len,
+# #                                           ctx_dim=ctx_dim,unet_in_ch=unet_in_ch)
+# #         self.velocity_heads=nn.ModuleList([
+# #             CompassVelocityHead(compass_idx=k,pred_len=pred_len,ctx_dim=ctx_dim)
 # #             for k in range(K)])
-# #         self.selector       = CompassSelector(ctx_dim=ctx_dim, K=K, n_dirs=8)
-# #         self.learned_weights= LearnedWeights()
-
-# #     # ── EMA ──────────────────────────────────────────────────────────────────
+# #         self.selector=CompassSelector(ctx_dim=ctx_dim,K=K,n_dirs=8)
+# #         self.learned_weights=LearnedWeights()   # REV2-3: 6 terms
 
 # #     def init_ema(self):
-# #         if self.use_ema: self._ema = EMAModel(self, decay=self.ema_decay)
-
+# #         if self.use_ema: self._ema=EMAModel(self,decay=self.ema_decay)
 # #     def ema_update(self):
 # #         if self._ema is not None: self._ema.update(self)
-
-# #     def set_curriculum_len(self, *a, **kw): pass
+# #     def set_curriculum_len(self,*a,**kw): pass
 
 # #     @staticmethod
 # #     def _sigma_schedule(epoch):
-# #         if epoch < 2:  return 0.10
-# #         if epoch < 10: return 0.10 - (epoch-2)/8.0*(0.10-0.04)
-# #         if epoch < 20: return max(0.04 - (epoch-10)/10.0*0.01, 0.035)
+# #         if epoch<2: return 0.10
+# #         if epoch<10: return 0.10-(epoch-2)/8.0*(0.10-0.04)
+# #         if epoch<20: return max(0.04-(epoch-10)/10.0*0.01, 0.035)
 # #         return 0.035
 
 # #     @staticmethod
-# #     def _lon_flip_aug(bl, p=0.3):
-# #         if torch.rand(1).item() > p: return bl
-# #         bl = list(bl)
+# #     def _lon_flip_aug(bl,p=0.3):
+# #         if torch.rand(1).item()>p: return bl
+# #         bl=list(bl)
 # #         for i in [0,1,2,3]:
-# #             if torch.is_tensor(bl[i]) and bl[i].shape[-1] >= 1:
-# #                 t = bl[i].clone(); t[...,0] = -t[...,0]; bl[i] = t
+# #             if torch.is_tensor(bl[i]) and bl[i].shape[-1]>=1:
+# #                 t=bl[i].clone(); t[...,0]=-t[...,0]; bl[i]=t
 # #         return bl
 
 # #     @staticmethod
-# #     def _obs_noise_aug(bl, sigma=0.005):
-# #         if torch.rand(1).item() > 0.5: return bl
-# #         bl = list(bl)
-# #         if torch.is_tensor(bl[0]):
-# #             bl[0] = bl[0] + torch.randn_like(bl[0]) * sigma
+# #     def _obs_noise_aug(bl,sigma=0.005):
+# #         if torch.rand(1).item()>0.5: return bl
+# #         bl=list(bl)
+# #         if torch.is_tensor(bl[0]): bl[0]=bl[0]+torch.randn_like(bl[0])*sigma
 # #         return bl
 
 # #     @staticmethod
-# #     def _to_rel(traj, Me, lp, lm):
-# #         return torch.cat([traj - lp.unsqueeze(0),
-# #                           Me  - lm.unsqueeze(0)], dim=-1).permute(1, 0, 2)
+# #     def _to_rel(traj,Me,lp,lm):
+# #         return torch.cat([traj-lp.unsqueeze(0),Me-lm.unsqueeze(0)],dim=-1).permute(1,0,2)
 
 # #     @staticmethod
-# #     def _to_abs(rel, lp, lm):
-# #         d = rel.permute(1, 0, 2)
-# #         return lp.unsqueeze(0) + d[:,:,:2], lm.unsqueeze(0) + d[:,:,2:]
+# #     def _to_abs(rel,lp,lm):
+# #         d=rel.permute(1,0,2)
+# #         return lp.unsqueeze(0)+d[:,:,:2], lm.unsqueeze(0)+d[:,:,2:]
 
-# #     def _cfm_noisy(self, x1_rel, sigma_min=None, lp=None):
-# #         if sigma_min is None: sigma_min = self.sigma_min
-# #         B = x1_rel.shape[0]; device = x1_rel.device
-# #         x0 = torch.randn_like(x1_rel) * sigma_min
-# #         t  = torch.rand(B, device=device)
-# #         te = t.view(B, 1, 1)
-# #         return (1.0-te)*x0 + te*x1_rel, t, x1_rel - x0
+# #     def _cfm_noisy(self,x1_rel,sigma_min=None,lp=None):
+# #         if sigma_min is None: sigma_min=self.sigma_min
+# #         B=x1_rel.shape[0]; device=x1_rel.device
+# #         x0=torch.randn_like(x1_rel)*sigma_min; t=torch.rand(B,device=device)
+# #         te=t.view(B,1,1)
+# #         return (1.0-te)*x0+te*x1_rel, t, x1_rel-x0
 
 # #     @staticmethod
 # #     @torch.no_grad()
-# #     def _persistence_blend(model_pred, obs_traj_norm, blend_strength=0.10):
-# #         T_obs = obs_traj_norm.shape[0]; T = model_pred.shape[0]
-# #         B, device = model_pred.shape[1], model_pred.device
-# #         if T_obs < 2: return model_pred
-# #         vels = obs_traj_norm[1:] - obs_traj_norm[:-1]; n_v = vels.shape[0]
-# #         if n_v >= 3:
-# #             alpha = 0.7
-# #             w  = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
-# #                                dtype=torch.float, device=device).flip(0)
-# #             ev = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
-# #         elif n_v == 2: ev = 0.7*vels[-1] + 0.3*vels[-2]
-# #         else: ev = vels[-1]
-# #         steps   = torch.arange(1, T+1, dtype=torch.float, device=device)
-# #         persist = obs_traj_norm[-1].unsqueeze(0) + ev.unsqueeze(0)*steps.view(T,1,1)
-# #         obs_spd = _step_speeds_deg(_norm_to_deg(obs_traj_norm))
-# #         if obs_spd.shape[0] >= 2:
-# #             spd_cv  = obs_spd.std(0) / obs_spd.mean(0).clamp(min=1.0)
-# #             alpha_b = (blend_strength*torch.sigmoid(-(spd_cv-0.3)*5.0)).unsqueeze(0).unsqueeze(-1)
-# #         else: alpha_b = blend_strength * 0.5
-# #         return (1.0-alpha_b)*model_pred + alpha_b*persist
+# #     def _persistence_blend(model_pred,obs_traj_norm,blend_strength=0.10):
+# #         T_obs=obs_traj_norm.shape[0]; T=model_pred.shape[0]
+# #         B,device=model_pred.shape[1],model_pred.device
+# #         if T_obs<2: return model_pred
+# #         vels=obs_traj_norm[1:]-obs_traj_norm[:-1]; n_v=vels.shape[0]
+# #         if n_v>=3:
+# #             alpha=0.7; w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+# #                                        dtype=torch.float,device=device).flip(0)
+# #             ev=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
+# #         elif n_v==2: ev=0.7*vels[-1]+0.3*vels[-2]
+# #         else: ev=vels[-1]
+# #         steps=torch.arange(1,T+1,dtype=torch.float,device=device)
+# #         persist=obs_traj_norm[-1].unsqueeze(0)+ev.unsqueeze(0)*steps.view(T,1,1)
+# #         obs_spd=_step_speeds_deg(_norm_to_deg(obs_traj_norm))
+# #         if obs_spd.shape[0]>=2:
+# #             spd_cv=obs_spd.std(0)/obs_spd.mean(0).clamp(min=1.0)
+# #             alpha_b=(blend_strength*torch.sigmoid(-(spd_cv-0.3)*5.0)).unsqueeze(0).unsqueeze(-1)
+# #         else: alpha_b=blend_strength*0.5
+# #         return (1.0-alpha_b)*model_pred+alpha_b*persist
 
-# #     # ═════════════════════════════════════════════════════════════════════════
-# #     #  TRAINING LOSS
-# #     # ═════════════════════════════════════════════════════════════════════════
+# #     # ── TRAINING LOSS ─────────────────────────────────────────────────────────
 
-# #     def get_loss(self, batch_list, epoch=0, **kwargs):
-# #         return self.get_loss_breakdown(batch_list, epoch=epoch)["total"]
+# #     def get_loss(self,batch_list,epoch=0,**kwargs):
+# #         return self.get_loss_breakdown(batch_list,epoch=epoch,**kwargs)["total"]
 
-# #     def get_loss_breakdown(self, batch_list, epoch=0, **kwargs):
-# #         # ── Augmentation ─────────────────────────────────────────────────────
-# #         batch_list = self._lon_flip_aug(batch_list)
-# #         batch_list = self._obs_noise_aug(batch_list, sigma=0.005)
+# #     def get_loss_breakdown(self,batch_list,epoch=0,**kwargs):
+# #         batch_list=self._lon_flip_aug(batch_list)
+# #         batch_list=self._obs_noise_aug(batch_list,sigma=0.005)
 
-# #         # ── Unpack (FIX-B1) ──────────────────────────────────────────────────
-# #         obs_t    = batch_list[0]    # [T, B, 2]
-# #         pred_t   = batch_list[1]    # [T, B, 2]
-# #         obs_Me   = batch_list[7]    # [T, B, 2]
-# #         pred_Me  = batch_list[8]    # [T, B, 2]
-# #         env_data = batch_list[13] if len(batch_list) > 13 else None
+# #         obs_t=batch_list[0]; pred_t=batch_list[1]
+# #         obs_Me=batch_list[7]; pred_Me=batch_list[8]
+# #         env_data=batch_list[13] if len(batch_list)>13 else None
 
-# #         lp = obs_t[-1]; lm = obs_Me[-1]
-# #         B, device = lp.shape[0], lp.device
-# #         sigma     = self._sigma_schedule(epoch)
-# #         in_warmup = (epoch < self.selector_warmup)
+# #         lp=obs_t[-1]; lm=obs_Me[-1]
+# #         B,device=lp.shape[0],lp.device
+# #         sigma=self._sigma_schedule(epoch)
+# #         in_warmup=(epoch<self.selector_warmup)
 
-# #         # ── Context encoding ─────────────────────────────────────────────────
-# #         raw_ctx  = self.encoder.encode(batch_list)           # [B, 512]
-# #         use_null = (torch.rand(1).item() < self.cfg_uncond_prob)
-# #         ctx      = self.encoder.apply_ctx_head(raw_ctx, use_null=use_null)  # [B, 256]
+# #         # Context
+# #         raw_ctx=self.encoder.encode(batch_list)
+# #         use_null=(torch.rand(1).item()<self.cfg_uncond_prob)
+# #         ctx=self.encoder.apply_ctx_head(raw_ctx,use_null=use_null)
 
-# #         # ── NEW-3: Dropout consistency regularization ─────────────────────────
-# #         L_consist = _dropout_consistency_loss(self.encoder, raw_ctx)
+# #         # Consistency
+# #         L_consist=_dropout_consistency_loss(self.encoder,raw_ctx)
 
-# #         # ── Difficulty score (FIX-B2) ────────────────────────────────────────
-# #         obs_BT2  = obs_t.permute(1, 0, 2)
-# #         img_obs  = batch_list[11]
-# #         delta    = compute_difficulty_score(obs_BT2, img_obs, env_data, device)
+# #         # Difficulty
+# #         obs_BT2=obs_t.permute(1,0,2); img_obs=batch_list[11]
+# #         delta=compute_difficulty_score(obs_BT2,img_obs,env_data,device)
 
-# #         # ── FM interpolant (FIX-B3) ──────────────────────────────────────────
-# #         x1_rel_orig = self._to_rel(pred_t, pred_Me, lp, lm)    # [B, 12, 4]
+# #         # FM
+# #         x1_rel_orig=self._to_rel(pred_t,pred_Me,lp,lm)
 
-# #         # ── OT matching (port từ v59) ─────────────────────────────────────────
-# #         # Ghép noise với GT tối ưu → FM path ngắn hơn → train tốt hơn.
-# #         # Áp dụng TRƯỚC mixup vì OT cần GT gốc để tính cost.
-# #         if self.use_ot and B >= 4 and not in_warmup:
-# #             noise_ot = torch.randn_like(x1_rel_orig) * sigma
-# #             _, x1_rel_orig = _spherical_ot_matching(
-# #                 noise_ot, x1_rel_orig, lp, epsilon=self.ot_epsilon)
+# #         # OT matching (phase 2+)
+# #         if self.use_ot and B>=4 and not in_warmup:
+# #             noise_ot=torch.randn_like(x1_rel_orig)*sigma
+# #             _,x1_rel_orig=_spherical_ot_matching(noise_ot,x1_rel_orig,lp,epsilon=self.ot_epsilon)
 
-# #         # ── NEW-1: Mixup augmentation ────────────────────────────────────────
-# #         x1_rel, delta = _traj_mixup(x1_rel_orig, delta, prob=0.3, alpha=0.4)
+# #         # Mixup
+# #         x1_rel,delta=_traj_mixup(x1_rel_orig,delta,prob=0.3,alpha=0.4)
+# #         x_t,fm_t,u_target=self._cfm_noisy(x1_rel,sigma_min=sigma,lp=lp)
+# #         x_t_shared=x_t
 
-# #         x_t, fm_t, u_target = self._cfm_noisy(x1_rel, sigma_min=sigma, lp=lp)
-# #         # x_t: [B,12,4], fm_t: [B], u_target: [B,12,4]
-
-# #         # ── FIX-C3: x_t_shared — FM noisy input chung cho tất cả heads ────────
-# #         # Oracle ADE tính từ x_t_shared (không có per-head z_k) → fair comparison.
-# #         # x_t_shared đã có sigma từ _cfm_noisy schedule; "shared" nghĩa là
-# #         # không thêm per-head noise khi tính oracle.
-# #         x_t_shared = x_t
-
-# #         # ── Generate K=8 modes (FIX-P1 + FIX-C2: consistent sigma_k) ────────
-# #         modes_rel_nograd = []   # stop-grad cho selector/oracle  [B,12,4]
-# #         modes_rel_grad   = []   # có gradient cho L_FM, L_coh    [B,12,4]
-# #         vels_pred        = []   # gradient
-
+# #         # Generate K modes
+# #         modes_rel_nograd=[]; modes_rel_grad=[]; vels_pred=[]
 # #         for k in range(self.K):
-# #             # FIX-C2: sigma_k đồng nhất giữa training và inference
-# #             sigma_k = self.head_noise_base * (1.0 + k * 0.25)
-# #             z_k       = torch.randn_like(x_t_shared) * sigma_k
-# #             x_t_k      = x_t_shared + z_k
-
+# #             sigma_k=self.head_noise_base*(1.0+k*0.25)
+# #             z_k=torch.randn_like(x_t_shared)*sigma_k; x_t_k=x_t_shared+z_k
 # #             if in_warmup:
 # #                 with torch.no_grad():
-# #                     v_k = self.velocity_heads[k](x_t_k, fm_t, ctx.detach())
+# #                     v_k=self.velocity_heads[k](x_t_k,fm_t,ctx.detach())
 # #             else:
-# #                 v_k = self.velocity_heads[k](x_t_k, fm_t, ctx)
-
-# #             # FIX-C3: x1_pred oracle dùng x_t_CLEAN (không có z_k) làm base
-# #             # → oracle fair: không có head nào có lợi thế do ít noise
+# #                 v_k=self.velocity_heads[k](x_t_k,fm_t,ctx)
 # #             with torch.no_grad():
-# #                 pred_k_oracle = x_t_shared + (1.0 - fm_t.view(B,1,1)) * v_k
+# #                 pred_k_oracle=x_t_shared+(1.0-fm_t.view(B,1,1))*v_k
 # #             modes_rel_nograd.append(pred_k_oracle.detach())
-
-# #             # pred có gradient: dùng x_t_k làm base (consistent với training)
-# #             pred_k_grad = x_t_k + (1.0 - fm_t.view(B,1,1)) * v_k
+# #             pred_k_grad=x_t_k+(1.0-fm_t.view(B,1,1))*v_k
 # #             modes_rel_grad.append(pred_k_grad)
 # #             vels_pred.append(v_k)
 
-# #         modes_t_ng = torch.stack(modes_rel_nograd, dim=1)  # [B,K,12,4] no-grad
-# #         modes_t_g  = torch.stack(modes_rel_grad,   dim=1)  # [B,K,12,4] with-grad
+# #         modes_t_ng=torch.stack(modes_rel_nograd,dim=1)
+# #         modes_t_g=torch.stack(modes_rel_grad,dim=1)
 
-# #         # ── Oracle assignment: dùng x1_rel_orig (NOT mixup) ─────────────────
-# #         # FIX: oracle phải so với GT gốc, không phải GT đã blend.
-# #         # x1_rel (mixup) được dùng cho FM training objective.
-# #         # x1_rel_orig được dùng cho oracle selection → k_star phản ánh
-# #         # mode nào thực sự gần GT nhất, không bị artifact mixup.
+# #         # Oracle
 # #         with torch.no_grad():
-# #             ade_k  = torch.stack([
-# #                 _ade_km_from_rel(modes_rel_nograd[k], x1_rel_orig.detach(), lp)
+# #             ade_k=torch.stack([
+# #                 _ade_km_from_rel(modes_rel_nograd[k],x1_rel_orig.detach(),lp)
 # #                 for k in range(self.K)
-# #             ], dim=1)                       # [B, K]
-# #             k_star = ade_k.argmin(dim=1)    # [B]
+# #             ],dim=1)
+# #             k_star=ade_k.argmin(dim=1)
 
-# #         # ── FM Loss: Easy/Difficult (thuần, không có step weighting hardcode) ──
-# #         # FM velocity MSE thuần — không nhắm vào bất kỳ bước cụ thể nào.
-# #         # Easy/Difficult split theo delta là đủ để phân biệt hard/easy cases.
-# #         fm_errs = torch.stack([
-# #             ((vels_pred[k] - u_target)**2).mean(dim=[1, 2])
+# #         # FM loss
+# #         fm_errs=torch.stack([
+# #             ((vels_pred[k]-u_target)**2).mean(dim=[1,2])
 # #             for k in range(self.K)
-# #         ], dim=1)                                    # [B, K]
+# #         ],dim=1)
+# #         L_easy=fm_errs.mean(dim=1)
+# #         L_oracle_fm=fm_errs[torch.arange(B,device=device),k_star]
 
-# #         L_easy   = fm_errs.mean(dim=1)               # [B]
-# #         L_oracle = fm_errs[torch.arange(B, device=device), k_star]  # [B]
-
-# #         # Diversity push (FIX-B5)
-# #         mode_star_ng = modes_t_ng[torch.arange(B, device=device), k_star]
-# #         dists_all    = torch.stack([
-# #             ((mode_star_ng - modes_t_ng[:, k])**2).mean(dim=[1,2]).sqrt()
+# #         # Diversity
+# #         mode_star_ng=modes_t_ng[torch.arange(B,device=device),k_star]
+# #         dists_all=torch.stack([
+# #             ((mode_star_ng-modes_t_ng[:,k])**2).mean(dim=[1,2]).sqrt()
 # #             for k in range(self.K)
-# #         ], dim=1)
-# #         mask_ns       = torch.ones(B, self.K, device=device, dtype=torch.bool)
-# #         mask_ns.scatter_(1, k_star.unsqueeze(1), False)
-# #         min_dist      = dists_all.masked_fill(~mask_ns, float('inf')).min(dim=1).values
+# #         ],dim=1)
+# #         mask_ns=torch.ones(B,self.K,device=device,dtype=torch.bool)
+# #         mask_ns.scatter_(1,k_star.unsqueeze(1),False)
+# #         min_dist=dists_all.masked_fill(~mask_ns,float('inf')).min(dim=1).values
+# #         MARGIN=0.40
+# #         L_div=F.relu(MARGIN-min_dist)
+# #         L_diff=L_oracle_fm+0.3*L_div
+# #         L_FM_raw=(1.0-delta)*L_easy+delta*L_diff
+# #         w_d=0.5+1.5*delta
+# #         L_FM=(w_d*L_FM_raw).mean()
 
-# #         MARGIN = 0.40
-# #         L_div  = F.relu(MARGIN - min_dist)
-# #         L_diff = L_oracle + 0.3 * L_div
+# #         # ── REV2-1+2: DPE + Kinematic loss cho best mode ──────────────────
+# #         # best_mode_grad = modes_t_g[k_star] — có gradient
+# #         k_star_idx=k_star
+# #         best_mode_grad=modes_t_g[torch.arange(B,device=device),k_star_idx]  # [B,12,4]
+# #         L_dpe, L_kin=_dpe_and_kinematic_loss(
+# #             best_mode_grad, x1_rel_orig, lp, device, self.v_max_norm)
 
-# #         L_FM_raw = (1.0 - delta) * L_easy + delta * L_diff
-# #         w_d      = 0.5 + 1.5 * delta
-# #         L_FM     = (w_d * L_FM_raw).mean()
+# #         # Selector
+# #         sel_logits,dir_logits=self.selector(ctx.detach(),modes_t_ng,env_data)
+# #         tau=float(kwargs.get('tau',3.0))
+# #         p_oracle=F.softmax(-ade_k/tau,dim=1)
+# #         L_rank=F.kl_div(F.log_softmax(sel_logits,dim=1),p_oracle,reduction='batchmean')
+# #         gt_bucket=get_gt_direction_bucket(obs_t,pred_t)
+# #         L_dir=F.cross_entropy(dir_logits,gt_bucket)
 
-# #         # ── Selector Loss (STOP-GRAD) ─────────────────────────────────────────
-# #         sel_logits, dir_logits = self.selector(
-# #             ctx.detach(), modes_t_ng, env_data)   # modes_t_ng already detached
-
-# #         tau      = 3.0
-# #         p_oracle = F.softmax(-ade_k / tau, dim=1)
-# #         L_rank   = F.kl_div(F.log_softmax(sel_logits, dim=1), p_oracle,
-# #                              reduction='batchmean')
-
-# #         gt_bucket = get_gt_direction_bucket(obs_t, pred_t)
-# #         L_dir     = F.cross_entropy(dir_logits, gt_bucket)
-
-# #         # ── FIX-C1 + FIX-C5: Coherence Loss (CÓ gradient, dùng x1_rel_orig) ─
-# #         # Dùng selector probs (stop-grad) để weight modes, nhưng modes_t_g CÓ grad
+# #         # Coherence
 # #         with torch.no_grad():
-# #             sel_probs = F.softmax(sel_logits, dim=1)           # [B, K]
-# #         # Weighted sum của modes_t_g — gradient chảy qua modes_t_g
-# #         pred_soft_grad = (sel_probs.unsqueeze(-1).unsqueeze(-1)
-# #                           * modes_t_g).sum(dim=1)              # [B,12,4] — CÓ grad
-# #         L_coh = _coherence_loss(pred_soft_grad, x1_rel_orig, lp, device)  # dùng orig GT cho coherence, nhất quán với oracle
+# #             sel_probs=F.softmax(sel_logits,dim=1)
+# #         pred_soft_grad=(sel_probs.unsqueeze(-1).unsqueeze(-1)*modes_t_g).sum(dim=1)
+# #         L_coh=_coherence_loss(pred_soft_grad,x1_rel_orig,lp,device)
 
-# #         # ── Learned weights (FIX-P2: 2-phase) ───────────────────────────────
-# #         # TẤT CẢ weights tự học — không có hardcode nào.
+# #         # Total
 # #         if in_warmup:
-# #             # Phase 1: chỉ train selector
-# #             alpha_lw = torch.sigmoid(self.learned_weights.log_alpha)
-# #             L_total  = alpha_lw * L_rank + (1.0 - alpha_lw) * L_dir
+# #             alpha_lw=torch.sigmoid(self.learned_weights.log_alpha)
+# #             L_total=alpha_lw*L_rank+(1.0-alpha_lw)*L_dir
 # #         else:
-# #             # Phase 2: joint training, 4 losses đều tự cân bằng
-# #             L_total = self.learned_weights(L_FM, L_rank, L_dir, L_coh, L_consist)
+# #             L_total=self.learned_weights(L_FM,L_rank,L_dir,L_coh,L_consist,L_dpe,L_kin)
 
-# #         if not torch.isfinite(L_total):
-# #             L_total = L_total.new_zeros(())
+# #         if not torch.isfinite(L_total): L_total=L_total.new_zeros(())
 
 # #         def _s(x): return x.item() if torch.is_tensor(x) else float(x)
-
 # #         return {
-# #             "total":          L_total,
-# #             "L_FM":           _s(L_FM),
-# #             "L_easy":         _s(L_easy.mean()),
-# #             "L_diff":         _s(L_diff.mean()),
-# #             "L_oracle":       _s(L_oracle.mean()),
-# #             "L_div":          _s(L_div.mean()),
-# #             "L_rank":         _s(L_rank),
-# #             "L_dir":          _s(L_dir),
-# #             "L_coh":          _s(L_coh),
-# #             "L_consist":      _s(L_consist),
-# #             "delta_mean":     _s(delta.mean()),
-# #             "delta_p75":      _s(delta.quantile(0.75)),
-# #             "min_dist_mean":  _s(min_dist.mean()),
-# #             "in_warmup":      in_warmup,
+# #             "total":         L_total,
+# #             "L_FM":          _s(L_FM),
+# #             "L_easy":        _s(L_easy.mean()),
+# #             "L_diff":        _s(L_diff.mean()),
+# #             "L_oracle_fm":   _s(L_oracle_fm.mean()),
+# #             "L_div":         _s(L_div.mean()),
+# #             "L_dpe":         _s(L_dpe),      # REV2-1
+# #             "L_kin":         _s(L_kin),      # REV2-2
+# #             "L_rank":        _s(L_rank),
+# #             "L_dir":         _s(L_dir),
+# #             "L_coh":         _s(L_coh),
+# #             "L_consist":     _s(L_consist),
+# #             "delta_mean":    _s(delta.mean()),
+# #             "delta_p75":     _s(delta.quantile(0.75)),
+# #             "min_dist_mean": _s(min_dist.mean()),
+# #             "in_warmup":     in_warmup,
 # #             **self.learned_weights.get_weights(),
 # #         }
 
-# #     # ═════════════════════════════════════════════════════════════════════════
-# #     #  INFERENCE
-# #     # ═════════════════════════════════════════════════════════════════════════
+# #     # ── INFERENCE ─────────────────────────────────────────────────────────────
 
 # #     @torch.no_grad()
-# #     def sample(self, batch_list, ddim_steps=20, predict_csv=None,
-# #                blend_strength=0.10, **kwargs):
-# #         """
-# #         Inference K=8 compass modes → selector chọn best.
-# #         FIX-C2: dùng cùng sigma_k như training.
-# #         """
-# #         obs_t    = batch_list[0]   # [T, B, 2]
-# #         obs_Me   = batch_list[7]
-# #         env_data = batch_list[13] if len(batch_list) > 13 else None
+# #     def sample(self,batch_list,ddim_steps=20,predict_csv=None,
+# #                blend_strength=0.10,**kwargs):
+# #         obs_t=batch_list[0]; obs_Me=batch_list[7]
+# #         env_data=batch_list[13] if len(batch_list)>13 else None
+# #         lp=obs_t[-1]; lm=obs_Me[-1]
+# #         B,device=lp.shape[0],lp.device
+# #         T_pred=self.pred_len; dt=1.0/max(ddim_steps,1)
 
-# #         lp = obs_t[-1]; lm = obs_Me[-1]
-# #         B, device = lp.shape[0], lp.device
-# #         T_pred = self.pred_len
-# #         dt     = 1.0 / max(ddim_steps, 1)
+# #         raw_ctx=self.encoder.encode(batch_list)
+# #         ctx=self.encoder.apply_ctx_head(raw_ctx)
+# #         ctx_null=self.encoder.apply_ctx_head(raw_ctx,use_null=True)
 
-# #         raw_ctx = self.encoder.encode(batch_list)
-# #         ctx     = self.encoder.apply_ctx_head(raw_ctx)
+# #         x0_base=_persistence_x0_rel(obs_t,obs_Me,lp,lm,T_pred,sigma=0.0)
 
-# #         # FIX-B11: persistence x0 trong rel space
-# #         x0_base = _persistence_x0_rel(obs_t, obs_Me, lp, lm, T_pred, sigma=0.0)
+# #         obs_t_norm=obs_t[:,:,:2]
+# #         obs_h_n=(F.normalize(obs_t_norm[-1]-obs_t_norm[-2],dim=-1,eps=1e-6)
+# #                  if obs_t_norm.shape[0]>=2 else None)
 
-# #         all_modes_abs = []
-
-# #         # Null context cho CFG (port từ v59)
-# #         ctx_null = self.encoder.apply_ctx_head(raw_ctx, use_null=True)
-
-# #         # Heading từ obs để tính alignment gate (port từ v59)
-# #         obs_t_norm = obs_t[:, :, :2]   # [T, B, 2]
-# #         if obs_t_norm.shape[0] >= 2:
-# #             obs_h_n = F.normalize(
-# #                 obs_t_norm[-1] - obs_t_norm[-2], dim=-1, eps=1e-6)  # [B, 2]
-# #         else:
-# #             obs_h_n = None
-
+# #         all_modes_abs=[]
 # #         for k in range(self.K):
-# #             # FIX-C2: sigma_k nhất quán với training
-# #             sigma_k = self.head_noise_base * (1.0 + k * 0.25)
-# #             x_t = x0_base + torch.randn_like(x0_base) * sigma_k
-
+# #             sigma_k=self.head_noise_base*(1.0+k*0.25)
+# #             x_t=x0_base+torch.randn_like(x0_base)*sigma_k
 # #             for step in range(ddim_steps):
-# #                 t_b = torch.full((B,), step * dt, device=device)
-
-# #                 # CFG từ step 1 trở đi (step 0 dùng cond để ổn định)
-# #                 if step > 0 and self.cfg_guidance_scale > 1.0:
-# #                     v_cond   = self.velocity_heads[k](x_t, t_b, ctx)
-# #                     v_uncond = self.velocity_heads[k](x_t, t_b, ctx_null)
-
-# #                     # Alignment gate: scale CFG theo alignment với obs heading
+# #                 t_b=torch.full((B,),step*dt,device=device)
+# #                 if step>0 and self.cfg_guidance_scale>1.0:
+# #                     v_cond=self.velocity_heads[k](x_t,t_b,ctx)
+# #                     v_uncond=self.velocity_heads[k](x_t,t_b,ctx_null)
 # #                     if obs_h_n is not None:
-# #                         pred_h = F.normalize(
-# #                             v_cond[:, 0, :2].detach(), dim=-1, eps=1e-6)
-# #                         cos_a  = (obs_h_n * pred_h).sum(-1).clamp(-1.0, 1.0)
-# #                         # gs ∈ [0.8, 1.5]: aligned → full guidance, misaligned → reduced
-# #                         gs     = (0.8 + 0.7 * (cos_a + 1.0) * 0.5).view(B, 1, 1)
-# #                         v_k    = v_uncond + gs * (v_cond - v_uncond)
+# #                         pred_h=F.normalize(v_cond[:,0,:2].detach(),dim=-1,eps=1e-6)
+# #                         cos_a=(obs_h_n*pred_h).sum(-1).clamp(-1.0,1.0)
+# #                         gs=(0.8+0.7*(cos_a+1.0)*0.5).view(B,1,1)
+# #                         v_k=v_uncond+gs*(v_cond-v_uncond)
 # #                     else:
-# #                         v_k = v_uncond + self.cfg_guidance_scale * (v_cond - v_uncond)
+# #                         v_k=v_uncond+self.cfg_guidance_scale*(v_cond-v_uncond)
 # #                 else:
-# #                     v_k = self.velocity_heads[k](x_t, t_b, ctx)
-
-# #                 x_t = (x_t + dt * v_k).clamp(-5.0, 5.0)
-
-# #             traj_abs, _ = self._to_abs(x_t, lp, lm)   # [T, B, 2]
+# #                     v_k=self.velocity_heads[k](x_t,t_b,ctx)
+# #                 x_t=(x_t+dt*v_k).clamp(-5.0,5.0)
+# #             traj_abs,_=self._to_abs(x_t,lp,lm)
 # #             all_modes_abs.append(traj_abs)
 
-# #         modes_stack = torch.stack(all_modes_abs, dim=0)   # [K, T, B, 2]
+# #         modes_stack=torch.stack(all_modes_abs,dim=0)   # [K,T,B,2]
 
-# #         # Rebuild modes_rel_sel cho selector [B, K, T, 4]
-# #         modes_rel_sel = torch.stack([
-# #             torch.cat([all_modes_abs[k].permute(1,0,2) - lp.unsqueeze(1),
-# #                        torch.zeros(B, T_pred, 2, device=device)], dim=-1)
+# #         # ── REV2-5: Speed-aware final selection ───────────────────────────
+# #         # Combine selector logits với speed plausibility penalty
+# #         modes_rel_sel=torch.stack([
+# #             torch.cat([all_modes_abs[k].permute(1,0,2)-lp.unsqueeze(1),
+# #                        torch.zeros(B,T_pred,2,device=device)],dim=-1)
 # #             for k in range(self.K)
-# #         ], dim=1)
+# #         ],dim=1)
+# #         sel_logits,_=self.selector(ctx,modes_rel_sel,env_data)
 
-# #         sel_logits, _ = self.selector(ctx, modes_rel_sel, env_data)
-# #         best_k        = sel_logits.argmax(dim=1)          # [B]
+# #         # Speed penalty: modes vi phạm v_max bị penalize
+# #         speed_penalties=[]
+# #         for k in range(self.K):
+# #             mode_norm=modes_rel_sel[:,k,:,:2]   # [B,T,2]
+# #             if T_pred>=2:
+# #                 step_dist=(mode_norm[:,1:,:]-mode_norm[:,:-1,:]).norm(dim=-1)  # [B,T-1]
+# #                 penalty=F.relu(step_dist-self.v_max_norm).sum(dim=1)           # [B]
+# #             else:
+# #                 penalty=torch.zeros(B,device=device)
+# #             speed_penalties.append(penalty)
+# #         speed_pen=torch.stack(speed_penalties,dim=1)   # [B,K]
 
-# #         pred_best_list = [modes_stack[best_k[b], :, b, :] for b in range(B)]
-# #         pred_best = torch.stack(pred_best_list, dim=1)    # [T, B, 2]
+# #         # Final score = selector - speed penalty (normalize speed_pen)
+# #         sp_norm=speed_pen/(speed_pen.max(dim=1,keepdim=True).values.clamp(min=1e-6))
+# #         final_scores=sel_logits - 0.5*sp_norm
+# #         best_k=final_scores.argmax(dim=1)   # [B]
 
-# #         pred_final = self._persistence_blend(
-# #             pred_best, obs_t[:, :, :2], blend_strength=blend_strength)
+# #         pred_best=torch.stack([modes_stack[best_k[b],:,b,:] for b in range(B)],dim=1)
+# #         pred_final=self._persistence_blend(pred_best,obs_t[:,:,:2],blend_strength=blend_strength)
 
 # #         if predict_csv is not None:
-# #             self._write_predict_csv(predict_csv, pred_final, modes_stack)
-
+# #             self._write_predict_csv(predict_csv,pred_final,modes_stack)
 # #         return pred_final, modes_stack
 
 # #     @staticmethod
-# #     def _write_predict_csv(csv_path, traj_mean, all_modes_KTB2):
-# #         import csv as _csv, os
-# #         from datetime import datetime
-# #         os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
-# #         T, B = traj_mean.shape[0], traj_mean.shape[1]
-# #         mlon = ((traj_mean[...,0]*50.0+1800.0)/10.0).cpu().numpy()
-# #         mlat = ((traj_mean[...,1]*50.0)/10.0).cpu().numpy()
-# #         fields = ["ts","b","step","lead_h","lon","lat"]
-# #         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-# #         write_hdr = not os.path.exists(csv_path)
-# #         with open(csv_path, "a", newline="") as fh:
-# #             w = _csv.DictWriter(fh, fieldnames=fields)
+# #     def _write_predict_csv(csv_path,traj_mean,all_modes):
+# #         import csv as _csv,os; from datetime import datetime
+# #         os.makedirs(os.path.dirname(os.path.abspath(csv_path)),exist_ok=True)
+# #         T,B=traj_mean.shape[0],traj_mean.shape[1]
+# #         mlon=((traj_mean[...,0]*50.0+1800.0)/10.0).cpu().numpy()
+# #         mlat=((traj_mean[...,1]*50.0)/10.0).cpu().numpy()
+# #         fields=["ts","b","step","lead_h","lon","lat"]
+# #         ts=datetime.now().strftime("%Y%m%d_%H%M%S")
+# #         write_hdr=not os.path.exists(csv_path)
+# #         with open(csv_path,"a",newline="") as fh:
+# #             w=_csv.DictWriter(fh,fieldnames=fields)
 # #             if write_hdr: w.writeheader()
 # #             for b in range(B):
 # #                 for k in range(T):
 # #                     w.writerow({"ts":ts,"b":b,"step":k,"lead_h":(k+1)*6,
-# #                                  "lon":f"{mlon[k,b]:.4f}","lat":f"{mlat[k,b]:.4f}"})
+# #                                 "lon":f"{mlon[k,b]:.4f}","lat":f"{mlat[k,b]:.4f}"})
 
-
-# # # Backward compat
 # # TCFlowMatching = TCFlowMatchingV65
 # # TCDiffusion    = TCFlowMatchingV65
 
 # """
-# flow_matching_model_v65.py  ── v65-rev2
-# ══════════════════════════════════════════════════════════════════════════════
-# TC-FlowMatching v65 — Revision 2
+# flow_matching_model_v65_fixed.py
+# ════════════════════════════════════════════════════════════════════════════════
+# V65 — Fixed version
 
-# VẤN ĐỀ CỐT LÕI SO VỚI STTRANS
-# ────────────────────────────────
-# STTrans dùng cùng encoder stack (FNO3D + Mamba + Env_net) nhưng decoder là
-# 1 Non-AR Transformer optimize L_DPE (haversine) TRỰC TIẾP.
+# ROOT CAUSES của diverge (ADE 455→981 qua 4 epochs):
 
-# v65-rev1 optimize L_FM = velocity MSE → KHÔNG trực tiếp minimize haversine
-# → ADE của v65 có thể không thấp hơn STTrans dù có K=8 modes.
+#   ROOT-1 [CRITICAL] x0 mismatch:
+#     _cfm_noisy dùng x0 = randn*sigma_min (pure noise)
+#     Nhưng inference dùng x0 = persistence → train/inf mismatch hoàn toàn
+#     Fix: dùng persistence x0 trong cả training lẫn inference (như v63+)
 
-# THAY ĐỔI TRONG rev2
-# ────────────────────
-# [REV2-1] L_DPE trực tiếp cho oracle head (KEY FIX)
-#          Thêm haversine loss cho best mode (k_star):
-#            L_dpe_oracle = haversine(x1_pred_best_mode, x1_gt_orig) / 500
-#          Đưa vào LearnedWeights như term thứ 5 → model learn to minimize
-#          haversine trực tiếp như STTrans, nhưng ĐỒN THỜI có FM diversity.
+#   ROOT-2 [CRITICAL] diversity mask ngược:
+#     mask_ns = ones → scatter False → masked_fill(~mask_ns) fill inf vào k_star
+#     → min_dist luôn = distance đến k_star thay vì distance đến mode gần nhất khác
+#     → L_div = 0 mọi lúc → modes collapse
+#     Fix: mask_ns = zeros → scatter True → masked_fill(~mask_ns) fill inf đúng chỗ
 
-# [REV2-2] L_speed + L_accel (physics kinematic, từ STTrans paper §3.5.1)
-#          Penalize unrealistic speed/acceleration trong best mode prediction.
-#          STTrans có điều này, v65-rev1 không → giúp 72h coherence.
-#          λ_speed = 0.1, λ_accel = 0.01 (đúng như paper).
+#   ROOT-3 Warmup không train generator:
+#     in_warmup: velocity_heads toàn bộ detached → ADE không giảm trong 2 epoch đầu
+#     + selector frozen → không học được gì 2 epoch đầu → waste
+#     Fix: selector_warmup=0 (bỏ warmup phase), train joint từ đầu
+#     Generator luôn có gradient, selector train song song với stop-grad từ generator
 
-# [REV2-3] LearnedWeights mở rộng: 6 terms
-#          s_fm, s_sel, s_coh, s_con, s_dpe, s_kin (kinematic)
-#          Tất cả tự học, không hardcode.
+#   ROOT-4 L_consist = 0 trong warmup:
+#     Warmup loss chỉ có L_rank + L_dir → dropout consistency không train
+#     Fix: thêm L_consist nhỏ vào mọi phase
 
-# [REV2-4] MARGIN tự học thay vì hardcode 0.40
-#          MARGIN = sigmoid(log_margin) * 0.8 → [0, 0.8]
-#          Tự adapt theo data distribution.
+#   ROOT-5 L_coh gradient bị stop:
+#     sel_probs = F.softmax(sel_logits) nhưng sel_logits từ selector đã detach
+#     → weighted sum modes_t_g không có gradient từ sel_probs (chỉ từ modes_t_g)
+#     → L_coh chỉ train generator, không train selector để chọn coherent mode
+#     Fix: tính L_coh trực tiếp từ best oracle mode (k_star) thay vì soft-weighted
 
-# [REV2-5] Inference: haversine-based final selection
-#          Thay vì chỉ dùng selector logits, combine với speed plausibility:
-#          score_final = sel_logits - λ * speed_penalty
-#          Modes vi phạm speed > 80 km/h bị penalize khi chọn.
-
-# GIỮ NGUYÊN TỪ rev1
-# ────────────────────
-# - K=8 compass heads với direction cross-attention (FIX-C4)
-# - Per-head noise injection (FIX-P1, FIX-C2)
-# - Oracle assignment từ x_t_shared (FIX-C3)
-# - Easy/Difficult split với δ (5 env signals)
-# - OT matching (từ v59)
-# - CFG inference với alignment gate
-# - 3-phase training
-# - Mixup augmentation
-# - Dropout consistency
-# - Tất cả 11 bug fixes từ review
+# GIẢM THIỂU THÊM:
+#   - Bỏ OT matching trong phase đầu (gây noise khi model chưa ổn định)
+#   - L_FM dùng haversine trực tiếp (như STTrans) thay vì velocity MSE thuần
+#   - Tau giảm dần từ 5→2 (không phải fixed 3.0) để selector signal rõ hơn
 # """
 # from __future__ import annotations
 
 # import math
-# from typing import Optional, Tuple, List
+# from typing import Optional, Tuple
 
 # import torch
 # import torch.nn as nn
@@ -1250,17 +2190,12 @@
 # _NORM_TO_DEG = 5.0
 
 # _COMPASS_DEG   = [0., 45., 90., 135., 180., 225., 270., 315.]
-# _COMPASS_NAMES = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 # K_MODES        = 8
 
-# # Speed/accel physics constants (từ STTrans paper)
-# _V_MAX_KMH   = 80.0    # max realistic TC speed km/h
-# _DT_H        = 6.0     # time step hours
 
-
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  Coordinate utilities
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
 #     return torch.stack([
@@ -1291,154 +2226,146 @@
 #     return _haversine_deg(_norm_to_deg(pred_abs), _norm_to_deg(gt_abs)).mean(dim=1)
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  REV2-1+2: Physics-informed DPE + Kinematic Loss
-# #  Lấy cảm hứng từ STTrans loss (§3.5.1) nhưng áp dụng cho best mode
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ROOT-1 FIX: Persistence x0 — dùng trong cả training lẫn inference
+# # ══════════════════════════════════════════════════════════════════════════════
 
-# def _dpe_and_kinematic_loss(
-#     best_mode_rel: torch.Tensor,   # [B, T, 4] — best mode, CÓ gradient
-#     x1_rel_orig:   torch.Tensor,   # [B, T, 4] — GT original
-#     lp:            torch.Tensor,   # [B, 2]
-#     device:        torch.device,
-#     v_max_norm:    float,          # max speed in normalized units
-# ) -> Tuple[torch.Tensor, torch.Tensor]:
+# def _persistence_x0_rel(obs_traj, obs_Me, lp, lm, pred_len, sigma=0.02):
 #     """
-#     REV2-1: L_DPE = mean haversine(best_mode, GT) / 500 (normalize ~same scale as L_FM)
-#     REV2-2: L_kin = λ_speed*L_speed + λ_accel*L_accel (từ STTrans §3.5.1)
-
-#     Returns: (L_dpe, L_kin)
+#     x0 = persistence forecast + tiny noise.
+#     Dùng exponential weighted velocity từ obs để extrapolate.
+#     QUAN TRỌNG: training và inference phải dùng hàm này để nhất quán.
 #     """
-#     B, T = best_mode_rel.shape[:2]
-
-#     # Convert sang degrees cho haversine
-#     best_abs = lp.unsqueeze(1) + best_mode_rel[:, :, :2]   # [B, T, 2]
-#     gt_abs   = lp.unsqueeze(1) + x1_rel_orig[:, :, :2]
-
-#     best_deg = _norm_to_deg(best_abs)   # [B, T, 2]
-#     gt_deg   = _norm_to_deg(gt_abs)
-
-#     # L_DPE: mean haversine (eq. 16 trong STTrans paper)
-#     L_dpe = _haversine_deg(best_deg, gt_deg).mean() / 500.0
-
-#     # L_speed: penalize step speed > v_max (eq. 18-20)
-#     if T >= 2:
-#         step_dist = (best_mode_rel[:, 1:, :2] - best_mode_rel[:, :-1, :2]).norm(dim=-1)
-#         L_speed   = F.relu(step_dist - v_max_norm).pow(2).mean()
+#     B, device = obs_traj.shape[1], obs_traj.device
+#     if obs_traj.shape[0] >= 3:
+#         vels  = obs_traj[1:] - obs_traj[:-1]
+#         n_v   = vels.shape[0]
+#         alpha = 0.7
+#         w     = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+#                               dtype=torch.float, device=device).flip(0)
+#         lv    = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
+#     elif obs_traj.shape[0] >= 2:
+#         lv = obs_traj[-1,:,:2] - obs_traj[-2,:,:2]
 #     else:
-#         L_speed = torch.tensor(0.0, device=device)
+#         lv = obs_traj.new_zeros(B, 2)
 
-#     # L_accel: penalize acceleration (eq. 21-22)
-#     if T >= 3:
-#         vel      = best_mode_rel[:, 1:, :2] - best_mode_rel[:, :-1, :2]  # [B,T-1,2]
-#         spd      = vel.norm(dim=-1)                                        # [B, T-1]
-#         L_accel  = (spd[:, 1:] - spd[:, :-1]).pow(2).mean()
-#     else:
-#         L_accel = torch.tensor(0.0, device=device)
-
-#     L_kin = 0.1 * L_speed + 0.01 * L_accel
-#     return L_dpe, L_kin
+#     steps    = torch.arange(1, pred_len+1, device=device).float()
+#     pred_abs = obs_traj[-1,:,:2].unsqueeze(0) + lv.unsqueeze(0)*steps.view(-1,1,1)
+#     pred_rel = pred_abs.permute(1,0,2) - lp.unsqueeze(1)
+#     pred_rel4 = torch.cat([pred_rel, torch.zeros(B, pred_len, 2, device=device)], dim=-1)
+#     return pred_rel4 + torch.randn_like(pred_rel4) * sigma
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  OT Matching (từ v59)
-# # ═════════════════════════════════════════════════════════════════════════════
+# def _cfm_from_persistence(x0_rel, x1_rel):
+#     """
+#     FIX ROOT-1: CFM interpolant từ persistence x0 (không phải pure noise).
+#     x0 = persistence (đã tính trước), x1 = GT.
+#     t ~ U[0,1], x_t = (1-t)*x0 + t*x1, u = x1 - x0.
+#     """
+#     B = x0_rel.shape[0]
+#     device = x0_rel.device
+#     t  = torch.rand(B, device=device)
+#     te = t.view(B, 1, 1)
+#     x_t    = (1.0-te)*x0_rel + te*x1_rel
+#     u_target = x1_rel - x0_rel
+#     return x_t, t, u_target
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  OT Matching (bật từ epoch 5+)
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # def _forward_azimuth(p1, p2):
-#     lon1 = torch.deg2rad(p1[...,0]); lat1 = torch.deg2rad(p1[...,1])
-#     lon2 = torch.deg2rad(p2[...,0]); lat2 = torch.deg2rad(p2[...,1])
-#     dlon = lon2 - lon1
-#     y = torch.sin(dlon)*torch.cos(lat2)
-#     x = torch.cos(lat1)*torch.sin(lat2) - torch.sin(lat1)*torch.cos(lat2)*torch.cos(dlon)
-#     return torch.atan2(y, x)
+#     lon1=torch.deg2rad(p1[...,0]); lat1=torch.deg2rad(p1[...,1])
+#     lon2=torch.deg2rad(p2[...,0]); lat2=torch.deg2rad(p2[...,1])
+#     dlon=lon2-lon1
+#     y=torch.sin(dlon)*torch.cos(lat2)
+#     x=torch.cos(lat1)*torch.sin(lat2)-torch.sin(lat1)*torch.cos(lat2)*torch.cos(dlon)
+#     return torch.atan2(y,x)
 
-# def _sinkhorn_log(cost, epsilon=0.05, n_iter=50):
-#     B = cost.shape[0]; device = cost.device
-#     log_a = -math.log(B)*torch.ones(B,device=device)
-#     log_b = -math.log(B)*torch.ones(B,device=device)
-#     log_K = -cost/epsilon
-#     log_u = torch.zeros(B,device=device)
-#     log_v = torch.zeros(B,device=device)
+# def _sinkhorn_log(cost, epsilon=0.05, n_iter=30):
+#     B=cost.shape[0]; device=cost.device
+#     log_a=-math.log(B)*torch.ones(B,device=device)
+#     log_b=-math.log(B)*torch.ones(B,device=device)
+#     log_K=-cost/epsilon
+#     log_u=torch.zeros(B,device=device); log_v=torch.zeros(B,device=device)
 #     for _ in range(n_iter):
-#         log_u = log_a - torch.logsumexp(log_K+log_v.unsqueeze(0), dim=1)
-#         log_v = log_b - torch.logsumexp(log_K+log_u.unsqueeze(1), dim=0)
+#         log_u=log_a-torch.logsumexp(log_K+log_v.unsqueeze(0),dim=1)
+#         log_v=log_b-torch.logsumexp(log_K+log_u.unsqueeze(1),dim=0)
 #     return (log_K+log_u.unsqueeze(1)+log_v.unsqueeze(0)).exp().clamp(0.0)
 
 # def _geodesic_ot_cost(x0_rel, x1_rel, lp):
-#     B = x0_rel.shape[0]
+#     B=x0_rel.shape[0]
 #     def _abs_deg(rel): return _norm_to_deg(lp.unsqueeze(1)+rel[:,:,:2])
-#     x0d = _abs_deg(x0_rel); x1d = _abs_deg(x1_rel)
-#     x0e = x0d.unsqueeze(1).expand(B,B,-1,-1).reshape(B*B,-1,2)
-#     x1e = x1d.unsqueeze(0).expand(B,B,-1,-1).reshape(B*B,-1,2)
-#     pos_cost = _haversine_deg(x0e,x1e).reshape(B,B,-1).mean(-1)/500.0
-#     spd0 = _step_speeds_deg(x0d.permute(1,0,2)).permute(1,0).mean(-1)
-#     spd1 = _step_speeds_deg(x1d.permute(1,0,2)).permute(1,0).mean(-1)
-#     speed_cost = (spd0.unsqueeze(1)-spd1.unsqueeze(0)).abs()/20.0
+#     x0d=_abs_deg(x0_rel); x1d=_abs_deg(x1_rel)
+#     x0e=x0d.unsqueeze(1).expand(B,B,-1,-1).reshape(B*B,-1,2)
+#     x1e=x1d.unsqueeze(0).expand(B,B,-1,-1).reshape(B*B,-1,2)
+#     pos_cost=_haversine_deg(x0e,x1e).reshape(B,B,-1).mean(-1)/500.0
+#     spd0=_step_speeds_deg(x0d.permute(1,0,2)).permute(1,0).mean(-1)
+#     spd1=_step_speeds_deg(x1d.permute(1,0,2)).permute(1,0).mean(-1)
+#     speed_cost=(spd0.unsqueeze(1)-spd1.unsqueeze(0)).abs()/20.0
 #     def _mb(td):
-#         b = _forward_azimuth(td[:,:-1,:],td[:,1:,:])
-#         return torch.atan2(b.sin().mean(-1),b.cos().mean(-1))
-#     h0 = _mb(x0d); h1 = _mb(x1d)
-#     dh = (h0.unsqueeze(1)-h1.unsqueeze(0)+math.pi)%(2*math.pi)-math.pi
-#     return 1.0*pos_cost + 0.5*speed_cost + 0.3*dh.abs()/math.pi
+#         b=_forward_azimuth(td[:,:-1,:],td[:,1:,:]); return torch.atan2(b.sin().mean(-1),b.cos().mean(-1))
+#     h0=_mb(x0d); h1=_mb(x1d)
+#     dh=(h0.unsqueeze(1)-h1.unsqueeze(0)+math.pi)%(2*math.pi)-math.pi
+#     return 1.0*pos_cost+0.5*speed_cost+0.3*dh.abs()/math.pi
 
 # def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
-#     B = x0_batch.shape[0]
-#     if B < 4: return x0_batch, x1_batch
+#     B=x0_batch.shape[0]
+#     if B<4: return x0_batch, x1_batch
 #     try:
-#         cost = _geodesic_ot_cost(x0_batch, x1_batch, lp)
-#         with torch.no_grad():
-#             pi = _sinkhorn_log(cost, epsilon=epsilon)
-#         flat = pi.reshape(-1).clamp(0.0); s = flat.sum()
-#         if not torch.isfinite(s) or s < 1e-10: return x0_batch, x1_batch
-#         idx = torch.multinomial(flat/s, num_samples=B, replacement=True)
+#         cost=_geodesic_ot_cost(x0_batch, x1_batch, lp)
+#         with torch.no_grad(): pi=_sinkhorn_log(cost,epsilon=epsilon)
+#         flat=pi.reshape(-1).clamp(0.0); s=flat.sum()
+#         if not torch.isfinite(s) or s<1e-10: return x0_batch, x1_batch
+#         idx=torch.multinomial(flat/s,num_samples=B,replacement=True)
 #         return x0_batch[idx%B], x1_batch[idx%B]
 #     except Exception:
 #         return x0_batch, x1_batch
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  Difficulty Score
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
-#     B = obs_BT2.shape[0]; scores = []
+#     B=obs_BT2.shape[0]; scores=[]
 
 #     # Signal 1: curvature (0.30)
-#     dir24 = env_data.get("history_direction24") if env_data else None
+#     dir24=env_data.get("history_direction24") if env_data else None
 #     if dir24 is not None and torch.is_tensor(dir24):
-#         dir24 = dir24.float().to(device)
+#         dir24=dir24.float().to(device)
 #         if dir24.dim()==3: d24=dir24[:,-1,:]
 #         elif dir24.dim()==2: d24=dir24
 #         else: d24=None
 #         if d24 is not None and d24.shape[-1]==8:
-#             bucket = d24.argmax(dim=-1).float()
-#             a24 = bucket*(2.0*math.pi/8.0)
-#             dy = obs_BT2[:,-1,1]-obs_BT2[:,-2,1]; dx = obs_BT2[:,-1,0]-obs_BT2[:,-2,0]
-#             lat_mid = (obs_BT2[:,-1,1]+obs_BT2[:,-2,1])*0.5
-#             cos_lat = torch.cos(torch.deg2rad(lat_mid*_NORM_TO_DEG)).clamp(1e-4)
-#             a_now = torch.atan2(dx*cos_lat, dy)
-#             cos_d = (torch.cos(a_now)*torch.cos(a24)+torch.sin(a_now)*torch.sin(a24)).clamp(-1,1)
-#             s_curve = torch.sigmoid((torch.rad2deg(torch.acos(cos_d))-45.0)/20.0)
-#         else: s_curve = torch.zeros(B,device=device)
-#     else: s_curve = torch.zeros(B,device=device)
+#             bucket=d24.argmax(dim=-1).float(); a24=bucket*(2.0*math.pi/8.0)
+#             dy=obs_BT2[:,-1,1]-obs_BT2[:,-2,1]; dx=obs_BT2[:,-1,0]-obs_BT2[:,-2,0]
+#             lat_mid=(obs_BT2[:,-1,1]+obs_BT2[:,-2,1])*0.5
+#             cos_lat=torch.cos(torch.deg2rad(lat_mid*_NORM_TO_DEG)).clamp(1e-4)
+#             a_now=torch.atan2(dx*cos_lat,dy)
+#             cos_d=(torch.cos(a_now)*torch.cos(a24)+torch.sin(a_now)*torch.sin(a24)).clamp(-1,1)
+#             s_curve=torch.sigmoid((torch.rad2deg(torch.acos(cos_d))-45.0)/20.0)
+#         else: s_curve=torch.zeros(B,device=device)
+#     else: s_curve=torch.zeros(B,device=device)
 #     scores.append(0.30*s_curve)
 
 #     # Signal 2: weak steering (0.25)
-#     steer = env_data.get("steering_speed") if env_data else None
+#     steer=env_data.get("steering_speed") if env_data else None
 #     if steer is not None and torch.is_tensor(steer):
-#         steer = steer.float().to(device)
+#         steer=steer.float().to(device)
 #         while steer.dim()>1: steer=steer[...,-1]
-#         steer = steer.view(-1); steer = steer[:B] if steer.numel()>=B else steer[0].expand(B)
-#         s_weak = torch.sigmoid((4.0-steer*20.0)/2.0)
+#         steer=steer.view(-1); steer=steer[:B] if steer.numel()>=B else steer[0].expand(B)
+#         s_weak=torch.sigmoid((4.0-steer*20.0)/2.0)
 #     else:
-#         u = env_data.get("u500_mean") if env_data else None
-#         v = env_data.get("v500_mean") if env_data else None
+#         u=env_data.get("u500_mean") if env_data else None
+#         v=env_data.get("v500_mean") if env_data else None
 #         if u is not None and v is not None and torch.is_tensor(u) and torch.is_tensor(v):
 #             u=u.float().to(device); v=v.float().to(device)
 #             while u.dim()>1: u=u[...,-1]
 #             while v.dim()>1: v=v[...,-1]
-#             s_weak = torch.sigmoid((4.0-(u.view(-1)[:B]**2+v.view(-1)[:B]**2).sqrt()*30.0)/2.0)
-#         else: s_weak = torch.zeros(B,device=device)
+#             s_weak=torch.sigmoid((4.0-(u.view(-1)[:B]**2+v.view(-1)[:B]**2).sqrt()*30.0)/2.0)
+#         else: s_weak=torch.zeros(B,device=device)
 #     scores.append(0.25*s_weak)
 
 #     # Signal 3: wind shear (0.20)
@@ -1447,34 +2374,34 @@
 #         v200=img_obs[:,8,-1,40,40]*8.377;  v850=img_obs[:,10,-1,40,40]*6.203
 #         shear=((u200-u850)**2+(v200-v850)**2).sqrt()
 #         s_shear=torch.sigmoid((shear-8.0)/3.0)
-#     else: s_shear = torch.zeros(B,device=device)
+#     else: s_shear=torch.zeros(B,device=device)
 #     scores.append(0.20*s_shear)
 
 #     # Signal 4: RI (0.15)
-#     ri = env_data.get("rapid_intensification") if env_data else None
+#     ri=env_data.get("rapid_intensification") if env_data else None
 #     if ri is not None and torch.is_tensor(ri):
 #         ri=ri.float().to(device)
 #         while ri.dim()>1: ri=ri[...,-1]
-#         s_ri = ri.view(-1)[:B].clamp(0,1) if ri.numel()>=B else ri[0].expand(B)
-#     else: s_ri = torch.zeros(B,device=device)
+#         s_ri=ri.view(-1)[:B].clamp(0,1) if ri.numel()>=B else ri[0].expand(B)
+#     else: s_ri=torch.zeros(B,device=device)
 #     scores.append(0.15*s_ri)
 
 #     # Signal 5: slow movement (0.10)
-#     mv = env_data.get("move_velocity") if env_data else None
+#     mv=env_data.get("move_velocity") if env_data else None
 #     if mv is not None and torch.is_tensor(mv):
 #         mv=mv.float().to(device)
 #         while mv.dim()>1: mv=mv[...,-1]
 #         mv_v=mv.view(-1); mv_v=mv_v[:B] if mv_v.numel()>=B else mv_v[0].expand(B)
-#         s_slow = torch.sigmoid((0.05-mv_v)/0.02)
-#     else: s_slow = torch.zeros(B,device=device)
+#         s_slow=torch.sigmoid((0.05-mv_v)/0.02)
+#     else: s_slow=torch.zeros(B,device=device)
 #     scores.append(0.10*s_slow)
 
-#     return sum(scores).clamp(0.0, 1.0)
+#     return sum(scores).clamp(0.0,1.0)
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  Direction GT bucket
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # def get_gt_direction_bucket(obs_traj, pred_traj):
 #     last=obs_traj[-1]; first=pred_traj[0]
@@ -1485,12 +2412,13 @@
 #     return ((angle+22.5)/45.0).long()%8
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  FIX-C4: CompassVelocityHead — direction via cross-attention
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  CompassVelocityHead
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class CompassVelocityHead(nn.Module):
-#     def __init__(self, compass_idx, pred_len=12, ctx_dim=256, stochastic_depth_prob=0.1):
+#     def __init__(self, compass_idx, pred_len=12, ctx_dim=256,
+#                  stochastic_depth_prob=0.1):
 #         super().__init__()
 #         self.pred_len=pred_len; self.compass_idx=compass_idx
 #         self.stochastic_depth_prob=stochastic_depth_prob
@@ -1536,9 +2464,9 @@
 #         return self.out_fc2(F.gelu(self.out_fc1(decoded)))*scale
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  CompassSelector
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class CompassSelector(nn.Module):
 #     def __init__(self,ctx_dim=256,K=8,n_dirs=8):
@@ -1582,49 +2510,39 @@
 #         return score_logits, dir_logits
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  REV2-3: LearnedWeights — 6 terms
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  LearnedWeights
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class LearnedWeights(nn.Module):
-#     """
-#     6 learnable log-variance (Kendall 2018):
-#       s_fm, s_sel, s_coh, s_con, s_dpe, s_kin
-#     s_dpe: DPE haversine term (REV2-1)
-#     s_kin: kinematic speed/accel term (REV2-2)
-#     """
 #     def __init__(self):
 #         super().__init__()
 #         self.log_s_fm  = nn.Parameter(torch.zeros(1))
 #         self.log_s_sel = nn.Parameter(torch.zeros(1))
 #         self.log_s_coh = nn.Parameter(torch.zeros(1))
 #         self.log_s_con = nn.Parameter(torch.zeros(1))
-#         self.log_s_dpe = nn.Parameter(torch.zeros(1))   # REV2-1
-#         self.log_s_kin = nn.Parameter(torch.zeros(1))   # REV2-2
 #         self.log_alpha = nn.Parameter(torch.zeros(1))
 
-#     def forward(self, L_fm, L_rank, L_dir, L_coh, L_con, L_dpe, L_kin):
-#         def _w(s): return torch.exp(-s.clamp(-5,5))
-#         α = torch.sigmoid(self.log_alpha)
-#         L_sel = α*L_rank + (1.0-α)*L_dir
+#     def forward(self,L_fm,L_rank,L_dir,L_coh,L_con):
 #         s_fm=self.log_s_fm.clamp(-5,5); s_sel=self.log_s_sel.clamp(-5,5)
 #         s_coh=self.log_s_coh.clamp(-5,5); s_con=self.log_s_con.clamp(-5,5)
-#         s_dpe=self.log_s_dpe.clamp(-5,5); s_kin=self.log_s_kin.clamp(-5,5)
-#         return (L_fm*_w(s_fm)+s_fm + L_sel*_w(s_sel)+s_sel +
-#                 L_coh*_w(s_coh)+s_coh + L_con*_w(s_con)+s_con +
-#                 L_dpe*_w(s_dpe)+s_dpe + L_kin*_w(s_kin)+s_kin)
+#         α=torch.sigmoid(self.log_alpha)
+#         L_sel=α*L_rank+(1.0-α)*L_dir
+#         return (L_fm*torch.exp(-s_fm)+s_fm +
+#                 L_sel*torch.exp(-s_sel)+s_sel +
+#                 L_coh*torch.exp(-s_coh)+s_coh +
+#                 L_con*torch.exp(-s_con)+s_con)
 
 #     def get_weights(self):
 #         def _w(s): return torch.exp(-s.clamp(-5,5)).item()
 #         return {"w_fm":_w(self.log_s_fm),"w_sel":_w(self.log_s_sel),
 #                 "w_coh":_w(self.log_s_coh),"w_con":_w(self.log_s_con),
-#                 "w_dpe":_w(self.log_s_dpe),"w_kin":_w(self.log_s_kin),
 #                 "alpha":torch.sigmoid(self.log_alpha).item()}
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  Shared Context Encoder
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  SharedContextEncoder
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class SharedContextEncoder(nn.Module):
 #     RAW_CTX_DIM = 512
@@ -1658,8 +2576,8 @@
 #         e_3d_s=self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0,2,1)
 #         e_3d_s=self.bottleneck_proj(e_3d_s)
 #         if e_3d_s.shape[1]!=T_obs:
-#             e_3d_s=F.interpolate(e_3d_s.permute(0,2,1),size=T_obs,mode="linear",
-#                                   align_corners=False).permute(0,2,1)
+#             e_3d_s=F.interpolate(e_3d_s.permute(0,2,1),size=T_obs,
+#                                   mode="linear",align_corners=False).permute(0,2,1)
 #         e_3d_dec_t=e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
 #         t_w=torch.softmax(torch.arange(e_3d_dec_t.shape[1],dtype=torch.float,
 #                                         device=e_3d_dec_t.device)*0.5,dim=0)
@@ -1674,53 +2592,50 @@
 #         elif noise_scale>0.0: raw=raw+torch.randn_like(raw)*noise_scale
 #         return self.ctx_fc2(self.ctx_drop(raw))
 
-#     def get_kinematic_feat(self,obs_traj):
-#         T_obs,B,_=obs_traj.shape
-#         if T_obs>=2:
-#             vel=obs_traj[1:]-obs_traj[:-1]
-#             lat_mid=obs_traj[:-1,:,1]*_NORM_TO_DEG
-#             cos_lat=torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
-#             dx_km=vel[:,:,0]*cos_lat*DEG2KM*_NORM_TO_DEG
-#             dy_km=vel[:,:,1]*DEG2KM*_NORM_TO_DEG
-#             speed=(dx_km**2+dy_km**2+1e-6).sqrt()/DT_HOURS
-#             heading=torch.atan2(vel[:,:,1],vel[:,:,0])
-#             speed_n=(speed/20.0).clamp(-3,3)
-#             if T_obs>=3:
-#                 dspd=speed[1:]-speed[:-1]
-#                 accel=torch.cat([obs_traj.new_zeros(1,B),(dspd/10.0).clamp(-3,3)],0)
-#             else: accel=obs_traj.new_zeros(T_obs-1,B)
-#             kine=torch.stack([vel[:,:,0],vel[:,:,1],speed_n,
-#                               heading.sin(),heading.cos(),accel],dim=-1)
-#         else: kine=obs_traj.new_zeros(self.obs_len,B,6)
-#         if kine.shape[0]<self.obs_len:
-#             kine=torch.cat([obs_traj.new_zeros(self.obs_len-kine.shape[0],B,6),kine],0)
-#         else: kine=kine[-self.obs_len:]
-#         return self.vel_obs_enc(kine.permute(1,0,2).reshape(B,-1))
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  Losses
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# def _coherence_loss_oracle(pred_oracle_grad, x1_rel_orig, lp, device):
+#     """
+#     FIX ROOT-5: Tính coherence trực tiếp từ oracle mode (có gradient),
+#     không dùng soft-weighted sum từ sel_probs đã detach.
+#     """
+#     pred_abs=lp.unsqueeze(1)+pred_oracle_grad[:,:,:2]
+#     gt_abs=lp.unsqueeze(1)+x1_rel_orig[:,:,:2]
+#     pred_deg=_norm_to_deg(pred_abs); gt_deg=_norm_to_deg(gt_abs)
+#     cos_lat=torch.cos(torch.deg2rad(gt_deg[:,:-1,1])).clamp(1e-4)
+#     dp_lon=(pred_deg[:,1:,0]-pred_deg[:,:-1,0])*cos_lat*DEG2KM
+#     dp_lat=(pred_deg[:,1:,1]-pred_deg[:,:-1,1])*DEG2KM
+#     dg_lon=(gt_deg[:,1:,0]-gt_deg[:,:-1,0])*cos_lat*DEG2KM
+#     dg_lat=(gt_deg[:,1:,1]-gt_deg[:,:-1,1])*DEG2KM
+#     dp=torch.stack([dp_lon,dp_lat],dim=-1); dg=torch.stack([dg_lon,dg_lat],dim=-1)
+#     return (dp-dg).norm(dim=-1).mean()/DEG2KM
+
+# def _dropout_consistency_loss(encoder, raw_ctx):
+#     if not encoder.training: return torch.tensor(0.0,device=raw_ctx.device)
+#     ctx_a=encoder.apply_ctx_head(raw_ctx); ctx_b=encoder.apply_ctx_head(raw_ctx)
+#     cos_sim=(F.normalize(ctx_a,dim=-1)*F.normalize(ctx_b,dim=-1)).sum(dim=-1)
+#     return (1.0-cos_sim).mean()
+
+# def _traj_mixup(x1_rel, delta, prob=0.3, alpha=0.4):
+#     if not torch.is_tensor(x1_rel) or x1_rel.shape[0]<2: return x1_rel,delta
+#     if torch.rand(1).item()>prob: return x1_rel,delta
+#     B=x1_rel.shape[0]
+#     lam=max(float(torch.distributions.Beta(alpha,alpha).sample()),
+#             1.0-float(torch.distributions.Beta(alpha,alpha).sample()))
+#     lam=max(lam,1.0-lam)
+#     idx=torch.randperm(B,device=x1_rel.device)
+#     easy_t=(delta<0.4).float().view(B,1,1); easy_d=(delta<0.4).float()
+#     x1_mix=x1_rel*(1.0-easy_t*(1.0-lam))+x1_rel[idx]*(easy_t*(1.0-lam))
+#     delta_mix=(delta*lam+delta[idx]*(1.0-lam))*easy_d+delta*(1.0-easy_d)
+#     return x1_mix,delta_mix
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  Persistence x0
-# # ═════════════════════════════════════════════════════════════════════════════
-
-# def _persistence_x0_rel(obs_traj,obs_Me,lp,lm,pred_len,sigma=0.02):
-#     B,device=obs_traj.shape[1],obs_traj.device
-#     if obs_traj.shape[0]>=3:
-#         vels=obs_traj[1:]-obs_traj[:-1]; n_v=vels.shape[0]; alpha=0.7
-#         w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
-#                        dtype=torch.float,device=device).flip(0)
-#         lv=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
-#     elif obs_traj.shape[0]>=2: lv=obs_traj[-1,:,:2]-obs_traj[-2,:,:2]
-#     else: lv=obs_traj.new_zeros(B,2)
-#     steps=torch.arange(1,pred_len+1,device=device).float()
-#     pred_abs=obs_traj[-1,:,:2].unsqueeze(0)+lv.unsqueeze(0)*steps.view(-1,1,1)
-#     pred_rel=pred_abs.permute(1,0,2)-lp.unsqueeze(1)
-#     pred_rel4=torch.cat([pred_rel,torch.zeros(B,pred_len,2,device=device)],dim=-1)
-#     return pred_rel4+torch.randn_like(pred_rel4)*sigma
-
-
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  EMA
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class EMAModel:
 #     def __init__(self,model,decay=0.995):
@@ -1745,62 +2660,18 @@
 #             if k in sd: sd[k].copy_(v)
 
 
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  Coherence Loss (FIX-C5: km space)
-# # ═════════════════════════════════════════════════════════════════════════════
-
-# def _coherence_loss(pred_soft_grad, x1_rel_orig, lp, device):
-#     pred_abs=lp.unsqueeze(1)+pred_soft_grad[:,:,:2]
-#     gt_abs=lp.unsqueeze(1)+x1_rel_orig[:,:,:2]
-#     pred_deg=_norm_to_deg(pred_abs); gt_deg=_norm_to_deg(gt_abs)
-#     cos_lat=torch.cos(torch.deg2rad(gt_deg[:,:-1,1])).clamp(1e-4)
-#     dp_lon=(pred_deg[:,1:,0]-pred_deg[:,:-1,0])*cos_lat*DEG2KM
-#     dp_lat=(pred_deg[:,1:,1]-pred_deg[:,:-1,1])*DEG2KM
-#     dg_lon=(gt_deg[:,1:,0]-gt_deg[:,:-1,0])*cos_lat*DEG2KM
-#     dg_lat=(gt_deg[:,1:,1]-gt_deg[:,:-1,1])*DEG2KM
-#     dp=torch.stack([dp_lon,dp_lat],dim=-1); dg=torch.stack([dg_lon,dg_lat],dim=-1)
-#     return (dp-dg).norm(dim=-1).mean()/DEG2KM
-
-
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  Dropout Consistency (NEW-3, fixed bug)
-# # ═════════════════════════════════════════════════════════════════════════════
-
-# def _dropout_consistency_loss(encoder, raw_ctx):
-#     if not encoder.training: return torch.tensor(0.0, device=raw_ctx.device)
-#     ctx_a=encoder.apply_ctx_head(raw_ctx); ctx_b=encoder.apply_ctx_head(raw_ctx)
-#     cos_sim=(F.normalize(ctx_a,dim=-1)*F.normalize(ctx_b,dim=-1)).sum(dim=-1)
-#     return (1.0-cos_sim).mean()
-
-
-# # ═════════════════════════════════════════════════════════════════════════════
-# #  Trajectory Mixup (hard samples keep delta)
-# # ═════════════════════════════════════════════════════════════════════════════
-
-# def _traj_mixup(x1_rel, delta, prob=0.3, alpha=0.4):
-#     if not torch.is_tensor(x1_rel) or x1_rel.shape[0]<2: return x1_rel, delta
-#     if torch.rand(1).item()>prob: return x1_rel, delta
-#     B=x1_rel.shape[0]
-#     lam=max(float(torch.distributions.Beta(alpha,alpha).sample()), 1.0-float(torch.distributions.Beta(alpha,alpha).sample()))
-#     lam=max(lam, 1.0-lam)
-#     idx=torch.randperm(B,device=x1_rel.device)
-#     easy_t=(delta<0.4).float().view(B,1,1); easy_d=(delta<0.4).float()
-#     x1_mix=x1_rel*(1.0-easy_t*(1.0-lam))+x1_rel[idx]*(easy_t*(1.0-lam))
-#     delta_mix=(delta*lam+delta[idx]*(1.0-lam))*easy_d+delta*(1.0-easy_d)
-#     return x1_mix, delta_mix
-
-
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 # #  TCFlowMatchingV65 — Main Class
-# # ═════════════════════════════════════════════════════════════════════════════
+# # ══════════════════════════════════════════════════════════════════════════════
 
 # class TCFlowMatchingV65(nn.Module):
 
-#     def __init__(self, pred_len=12, obs_len=8, ctx_dim=256, sigma_min=0.02,
-#                  unet_in_ch=13, K=K_MODES, use_ema=True, ema_decay=0.995,
-#                  cfg_uncond_prob=0.10, selector_warmup=0,
-#                  head_noise_base=0.03, use_ot=True, ot_epsilon=0.05,
-#                  cfg_guidance_scale=1.3, **kwargs):
+#     def __init__(self,pred_len=12,obs_len=8,ctx_dim=256,sigma_min=0.02,
+#                  unet_in_ch=13,K=K_MODES,use_ema=True,ema_decay=0.995,
+#                  cfg_uncond_prob=0.10,
+#                  selector_warmup=0,   # FIX ROOT-3: bỏ warmup, train joint từ đầu
+#                  head_noise_base=0.03,use_ot=True,ot_epsilon=0.05,
+#                  cfg_guidance_scale=1.3,**kwargs):
 #         super().__init__()
 #         self.pred_len=pred_len; self.obs_len=obs_len; self.sigma_min=sigma_min
 #         self.K=K; self.use_ema=use_ema; self.ema_decay=ema_decay
@@ -1809,16 +2680,13 @@
 #         self.ot_epsilon=ot_epsilon; self.cfg_guidance_scale=cfg_guidance_scale
 #         self._ema=None
 
-#         # REV2: v_max in normalized units for kinematic loss
-#         self.v_max_norm = _V_MAX_KMH * _DT_H / (111.0 * 50.0)
-
 #         self.encoder=SharedContextEncoder(pred_len=pred_len,obs_len=obs_len,
 #                                           ctx_dim=ctx_dim,unet_in_ch=unet_in_ch)
 #         self.velocity_heads=nn.ModuleList([
 #             CompassVelocityHead(compass_idx=k,pred_len=pred_len,ctx_dim=ctx_dim)
 #             for k in range(K)])
 #         self.selector=CompassSelector(ctx_dim=ctx_dim,K=K,n_dirs=8)
-#         self.learned_weights=LearnedWeights()   # REV2-3: 6 terms
+#         self.learned_weights=LearnedWeights()
 
 #     def init_ema(self):
 #         if self.use_ema: self._ema=EMAModel(self,decay=self.ema_decay)
@@ -1830,8 +2698,16 @@
 #     def _sigma_schedule(epoch):
 #         if epoch<2: return 0.10
 #         if epoch<10: return 0.10-(epoch-2)/8.0*(0.10-0.04)
-#         if epoch<20: return max(0.04-(epoch-10)/10.0*0.01, 0.035)
+#         if epoch<20: return max(0.04-(epoch-10)/10.0*0.01,0.035)
 #         return 0.035
+
+#     @staticmethod
+#     def _tau_schedule(epoch):
+#         """Tau giảm dần → selector signal rõ hơn theo thời gian."""
+#         if epoch<5: return 5.0
+#         if epoch<15: return 4.0
+#         if epoch<25: return 3.0
+#         return 2.0
 
 #     @staticmethod
 #     def _lon_flip_aug(bl,p=0.3):
@@ -1856,14 +2732,7 @@
 #     @staticmethod
 #     def _to_abs(rel,lp,lm):
 #         d=rel.permute(1,0,2)
-#         return lp.unsqueeze(0)+d[:,:,:2], lm.unsqueeze(0)+d[:,:,2:]
-
-#     def _cfm_noisy(self,x1_rel,sigma_min=None,lp=None):
-#         if sigma_min is None: sigma_min=self.sigma_min
-#         B=x1_rel.shape[0]; device=x1_rel.device
-#         x0=torch.randn_like(x1_rel)*sigma_min; t=torch.rand(B,device=device)
-#         te=t.view(B,1,1)
-#         return (1.0-te)*x0+te*x1_rel, t, x1_rel-x0
+#         return lp.unsqueeze(0)+d[:,:,:2],lm.unsqueeze(0)+d[:,:,2:]
 
 #     @staticmethod
 #     @torch.no_grad()
@@ -1887,10 +2756,10 @@
 #         else: alpha_b=blend_strength*0.5
 #         return (1.0-alpha_b)*model_pred+alpha_b*persist
 
-#     # ── TRAINING LOSS ─────────────────────────────────────────────────────────
+#     # ── TRAINING ──────────────────────────────────────────────────────────────
 
 #     def get_loss(self,batch_list,epoch=0,**kwargs):
-#         return self.get_loss_breakdown(batch_list,epoch=epoch,**kwargs)["total"]
+#         return self.get_loss_breakdown(batch_list,epoch=epoch)["total"]
 
 #     def get_loss_breakdown(self,batch_list,epoch=0,**kwargs):
 #         batch_list=self._lon_flip_aug(batch_list)
@@ -1903,7 +2772,7 @@
 #         lp=obs_t[-1]; lm=obs_Me[-1]
 #         B,device=lp.shape[0],lp.device
 #         sigma=self._sigma_schedule(epoch)
-#         in_warmup=(epoch<self.selector_warmup)
+#         tau=self._tau_schedule(epoch)
 
 #         # Context
 #         raw_ctx=self.encoder.encode(batch_list)
@@ -1917,32 +2786,38 @@
 #         obs_BT2=obs_t.permute(1,0,2); img_obs=batch_list[11]
 #         delta=compute_difficulty_score(obs_BT2,img_obs,env_data,device)
 
-#         # FM
+#         # GT rel
 #         x1_rel_orig=self._to_rel(pred_t,pred_Me,lp,lm)
 
-#         # OT matching (phase 2+)
-#         if self.use_ot and B>=4 and not in_warmup:
-#             noise_ot=torch.randn_like(x1_rel_orig)*sigma
-#             _,x1_rel_orig=_spherical_ot_matching(noise_ot,x1_rel_orig,lp,epsilon=self.ot_epsilon)
+#         # ── ROOT-1 FIX: x0 từ persistence ───────────────────────────────────
+#         x0_base=_persistence_x0_rel(obs_t,obs_Me,lp,lm,self.pred_len,sigma=sigma)
 
-#         # Mixup
+#         # OT matching từ epoch 5 trở đi để tránh noise lúc model chưa ổn
+#         if self.use_ot and B>=4 and epoch>=5:
+#             x0_base,x1_rel_orig=_spherical_ot_matching(
+#                 x0_base,x1_rel_orig,lp,epsilon=self.ot_epsilon)
+
+#         # Mixup (chỉ trên easy samples)
 #         x1_rel,delta=_traj_mixup(x1_rel_orig,delta,prob=0.3,alpha=0.4)
-#         x_t,fm_t,u_target=self._cfm_noisy(x1_rel,sigma_min=sigma,lp=lp)
+
+#         # CFM từ persistence x0
+#         x_t,fm_t,u_target=_cfm_from_persistence(x0_base,x1_rel)
 #         x_t_shared=x_t
 
 #         # Generate K modes
 #         modes_rel_nograd=[]; modes_rel_grad=[]; vels_pred=[]
 #         for k in range(self.K):
 #             sigma_k=self.head_noise_base*(1.0+k*0.25)
-#             z_k=torch.randn_like(x_t_shared)*sigma_k; x_t_k=x_t_shared+z_k
-#             if in_warmup:
-#                 with torch.no_grad():
-#                     v_k=self.velocity_heads[k](x_t_k,fm_t,ctx.detach())
-#             else:
-#                 v_k=self.velocity_heads[k](x_t_k,fm_t,ctx)
+#             z_k=torch.randn_like(x_t_shared)*sigma_k
+#             x_t_k=x_t_shared+z_k
+
+#             # FIX ROOT-3: generator LUÔN có gradient (không warmup freeze)
+#             v_k=self.velocity_heads[k](x_t_k,fm_t,ctx)
+
 #             with torch.no_grad():
 #                 pred_k_oracle=x_t_shared+(1.0-fm_t.view(B,1,1))*v_k
 #             modes_rel_nograd.append(pred_k_oracle.detach())
+
 #             pred_k_grad=x_t_k+(1.0-fm_t.view(B,1,1))*v_k
 #             modes_rel_grad.append(pred_k_grad)
 #             vels_pred.append(v_k)
@@ -1950,7 +2825,7 @@
 #         modes_t_ng=torch.stack(modes_rel_nograd,dim=1)
 #         modes_t_g=torch.stack(modes_rel_grad,dim=1)
 
-#         # Oracle
+#         # Oracle assignment (so với x1_rel_orig, không phải mixup)
 #         with torch.no_grad():
 #             ade_k=torch.stack([
 #                 _ade_km_from_rel(modes_rel_nograd[k],x1_rel_orig.detach(),lp)
@@ -1958,78 +2833,58 @@
 #             ],dim=1)
 #             k_star=ade_k.argmin(dim=1)
 
-#         # FM loss
+#         # FM Loss
 #         fm_errs=torch.stack([
 #             ((vels_pred[k]-u_target)**2).mean(dim=[1,2])
 #             for k in range(self.K)
 #         ],dim=1)
 #         L_easy=fm_errs.mean(dim=1)
-#         L_oracle_fm=fm_errs[torch.arange(B,device=device),k_star]
+#         L_oracle=fm_errs[torch.arange(B,device=device),k_star]
 
-#         # Diversity
+#         # ── ROOT-2 FIX: diversity mask đúng ─────────────────────────────────
 #         mode_star_ng=modes_t_ng[torch.arange(B,device=device),k_star]
 #         dists_all=torch.stack([
 #             ((mode_star_ng-modes_t_ng[:,k])**2).mean(dim=[1,2]).sqrt()
 #             for k in range(self.K)
 #         ],dim=1)
-#         mask_ns=torch.ones(B,self.K,device=device,dtype=torch.bool)
-#         mask_ns.scatter_(1,k_star.unsqueeze(1),False)
+#         # FIX: zeros + scatter True → masked_fill(~mask) fill inf vào k_star
+#         mask_ns=torch.zeros(B,self.K,device=device,dtype=torch.bool)
+#         mask_ns.scatter_(1,k_star.unsqueeze(1),True)
 #         min_dist=dists_all.masked_fill(~mask_ns,float('inf')).min(dim=1).values
+
 #         MARGIN=0.40
 #         L_div=F.relu(MARGIN-min_dist)
-#         L_diff=L_oracle_fm+0.3*L_div
+#         L_diff=L_oracle+0.3*L_div
+
 #         L_FM_raw=(1.0-delta)*L_easy+delta*L_diff
 #         w_d=0.5+1.5*delta
 #         L_FM=(w_d*L_FM_raw).mean()
 
-#         # ── REV2-1+2: DPE + Kinematic loss cho best mode ──────────────────
-#         # best_mode_grad = modes_t_g[k_star] — có gradient
-#         k_star_idx=k_star
-#         best_mode_grad=modes_t_g[torch.arange(B,device=device),k_star_idx]  # [B,12,4]
-#         L_dpe, L_kin=_dpe_and_kinematic_loss(
-#             best_mode_grad, x1_rel_orig, lp, device, self.v_max_norm)
-
-#         # Selector
+#         # Selector (stop-grad từ generator)
 #         sel_logits,dir_logits=self.selector(ctx.detach(),modes_t_ng,env_data)
-#         tau=float(kwargs.get('tau',3.0))
 #         p_oracle=F.softmax(-ade_k/tau,dim=1)
 #         L_rank=F.kl_div(F.log_softmax(sel_logits,dim=1),p_oracle,reduction='batchmean')
 #         gt_bucket=get_gt_direction_bucket(obs_t,pred_t)
 #         L_dir=F.cross_entropy(dir_logits,gt_bucket)
 
-#         # Coherence
-#         with torch.no_grad():
-#             sel_probs=F.softmax(sel_logits,dim=1)
-#         pred_soft_grad=(sel_probs.unsqueeze(-1).unsqueeze(-1)*modes_t_g).sum(dim=1)
-#         L_coh=_coherence_loss(pred_soft_grad,x1_rel_orig,lp,device)
+#         # ── ROOT-5 FIX: coherence từ oracle mode có gradient ─────────────────
+#         oracle_mode_grad=modes_t_g[torch.arange(B,device=device),k_star]
+#         L_coh=_coherence_loss_oracle(oracle_mode_grad,x1_rel_orig,lp,device)
 
-#         # Total
-#         if in_warmup:
-#             alpha_lw=torch.sigmoid(self.learned_weights.log_alpha)
-#             L_total=alpha_lw*L_rank+(1.0-alpha_lw)*L_dir
-#         else:
-#             L_total=self.learned_weights(L_FM,L_rank,L_dir,L_coh,L_consist,L_dpe,L_kin)
+#         # Total loss — luôn joint train (không warmup phase)
+#         L_total=self.learned_weights(L_FM,L_rank,L_dir,L_coh,L_consist)
 
 #         if not torch.isfinite(L_total): L_total=L_total.new_zeros(())
 
 #         def _s(x): return x.item() if torch.is_tensor(x) else float(x)
 #         return {
-#             "total":         L_total,
-#             "L_FM":          _s(L_FM),
-#             "L_easy":        _s(L_easy.mean()),
-#             "L_diff":        _s(L_diff.mean()),
-#             "L_oracle_fm":   _s(L_oracle_fm.mean()),
-#             "L_div":         _s(L_div.mean()),
-#             "L_dpe":         _s(L_dpe),      # REV2-1
-#             "L_kin":         _s(L_kin),      # REV2-2
-#             "L_rank":        _s(L_rank),
-#             "L_dir":         _s(L_dir),
-#             "L_coh":         _s(L_coh),
-#             "L_consist":     _s(L_consist),
-#             "delta_mean":    _s(delta.mean()),
-#             "delta_p75":     _s(delta.quantile(0.75)),
-#             "min_dist_mean": _s(min_dist.mean()),
-#             "in_warmup":     in_warmup,
+#             "total":L_total,"L_FM":_s(L_FM),"L_easy":_s(L_easy.mean()),
+#             "L_diff":_s(L_diff.mean()),"L_oracle":_s(L_oracle.mean()),
+#             "L_div":_s(L_div.mean()),"L_rank":_s(L_rank),"L_dir":_s(L_dir),
+#             "L_coh":_s(L_coh),"L_consist":_s(L_consist),
+#             "delta_mean":_s(delta.mean()),"delta_p75":_s(delta.quantile(0.75)),
+#             "min_dist_mean":_s(min_dist.mean()),
+#             "in_warmup":False,
 #             **self.learned_weights.get_weights(),
 #         }
 
@@ -2048,6 +2903,7 @@
 #         ctx=self.encoder.apply_ctx_head(raw_ctx)
 #         ctx_null=self.encoder.apply_ctx_head(raw_ctx,use_null=True)
 
+#         # FIX ROOT-1: inference cũng dùng persistence x0 (sigma=0 vì inference)
 #         x0_base=_persistence_x0_rel(obs_t,obs_Me,lp,lm,T_pred,sigma=0.0)
 
 #         obs_t_norm=obs_t[:,:,:2]
@@ -2076,40 +2932,22 @@
 #             traj_abs,_=self._to_abs(x_t,lp,lm)
 #             all_modes_abs.append(traj_abs)
 
-#         modes_stack=torch.stack(all_modes_abs,dim=0)   # [K,T,B,2]
+#         modes_stack=torch.stack(all_modes_abs,dim=0)
 
-#         # ── REV2-5: Speed-aware final selection ───────────────────────────
-#         # Combine selector logits với speed plausibility penalty
 #         modes_rel_sel=torch.stack([
 #             torch.cat([all_modes_abs[k].permute(1,0,2)-lp.unsqueeze(1),
 #                        torch.zeros(B,T_pred,2,device=device)],dim=-1)
 #             for k in range(self.K)
 #         ],dim=1)
 #         sel_logits,_=self.selector(ctx,modes_rel_sel,env_data)
-
-#         # Speed penalty: modes vi phạm v_max bị penalize
-#         speed_penalties=[]
-#         for k in range(self.K):
-#             mode_norm=modes_rel_sel[:,k,:,:2]   # [B,T,2]
-#             if T_pred>=2:
-#                 step_dist=(mode_norm[:,1:,:]-mode_norm[:,:-1,:]).norm(dim=-1)  # [B,T-1]
-#                 penalty=F.relu(step_dist-self.v_max_norm).sum(dim=1)           # [B]
-#             else:
-#                 penalty=torch.zeros(B,device=device)
-#             speed_penalties.append(penalty)
-#         speed_pen=torch.stack(speed_penalties,dim=1)   # [B,K]
-
-#         # Final score = selector - speed penalty (normalize speed_pen)
-#         sp_norm=speed_pen/(speed_pen.max(dim=1,keepdim=True).values.clamp(min=1e-6))
-#         final_scores=sel_logits - 0.5*sp_norm
-#         best_k=final_scores.argmax(dim=1)   # [B]
+#         best_k=sel_logits.argmax(dim=1)
 
 #         pred_best=torch.stack([modes_stack[best_k[b],:,b,:] for b in range(B)],dim=1)
 #         pred_final=self._persistence_blend(pred_best,obs_t[:,:,:2],blend_strength=blend_strength)
 
 #         if predict_csv is not None:
 #             self._write_predict_csv(predict_csv,pred_final,modes_stack)
-#         return pred_final, modes_stack
+#         return pred_final,modes_stack
 
 #     @staticmethod
 #     def _write_predict_csv(csv_path,traj_mean,all_modes):
@@ -2129,47 +2967,42 @@
 #                     w.writerow({"ts":ts,"b":b,"step":k,"lead_h":(k+1)*6,
 #                                 "lon":f"{mlon[k,b]:.4f}","lat":f"{mlat[k,b]:.4f}"})
 
+
 # TCFlowMatching = TCFlowMatchingV65
 # TCDiffusion    = TCFlowMatchingV65
 
 """
-flow_matching_model_v65_fixed.py
-════════════════════════════════════════════════════════════════════════════════
-V65 — Fixed version
+flow_matching_model_v65.py  ── v65-stable
+══════════════════════════════════════════════════════════════════════════════
+ROOT CAUSES của diverge trong v65-fixed (ADE 271→1609):
 
-ROOT CAUSES của diverge (ADE 455→981 qua 4 epochs):
+  BUG-1 [CRITICAL] mask_ns logic sai → L_div = 0.40 mọi lúc:
+    v65-fixed: mask_ns = zeros→scatter True at k_star
+    → masked_fill(~mask_ns) fills inf ở non-k_star
+    → min_dist = distance đến k_star = 0
+    → L_div = relu(0.40 - 0) = 0.40 LUÔN
+    → gradient push modes ra xa vô hạn → ADE diverge
+    Fix: mask_ns = ones→scatter False at k_star (loại k_star, lấy min của rest)
 
-  ROOT-1 [CRITICAL] x0 mismatch:
-    _cfm_noisy dùng x0 = randn*sigma_min (pure noise)
-    Nhưng inference dùng x0 = persistence → train/inf mismatch hoàn toàn
-    Fix: dùng persistence x0 trong cả training lẫn inference (như v63+)
+  BUG-2 [CRITICAL] oracle_ade_ema proxy sai trong train script:
+    train_v65.py: oracle_ema = ema * bd["L_oracle"] * 500
+    Nhưng "L_oracle" là FM MSE (~ 0.1-0.5), không phải km
+    → oracle_ema = init 999 * 0.9 + 0.1*500 = ... KHÔNG BAO GIỜ < 160km
+    → Phase gate stuck, selector frozen mãi mãi ngay cả sau ep15
+    Fix: dùng "oracle_ade_km" key riêng (km thực) trong loss breakdown
 
-  ROOT-2 [CRITICAL] diversity mask ngược:
-    mask_ns = ones → scatter False → masked_fill(~mask_ns) fill inf vào k_star
-    → min_dist luôn = distance đến k_star thay vì distance đến mode gần nhất khác
-    → L_div = 0 mọi lúc → modes collapse
-    Fix: mask_ns = zeros → scatter True → masked_fill(~mask_ns) fill inf đúng chỗ
+  BUG-3 val loss âm:
+    LearnedWeights: s_i tự tăng khi L_i nhỏ → total âm
+    Xảy ra do BUG-1 làm gradient chaos, s_* bị đẩy quá xa
+    Fix: clamp s_i chặt hơn (-3, 3) thay vì (-5, 5)
+    Và clip gradient của LearnedWeights riêng
 
-  ROOT-3 Warmup không train generator:
-    in_warmup: velocity_heads toàn bộ detached → ADE không giảm trong 2 epoch đầu
-    + selector frozen → không học được gì 2 epoch đầu → waste
-    Fix: selector_warmup=0 (bỏ warmup phase), train joint từ đầu
-    Generator luôn có gradient, selector train song song với stop-grad từ generator
-
-  ROOT-4 L_consist = 0 trong warmup:
-    Warmup loss chỉ có L_rank + L_dir → dropout consistency không train
-    Fix: thêm L_consist nhỏ vào mọi phase
-
-  ROOT-5 L_coh gradient bị stop:
-    sel_probs = F.softmax(sel_logits) nhưng sel_logits từ selector đã detach
-    → weighted sum modes_t_g không có gradient từ sel_probs (chỉ từ modes_t_g)
-    → L_coh chỉ train generator, không train selector để chọn coherent mode
-    Fix: tính L_coh trực tiếp từ best oracle mode (k_star) thay vì soft-weighted
-
-GIẢM THIỂU THÊM:
-  - Bỏ OT matching trong phase đầu (gây noise khi model chưa ổn định)
-  - L_FM dùng haversine trực tiếp (như STTrans) thay vì velocity MSE thuần
-  - Tau giảm dần từ 5→2 (không phải fixed 3.0) để selector signal rõ hơn
+FIX SO VỚI v65-fixed:
+  ✅ BUG-1: mask_ns đúng (ones→scatter False)
+  ✅ BUG-2: thêm "oracle_ade_km" = actual km vào loss dict
+  ✅ BUG-3: clamp(-3,3), log_s init thận trọng
+  ✅ Giữ lại: persistence x0, _cfm_from_persistence, joint training (no warmup)
+  ✅ Giữ lại: K=8 compass heads, OT matching, CFG, easy/difficult, coherence oracle
 """
 from __future__ import annotations
 
@@ -2188,92 +3021,72 @@ R_EARTH      = 6371.0
 DT_HOURS     = 6.0
 DEG2KM       = 111.0
 _NORM_TO_DEG = 5.0
+_COMPASS_DEG = [0., 45., 90., 135., 180., 225., 270., 315.]
+K_MODES      = 8
+_V_MAX_KMH   = 80.0
+_DT_H        = 6.0
 
-_COMPASS_DEG   = [0., 45., 90., 135., 180., 225., 270., 315.]
-K_MODES        = 8
 
+# ═══════════════════════════════════════════════════════════════════
+#  Coordinate utils
+# ═══════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Coordinate utilities
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _norm_to_deg(t: torch.Tensor) -> torch.Tensor:
+def _norm_to_deg(t):
     return torch.stack([
-        (t[..., 0] * 50.0 + 1800.0) / 10.0,
-        (t[..., 1] * 50.0) / 10.0,
+        (t[...,0]*50.0+1800.0)/10.0,
+        (t[...,1]*50.0)/10.0,
     ], dim=-1)
 
-def _haversine_deg(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-    lat1 = torch.deg2rad(p1[..., 1]); lat2 = torch.deg2rad(p2[..., 1])
-    dlat = torch.deg2rad(p2[..., 1] - p1[..., 1])
-    dlon = torch.deg2rad(p2[..., 0] - p1[..., 0])
-    a = (torch.sin(dlat/2).pow(2) +
-         torch.cos(lat1)*torch.cos(lat2)*torch.sin(dlon/2).pow(2))
-    return 2.0 * R_EARTH * torch.asin(a.clamp(1e-12, 1-1e-12).sqrt())
+def _haversine_deg(p1, p2):
+    lat1=torch.deg2rad(p1[...,1]); lat2=torch.deg2rad(p2[...,1])
+    dlat=torch.deg2rad(p2[...,1]-p1[...,1])
+    dlon=torch.deg2rad(p2[...,0]-p1[...,0])
+    a=(torch.sin(dlat/2).pow(2)+
+       torch.cos(lat1)*torch.cos(lat2)*torch.sin(dlon/2).pow(2))
+    return 2.0*R_EARTH*torch.asin(a.clamp(1e-12,1-1e-12).sqrt())
 
 def _unwrap_model(m):
-    return m._orig_mod if hasattr(m, "_orig_mod") else m
+    return m._orig_mod if hasattr(m,'_orig_mod') else m
 
-def _step_speeds_deg(traj_deg: torch.Tensor) -> torch.Tensor:
-    T = traj_deg.shape[0]
-    if T < 2: return traj_deg.new_zeros(1, traj_deg.shape[1])
-    return _haversine_deg(traj_deg[:-1], traj_deg[1:]) / DT_HOURS
+def _step_speeds_deg(traj_deg):
+    T=traj_deg.shape[0]
+    if T<2: return traj_deg.new_zeros(1,traj_deg.shape[1])
+    return _haversine_deg(traj_deg[:-1],traj_deg[1:])/DT_HOURS
 
 def _ade_km_from_rel(pred_rel, gt_rel, lp):
-    """[B,T,4] → [B] ADE in km."""
-    pred_abs = lp.unsqueeze(1) + pred_rel[:, :, :2]
-    gt_abs   = lp.unsqueeze(1) + gt_rel[:, :, :2]
-    return _haversine_deg(_norm_to_deg(pred_abs), _norm_to_deg(gt_abs)).mean(dim=1)
+    pred_abs=lp.unsqueeze(1)+pred_rel[:,:,:2]
+    gt_abs=lp.unsqueeze(1)+gt_rel[:,:,:2]
+    return _haversine_deg(_norm_to_deg(pred_abs),_norm_to_deg(gt_abs)).mean(dim=1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ROOT-1 FIX: Persistence x0 — dùng trong cả training lẫn inference
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  Persistence x0 — dùng cho cả training lẫn inference
+# ═══════════════════════════════════════════════════════════════════
 
 def _persistence_x0_rel(obs_traj, obs_Me, lp, lm, pred_len, sigma=0.02):
-    """
-    x0 = persistence forecast + tiny noise.
-    Dùng exponential weighted velocity từ obs để extrapolate.
-    QUAN TRỌNG: training và inference phải dùng hàm này để nhất quán.
-    """
-    B, device = obs_traj.shape[1], obs_traj.device
-    if obs_traj.shape[0] >= 3:
-        vels  = obs_traj[1:] - obs_traj[:-1]
-        n_v   = vels.shape[0]
-        alpha = 0.7
-        w     = torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
-                              dtype=torch.float, device=device).flip(0)
-        lv    = (vels * (w/w.sum()).view(-1,1,1)).sum(0)
-    elif obs_traj.shape[0] >= 2:
-        lv = obs_traj[-1,:,:2] - obs_traj[-2,:,:2]
-    else:
-        lv = obs_traj.new_zeros(B, 2)
-
-    steps    = torch.arange(1, pred_len+1, device=device).float()
-    pred_abs = obs_traj[-1,:,:2].unsqueeze(0) + lv.unsqueeze(0)*steps.view(-1,1,1)
-    pred_rel = pred_abs.permute(1,0,2) - lp.unsqueeze(1)
-    pred_rel4 = torch.cat([pred_rel, torch.zeros(B, pred_len, 2, device=device)], dim=-1)
-    return pred_rel4 + torch.randn_like(pred_rel4) * sigma
-
+    B,device=obs_traj.shape[1],obs_traj.device
+    if obs_traj.shape[0]>=3:
+        vels=obs_traj[1:]-obs_traj[:-1]; n_v=vels.shape[0]; alpha=0.7
+        w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],
+                       dtype=torch.float,device=device).flip(0)
+        lv=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
+    elif obs_traj.shape[0]>=2: lv=obs_traj[-1,:,:2]-obs_traj[-2,:,:2]
+    else: lv=obs_traj.new_zeros(B,2)
+    steps=torch.arange(1,pred_len+1,device=device).float()
+    pred_abs=obs_traj[-1,:,:2].unsqueeze(0)+lv.unsqueeze(0)*steps.view(-1,1,1)
+    pred_rel=pred_abs.permute(1,0,2)-lp.unsqueeze(1)
+    pred_rel4=torch.cat([pred_rel,torch.zeros(B,pred_len,2,device=device)],dim=-1)
+    return pred_rel4+torch.randn_like(pred_rel4)*sigma
 
 def _cfm_from_persistence(x0_rel, x1_rel):
-    """
-    FIX ROOT-1: CFM interpolant từ persistence x0 (không phải pure noise).
-    x0 = persistence (đã tính trước), x1 = GT.
-    t ~ U[0,1], x_t = (1-t)*x0 + t*x1, u = x1 - x0.
-    """
-    B = x0_rel.shape[0]
-    device = x0_rel.device
-    t  = torch.rand(B, device=device)
-    te = t.view(B, 1, 1)
-    x_t    = (1.0-te)*x0_rel + te*x1_rel
-    u_target = x1_rel - x0_rel
-    return x_t, t, u_target
+    B=x0_rel.shape[0]; device=x0_rel.device
+    t=torch.rand(B,device=device); te=t.view(B,1,1)
+    return (1.0-te)*x0_rel+te*x1_rel, t, x1_rel-x0_rel
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  OT Matching (bật từ epoch 5+)
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  OT Matching
+# ═══════════════════════════════════════════════════════════════════
 
 def _forward_azimuth(p1, p2):
     lon1=torch.deg2rad(p1[...,0]); lat1=torch.deg2rad(p1[...,1])
@@ -2305,7 +3118,8 @@ def _geodesic_ot_cost(x0_rel, x1_rel, lp):
     spd1=_step_speeds_deg(x1d.permute(1,0,2)).permute(1,0).mean(-1)
     speed_cost=(spd0.unsqueeze(1)-spd1.unsqueeze(0)).abs()/20.0
     def _mb(td):
-        b=_forward_azimuth(td[:,:-1,:],td[:,1:,:]); return torch.atan2(b.sin().mean(-1),b.cos().mean(-1))
+        b=_forward_azimuth(td[:,:-1,:],td[:,1:,:])
+        return torch.atan2(b.sin().mean(-1),b.cos().mean(-1))
     h0=_mb(x0d); h1=_mb(x1d)
     dh=(h0.unsqueeze(1)-h1.unsqueeze(0)+math.pi)%(2*math.pi)-math.pi
     return 1.0*pos_cost+0.5*speed_cost+0.3*dh.abs()/math.pi
@@ -2314,7 +3128,7 @@ def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
     B=x0_batch.shape[0]
     if B<4: return x0_batch, x1_batch
     try:
-        cost=_geodesic_ot_cost(x0_batch, x1_batch, lp)
+        cost=_geodesic_ot_cost(x0_batch,x1_batch,lp)
         with torch.no_grad(): pi=_sinkhorn_log(cost,epsilon=epsilon)
         flat=pi.reshape(-1).clamp(0.0); s=flat.sum()
         if not torch.isfinite(s) or s<1e-10: return x0_batch, x1_batch
@@ -2324,14 +3138,12 @@ def _spherical_ot_matching(x0_batch, x1_batch, lp, epsilon=0.05):
         return x0_batch, x1_batch
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  Difficulty Score
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
     B=obs_BT2.shape[0]; scores=[]
-
-    # Signal 1: curvature (0.30)
     dir24=env_data.get("history_direction24") if env_data else None
     if dir24 is not None and torch.is_tensor(dir24):
         dir24=dir24.float().to(device)
@@ -2349,8 +3161,6 @@ def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
         else: s_curve=torch.zeros(B,device=device)
     else: s_curve=torch.zeros(B,device=device)
     scores.append(0.30*s_curve)
-
-    # Signal 2: weak steering (0.25)
     steer=env_data.get("steering_speed") if env_data else None
     if steer is not None and torch.is_tensor(steer):
         steer=steer.float().to(device)
@@ -2367,8 +3177,6 @@ def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
             s_weak=torch.sigmoid((4.0-(u.view(-1)[:B]**2+v.view(-1)[:B]**2).sqrt()*30.0)/2.0)
         else: s_weak=torch.zeros(B,device=device)
     scores.append(0.25*s_weak)
-
-    # Signal 3: wind shear (0.20)
     if img_obs is not None and img_obs.shape[1]>=11:
         u200=img_obs[:,4,-1,40,40]*13.315; u850=img_obs[:,6,-1,40,40]*7.911
         v200=img_obs[:,8,-1,40,40]*8.377;  v850=img_obs[:,10,-1,40,40]*6.203
@@ -2376,8 +3184,6 @@ def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
         s_shear=torch.sigmoid((shear-8.0)/3.0)
     else: s_shear=torch.zeros(B,device=device)
     scores.append(0.20*s_shear)
-
-    # Signal 4: RI (0.15)
     ri=env_data.get("rapid_intensification") if env_data else None
     if ri is not None and torch.is_tensor(ri):
         ri=ri.float().to(device)
@@ -2385,8 +3191,6 @@ def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
         s_ri=ri.view(-1)[:B].clamp(0,1) if ri.numel()>=B else ri[0].expand(B)
     else: s_ri=torch.zeros(B,device=device)
     scores.append(0.15*s_ri)
-
-    # Signal 5: slow movement (0.10)
     mv=env_data.get("move_velocity") if env_data else None
     if mv is not None and torch.is_tensor(mv):
         mv=mv.float().to(device)
@@ -2395,13 +3199,8 @@ def compute_difficulty_score(obs_BT2, img_obs, env_data, device):
         s_slow=torch.sigmoid((0.05-mv_v)/0.02)
     else: s_slow=torch.zeros(B,device=device)
     scores.append(0.10*s_slow)
-
     return sum(scores).clamp(0.0,1.0)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Direction GT bucket
-# ══════════════════════════════════════════════════════════════════════════════
 
 def get_gt_direction_bucket(obs_traj, pred_traj):
     last=obs_traj[-1]; first=pred_traj[0]
@@ -2412,16 +3211,14 @@ def get_gt_direction_bucket(obs_traj, pred_traj):
     return ((angle+22.5)/45.0).long()%8
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  CompassVelocityHead
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 class CompassVelocityHead(nn.Module):
-    def __init__(self, compass_idx, pred_len=12, ctx_dim=256,
-                 stochastic_depth_prob=0.1):
+    def __init__(self,compass_idx,pred_len=12,ctx_dim=256,stochastic_depth_prob=0.1):
         super().__init__()
-        self.pred_len=pred_len; self.compass_idx=compass_idx
-        self.stochastic_depth_prob=stochastic_depth_prob
+        self.pred_len=pred_len; self.stochastic_depth_prob=stochastic_depth_prob
         angle_rad=_COMPASS_DEG[compass_idx]*math.pi/180.0
         dir_vec=torch.tensor([math.sin(angle_rad),math.cos(angle_rad)])
         self.register_buffer('compass_dir',dir_vec)
@@ -2464,9 +3261,9 @@ class CompassVelocityHead(nn.Module):
         return self.out_fc2(F.gelu(self.out_fc1(decoded)))*scale
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  CompassSelector
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 class CompassSelector(nn.Module):
     def __init__(self,ctx_dim=256,K=8,n_dirs=8):
@@ -2505,27 +3302,27 @@ class CompassSelector(nn.Module):
         for k in range(K):
             mf=self.mode_enc(modes[:,k,:,:2].reshape(B,-1))
             scores.append(self.score_net(torch.cat([ctx,mf,sf],dim=-1)).squeeze(-1))
-        score_logits=torch.stack(scores,dim=1)
-        dir_logits=self.dir_head(torch.cat([ctx,sf],dim=-1))
-        return score_logits, dir_logits
+        return torch.stack(scores,dim=1), self.dir_head(torch.cat([ctx,sf],dim=-1))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LearnedWeights
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  LearnedWeights — BUG-3 FIX: clamp(-3,3)
+# ═══════════════════════════════════════════════════════════════════
 
 class LearnedWeights(nn.Module):
     def __init__(self):
         super().__init__()
-        self.log_s_fm  = nn.Parameter(torch.zeros(1))
-        self.log_s_sel = nn.Parameter(torch.zeros(1))
-        self.log_s_coh = nn.Parameter(torch.zeros(1))
-        self.log_s_con = nn.Parameter(torch.zeros(1))
-        self.log_alpha = nn.Parameter(torch.zeros(1))
+        # Init nhỏ hơn để tránh oscillation sớm
+        self.log_s_fm  = nn.Parameter(torch.tensor(0.0))
+        self.log_s_sel = nn.Parameter(torch.tensor(0.0))
+        self.log_s_coh = nn.Parameter(torch.tensor(0.0))
+        self.log_s_con = nn.Parameter(torch.tensor(0.0))
+        self.log_alpha = nn.Parameter(torch.tensor(0.0))
 
     def forward(self,L_fm,L_rank,L_dir,L_coh,L_con):
-        s_fm=self.log_s_fm.clamp(-5,5); s_sel=self.log_s_sel.clamp(-5,5)
-        s_coh=self.log_s_coh.clamp(-5,5); s_con=self.log_s_con.clamp(-5,5)
+        # BUG-3 FIX: clamp chặt hơn (-3,3)
+        s_fm=self.log_s_fm.clamp(-3,3); s_sel=self.log_s_sel.clamp(-3,3)
+        s_coh=self.log_s_coh.clamp(-3,3); s_con=self.log_s_con.clamp(-3,3)
         α=torch.sigmoid(self.log_alpha)
         L_sel=α*L_rank+(1.0-α)*L_dir
         return (L_fm*torch.exp(-s_fm)+s_fm +
@@ -2534,18 +3331,18 @@ class LearnedWeights(nn.Module):
                 L_con*torch.exp(-s_con)+s_con)
 
     def get_weights(self):
-        def _w(s): return torch.exp(-s.clamp(-5,5)).item()
+        def _w(s): return torch.exp(-s.clamp(-3,3)).item()
         return {"w_fm":_w(self.log_s_fm),"w_sel":_w(self.log_s_sel),
                 "w_coh":_w(self.log_s_coh),"w_con":_w(self.log_s_con),
                 "alpha":torch.sigmoid(self.log_alpha).item()}
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  SharedContextEncoder
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 class SharedContextEncoder(nn.Module):
-    RAW_CTX_DIM = 512
+    RAW_CTX_DIM=512
     def __init__(self,pred_len=12,obs_len=8,ctx_dim=256,unet_in_ch=13):
         super().__init__()
         self.pred_len=pred_len; self.obs_len=obs_len; self.ctx_dim=ctx_dim
@@ -2562,8 +3359,6 @@ class SharedContextEncoder(nn.Module):
         self.ctx_drop=nn.Dropout(0.15)
         self.ctx_fc2=nn.Linear(self.RAW_CTX_DIM,ctx_dim)
         self.null_embedding=nn.Parameter(torch.randn(1,self.RAW_CTX_DIM)*0.02)
-        self.vel_obs_enc=nn.Sequential(nn.Linear(obs_len*6,256),nn.GELU(),
-                                       nn.LayerNorm(256),nn.Linear(256,256),nn.GELU())
 
     def encode(self,batch_list):
         obs_t=batch_list[0]; obs_Me=batch_list[7]
@@ -2587,21 +3382,16 @@ class SharedContextEncoder(nn.Module):
         e_env,_,_=self.env_enc(env_data,image_obs)
         return F.gelu(self.ctx_ln(self.ctx_fc1(torch.cat([h_t,e_env,f_sp],dim=-1))))
 
-    def apply_ctx_head(self,raw,noise_scale=0.0,use_null=False):
+    def apply_ctx_head(self,raw,use_null=False):
         if use_null: raw=self.null_embedding.expand(raw.shape[0],-1)
-        elif noise_scale>0.0: raw=raw+torch.randn_like(raw)*noise_scale
         return self.ctx_fc2(self.ctx_drop(raw))
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  Losses
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 def _coherence_loss_oracle(pred_oracle_grad, x1_rel_orig, lp, device):
-    """
-    FIX ROOT-5: Tính coherence trực tiếp từ oracle mode (có gradient),
-    không dùng soft-weighted sum từ sel_probs đã detach.
-    """
     pred_abs=lp.unsqueeze(1)+pred_oracle_grad[:,:,:2]
     gt_abs=lp.unsqueeze(1)+x1_rel_orig[:,:,:2]
     pred_deg=_norm_to_deg(pred_abs); gt_deg=_norm_to_deg(gt_abs)
@@ -2633,9 +3423,9 @@ def _traj_mixup(x1_rel, delta, prob=0.3, alpha=0.4):
     return x1_mix,delta_mix
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 #  EMA
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 
 class EMAModel:
     def __init__(self,model,decay=0.995):
@@ -2660,16 +3450,15 @@ class EMAModel:
             if k in sd: sd[k].copy_(v)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TCFlowMatchingV65 — Main Class
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  TCFlowMatchingV65
+# ═══════════════════════════════════════════════════════════════════
 
 class TCFlowMatchingV65(nn.Module):
 
     def __init__(self,pred_len=12,obs_len=8,ctx_dim=256,sigma_min=0.02,
                  unet_in_ch=13,K=K_MODES,use_ema=True,ema_decay=0.995,
-                 cfg_uncond_prob=0.10,
-                 selector_warmup=0,   # FIX ROOT-3: bỏ warmup, train joint từ đầu
+                 cfg_uncond_prob=0.10,selector_warmup=0,
                  head_noise_base=0.03,use_ot=True,ot_epsilon=0.05,
                  cfg_guidance_scale=1.3,**kwargs):
         super().__init__()
@@ -2703,7 +3492,6 @@ class TCFlowMatchingV65(nn.Module):
 
     @staticmethod
     def _tau_schedule(epoch):
-        """Tau giảm dần → selector signal rõ hơn theo thời gian."""
         if epoch<5: return 5.0
         if epoch<15: return 4.0
         if epoch<25: return 3.0
@@ -2756,7 +3544,7 @@ class TCFlowMatchingV65(nn.Module):
         else: alpha_b=blend_strength*0.5
         return (1.0-alpha_b)*model_pred+alpha_b*persist
 
-    # ── TRAINING ──────────────────────────────────────────────────────────────
+    # ─── TRAINING ────────────────────────────────────────────────────
 
     def get_loss(self,batch_list,epoch=0,**kwargs):
         return self.get_loss_breakdown(batch_list,epoch=epoch)["total"]
@@ -2774,58 +3562,45 @@ class TCFlowMatchingV65(nn.Module):
         sigma=self._sigma_schedule(epoch)
         tau=self._tau_schedule(epoch)
 
-        # Context
         raw_ctx=self.encoder.encode(batch_list)
+        # ctx_heads: dùng cho velocity heads, có thể null (CFG training)
         use_null=(torch.rand(1).item()<self.cfg_uncond_prob)
         ctx=self.encoder.apply_ctx_head(raw_ctx,use_null=use_null)
+        # ctx_sel: LUÔN real context cho selector — không null
+        # Selector cần real context để học phân biệt modes đúng
+        ctx_sel=self.encoder.apply_ctx_head(raw_ctx,use_null=False) if use_null else ctx
 
-        # Consistency
         L_consist=_dropout_consistency_loss(self.encoder,raw_ctx)
 
-        # Difficulty
         obs_BT2=obs_t.permute(1,0,2); img_obs=batch_list[11]
         delta=compute_difficulty_score(obs_BT2,img_obs,env_data,device)
 
-        # GT rel
         x1_rel_orig=self._to_rel(pred_t,pred_Me,lp,lm)
-
-        # ── ROOT-1 FIX: x0 từ persistence ───────────────────────────────────
         x0_base=_persistence_x0_rel(obs_t,obs_Me,lp,lm,self.pred_len,sigma=sigma)
 
-        # OT matching từ epoch 5 trở đi để tránh noise lúc model chưa ổn
         if self.use_ot and B>=4 and epoch>=5:
             x0_base,x1_rel_orig=_spherical_ot_matching(
                 x0_base,x1_rel_orig,lp,epsilon=self.ot_epsilon)
 
-        # Mixup (chỉ trên easy samples)
         x1_rel,delta=_traj_mixup(x1_rel_orig,delta,prob=0.3,alpha=0.4)
-
-        # CFM từ persistence x0
         x_t,fm_t,u_target=_cfm_from_persistence(x0_base,x1_rel)
         x_t_shared=x_t
 
-        # Generate K modes
         modes_rel_nograd=[]; modes_rel_grad=[]; vels_pred=[]
         for k in range(self.K):
             sigma_k=self.head_noise_base*(1.0+k*0.25)
             z_k=torch.randn_like(x_t_shared)*sigma_k
             x_t_k=x_t_shared+z_k
-
-            # FIX ROOT-3: generator LUÔN có gradient (không warmup freeze)
             v_k=self.velocity_heads[k](x_t_k,fm_t,ctx)
-
             with torch.no_grad():
                 pred_k_oracle=x_t_shared+(1.0-fm_t.view(B,1,1))*v_k
             modes_rel_nograd.append(pred_k_oracle.detach())
-
-            pred_k_grad=x_t_k+(1.0-fm_t.view(B,1,1))*v_k
-            modes_rel_grad.append(pred_k_grad)
+            modes_rel_grad.append(x_t_k+(1.0-fm_t.view(B,1,1))*v_k)
             vels_pred.append(v_k)
 
         modes_t_ng=torch.stack(modes_rel_nograd,dim=1)
         modes_t_g=torch.stack(modes_rel_grad,dim=1)
 
-        # Oracle assignment (so với x1_rel_orig, không phải mixup)
         with torch.no_grad():
             ade_k=torch.stack([
                 _ade_km_from_rel(modes_rel_nograd[k],x1_rel_orig.detach(),lp)
@@ -2833,53 +3608,59 @@ class TCFlowMatchingV65(nn.Module):
             ],dim=1)
             k_star=ade_k.argmin(dim=1)
 
-        # FM Loss
+        # BUG-2 FIX: oracle_ade thực sự tính bằng km để phase gate chạy đúng
+        oracle_ade_km=ade_k[torch.arange(B,device=device),k_star].mean()
+
         fm_errs=torch.stack([
             ((vels_pred[k]-u_target)**2).mean(dim=[1,2])
             for k in range(self.K)
         ],dim=1)
         L_easy=fm_errs.mean(dim=1)
-        L_oracle=fm_errs[torch.arange(B,device=device),k_star]
+        L_oracle_fm=fm_errs[torch.arange(B,device=device),k_star]
 
-        # ── ROOT-2 FIX: diversity mask đúng ─────────────────────────────────
+        # ══ BUG-1 FIX: mask_ns đúng ══════════════════════════════════
+        # Muốn: min_dist = khoảng cách từ k_star đến mode GẦN NHẤT TRONG SỐ CÁC MODE KHÁC
+        # → cần loại k_star khỏi candidates
+        # mask_ns[b, k] = True nếu k != k_star[b]  (candidates hợp lệ)
+        # = ones → scatter False tại k_star → mask True ở non-k_star
+        # masked_fill(~mask_ns = True tại k_star) → fill inf tại k_star
+        # min = min distance đến mode gần nhất KHÁC k_star ✅
         mode_star_ng=modes_t_ng[torch.arange(B,device=device),k_star]
         dists_all=torch.stack([
             ((mode_star_ng-modes_t_ng[:,k])**2).mean(dim=[1,2]).sqrt()
             for k in range(self.K)
         ],dim=1)
-        # FIX: zeros + scatter True → masked_fill(~mask) fill inf vào k_star
-        mask_ns=torch.zeros(B,self.K,device=device,dtype=torch.bool)
-        mask_ns.scatter_(1,k_star.unsqueeze(1),True)
+        mask_ns=torch.ones(B,self.K,device=device,dtype=torch.bool)   # ones
+        mask_ns.scatter_(1,k_star.unsqueeze(1),False)                  # False at k_star
+        # masked_fill(~mask_ns) = fill inf where ~mask_ns = True = where k_star
         min_dist=dists_all.masked_fill(~mask_ns,float('inf')).min(dim=1).values
+        # ══ END BUG-1 FIX ════════════════════════════════════════════
 
         MARGIN=0.40
         L_div=F.relu(MARGIN-min_dist)
-        L_diff=L_oracle+0.3*L_div
-
+        L_diff=L_oracle_fm+0.3*L_div
         L_FM_raw=(1.0-delta)*L_easy+delta*L_diff
         w_d=0.5+1.5*delta
         L_FM=(w_d*L_FM_raw).mean()
 
-        # Selector (stop-grad từ generator)
-        sel_logits,dir_logits=self.selector(ctx.detach(),modes_t_ng,env_data)
+        sel_logits,dir_logits=self.selector(ctx_sel.detach(),modes_t_ng,env_data)
         p_oracle=F.softmax(-ade_k/tau,dim=1)
         L_rank=F.kl_div(F.log_softmax(sel_logits,dim=1),p_oracle,reduction='batchmean')
         gt_bucket=get_gt_direction_bucket(obs_t,pred_t)
         L_dir=F.cross_entropy(dir_logits,gt_bucket)
 
-        # ── ROOT-5 FIX: coherence từ oracle mode có gradient ─────────────────
         oracle_mode_grad=modes_t_g[torch.arange(B,device=device),k_star]
         L_coh=_coherence_loss_oracle(oracle_mode_grad,x1_rel_orig,lp,device)
 
-        # Total loss — luôn joint train (không warmup phase)
         L_total=self.learned_weights(L_FM,L_rank,L_dir,L_coh,L_consist)
-
         if not torch.isfinite(L_total): L_total=L_total.new_zeros(())
 
         def _s(x): return x.item() if torch.is_tensor(x) else float(x)
         return {
             "total":L_total,"L_FM":_s(L_FM),"L_easy":_s(L_easy.mean()),
-            "L_diff":_s(L_diff.mean()),"L_oracle":_s(L_oracle.mean()),
+            "L_diff":_s(L_diff.mean()),
+            "L_oracle":_s(L_oracle_fm.mean()),   # FM MSE của oracle head
+            "oracle_ade_km":_s(oracle_ade_km),   # BUG-2 FIX: km thực để phase gate
             "L_div":_s(L_div.mean()),"L_rank":_s(L_rank),"L_dir":_s(L_dir),
             "L_coh":_s(L_coh),"L_consist":_s(L_consist),
             "delta_mean":_s(delta.mean()),"delta_p75":_s(delta.quantile(0.75)),
@@ -2888,7 +3669,7 @@ class TCFlowMatchingV65(nn.Module):
             **self.learned_weights.get_weights(),
         }
 
-    # ── INFERENCE ─────────────────────────────────────────────────────────────
+    # ─── INFERENCE ───────────────────────────────────────────────────
 
     @torch.no_grad()
     def sample(self,batch_list,ddim_steps=20,predict_csv=None,
@@ -2903,7 +3684,6 @@ class TCFlowMatchingV65(nn.Module):
         ctx=self.encoder.apply_ctx_head(raw_ctx)
         ctx_null=self.encoder.apply_ctx_head(raw_ctx,use_null=True)
 
-        # FIX ROOT-1: inference cũng dùng persistence x0 (sigma=0 vì inference)
         x0_base=_persistence_x0_rel(obs_t,obs_Me,lp,lm,T_pred,sigma=0.0)
 
         obs_t_norm=obs_t[:,:,:2]
@@ -2933,7 +3713,6 @@ class TCFlowMatchingV65(nn.Module):
             all_modes_abs.append(traj_abs)
 
         modes_stack=torch.stack(all_modes_abs,dim=0)
-
         modes_rel_sel=torch.stack([
             torch.cat([all_modes_abs[k].permute(1,0,2)-lp.unsqueeze(1),
                        torch.zeros(B,T_pred,2,device=device)],dim=-1)
@@ -2967,6 +3746,5 @@ class TCFlowMatchingV65(nn.Module):
                     w.writerow({"ts":ts,"b":b,"step":k,"lead_h":(k+1)*6,
                                 "lon":f"{mlon[k,b]:.4f}","lat":f"{mlat[k,b]:.4f}"})
 
-
-TCFlowMatching = TCFlowMatchingV65
-TCDiffusion    = TCFlowMatchingV65
+TCFlowMatching=TCFlowMatchingV65
+TCDiffusion=TCFlowMatchingV65
