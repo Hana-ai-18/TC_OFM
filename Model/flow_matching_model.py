@@ -1660,11 +1660,15 @@ class TCFlowMatching(nn.Module):
         ], dim=0).permute(1, 0, 2)   # [T, B, 2]
 
         # ── Adaptive persistence blend (FIX BUG-7) ───────────
+        # pred_norm_t = torch.stack([
+        #     ((pred_mean[:, :, 0] * 10.0 - 1800.0) / 50.0),
+        #     (pred_mean[:, :, 1] * 10.0 / 50.0),
+        # ], dim=-1).permute(1, 0, 2)  # norm → [T, B, 2]
+
         pred_norm_t = torch.stack([
             ((pred_mean[:, :, 0] * 10.0 - 1800.0) / 50.0),
             (pred_mean[:, :, 1] * 10.0 / 50.0),
-        ], dim=-1).permute(1, 0, 2)  # norm → [T, B, 2]
-
+        ], dim=-1)  # [T, B, 2] — xóa .permute(1, 0, 2)
         blended_norm = _persistence_blend_adaptive(pred_norm_t, obs_norm, blend_alpha)
 
         # Convert back to degrees
