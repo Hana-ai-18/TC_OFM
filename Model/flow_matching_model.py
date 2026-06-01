@@ -1638,12 +1638,13 @@ class TCFlowMatching(nn.Module):
         # Không có prior_sc (v_opt=15 sai)
         # Dùng learned scorer MLP
         scores = []
+        # for tn in all_norms:
+        #     # Normalize back to norm space for scorer
+        #     lon_n = (tn[:, :, 0] * 10.0 - 1800.0) / 50.0  # [B, T]
+        #     lat_n = (tn[:, :, 1] * 10.0) / 50.0
+        #     tn_norm = torch.stack([lon_n, lat_n], dim=-1).permute(1, 0, 2)  # [T, B, 2]
         for tn in all_norms:
-            # Normalize back to norm space for scorer
-            lon_n = (tn[:, :, 0] * 10.0 - 1800.0) / 50.0  # [B, T]
-            lat_n = (tn[:, :, 1] * 10.0) / 50.0
-            tn_norm = torch.stack([lon_n, lat_n], dim=-1).permute(1, 0, 2)  # [T, B, 2]
-
+            tn_norm = tn.permute(1, 0, 2)   # [B,T,2] → [T,B,2]
             sc = self.criterion.scorer.score(tn_norm, obs_norm)  # [B]
             scores.append(sc)
 
@@ -1665,10 +1666,11 @@ class TCFlowMatching(nn.Module):
         #     (pred_mean[:, :, 1] * 10.0 / 50.0),
         # ], dim=-1).permute(1, 0, 2)  # norm → [T, B, 2]
 
-        pred_norm_t = torch.stack([
-            ((pred_mean[:, :, 0] * 10.0 - 1800.0) / 50.0),
-            (pred_mean[:, :, 1] * 10.0 / 50.0),
-        ], dim=-1)  # [T, B, 2] — xóa .permute(1, 0, 2)
+        # pred_norm_t = torch.stack([
+        #     ((pred_mean[:, :, 0] * 10.0 - 1800.0) / 50.0),
+        #     (pred_mean[:, :, 1] * 10.0 / 50.0),
+        # ], dim=-1)  # [T, B, 2] — xóa .permute(1, 0, 2)
+        pred_norm_t = pred_mean   # [T, B, 2] normalized — không cần convert
         blended_norm = _persistence_blend_adaptive(pred_norm_t, obs_norm, blend_alpha)
 
         # Convert back to degrees
