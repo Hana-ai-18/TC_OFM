@@ -4030,6 +4030,1103 @@
 
 # TCDiffusion = TCFlowMatching
 
+# """
+# flow_matching_model.py — FM v74-fix
+# ====================================
+# DROP-IN REPLACEMENT cho v60.
+
+# ROOT CAUSES của v60 oscillation (từ log analysis):
+#   BUG-A: x0=persist+noise → u_target=correction (nhỏ 0.29x so với standard)
+#          → Model học predict small velocity → speed undershoot -17 to -28 km/6h mỗi epoch
+#          → ADE oscillate vì inference distribution ≠ training distribution
+#   BUG-B: l_logspd gradient asymmetric → log-space MSE penalize underestimation
+#          nặng hơn overestimation → conflict với BUG-A → oscillation amplified
+#   BUG-C: Không có direct position loss → model chỉ học velocity, không
+#          minimize haversine(pred_pos, gt_pos) trực tiếp → gradient path dài
+
+# FIXES:
+#   FIX-A: x0 = N(0, sigma) pure noise như v59
+#          → u_target = x1 - x0 ≈ x1 (magnitude chuẩn)
+#          → Inference distribution matches training distribution
+#          → No speed bias
+
+#   FIX-B: Remove l_logspd
+#          → Thay bằng L_disp = ||Δpred - Δgt|| / ||Δgt||.clamp(10km)
+#          → Normalized ratio, không asymmetric, không km-scale
+#          → Covers ATE+CTE implicitly without naming either
+
+#   FIX-C: Add L_pos = huber(haversine(pred, gt), d=300) / 300
+#          → Direct position loss như v59's l_dpe
+#          → Clear gradient: push pred_pos toward gt_pos mỗi step
+#          → Guarantees monotone decrease (direct ADE proxy)
+#          → With LEARNED step_weights (monotone, sw72/sw6≥3)
+
+# LOSS FORMULA (general — không ATE, CTE, speed tên):
+#   Total = w_fm * L_fm                    — flow matching velocity
+#         + w_pos * L_pos(step_weights)     — position quality (ADE proxy)
+#         + w_disp * L_disp                 — displacement quality (ATE+CTE proxy)
+#         + 0.3 * L_speed_head              — auxiliary speed prediction
+#         + anchor losses
+
+# GIỮA NGUYÊN từ v60:
+#   - VelocityField architecture (toàn bộ — FNO3D, Mamba, recurv_enc, etc.)
+#   - EMA, OT matching, CFG guidance
+#   - LearnedStepWeights (monotone cumsum)
+#   - DifficultyWeighter (per-sample [1,2])
+#   - EnsembleScorer (auxiliary BCE)
+#   - K=3 mode clustering inference (từ analysis trước)
+# """
+# from __future__ import annotations
+
+# import csv, math, os
+# from datetime import datetime
+# from typing import Optional, Tuple
+
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+# from Model.FNO3D_encoder import FNO3DEncoder
+# from Model.mamba_encoder import DataEncoder1D_Mamba as DataEncoder1D
+# from Model.env_net_transformer_gphsplit import Env_net
+
+# R_EARTH  = 6371.0
+# DT_HOURS = 6.0
+# DEG2KM   = 111.0
+# MAX_CURVATURE_RAD = math.pi / 4
+# _NORM_TO_DEG = 5.0
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  Coordinate utilities (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# def norm_to_deg(t):
+#     return torch.stack([(t[...,0]*50.+1800.)/10., (t[...,1]*50.)/10.], dim=-1)
+
+# _norm_to_deg = norm_to_deg
+
+# def haversine_km(p1, p2):
+#     la1=torch.deg2rad(p1[...,1]); la2=torch.deg2rad(p2[...,1])
+#     dlat=torch.deg2rad(p2[...,1]-p1[...,1]); dlon=torch.deg2rad(p2[...,0]-p1[...,0])
+#     a=torch.sin(dlat/2).pow(2)+torch.cos(la1)*torch.cos(la2)*torch.sin(dlon/2).pow(2)
+#     return 2.*R_EARTH*torch.asin(a.clamp(1e-12,1-1e-12).sqrt())
+
+# def velocity_km_s(traj_deg):
+#     """[T,B,2] degrees → [T-1,B,2] km/6h."""
+#     lon=traj_deg[:,:,0]; lat=traj_deg[:,:,1]
+#     dlat=lat[1:]-lat[:-1]; dlon=lon[1:]-lon[:-1]
+#     lat_mid=(lat[1:]+lat[:-1])/2.
+#     cos_lat=torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+#     return torch.stack([dlon*cos_lat*DEG2KM, dlat*DEG2KM], dim=-1)
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  LearnedStepWeights (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# class LearnedStepWeights(nn.Module):
+#     def __init__(self, n_steps=12):
+#         super().__init__()
+#         self.n_steps=n_steps
+#         self.raw=nn.Parameter(torch.zeros(n_steps)+0.5)
+#     def forward(self):
+#         w=torch.cumsum(F.softplus(self.raw),dim=0)
+#         return w/w.mean().clamp(1e-8)
+#     def get(self,n=None):
+#         w=self.forward(); return w[:n] if n is not None else w
+#     @torch.no_grad()
+#     def stats(self):
+#         w=self.forward()
+#         return {"sw_ratio":(w[-1]/w[0].clamp(1e-6)).item(),
+#                 "sw_monotonic":bool((w[1:]-w[:-1]).min().item()>=-1e-6),
+#                 "sw_6h":w[0].item(),"sw_24h":w[3].item(),
+#                 "sw_48h":w[7].item(),"sw_72h":w[-1].item()}
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  [NEW] ConstrainedLossWeights — softplus_inv init
+# # ══════════════════════════════════════════════════════════════
+
+# class ConstrainedLossWeights(nn.Module):
+#     """
+#     3 weights: w_fm, w_pos, w_disp. Tự học, init chính xác qua softplus_inv.
+#     Anchor loss ngăn drift khỏi reasonable region.
+#     """
+#     @staticmethod
+#     def _sp_inv(y):
+#         if y>20.: return y
+#         if y<1e-6: return -20.
+#         return math.log(math.expm1(y))
+
+#     def __init__(self, init_fm=1.0, init_pos=2.0, init_disp=0.8, anchor_w=0.02):
+#         super().__init__()
+#         self.anchor_w = anchor_w
+#         raw = torch.tensor([self._sp_inv(init_fm),
+#                               self._sp_inv(init_pos),
+#                               self._sp_inv(init_disp)], dtype=torch.float)
+#         self.log_w = nn.Parameter(raw)
+#         self.register_buffer('log_w0', raw.clone())
+
+#     def _get(self,i,mn,mx): return F.softplus(self.log_w[i]).clamp(mn,mx)
+#     def w_fm(self):   return self._get(0, 0.2, 4.0)
+#     def w_pos(self):  return self._get(1, 0.5, 6.0)
+#     def w_disp(self): return self._get(2, 0.1, 3.0)
+#     def anchor_loss(self): return self.anchor_w*((self.log_w-self.log_w0)**2).mean()
+#     @torch.no_grad()
+#     def stats(self):
+#         return {"lw_fm":self.w_fm().item(),"lw_pos":self.w_pos().item(),
+#                 "lw_disp":self.w_disp().item(),
+#                 "lw_pos_fm":(self.w_pos()/self.w_fm().clamp(1e-6)).item()}
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  DifficultyWeighter (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# class DifficultyWeighter(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#         self.linear=nn.Linear(3,1,bias=True)
+#         nn.init.zeros_(self.linear.weight)
+#         nn.init.constant_(self.linear.bias,-2.0)
+#     def compute_difficulty(self,gt_deg):
+#         B=gt_deg.shape[1]; v=velocity_km_s(gt_deg)
+#         if v.shape[0]>=2:
+#             heading=torch.atan2(v[:,:,0],v[:,:,1])
+#             dh=heading[1:]-heading[:-1]
+#             dh=(dh+math.pi)%(2*math.pi)-math.pi
+#             curv_rate=dh.abs().mean(0)
+#             excess=F.relu(dh.abs()-MAX_CURVATURE_RAD).mean(0)
+#         else:
+#             curv_rate=excess=gt_deg.new_zeros(B)
+#         spd=v.norm(dim=-1); mean_spd=spd.mean(0).clamp(1.)
+#         speed_cv=(spd.std(0)/mean_spd).clamp(max=3.)
+#         d1=(curv_rate/(math.pi/2)).clamp(0,1)
+#         d2=speed_cv.clamp(0,1)
+#         d3=(excess/(math.pi/4)).clamp(0,1)
+#         return torch.stack([d1,d2,d3],dim=-1)
+#     def forward(self,gt_deg):
+#         diff=self.compute_difficulty(gt_deg)
+#         return 1.0+torch.sigmoid(self.linear(diff).squeeze(-1))
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  EnsembleScorer (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# class EnsembleScorer(nn.Module):
+#     def __init__(self,feat_dim=7,hidden=32):
+#         super().__init__()
+#         self.net=nn.Sequential(
+#             nn.Linear(feat_dim,hidden),nn.GELU(),
+#             nn.Linear(hidden,16),nn.GELU(),
+#             nn.Linear(16,1))
+#         nn.init.zeros_(self.net[-1].weight)
+#         nn.init.zeros_(self.net[-1].bias)
+
+#     def extract_features(self,traj_norm,obs_norm):
+#         B=traj_norm.shape[1]
+#         traj_deg=norm_to_deg(traj_norm); obs_deg=norm_to_deg(obs_norm)
+#         v=velocity_km_s(traj_deg); spd=v.norm(dim=-1)
+#         f1=torch.log1p(spd.mean(0)); f2=torch.log1p(spd.std(0).clamp(0))
+#         if v.shape[0]>=2:
+#             heading=torch.atan2(v[:,:,0],v[:,:,1])
+#             dh=heading[1:]-heading[:-1]; dh=(dh+math.pi)%(2*math.pi)-math.pi
+#             f3=torch.cos(dh).mean(0)
+#         else: f3=traj_norm.new_ones(B)
+#         v_obs=velocity_km_s(obs_deg); n_obs=min(3,v_obs.shape[0])
+#         obs_spd=v_obs[-n_obs:].norm(dim=-1).mean(0).clamp(1.)
+#         n_pred=min(3,spd.shape[0]); pred_spd=spd[:n_pred].mean(0)
+#         f4=torch.exp(-((pred_spd-obs_spd)/obs_spd).pow(2)*2.)
+#         if v_obs.shape[0]>=1 and v.shape[0]>=1:
+#             obs_h=torch.atan2(v_obs[-1,:,0],v_obs[-1,:,1])
+#             pred_h=torch.atan2(v[0,:,0],v[0,:,1])
+#             dh_cont=pred_h-obs_h; dh_cont=(dh_cont+math.pi)%(2*math.pi)-math.pi
+#             f5=torch.cos(dh_cont)
+#         else: f5=traj_norm.new_ones(B)
+#         if obs_norm.shape[0]>=2:
+#             lv=obs_norm[-1]-obs_norm[-2]
+#             steps=torch.arange(1,traj_norm.shape[0]+1,device=traj_norm.device,dtype=traj_norm.dtype)
+#             persist=obs_norm[-1].unsqueeze(0)+lv.unsqueeze(0)*steps.view(-1,1,1)
+#             dfp=(traj_norm-persist).norm(dim=-1).mean(0)
+#             ref=(lv.norm(dim=-1)*traj_norm.shape[0]).clamp(1e-3)
+#             f6=dfp/ref
+#         else: f6=traj_norm.new_zeros(B)
+#         if v.shape[0]>=2:
+#             heading=torch.atan2(v[:,:,0],v[:,:,1])
+#             dh=heading[1:]-heading[:-1]; dh=(dh+math.pi)%(2*math.pi)-math.pi
+#             f7=dh.abs().mean(0)
+#         else: f7=traj_norm.new_zeros(B)
+#         return torch.stack([f1,f2,f3,f4,f5,f6,f7],dim=-1).clamp(-10.,10.)
+
+#     def score(self,traj_norm,obs_norm):
+#         return torch.sigmoid(self.net(self.extract_features(traj_norm,obs_norm)).squeeze(-1))
+
+#     def logits(self,traj_norm,obs_norm):
+#         return self.net(self.extract_features(traj_norm,obs_norm)).squeeze(-1)
+
+#     def auxiliary_loss(self,candidates,obs_norm,gt_deg):
+#         if len(candidates)<2: return candidates[0].new_zeros(())
+#         gt_b=gt_deg.permute(1,0,2)
+#         ades=[]
+#         for c in candidates:
+#             cb=norm_to_deg(c).permute(1,0,2)
+#             ades.append(haversine_km(cb,gt_b).mean(1))
+#         ades_t=torch.stack(ades,0); best=ades_t.argmin(0)
+#         tot=ades_t.new_zeros(())
+#         for i,c in enumerate(candidates):
+#             tot=tot+F.binary_cross_entropy_with_logits(
+#                 self.logits(c,obs_norm),(best==i).float())
+#         return tot/len(candidates)
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  [NEW] L_pos: direct position loss — the key to monotone decrease
+# # ══════════════════════════════════════════════════════════════
+
+# def l_position(pred_deg, gt_deg, step_weights, d=300., sample_w=None):
+#     """
+#     FIX-C: Direct position loss — haversine(pred_pos, gt_pos).
+
+#     Đây là thành phần QUAN TRỌNG NHẤT để ADE giảm đều.
+#     - Gradient trực tiếp: push pred_pos về phía gt_pos
+#     - Không qua intermediate velocity → không oscillate
+#     - step_weights: learned monotone (w_72h >= 3x w_6h)
+#     - sample_w: difficulty weights [1,2]
+
+#     d=300: rộng hơn v59's 200 → better gradient khi error lớn (>300km)
+#     Scale: huber(dist,300)/300 → ~0.1-1.0, same as L_fm
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 2: return pred_deg.new_zeros(())
+#     dist = haversine_km(pred_deg[:T], gt_deg[:T])          # [T,B] km
+#     w = step_weights[:T]                                    # [T] learned
+#     huber = torch.where(dist<d, dist.pow(2)/(2.*d), dist-d/2.)
+#     loss = (huber * w.unsqueeze(1)).mean() / d
+#     if sample_w is not None:
+#         # Apply difficulty weighting: hard storms get more gradient
+#         loss = (loss * sample_w.mean())  # simplified: scale by mean difficulty
+#     return loss
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  [NEW] L_disp: normalized displacement — ATE+CTE proxy
+# # ══════════════════════════════════════════════════════════════
+
+# def l_displacement(pred_deg, gt_deg):
+#     """
+#     FIX-B: Normalized displacement error, replaces l_logspd.
+
+#     ||Δpred - Δgt|| / ||Δgt||.clamp(10km)
+#     Δ[t] = traj[t+1] - traj[t] (displacement vector in km)
+
+#     Tại sao tốt hơn l_logspd:
+#     - l_logspd: MSE in log-space → asymmetric gradient → oscillation
+#     - l_disp:   ratio, symmetric → stable gradient → smooth decrease
+
+#     Tại sao covers ATE+CTE:
+#     - ATE lớn: |Δpred| ≠ |Δgt| (wrong speed/magnitude) → ratio > 1
+#     - CTE lớn: direction(Δpred) ≠ direction(Δgt)       → ratio > 1
+#     - Cả hai về 0 khi pred tốt → L_disp → 0
+
+#     Scale: ~0.1-1.5, independent of km magnitude.
+#     """
+#     T = min(pred_deg.shape[0], gt_deg.shape[0])
+#     if T < 3: return pred_deg.new_zeros(())
+#     cos_lat = torch.cos(torch.deg2rad(gt_deg[1:T,:,1])).clamp(1e-4)  # [T-1,B]
+#     def _disp_km(traj):
+#         dx=(traj[1:T,:,0]-traj[:T-1,:,0])*cos_lat*DEG2KM
+#         dy=(traj[1:T,:,1]-traj[:T-1,:,1])*DEG2KM
+#         return torch.stack([dx,dy],dim=-1)  # [T-1,B,2]
+#     dp=_disp_km(pred_deg); dg=_disp_km(gt_deg)
+#     err_km=(dp-dg).norm(dim=-1)           # [T-1,B]
+#     gt_mag=dg.norm(dim=-1).clamp(min=10.) # [T-1,B] min 10km
+#     ratio=err_km/gt_mag                   # dimensionless ~0-3
+#     return F.huber_loss(ratio, torch.zeros_like(ratio), delta=0.5)
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  SpeedHead (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# class SpeedHead(nn.Module):
+#     def __init__(self,ctx_dim=256,obs_feat_dim=256,pred_len=12):
+#         super().__init__()
+#         self.net=nn.Sequential(
+#             nn.Linear(ctx_dim+obs_feat_dim,256),nn.GELU(),nn.LayerNorm(256),
+#             nn.Linear(256,128),nn.GELU(),nn.Linear(128,pred_len))
+#         nn.init.xavier_uniform_(self.net[-1].weight,gain=0.1)
+#         nn.init.zeros_(self.net[-1].bias)
+#     def forward(self,ctx,obs_feat):
+#         return torch.exp(self.net(torch.cat([ctx,obs_feat],dim=-1))).clamp(3.,150.)
+
+# def l_speed_head(speed_pred, pred_deg, gt_deg, step_weights):
+#     """Speed head auxiliary loss — general speed quality."""
+#     T = min(speed_pred.shape[1]+1, gt_deg.shape[0])
+#     if T < 2: return speed_pred.new_zeros(())
+#     v_gt = velocity_km_s(gt_deg[:T])               # [T-1,B,2]
+#     spd_gt = v_gt.norm(dim=-1).clamp(3.).permute(1,0)  # [B,T-1]
+#     n = min(speed_pred.shape[1], spd_gt.shape[1])
+#     w = step_weights[:n]; w = w/w.sum()
+#     # MSE in log space but with GT reference — no asymmetry issue
+#     # since we're comparing pred to GT directly
+#     return F.mse_loss(torch.log1p(speed_pred[:,:n]),
+#                        torch.log1p(spd_gt[:,:n]), reduction='none').mean()
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  Master Loss (v74-fix)
+# # ══════════════════════════════════════════════════════════════
+
+# class FMv74Loss(nn.Module):
+#     """
+#     v74-fix loss: 3 general terms + auxiliary.
+
+#     Total = w_fm*L_fm + w_pos*L_pos(step_w) + w_disp*L_disp
+#           + 0.3*L_speed_head + 0.05*L_scorer + anchors
+
+#     L_fm:   velocity MSE (flow matching)
+#     L_pos:  haversine position loss (ADE proxy, DIRECT)
+#     L_disp: normalized displacement (ATE+CTE proxy, INDIRECT)
+#     """
+#     def __init__(self, pred_len=12):
+#         super().__init__()
+#         self.pred_len     = pred_len
+#         self.step_weights = LearnedStepWeights(n_steps=pred_len)
+#         self.loss_weights = ConstrainedLossWeights(
+#             init_fm=1.0, init_pos=2.0, init_disp=0.8, anchor_w=0.02)
+#         self.diff_weighter = DifficultyWeighter()
+#         self.scorer        = EnsembleScorer()
+#         self.speed_head_aux = None  # set externally
+
+#     def compute_main_losses(self, pred_deg, gt_deg,
+#                              fm_vel_pred, fm_vel_target,
+#                              epoch=0):
+#         T = min(pred_deg.shape[0], gt_deg.shape[0])
+#         sample_w = self.diff_weighter(gt_deg[:T])  # [B] ∈ [1,2]
+#         sw = self.step_weights.get(n=T)             # [T] monotone
+
+#         w_fm   = self.loss_weights.w_fm()
+#         w_pos  = self.loss_weights.w_pos()
+#         w_disp = self.loss_weights.w_disp()
+#         anc    = self.step_weights.stats()
+#         # Note: step_weights has no anchor loss here — it learns freely
+#         # but constrained by cumsum(softplus) monotonicity
+#         lw_anc = self.loss_weights.anchor_loss()
+
+#         # FIX-A applied at caller: x0=N(0,sigma), so fm_vel_pred/target are standard
+#         L_fm   = F.mse_loss(fm_vel_pred, fm_vel_target)
+
+#         # FIX-C: direct position loss (key to monotone decrease)
+#         L_pos  = l_position(pred_deg[:T], gt_deg[:T], sw, d=300., sample_w=sample_w)
+
+#         # FIX-B: normalized displacement (ATE+CTE proxy, no speed bias)
+#         L_disp = l_displacement(pred_deg[:T], gt_deg[:T])
+
+#         total = w_fm*L_fm + w_pos*L_pos + w_disp*L_disp + lw_anc
+
+#         if not torch.isfinite(total): total = pred_deg.new_zeros(())
+
+#         sw_s = self.step_weights.stats()
+#         lw_s = self.loss_weights.stats()
+#         bd = {
+#             "l_fm":    L_fm.item(),
+#             "l_pos":   L_pos.item(),
+#             "l_disp":  L_disp.item(),
+#             "diff_w_mean": sample_w.mean().item(),
+#             **{f"sw_{k}":v for k,v in sw_s.items()},
+#             **{f"lw_{k}":v for k,v in lw_s.items()},
+#         }
+#         return total, bd
+
+#     def forward(self, pred_deg, gt_deg, fm_vel_pred, fm_vel_target,
+#                  speed_pred=None, candidates=None, obs_norm=None, epoch=0):
+#         total, bd = self.compute_main_losses(
+#             pred_deg, gt_deg, fm_vel_pred, fm_vel_target, epoch=epoch)
+
+#         # Speed head auxiliary (small weight)
+#         l_sh = pred_deg.new_zeros(())
+#         if speed_pred is not None:
+#             T = min(pred_deg.shape[0], gt_deg.shape[0])
+#             sw = self.step_weights.get(n=T)
+#             l_sh = l_speed_head(speed_pred, pred_deg, gt_deg, sw)
+#             total = total + 0.3 * l_sh
+
+#         # Scorer auxiliary
+#         l_scr = pred_deg.new_zeros(())
+#         if candidates is not None and obs_norm is not None and len(candidates)>=2:
+#             l_scr = self.scorer.auxiliary_loss(candidates, obs_norm, gt_deg)
+#             total = total + 0.05 * l_scr
+
+#         bd.update({"l_sh":l_sh.item(),"l_scorer":l_scr.item(),"total":total})
+#         return total, bd
+
+#     @torch.no_grad()
+#     def stats(self):
+#         return {**self.step_weights.stats(), **self.loss_weights.stats()}
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  Safe env helpers (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# def _safe_env(env_data,key,B,device,norm=1.0):
+#     v=env_data.get(key) if env_data is not None else None
+#     if v is None or not torch.is_tensor(v): return torch.zeros(B,device=device)
+#     v=v.float().to(device)
+#     while v.dim()>1: v=v.mean(-1)
+#     v=v.view(-1)[:B] if v.numel()>=B else torch.zeros(B,device=device)
+#     return (v/norm).clamp(-3.,3.)
+
+# def _safe_env_vec(env_data,key,dim,B,device):
+#     v=env_data.get(key) if env_data is not None else None
+#     if v is None: return torch.zeros(B,dim,device=device)
+#     if not torch.is_tensor(v):
+#         try: v=torch.tensor(v,dtype=torch.float,device=device)
+#         except: return torch.zeros(B,dim,device=device)
+#     v=v.float().to(device)
+#     if v.dim()==0: return torch.zeros(B,dim,device=device)
+#     if v.dim()==1:
+#         return v.unsqueeze(0).expand(B,dim) if v.shape[0]==dim else torch.zeros(B,dim,device=device)
+#     if v.dim()==2:
+#         if v.shape==(B,dim): return v
+#         if v.shape[0]==B:
+#             return v[:,:dim] if v.shape[1]>=dim else F.pad(v,(0,dim-v.shape[1]))
+#         return torch.zeros(B,dim,device=device)
+#     if v.dim()==3:
+#         vv=v[:B,-1,:]
+#         return vv[:,:dim] if vv.shape[1]>=dim else F.pad(vv,(0,dim-vv.shape[1]))
+#     return torch.zeros(B,dim,device=device)
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  VelocityField (giữ nguyên v60 — toàn bộ architecture)
+# # ══════════════════════════════════════════════════════════════
+
+# class VelocityField(nn.Module):
+#     RAW_CTX_DIM = 512
+
+#     def __init__(self, pred_len=12, obs_len=8, ctx_dim=256,
+#                  sigma_min=0.02, unet_in_ch=13, **kwargs):
+#         super().__init__()
+#         self.pred_len=pred_len; self.obs_len=obs_len; self.ctx_dim=ctx_dim
+#         self.sigma_min=sigma_min
+
+#         self.spatial_enc=FNO3DEncoder(in_channel=unet_in_ch,out_channel=1,d_model=32,
+#             n_layers=4,modes_t=4,modes_h=4,modes_w=4,spatial_down=32,dropout=0.05)
+#         self.bottleneck_pool=nn.AdaptiveAvgPool3d((None,1,1))
+#         self.bottleneck_proj=nn.Linear(128,128)
+#         self.decoder_proj=nn.Linear(1,16)
+#         self.enc_1d=DataEncoder1D(in_1d=4,feat_3d_dim=128,mlp_h=64,
+#             lstm_hidden=128,lstm_layers=3,dropout=0.1,d_state=16)
+#         self.env_enc=Env_net(obs_len=obs_len,d_model=32)
+#         self.steering_enc=nn.Sequential(
+#             nn.Linear(9,64),nn.GELU(),nn.LayerNorm(64),
+#             nn.Linear(64,128),nn.GELU(),nn.Linear(128,256))
+#         self.env_kine_enc=nn.Sequential(
+#             nn.Linear(14,64),nn.GELU(),nn.LayerNorm(64),nn.Linear(64,256),nn.GELU())
+#         self.recurv_enc=nn.Sequential(
+#             nn.Linear(33,64),nn.GELU(),nn.LayerNorm(64),nn.Linear(64,64))
+#         self.speed_hist_enc=nn.Sequential(
+#             nn.Linear(11,32),nn.GELU(),nn.LayerNorm(32),nn.Linear(32,32))
+#         self.ctx_fc1=nn.Linear(128+32+16+64+32,self.RAW_CTX_DIM)
+#         self.ctx_ln=nn.LayerNorm(self.RAW_CTX_DIM)
+#         self.ctx_drop=nn.Dropout(0.20)
+#         self.ctx_fc2=nn.Linear(self.RAW_CTX_DIM,ctx_dim)
+#         self.null_embedding=nn.Parameter(torch.randn(1,self.RAW_CTX_DIM)*0.02)
+#         self.vel_obs_enc=nn.Sequential(
+#             nn.Linear(obs_len*6,256),nn.GELU(),nn.LayerNorm(256),
+#             nn.Linear(256,256),nn.GELU())
+#         self.blend_head=nn.Linear(ctx_dim,1)
+#         self.guidance_head=nn.Linear(ctx_dim,1)
+#         self.sigma_head=nn.Linear(ctx_dim,1)
+#         nn.init.zeros_(self.blend_head.weight); nn.init.constant_(self.blend_head.bias,-1.)
+#         nn.init.zeros_(self.guidance_head.weight); nn.init.constant_(self.guidance_head.bias,0.)
+#         nn.init.zeros_(self.sigma_head.weight); nn.init.constant_(self.sigma_head.bias,-1.)
+#         self.time_fc1=nn.Linear(256,512); self.time_fc2=nn.Linear(512,256)
+#         self.traj_embed=nn.Linear(4,256)
+#         self.pos_enc=nn.Parameter(torch.randn(1,pred_len,256)*0.02)
+#         self.step_embed=nn.Embedding(pred_len,256)
+#         self.transformer=nn.TransformerDecoder(
+#             nn.TransformerDecoderLayer(d_model=256,nhead=8,dim_feedforward=1024,
+#                 dropout=0.12,activation='gelu',batch_first=True),num_layers=2)
+#         self.out_fc1=nn.Linear(256,512); self.out_fc2=nn.Linear(512,4)
+#         self.step_scale=nn.Parameter(torch.ones(pred_len)*0.5)
+#         self.physics_scale=nn.Parameter(torch.ones(4)*1.5)
+#         self.steering_scale=nn.Parameter(torch.ones(4)*1.0)
+#         self.speed_head=SpeedHead(ctx_dim=ctx_dim,obs_feat_dim=256,pred_len=pred_len)
+#         self._init_weights()
+
+#     def _init_weights(self):
+#         with torch.no_grad():
+#             for n,m in self.named_modules():
+#                 if isinstance(m,nn.Linear) and 'out_fc' in n:
+#                     nn.init.xavier_uniform_(m.weight,gain=0.1)
+#                     if m.bias is not None: nn.init.zeros_(m.bias)
+
+#     def _time_emb(self,t,dim=256):
+#         h=dim//2
+#         fr=torch.exp(torch.arange(h,dtype=torch.float,device=t.device)*(-math.log(10000.)/max(h-1,1)))
+#         em=t.float().unsqueeze(1)*1000.*fr.unsqueeze(0)
+#         return F.pad(torch.cat([em.sin(),em.cos()],dim=-1),(0,dim%2))
+
+#     def _get_steering_feat(self,env_data,B,device):
+#         if env_data is None: return torch.zeros(B,256,device=device)
+#         feats=torch.stack([_safe_env(env_data,'u500_mean',B,device,30.),
+#             _safe_env(env_data,'v500_mean',B,device,30.),
+#             _safe_env(env_data,'u500_center',B,device,30.),
+#             _safe_env(env_data,'v500_center',B,device,30.),
+#             _safe_env(env_data,'steering_speed',B,device,1.),
+#             _safe_env(env_data,'steering_dir_sin',B,device,1.),
+#             _safe_env(env_data,'steering_dir_cos',B,device,1.),
+#             _safe_env(env_data,'gph500_mean',B,device,1.),
+#             _safe_env(env_data,'gph500_center',B,device,1.)],dim=-1)
+#         return self.steering_enc(feats)
+
+#     def _get_env_kine_feat(self,env_data,B,device):
+#         if env_data is None: return torch.zeros(B,256,device=device)
+#         mv=_safe_env(env_data,'move_velocity',B,device,150.).unsqueeze(-1)
+#         hd24=_safe_env_vec(env_data,'history_direction24',8,B,device)
+#         dv=_safe_env_vec(env_data,'delta_velocity',5,B,device)
+#         return self.env_kine_enc(torch.cat([mv,hd24,dv],dim=-1))
+
+#     def _get_recurv_feat(self,env_data,B,device):
+#         if env_data is None: return torch.zeros(B,64,device=device)
+#         bearing=_safe_env_vec(env_data,'bearing_to_scs_center',16,B,device)
+#         dist=_safe_env_vec(env_data,'dist_to_scs_boundary',5,B,device)
+#         month=_safe_env_vec(env_data,'month',12,B,device)
+#         return self.recurv_enc(torch.cat([bearing,dist,month],dim=-1))
+
+#     def _get_speed_hist_feat(self,env_data,B,device):
+#         if env_data is None: return torch.zeros(B,32,device=device)
+#         vh=_safe_env_vec(env_data,'velocity_history',4,B,device)
+#         ri=_safe_env(env_data,'rapid_intensification',B,device,1.).unsqueeze(-1)
+#         ic=_safe_env_vec(env_data,'intensity_class',6,B,device)
+#         return self.speed_hist_enc(torch.cat([vh,ri,ic],dim=-1))
+
+#     def _get_kinematic_obs_feat(self,obs_traj):
+#         B=obs_traj.shape[1]; T_obs=obs_traj.shape[0]
+#         if T_obs>=2:
+#             vel=obs_traj[1:]-obs_traj[:-1]
+#             lat_mid=obs_traj[:-1,:,1]*_NORM_TO_DEG
+#             cos_lat=torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+#             dx_km=vel[:,:,0]*cos_lat*DEG2KM*_NORM_TO_DEG
+#             dy_km=vel[:,:,1]*DEG2KM*_NORM_TO_DEG
+#             speed=torch.sqrt(dx_km**2+dy_km**2+1e-6)/DT_HOURS
+#             heading=torch.atan2(vel[:,:,1],vel[:,:,0])
+#             speed_n=(speed/20.).clamp(-3.,3.)
+#             if T_obs>=3:
+#                 dspd=speed[1:]-speed[:-1]
+#                 accel=torch.cat([obs_traj.new_zeros(1,B),(dspd/10.).clamp(-3.,3.)],0)
+#             else: accel=obs_traj.new_zeros(T_obs-1,B)
+#             kine=torch.stack([vel[:,:,0],vel[:,:,1],speed_n,heading.sin(),heading.cos(),accel],dim=-1)
+#         else: kine=obs_traj.new_zeros(self.obs_len,B,6)
+#         if kine.shape[0]<self.obs_len:
+#             kine=torch.cat([obs_traj.new_zeros(self.obs_len-kine.shape[0],B,6),kine],0)
+#         else: kine=kine[-self.obs_len:]
+#         return self.vel_obs_enc(kine.permute(1,0,2).reshape(B,-1))
+
+#     def _context(self,batch_list):
+#         obs_traj=batch_list[0]; obs_Me=batch_list[7]; image_obs=batch_list[11]
+#         env_data=batch_list[13] if len(batch_list)>13 else None
+#         B=obs_traj.shape[1]; device=obs_traj.device
+#         if image_obs.dim()==4: image_obs=image_obs.unsqueeze(2)
+#         if image_obs.shape[1]==1 and self.spatial_enc.in_channel!=1:
+#             image_obs=image_obs.expand(-1,self.spatial_enc.in_channel,-1,-1,-1)
+#         e_3d_bot,e_3d_dec=self.spatial_enc.encode(image_obs)
+#         T_obs=obs_traj.shape[0]
+#         e_3d_s=self.bottleneck_pool(e_3d_bot).squeeze(-1).squeeze(-1).permute(0,2,1)
+#         e_3d_s=self.bottleneck_proj(e_3d_s)
+#         if e_3d_s.shape[1]!=T_obs:
+#             e_3d_s=F.interpolate(e_3d_s.permute(0,2,1),size=T_obs,mode='linear',align_corners=False).permute(0,2,1)
+#         e_3d_dec_t=e_3d_dec.squeeze(1).squeeze(-1).squeeze(-1)
+#         t_w=torch.softmax(torch.arange(e_3d_dec_t.shape[1],dtype=torch.float,device=device)*0.5,dim=0)
+#         f_sp=self.decoder_proj((e_3d_dec_t*t_w.unsqueeze(0)).sum(1,keepdim=True))
+#         obs_in=torch.cat([obs_traj,obs_Me],dim=2).permute(1,0,2)
+#         h_t=self.enc_1d(obs_in,e_3d_s)
+#         e_env,_,_=self.env_enc(env_data,image_obs)
+#         recurv_feat=self._get_recurv_feat(env_data,B,device)
+#         speed_h_feat=self._get_speed_hist_feat(env_data,B,device)
+#         cat_feat=torch.cat([h_t,e_env,f_sp,recurv_feat,speed_h_feat],dim=-1)
+#         return F.gelu(self.ctx_ln(self.ctx_fc1(cat_feat)))
+
+#     def _apply_ctx_head(self,raw,noise_scale=0.,use_null=False):
+#         if use_null: raw=self.null_embedding.expand(raw.shape[0],-1)
+#         elif noise_scale>0.: raw=raw+torch.randn_like(raw)*noise_scale
+#         return self.ctx_fc2(self.ctx_drop(raw))
+
+#     def get_blend_alpha(self,ctx): return torch.sigmoid(self.blend_head(ctx)).squeeze(-1)*0.5
+#     def get_guidance_scale(self,ctx): return 0.8+1.2*torch.sigmoid(self.guidance_head(ctx)).squeeze(-1)
+#     def get_sigma(self,ctx): return 0.02+0.08*torch.sigmoid(self.sigma_head(ctx)).squeeze(-1)
+
+#     def _beta_drift(self,x_t):
+#         lat_rad=torch.deg2rad(x_t[:,:,1]*5.).clamp(-85,85)
+#         beta=2*7.2921e-5*torch.cos(lat_rad)/6.371e6; R=3e5
+#         v=torch.zeros_like(x_t)
+#         v[:,:,0]=-beta*R**2/2.*6*3600./(5*111*1000.)
+#         v[:,:,1]=beta*R**2/4.*6*3600./(5*111*1000.)
+#         return v
+
+#     def _steering_drift(self,x_t,env_data):
+#         if env_data is None: return torch.zeros_like(x_t)
+#         B,device=x_t.shape[0],x_t.device
+#         u=_safe_env(env_data,'u500_center',B,device,30.)
+#         vv=_safe_env(env_data,'v500_center',B,device,30.)
+#         cos=torch.cos(torch.deg2rad(x_t[:,:,1]*5.)).clamp(1e-3)
+#         out=torch.zeros_like(x_t)
+#         out[:,:,0]=u.unsqueeze(1)*30.*21600./(111.*1000.*cos)
+#         out[:,:,1]=vv.unsqueeze(1)*30.*21600./(111.*1000.)
+#         return out
+
+#     def _decode(self,x_t,t,ctx,vel_obs_feat=None,steering_feat=None,
+#                  env_kine_feat=None,env_data=None):
+#         B=x_t.shape[0]
+#         t_emb=F.gelu(self.time_fc1(self._time_emb(t))); t_emb=self.time_fc2(t_emb)
+#         T=min(x_t.size(1),self.pos_enc.shape[1])
+#         si=torch.arange(T,device=x_t.device).unsqueeze(0).expand(B,-1)
+#         xe=(self.traj_embed(x_t[:,:T])+self.pos_enc[:,:T]+t_emb.unsqueeze(1)+self.step_embed(si))
+#         mem=[t_emb.unsqueeze(1),ctx.unsqueeze(1)]
+#         if vel_obs_feat is not None: mem.append(vel_obs_feat.unsqueeze(1))
+#         if steering_feat is not None: mem.append(steering_feat.unsqueeze(1))
+#         if env_kine_feat is not None: mem.append(env_kine_feat.unsqueeze(1))
+#         dec=self.transformer(xe,torch.cat(mem,dim=1))
+#         vn=self.out_fc2(F.gelu(self.out_fc1(dec)))
+#         sc=torch.sigmoid(self.step_scale[:T]).view(1,T,1)*2.; vn=vn*sc
+#         with torch.no_grad():
+#             vp=self._beta_drift(x_t[:,:T]); vs=self._steering_drift(x_t[:,:T],env_data)
+#         return vn+torch.sigmoid(self.physics_scale)*vp+torch.sigmoid(self.steering_scale)*vs
+
+#     def forward_with_ctx(self,x_t,t,raw_ctx,noise_scale=0.,vel_obs_feat=None,
+#                           steering_feat=None,env_kine_feat=None,env_data=None,use_null=False):
+#         ctx=self._apply_ctx_head(raw_ctx,noise_scale,use_null=use_null)
+#         return self._decode(x_t,t,ctx,vel_obs_feat=vel_obs_feat,
+#                             steering_feat=steering_feat,env_kine_feat=env_kine_feat,env_data=env_data)
+
+#     def predict_speed(self,raw_ctx,vel_obs_feat):
+#         return self.speed_head(self._apply_ctx_head(raw_ctx),vel_obs_feat)
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  EMA, OT (giữ nguyên v60)
+# # ══════════════════════════════════════════════════════════════
+
+# class EMAModel:
+#     def __init__(self,model,decay=0.995):
+#         self.decay=decay; m=model._orig_mod if hasattr(model,'_orig_mod') else model
+#         self.shadow={k:v.detach().clone() for k,v in m.state_dict().items() if v.dtype.is_floating_point}
+#     def update(self,model):
+#         m=model._orig_mod if hasattr(model,'_orig_mod') else model
+#         with torch.no_grad():
+#             for k,v in m.state_dict().items():
+#                 if k in self.shadow: self.shadow[k].mul_(self.decay).add_(v.detach(),alpha=1-self.decay)
+#     def apply_to(self,model):
+#         m=model._orig_mod if hasattr(model,'_orig_mod') else model
+#         bk,sd={},m.state_dict()
+#         for k in self.shadow:
+#             if k not in sd: continue
+#             bk[k]=sd[k].detach().clone(); sd[k].copy_(self.shadow[k])
+#         return bk
+#     def restore(self,model,bk):
+#         m=model._orig_mod if hasattr(model,'_orig_mod') else model; sd=m.state_dict()
+#         for k,v in bk.items():
+#             if k in sd: sd[k].copy_(v)
+
+
+# def _sinkhorn_log(cost,epsilon=0.05,n_iter=50):
+#     B=cost.shape[0]; device=cost.device
+#     la=-math.log(B)*torch.ones(B,device=device); lb=la.clone()
+#     lK=-cost/epsilon; lu=torch.zeros(B,device=device); lv=lu.clone()
+#     for _ in range(n_iter):
+#         lu=la-torch.logsumexp(lK+lv.unsqueeze(0),dim=1)
+#         lv=lb-torch.logsumexp(lK+lu.unsqueeze(1),dim=0)
+#     return (lK+lu.unsqueeze(1)+lv.unsqueeze(0)).exp().clamp(0.)
+
+# def _spherical_ot_matching(x0_batch,x1_batch,lp,epsilon=0.05):
+#     try:
+#         B=x0_batch.shape[0]
+#         abs0=lp.unsqueeze(1)[:,:,:2]+x0_batch[:,:,:2]; abs1=lp.unsqueeze(1)[:,:,:2]+x1_batch[:,:,:2]
+#         abs0_deg=norm_to_deg(abs0); abs1_deg=norm_to_deg(abs1)
+#         cost=haversine_km(
+#             abs0_deg.unsqueeze(1).expand(B,B,-1,-1).reshape(B*B,-1,2),
+#             abs1_deg.unsqueeze(0).expand(B,B,-1,-1).reshape(B*B,-1,2)
+#         ).mean(-1).reshape(B,B)/500.
+#         pi=_sinkhorn_log(cost,epsilon=epsilon)
+#         flat=pi.reshape(-1).clamp(0.); s=flat.sum()
+#         if not torch.isfinite(s) or s<1e-10: return x0_batch,x1_batch
+#         idx=torch.multinomial(flat/s,num_samples=B,replacement=True)
+#         return x0_batch[idx%B],x1_batch[idx%B]
+#     except: return x0_batch,x1_batch
+
+
+# def compute_speed_stats_from_norm(obs_traj_norm):
+#     T_obs=obs_traj_norm.shape[0]
+#     if T_obs<2: return {'v_opt':15.,'v_sigma':10.,'v_hard_cap':80.,'p50_kmh':15.}
+#     lon=(obs_traj_norm[...,0]*50.+1800.)/10.; lat=(obs_traj_norm[...,1]*50.)/10.
+#     lat_mid=(lat[:-1]+lat[1:])/2; cos_lat=torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
+#     dx=(lon[1:]-lon[:-1])*cos_lat*DEG2KM; dy=(lat[1:]-lat[:-1])*DEG2KM
+#     spd=torch.sqrt(dx**2+dy**2)/DT_HOURS
+#     p50=float(spd.flatten().median()); p95=float(torch.quantile(spd.flatten(),.95))
+#     return {'v_opt':max(p50,5.),'v_sigma':10.,
+#             'v_hard_cap':float(torch.tensor(p95*1.8).clamp(25.,130.)),'p50_kmh':p50}
+
+
+# @torch.no_grad()
+# def _persistence_blend_adaptive(model_pred_norm,obs_traj_norm,blend_alpha):
+#     T_obs=obs_traj_norm.shape[0]; T=model_pred_norm.shape[0]
+#     B=model_pred_norm.shape[1]; device=model_pred_norm.device
+#     if T_obs<2: return model_pred_norm
+#     vels=obs_traj_norm[1:]-obs_traj_norm[:-1]; n_v=vels.shape[0]
+#     if n_v>=3:
+#         alpha=0.7; w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],dtype=torch.float,device=device).flip(0)
+#         ev=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
+#     elif n_v==2: ev=0.7*vels[-1]+0.3*vels[-2]
+#     else: ev=vels[-1]
+#     steps=torch.arange(1,T+1,dtype=torch.float,device=device)
+#     persist=obs_traj_norm[-1].unsqueeze(0)+ev.unsqueeze(0)*steps.view(T,1,1)
+#     alpha_b=blend_alpha.view(1,B,1).clamp(0.,.5)
+#     return (1.-alpha_b)*model_pred_norm+alpha_b*persist
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  [NEW] K=3 mode clustering inference
+# # ══════════════════════════════════════════════════════════════
+
+# @torch.no_grad()
+# def _mode_cluster_k3(trajs_norm, obs_norm, scorer, speed_stats=None):
+#     """
+#     K=3 mode clustering tại 72h endpoint.
+#     Thay top-35% median → CTE thấp hơn tự nhiên.
+
+#     trajs_norm: list of [T,B,2] seq-first normalized
+#     obs_norm:   [T_obs,B,2] seq-first
+#     scorer:     EnsembleScorer
+#     returns:    [T,B,2] seq-first normalized
+#     """
+#     if not trajs_norm: return obs_norm[-1:].expand(12,obs_norm.shape[1],2)
+#     dev=trajs_norm[0].device; T,B=trajs_norm[0].shape[0],trajs_norm[0].shape[1]; N=len(trajs_norm); K=min(3,N)
+
+#     # Scores [N,B]
+#     all_sc=torch.stack([scorer.score(tr,obs_norm) for tr in trajs_norm],dim=0)
+#     # 72h endpoints in degrees [N,B,2]
+#     endpoints=torch.stack([norm_to_deg(tr[-1]) for tr in trajs_norm],dim=0)
+
+#     results=[]
+#     for b in range(B):
+#         ep_b=endpoints[:,b,:]; sc_b=all_sc[:,b]
+#         tr_b=torch.stack([tr[:,b,:] for tr in trajs_norm],dim=0)  # [N,T,2]
+#         if N<K:
+#             w=F.softmax(sc_b*3.,0); results.append((tr_b*w.view(N,1,1)).sum(0)); continue
+#         # Farthest-point init
+#         idx0=sc_b.argmax().item(); centers=[ep_b[idx0]]
+#         for _ in range(K-1):
+#             d2c=torch.stack([haversine_km(ep_b,c.unsqueeze(0).expand_as(ep_b)) for c in centers],1).min(1).values
+#             centers.append(ep_b[d2c.argmax()])
+#         centers=torch.stack(centers,0)
+#         # 3 K-means iterations
+#         for _ in range(3):
+#             d2c=torch.stack([haversine_km(ep_b,c.unsqueeze(0).expand_as(ep_b)) for c in centers],1)
+#             assign=d2c.argmin(1)
+#             new_c=[]
+#             for k in range(K):
+#                 mk=(assign==k)
+#                 if mk.sum()>0:
+#                     wk=F.softmax(sc_b[mk]*3.,0)
+#                     new_c.append((ep_b[mk]*wk.unsqueeze(1)).sum(0))
+#                 else: new_c.append(centers[k])
+#             centers=torch.stack(new_c,0)
+#         # Score clusters
+#         d2c=torch.stack([haversine_km(ep_b,c.unsqueeze(0).expand_as(ep_b)) for c in centers],1)
+#         assign=d2c.argmin(1)
+#         csc=torch.zeros(K,device=dev)
+#         for k in range(K):
+#             mk=(assign==k)
+#             if mk.sum()>0: csc[k]=sc_b[mk].sum()
+#         best_k=csc.argmax().item(); mk=(assign==best_k)
+#         if not mk.any(): mk=torch.ones(N,dtype=torch.bool,device=dev)
+#         w_win=F.softmax(sc_b[mk]*3.,0)
+#         results.append((tr_b[mk]*w_win.view(-1,1,1)).sum(0))
+#     return torch.stack(results,dim=1)  # [T,B,2]
+
+
+# # ══════════════════════════════════════════════════════════════
+# #  TCFlowMatching v74-fix
+# # ══════════════════════════════════════════════════════════════
+
+# class TCFlowMatching(nn.Module):
+
+#     def __init__(self, pred_len=12, obs_len=8, sigma_min=0.02, unet_in_ch=13,
+#                  ctx_noise_scale=0.01, use_ema=True, ema_decay=0.995,
+#                  use_ate_ot=True, ot_epsilon=0.05, cfg_uncond_prob=0.1, **kwargs):
+#         super().__init__()
+#         self.pred_len=pred_len; self.obs_len=obs_len; self.sigma_min=sigma_min
+#         self.ctx_noise_scale=ctx_noise_scale; self.use_ate_ot=use_ate_ot
+#         self.ot_epsilon=ot_epsilon; self.cfg_uncond_prob=cfg_uncond_prob
+#         self.net=VelocityField(pred_len=pred_len,obs_len=obs_len,
+#                                 sigma_min=sigma_min,unet_in_ch=unet_in_ch,ctx_dim=256)
+#         self.criterion=FMv74Loss(pred_len=pred_len)
+#         self.use_ema=use_ema; self._ema=None
+
+#     def init_ema(self):
+#         if self.use_ema: self._ema=EMAModel(self,decay=0.995)
+#     def ema_update(self):
+#         if self._ema is not None: self._ema.update(self)
+
+#     @staticmethod
+#     def _to_rel(traj,Me,lp,lm):
+#         return torch.cat([traj-lp[:,:2].unsqueeze(0),Me-lm.unsqueeze(0)],dim=-1).permute(1,0,2)
+
+#     @staticmethod
+#     def _to_abs(rel,lp,lm):
+#         d=rel.permute(1,0,2)
+#         return lp[:,:2].unsqueeze(0)+d[:,:,:2], lm.unsqueeze(0)+d[:,:,2:]
+
+#     @staticmethod
+#     def _sigma_schedule(ep):
+#         if ep<2: return 0.10
+#         if ep<10: return 0.10-(ep-2)/8.*(0.10-0.04)
+#         if ep<20: return max(0.04-(ep-10)/10.*0.01,0.035)
+#         return 0.035
+
+#     def _cfm_standard(self,x1,sigma_min=None):
+#         """FIX-A: standard FM x0=N(0,sigma), NOT persist+noise."""
+#         if sigma_min is None: sigma_min=self.sigma_min
+#         B=x1.shape[0]; dev=x1.device
+#         x0=torch.randn_like(x1)*sigma_min
+#         t=torch.rand(B,device=dev); te=t.view(B,1,1)
+#         return (1.-te)*x0+te*x1, t, x1-x0
+
+#     def _persistence_forecast_rel(self,obs_traj,lp,lm,pred_len):
+#         B,device=obs_traj.shape[1],obs_traj.device
+#         obs_pos=obs_traj[:,:,:2]
+#         if obs_pos.shape[0]>=3:
+#             vels=obs_pos[1:]-obs_pos[:-1]; n_v=vels.shape[0]; alpha=0.7
+#             w=torch.tensor([alpha*(1-alpha)**i for i in range(n_v)],dtype=torch.float,device=device).flip(0)
+#             lv=(vels*(w/w.sum()).view(-1,1,1)).sum(0)
+#         elif obs_pos.shape[0]>=2: lv=obs_pos[-1]-obs_pos[-2]
+#         else: lv=obs_traj.new_zeros(B,2)
+#         steps=torch.arange(1,pred_len+1,device=device).float()
+#         pred_abs=obs_pos[-1].unsqueeze(1)+lv.unsqueeze(1)*steps.view(1,-1,1)
+#         pred_rel=torch.cat([pred_abs-lp[:,:2].unsqueeze(1),torch.zeros_like(pred_abs)],dim=-1)
+#         return pred_rel
+
+#     def _compute_obs_momentum(self,obs_norm):
+#         T_obs=obs_norm.shape[0]
+#         if T_obs<2: return torch.zeros(obs_norm.shape[1],2,device=obs_norm.device)
+#         vels=obs_norm[1:]-obs_norm[:-1]; n_v=vels.shape[0]
+#         if n_v>=3:
+#             a=0.65; w=torch.tensor([a*(1-a)**i for i in range(n_v)],dtype=torch.float,device=obs_norm.device).flip(0)
+#             return (vels*(w/w.sum()).view(-1,1,1)).sum(0)
+#         elif n_v==2: return 0.65*vels[-1]+0.35*vels[-2]
+#         return vels[-1]
+
+#     @staticmethod
+#     @staticmethod
+#     def _obs_noise_aug(bl,sigma=0.005):
+#         if torch.rand(1).item()>0.5: return bl
+#         bl=list(bl)
+#         if torch.is_tensor(bl[0]): bl[0]=bl[0]+torch.randn_like(bl[0])*sigma
+#         return bl
+
+#     @staticmethod
+#     def _lon_flip_aug(bl, p=0.35):
+#         """
+#         Flip longitude: lon_norm → -lon_norm.
+#         Mô phỏng bão ở phía đối xứng → model học invariant với hướng E/W.
+#         Giảm val-test gap vì test set có nhiều bão hướng khác nhau hơn.
+#         """
+#         if torch.rand(1).item() > p: return bl
+#         bl = list(bl)
+#         for i in [0, 1, 2, 3, 7, 8]:
+#             if i < len(bl) and torch.is_tensor(bl[i]) and bl[i].shape[-1] >= 1:
+#                 t = bl[i].clone(); t[..., 0] = -t[..., 0]; bl[i] = t
+#         return bl
+
+#     @staticmethod
+#     def _speed_scale_aug(bl, scale_range=(0.88, 1.14), p=0.40):
+#         """
+#         Scale obs velocity by random factor 0.88-1.14x.
+#         Mô phỏng bão nhanh/chậm hơn → generalize đến recent storms (2017-2021).
+#         Giúp giảm val-test gap vì test storms thường nhanh hơn train distribution.
+#         """
+#         if torch.rand(1).item() > p: return bl
+#         bl = list(bl)
+#         scale = torch.empty(1).uniform_(*scale_range).item()
+#         if torch.is_tensor(bl[0]) and bl[0].shape[0] >= 2:
+#             obs = bl[0].clone()
+#             displ = obs[1:] - obs[:-1]
+#             new_obs = obs.clone()
+#             for t in range(1, obs.shape[0]):
+#                 new_obs[t] = new_obs[t-1] + displ[t-1] * scale
+#             bl[0] = new_obs
+#         return bl
+
+#     # ── Training ──────────────────────────────────────────────
+
+#     def get_loss(self,batch_list,epoch=0,**kwargs):
+#         return self.get_loss_breakdown(batch_list,epoch=epoch)['total']
+
+#     def get_loss_breakdown(self,batch_list,epoch=0):
+#         batch_list=self._obs_noise_aug(batch_list,sigma=0.005)
+#         batch_list=self._lon_flip_aug(batch_list, p=0.35)
+#         batch_list=self._speed_scale_aug(batch_list, p=0.40)
+#         obs_t=batch_list[0]; env_data=batch_list[13] if len(batch_list)>13 else None
+#         lp=obs_t[-1]; lm=batch_list[7][-1]; B,device=lp.shape[0],lp.device
+#         gt_traj_s=batch_list[1]
+
+#         current_sigma=self._sigma_schedule(epoch)
+#         raw_ctx=self.net._context(batch_list)
+#         x1_rel=self._to_rel(gt_traj_s,batch_list[8],lp,lm)
+
+#         # FIX-A: standard x0=N(0,sigma), NOT persist+noise
+#         if self.use_ate_ot and B>=4:
+#             x0_noise=torch.randn_like(x1_rel)*current_sigma
+#             _,x1_matched=_spherical_ot_matching(x0_noise,x1_rel,lp,epsilon=self.ot_epsilon)
+#         else:
+#             x1_matched=x1_rel
+#         x_t,fm_t,u_target=self._cfm_standard(x1_matched,sigma_min=current_sigma)
+
+#         use_null=(torch.rand(1).item()<self.cfg_uncond_prob)
+#         vel_obs_feat=self.net._get_kinematic_obs_feat(obs_t[:,:,:2])
+#         steering_feat=self.net._get_steering_feat(env_data,B,device)
+#         env_kine_feat=self.net._get_env_kine_feat(env_data,B,device)
+
+#         pred_vel=self.net.forward_with_ctx(x_t,fm_t,raw_ctx,env_data=env_data,use_null=use_null,
+#             vel_obs_feat=vel_obs_feat,steering_feat=steering_feat,env_kine_feat=env_kine_feat)
+
+#         fm_te=fm_t.view(B,1,1)
+#         x1_pred=x_t+(1.-fm_te)*pred_vel
+#         pred_abs,_=self._to_abs(x1_pred,lp,lm)
+#         pred_deg=norm_to_deg(pred_abs)    # [T,B,2]
+#         gt_deg=norm_to_deg(gt_traj_s)    # [T,B,2]
+
+#         # Speed head prediction for auxiliary loss
+#         speed_pred=None
+#         if not use_null:
+#             speed_pred=self.net.predict_speed(raw_ctx,vel_obs_feat)
+
+#         # Scorer candidates
+#         candidates=None; obs_norm=obs_t[:,:,:2]
+#         if epoch>=5 and not use_null:
+#             cands=[]
+#             for _ in range(3):
+#                 te_c=fm_t.view(B,1,1)
+#                 x0_c=torch.randn_like(x1_rel)*current_sigma
+#                 x_c=(1.-te_c)*x0_c+te_c*x1_rel
+#                 with torch.no_grad():
+#                     v_c=self.net.forward_with_ctx(x_c,fm_t,raw_ctx,env_data=env_data,
+#                         vel_obs_feat=vel_obs_feat,steering_feat=steering_feat,env_kine_feat=env_kine_feat)
+#                     x1_c=x_c+(1.-te_c)*v_c; abs_c,_=self._to_abs(x1_c,lp,lm)
+#                     cands.append(abs_c[:,:,:2])
+#             candidates=cands
+
+#         total,bd=self.criterion(pred_deg,gt_deg,pred_vel,u_target,
+#                                   speed_pred=speed_pred,candidates=candidates,
+#                                   obs_norm=obs_norm,epoch=epoch)
+
+#         if torch.isnan(total) or torch.isinf(total): total=obs_t.new_zeros(())
+
+#         bd.update({'sigma':current_sigma,
+#                    'v_opt':compute_speed_stats_from_norm(obs_t[:,:,:2]).get('v_opt',15.),
+#                    'total':total,
+#                    # legacy keys
+#                    'l_fm':bd.get('l_fm',0.),'l_kin':0.,'l_logspd':0.,
+#                    'l_curv':0.,'diff_w_mean':bd.get('diff_w_mean',1.),
+#                    'lam_kin':0.,'lam_logspd':0.,'lam_curv':0.})
+#         return bd
+
+#     # ── Inference ─────────────────────────────────────────────
+
+#     @torch.no_grad()
+#     def sample(self,batch_list,num_ensemble=50,ddim_steps=20,predict_csv=None,use_tta=True):
+#         obs_t=batch_list[0]; env_data=batch_list[13] if len(batch_list)>13 else None
+#         lp=obs_t[-1]; lm=batch_list[7][-1]; B=lp.shape[0]; device=lp.device
+#         T=self.pred_len; dt=1./max(ddim_steps,1)
+
+#         def _run_ensemble(bl, n_ens):
+#             """Run n_ens ensemble members on a batch_list."""
+#             _obs_t=bl[0]; _env=bl[13] if len(bl)>13 else None
+#             _lp=_obs_t[-1]; _lm=bl[7][-1]
+#             _raw_ctx=self.net._context(bl)
+#             _ctx=self.net._apply_ctx_head(_raw_ctx)
+#             _vel_f=self.net._get_kinematic_obs_feat(_obs_t[:,:,:2])
+#             _steer_f=self.net._get_steering_feat(_env,B,device)
+#             _env_f=self.net._get_env_kine_feat(_env,B,device)
+#             _obs_n=_obs_t[:,:,:2]; _obs_m=self._compute_obs_momentum(_obs_n)
+#             _blend=self.net.get_blend_alpha(_ctx)
+#             _gs=self.net.get_guidance_scale(_ctx)
+
+#             def _ms(s,tot): return 0.06*0.5*(1.+math.cos(math.pi*s/max(tot,1)))
+#             trajs=[]
+#             for _ in range(n_ens):
+#                 x_t=torch.randn(B,T,4,device=device)*self.sigma_min
+#                 for step in range(ddim_steps):
+#                     t_b=torch.full((B,),step*dt,device=device)
+#                     ns=self.ctx_noise_scale*2. if step<3 else 0.
+#                     if step>0:
+#                         vc=self.net.forward_with_ctx(x_t,t_b,_raw_ctx,noise_scale=ns,
+#                             vel_obs_feat=_vel_f,steering_feat=_steer_f,
+#                             env_kine_feat=_env_f,env_data=_env,use_null=False)
+#                         vu=self.net.forward_with_ctx(x_t,t_b,_raw_ctx,noise_scale=0.,
+#                             vel_obs_feat=_vel_f,steering_feat=_steer_f,
+#                             env_kine_feat=_env_f,env_data=_env,use_null=True)
+#                         vel=vu+_gs.view(B,1,1)*(vc-vu)
+#                     else:
+#                         vel=self.net.forward_with_ctx(x_t,t_b,_raw_ctx,noise_scale=ns,
+#                             vel_obs_feat=_vel_f,steering_feat=_steer_f,
+#                             env_kine_feat=_env_f,env_data=_env)
+#                     ms=_ms(step,ddim_steps)
+#                     if ms>1e-4:
+#                         me=_obs_m.unsqueeze(1).expand(B,T,2)
+#                         vel=vel+ms*torch.cat([me,torch.zeros(B,T,2,device=device)],dim=-1)
+#                     x_t=(x_t+dt*vel).clamp(-3.,3.)
+#                 pa,_=self._to_abs(x_t,_lp,_lm); trajs.append(pa)
+#             pred_m=_mode_cluster_k3(trajs,_obs_n,self.criterion.scorer)
+#             pred_f=_persistence_blend_adaptive(pred_m,_obs_n,_blend)
+#             return pred_f, trajs
+
+#         # Normal inference
+#         n_ens_each = num_ensemble if not use_tta else max(num_ensemble//2, 20)
+#         pred_normal, all_norms = _run_ensemble(batch_list, n_ens_each)
+
+#         if use_tta:
+#             # TTA: flip longitude, predict, unflip, average
+#             # Giảm systematic directional bias → test gap thấp hơn
+#             bl_flip = list(batch_list)
+#             for i in [0,1,2,3,7,8]:
+#                 if i<len(bl_flip) and torch.is_tensor(bl_flip[i]):
+#                     t=bl_flip[i].clone(); t[...,0]=-t[...,0]; bl_flip[i]=t
+#             pred_flip, _ = _run_ensemble(bl_flip, n_ens_each)
+#             # Unflip
+#             pred_unflip = pred_flip.clone()
+#             pred_unflip[...,0] = -pred_unflip[...,0]
+#             # Average (equal weight)
+#             pred_final = 0.5*pred_normal + 0.5*pred_unflip
+#         else:
+#             pred_final = pred_normal
+
+#         if predict_csv: self._write_predict_csv(predict_csv,pred_final)
+#         return pred_final,torch.stack(all_norms)
+
+#     @staticmethod
+#     def _write_predict_csv(csv_path,traj_mean):
+#         os.makedirs(os.path.dirname(os.path.abspath(csv_path)),exist_ok=True)
+#         T,B,_=traj_mean.shape
+#         mlon=((traj_mean[:,:,0]*50.+1800.)/10.).cpu().numpy()
+#         mlat=((traj_mean[:,:,1]*50.)/10.).cpu().numpy()
+#         ts=datetime.now().strftime('%Y%m%d_%H%M%S')
+#         hdr=not os.path.exists(csv_path)
+#         with open(csv_path,'a',newline='') as fh:
+#             w=csv.DictWriter(fh,fieldnames=['ts','b','step','lead_h','lon','lat'])
+#             if hdr: w.writeheader()
+#             for b in range(B):
+#                 for k in range(T):
+#                     w.writerow({'ts':ts,'b':b,'step':k,'lead_h':(k+1)*6,
+#                                  'lon':f'{mlon[k,b]:.4f}','lat':f'{mlat[k,b]:.4f}'})
+
+
+# TCDiffusion = TCFlowMatching
+
 """
 flow_matching_model.py — FM v74-fix
 ====================================
