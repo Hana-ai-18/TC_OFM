@@ -37,7 +37,7 @@ if _root not in sys.path:
 # ── Imports ───────────────────────────────────────────────────
 from Model.flow_matching_model import (
     TCFlowMatching, compute_speed_stats_from_norm,
-    _norm_to_deg, _haversine_km
+    _norm_to_deg, haversine_km
 )
 
 try:
@@ -88,7 +88,7 @@ def _move(batch_list, device):
 def compute_metrics(pred_deg, gt_deg):
     """[N,T,2] lon°,lat° → dict"""
     N, T, _ = pred_deg.shape
-    dist = _haversine_km(
+    dist = haversine_km(
         pred_deg.reshape(N*T, 2), gt_deg.reshape(N*T, 2)
     ).reshape(N, T)
 
