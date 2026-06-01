@@ -1478,7 +1478,7 @@ class TCFlowMatching(nn.Module):
         pred_deg_t  = _norm_to_deg(pred_abs)          # [T, B, 2] trực tiếp
         gt_deg_t    = _norm_to_deg(batch_list[1])      # [T, B, 2] trực tiếp
 
-        
+
         # FM velocity: [B, T, 4]
         fm_vel_pred   = pred_vel
         fm_vel_target = u_target
@@ -1629,8 +1629,10 @@ class TCFlowMatching(nn.Module):
 
                 x_t = (x_t + dt * vel).clamp(-3.0, 3.0)
 
+            # tr, me = self._to_abs(x_t, lp, lm)
+            # all_norms.append(tr)
             tr, me = self._to_abs(x_t, lp, lm)
-            all_norms.append(tr)
+            all_norms.append(tr.permute(1, 0, 2))   # [B, T, 2]
 
         # ── Learned scoring (FIX BUG-1, BUG-5) ──────────────
         # Không có prior_sc (v_opt=15 sai)
