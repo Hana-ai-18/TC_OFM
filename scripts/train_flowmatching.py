@@ -489,7 +489,7 @@ from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
-from Model.flow_matching_model import TCFlowMatchingV74
+from Model.flow_matching_model import TCFlowMatching
 
 try:
     from Model.utils import get_cosine_schedule_with_warmup
@@ -748,7 +748,7 @@ def main(args):
     vsub=mksub(vd,args.val_subset_size,args.batch_size,seq_collate)
     print(f"  train:{len(trd)} seqs  val:{len(vd)} seqs")
 
-    model=TCFlowMatchingV74(
+    model=TCFlowMatching(
         pred_len=args.pred_len, obs_len=args.obs_len,
         sigma_min=args.sigma_min, use_ema=args.use_ema, ema_decay=args.ema_decay,
         use_ot=args.use_ot, cfg_guidance_scale=args.cfg_guidance_scale,
