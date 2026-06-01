@@ -1465,14 +1465,20 @@ class TCFlowMatching(nn.Module):
         # Get predicted trajectory để tính physics losses
         fm_te       = fm_t.view(B, 1, 1)
         x1_pred     = x_t + (1.0 - fm_te) * pred_vel
+        # pred_abs, _ = self._to_abs(x1_pred, lp, lm)
+        # pred_deg    = _norm_to_deg(pred_abs)                    # [B, T, 2]
+        # gt_deg      = _norm_to_deg(batch_list[1])               # [B, T, 2]
+
+        # # Reshape: loss expects [T, B, 2]
+        # pred_deg_t = pred_deg.permute(1, 0, 2)   # [T, B, 2]
+        # gt_deg_t   = gt_deg.permute(1, 0, 2)     # [T, B, 2]
+
+
         pred_abs, _ = self._to_abs(x1_pred, lp, lm)
-        pred_deg    = _norm_to_deg(pred_abs)                    # [B, T, 2]
-        gt_deg      = _norm_to_deg(batch_list[1])               # [B, T, 2]
+        pred_deg_t  = _norm_to_deg(pred_abs)          # [T, B, 2] trực tiếp
+        gt_deg_t    = _norm_to_deg(batch_list[1])      # [T, B, 2] trực tiếp
 
-        # Reshape: loss expects [T, B, 2]
-        pred_deg_t = pred_deg.permute(1, 0, 2)   # [T, B, 2]
-        gt_deg_t   = gt_deg.permute(1, 0, 2)     # [T, B, 2]
-
+        
         # FM velocity: [B, T, 4]
         fm_vel_pred   = pred_vel
         fm_vel_target = u_target
