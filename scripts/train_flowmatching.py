@@ -3352,7 +3352,7 @@ from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
 # v75: import updated model
-from Model.flow_matching_model import TCFlowMatching
+from Model.flow_matching_model_v75 import TCFlowMatching
 
 try:
     from Model.utils import get_cosine_schedule_with_warmup
@@ -3508,8 +3508,7 @@ def _gap(r):
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, dev, tag="", ema=None, steps=20, num_ensemble=30):
-    """num_ensemble: 30 for FAST eval (speed), 50 for RAW/EMA eval (quality)."""
+def evaluate(model, loader, dev, tag="", ema=None, steps=20):
     bk = None
     if ema:
         try:
@@ -3521,7 +3520,7 @@ def evaluate(model, loader, dev, tag="", ema=None, steps=20, num_ensemble=30):
     t0  = time.perf_counter()
     for b in loader:
         bl = move(list(b), dev)
-        result = model.sample(bl, ddim_steps=steps, num_ensemble=num_ensemble)
+        result = model.sample(bl, ddim_steps=steps)
         p = result[0] if isinstance(result, (tuple, list)) else result
         g = bl[1]
         T = min(p.shape[0], g.shape[0])
@@ -3670,8 +3669,7 @@ def get_args():
     p.add_argument("--dataset_root",    default="TCND_vn")
     p.add_argument("--obs_len",         default=8,    type=int)
     p.add_argument("--pred_len",        default=12,   type=int)
-    p.add_argument("--batch_size",      default=32,   type=int,
-                   help="32=safe. Try 48 or 64 if VRAM≥20GB: halves epoch time.")
+    p.add_argument("--batch_size",      default=32,   type=int)
     p.add_argument("--num_epochs",      default=120,  type=int)
     p.add_argument("--learning_rate",   default=1e-4, type=float)
     p.add_argument("--weight_decay",    default=1e-3, type=float)
@@ -3680,22 +3678,14 @@ def get_args():
     p.add_argument("--patience",        default=40,   type=int)
     p.add_argument("--min_ep",          default=35,   type=int)
     p.add_argument("--use_amp",         action="store_true")
-    p.add_argument("--num_workers",     default=4,    type=int,
-                   help="4 reduces CPU→GPU stall vs old default 2.")
-    p.add_argument("--pin_memory",      default=True, action="store_true")
-    p.add_argument("--no_pin_memory",   dest="pin_memory", action="store_false")
+    p.add_argument("--num_workers",     default=2,    type=int)
     p.add_argument("--sigma_min",       default=0.02, type=float)
     p.add_argument("--use_ot",          default=True, action="store_true")
     p.add_argument("--no_ot",           dest="use_ot", action="store_false")
     p.add_argument("--cfg_guidance_scale", default=2.0, type=float)
     p.add_argument("--easy_thresh",     default=0.25, type=float)
-    p.add_argument("--n_ensemble",      default=100,  type=int,
-                   help="Ensemble size for RAW/EMA eval and final inference.")
-    p.add_argument("--n_ensemble_fast", default=30,   type=int,
-                   help="Ensemble for per-epoch FAST eval. 30≈60s vs 50≈112s. "
-                        "No effect on model quality.")
-    p.add_argument("--val_freq",        default=5,    type=int,
-                   help="RAW+EMA eval every N epochs. 5 = 40%% less eval overhead vs 3.")
+    p.add_argument("--n_ensemble",      default=100,  type=int)
+    p.add_argument("--val_freq",        default=3,    type=int)
     p.add_argument("--val_subset_size", default=500,  type=int)
     p.add_argument("--fast_ddim",       default=15,   type=int)
     p.add_argument("--full_ddim",       default=30,   type=int)
@@ -3714,9 +3704,6 @@ def get_args():
     p.add_argument("--resume_epoch",    default=None, type=int)
     p.add_argument("--finetune_lr",     default=None, type=float)
     p.add_argument("--eval_test_after_train", default=True, action="store_true")
-    p.add_argument("--compile_mode",    default="reduce-overhead",
-                   choices=["reduce-overhead", "max-autotune", "default"],
-                   help="max-autotune: ~10%% faster after warmup, longer first epoch.")
     p.add_argument("--w_kin",    default=1.0,  type=float)
     p.add_argument("--w_lspd",   default=0.15, type=float)
     p.add_argument("--w_smooth", default=0.20, type=float)
@@ -3753,16 +3740,8 @@ def main(args):
     vd, vl   = data_loader(args, {"root": args.dataset_root, "type": "val"},
                             test=True)
     from Model.data.trajectoriesWithMe_unet_training import seq_collate
-    # Rebuild val DataLoader with pin_memory + persistent_workers for speed
-    if args.pin_memory and torch.cuda.is_available():
-        vl = DataLoader(vd, batch_size=args.batch_size, shuffle=False,
-                        collate_fn=seq_collate, num_workers=args.num_workers,
-                        drop_last=False, pin_memory=True,
-                        persistent_workers=(args.num_workers > 0))
     vsub = mksub(vd, args.val_subset_size, args.batch_size, seq_collate)
-    print(f"  train:{len(trd)} seqs  val:{len(vd)} seqs"
-          f"  workers={args.num_workers}  pin_memory={args.pin_memory}"
-          f"  bs={args.batch_size}")
+    print(f"  train:{len(trd)} seqs  val:{len(vd)} seqs")
 
     # ── Model ─────────────────────────────────────────────────
     model = TCFlowMatching(
@@ -3837,8 +3816,8 @@ def main(args):
 
     # ── Compile ───────────────────────────────────────────────
     try:
-        model = torch.compile(model, mode=args.compile_mode)
-        print(f"  torch.compile: ok  (mode={args.compile_mode})")
+        model = torch.compile(model, mode="reduce-overhead")
+        print("  torch.compile: ok")
     except Exception as e:
         print(f"  torch.compile skipped: {e}")
 
@@ -3918,28 +3897,23 @@ def main(args):
         print(f"  Epoch {ep:>3} | train={avt:.4f} val={avv:.4f}"
               f" | lr={lr_cur:.2e} | {eps:.0f}s")
 
-        # ── Eval: BUG-1 FIX: collect + commit_epoch ───────────
-        # FAST: n_ensemble_fast=30 (was 50 default) → ~60s vs 112s
+        # ── Eval: collect + commit_epoch ──────────────────────
         rf = evaluate(model, vsub, dev, tag=f"FAST ep{ep}",
-                      steps=args.fast_ddim,
-                      num_ensemble=args.n_ensemble_fast)
+                      steps=args.fast_ddim)
         saver.collect(rf, model, args.output_dir, ep, opt, sched, avt, avv,
                       tag="fast")
 
         if ep % args.val_freq == 0:
             em = getattr(_unwrap(model), "_ema", None)
 
-            # RAW/EMA: use full n_ensemble for accurate scoring
             rr = evaluate(model, vl, dev, tag=f"RAW ep{ep}",
-                          steps=args.full_ddim,
-                          num_ensemble=args.n_ensemble)
+                          steps=args.full_ddim)
             saver.collect(rr, model, args.output_dir, ep, opt, sched, avt, avv,
                           tag="raw")
 
             if em and ep >= 3:
                 re = evaluate(model, vl, dev, tag=f"EMA ep{ep}",
-                              ema=em, steps=args.full_ddim,
-                              num_ensemble=args.n_ensemble)
+                              ema=em, steps=args.full_ddim)
                 saver.collect(re, model, args.output_dir, ep, opt, sched,
                               avt, avv, tag="ema")
 
