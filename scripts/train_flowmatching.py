@@ -3352,7 +3352,7 @@ from torch.utils.data import DataLoader, Subset
 
 from Model.data.loader_training import data_loader
 # v75: import updated model
-from Model.flow_matching_model_v75 import TCFlowMatching
+from Model.flow_matching_model import TCFlowMatching
 
 try:
     from Model.utils import get_cosine_schedule_with_warmup
