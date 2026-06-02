@@ -15216,7 +15216,7 @@ class TCFlowMatchingV76(nn.Module):
     # ── Inference ─────────────────────────────────────────────────────────────
 
     @torch.no_grad()
-    def sample(self, batch_list, num_ensemble=100, ddim_steps=20):
+    def sample(self, batch_list, num_ensemble=50, ddim_steps=20):
         obs_t = batch_list[0]
         env   = batch_list[13] if len(batch_list) > 13 else None
         lp    = obs_t[-1]; lm = batch_list[7][-1]
