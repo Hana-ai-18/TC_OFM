@@ -7900,6 +7900,49 @@ class GradNormManager:
         self._dense_steps_left = 200    # dense ở lúc khởi động training
         self._current_phase    = 1
 
+    # ─────────────────────────────────────────────────────────────────
+    # [FIX-GN-4] state_dict/load_state_dict — persist λ_aux, optimizer
+    # GradNorm, _step, _dense_steps_left, _current_phase qua checkpoint.
+    #
+    # BUG trước fix: GradNormManager được khởi tạo lại từ constructor
+    # mỗi lần script chạy (kể cả khi resume) → λ_aux reset về
+    # DEFAULT_LAMBDA (1.40/0.40/0.05/0.01), _dense_steps_left reset về
+    # 200, _step reset về 0 → 30 epoch điều chỉnh λ bị MẤT HOÀN TOÀN,
+    # GradNorm phải "học lại từ đầu" sau mỗi resume (dense window 200
+    # step lại chạy lại, λ lại tăng dần từ default y như epoch 0).
+    # ─────────────────────────────────────────────────────────────────
+    def state_dict(self) -> Dict:
+        return {
+            "lambdas": {t: v.detach().cpu().clone()
+                        for t, v in self.lambdas.items()},
+            "opt": self.opt.state_dict(),
+            "step": self._step,
+            "dense_steps_left": self._dense_steps_left,
+            "current_phase": self._current_phase,
+        }
+
+    def load_state_dict(self, sd: Dict) -> None:
+        try:
+            for t, v in sd["lambdas"].items():
+                if t in self.lambdas:
+                    with torch.no_grad():
+                        self.lambdas[t].copy_(v.to(self.device))
+            # Re-tạo optimizer trên cùng tensor self.lambdas (đã copy_
+            # giá trị ở trên, KHÔNG thay reference) rồi load lại state
+            # (momentum Adam) — tránh mismatch param-group nếu thứ tự
+            # self.aux_terms khác giữa lần lưu và lần load.
+            self.opt = optim.Adam(list(self.lambdas.values()),
+                                   lr=self.opt.param_groups[0]["lr"])
+            try:
+                self.opt.load_state_dict(sd["opt"])
+            except Exception:
+                pass  # momentum Adam không critical, lambdas đã đúng
+            self._step             = sd.get("step", 0)
+            self._dense_steps_left = sd.get("dense_steps_left", 0)
+            self._current_phase    = sd.get("current_phase", self._current_phase)
+        except Exception as e:
+            print(f"  [FIX-GN-4] Lỗi khi restore GradNorm state: {e}")
+
     def phase_reset(self, new_phase: int) -> None:
         """
         [FIX-GN-2] Gọi khi chuyển sang phase mới.
@@ -8518,6 +8561,7 @@ def _save_ckpt(path, ep, model, opt, sched, saver, tl, vl,
                smooth_sched_step: int = 0,
                global_hard_threshold: Optional[float] = None,
                diversity_boost_factor: float = 1.0,
+               gradnorm_state: Optional[Dict] = None,
                extra=None):
     m = _unwrap(model)
     ema = getattr(m, "_ema", None)
@@ -8546,7 +8590,13 @@ def _save_ckpt(path, ep, model, opt, sched, saver, tl, vl,
         # sigma_min/ctx_noise_scale (đây là plain float attr, KHÔNG nằm
         # trong model.state_dict() nên sẽ mất nếu không lưu riêng).
         "diversity_boost_factor": diversity_boost_factor,
-        "version":          "v59strategy_fixed_v3",
+        # [FIX-GN-4] Lưu state GradNormManager (λ_aux, optimizer riêng,
+        # _step, _dense_steps_left, _current_phase) — KHÔNG nằm trong
+        # model.state_dict(), nên nếu không lưu sẽ mất khi resume và
+        # GradNorm phải "học lại từ đầu" (λ_aux reset về DEFAULT_LAMBDA,
+        # dense window 200 step chạy lại).
+        "gradnorm_state":   gradnorm_state,
+        "version":          "v59strategy_fixed_v4",
     }
     if extra:
         d.update(extra)
@@ -8574,7 +8624,8 @@ class Saver:
     def update(self, r, model, out_dir, ep, opt, sched, tl, vl, tag="",
                smooth_sched_step: int = 0,
                global_hard_threshold: Optional[float] = None,
-               diversity_boost_factor: float = 1.0):
+               diversity_boost_factor: float = 1.0,
+               gradnorm_state: Optional[Dict] = None):
         sc  = _score(r)
         ade = r.get("ADE",     1e9)
         h72 = r.get("72h",     1e9)
@@ -8596,7 +8647,8 @@ class Saver:
                            sched, self, tl, vl,
                            smooth_sched_step=smooth_sched_step,
                            global_hard_threshold=global_hard_threshold,
-                           diversity_boost_factor=diversity_boost_factor)
+                           diversity_boost_factor=diversity_boost_factor,
+                           gradnorm_state=gradnorm_state)
                 any_improved = True
 
         if sc < self.bs:
@@ -8606,7 +8658,8 @@ class Saver:
                        ep, model, opt, sched, self, tl, vl,
                        smooth_sched_step=smooth_sched_step,
                        global_hard_threshold=global_hard_threshold,
-                       diversity_boost_factor=diversity_boost_factor)
+                       diversity_boost_factor=diversity_boost_factor,
+                       gradnorm_state=gradnorm_state)
             print(f"  [BEST] {tag} ep={ep} score={sc:.2f}"
                   f"  ADE={ade:.1f}  72h={h72:.0f}"
                   f"  ATE={ate:.1f}  CTE={cte:.1f}")
@@ -8870,6 +8923,26 @@ def main(args):
             global_hard_threshold = ck["global_hard_threshold"]
             _threshold_computed = True
             print(f"  Restored global_hard_threshold={global_hard_threshold:.4f}")
+
+        # [FIX-GN-4] Restore GradNorm state (λ_aux, optimizer riêng, _step,
+        # _dense_steps_left, _current_phase). Checkpoint cũ (trước fix này)
+        # không có key "gradnorm_state" -> bỏ qua, GradNorm khởi động lại
+        # từ DEFAULT_LAMBDA + dense window 200 step (behavior cũ, không
+        # crash, chỉ là không tối ưu — chấp nhận được cho checkpoint cũ).
+        if ck.get("gradnorm_state") is not None:
+            gradnorm.load_state_dict(ck["gradnorm_state"])
+            lam_str = " ".join(
+                f"λ_{t.replace('l_','').replace('_reg','')}="
+                f"{gradnorm.lambdas[t].item():.3f}"
+                for t in gradnorm.aux_terms)
+            print(f"  [FIX-GN-4] Restored GradNorm state: {lam_str}"
+                  f"  step={gradnorm._step}"
+                  f"  dense_left={gradnorm._dense_steps_left}"
+                  f"  phase={gradnorm._current_phase}")
+        else:
+            print(f"  [FIX-GN-4] Checkpoint không có gradnorm_state"
+                  f" (checkpoint cũ trước fix) -> GradNorm khởi động lại"
+                  f" từ DEFAULT_LAMBDA + dense window 200 step.")
 
         # [FIX-DIV-2] Restore hệ số boost diversity. sigma_min/ctx_noise_scale
         # là plain float attribute trên model — KHÔNG nằm trong state_dict()
@@ -9190,7 +9263,8 @@ def main(args):
                           tag="fast",
                           smooth_sched_step=smooth_sched.global_step,
                           global_hard_threshold=global_hard_threshold,
-                          diversity_boost_factor=diversity_boost_factor)
+                          diversity_boost_factor=diversity_boost_factor,
+                          gradnorm_state=gradnorm.state_dict())
 
         # ── [G-E + FIX-EMA-2] EMA guard: kiểm tra easy_ADE sau mỗi epoch ──
         #
@@ -9241,6 +9315,7 @@ def main(args):
                             smooth_sched_step=smooth_sched.global_step,
                             global_hard_threshold=global_hard_threshold,
                             diversity_boost_factor=diversity_boost_factor,
+                            gradnorm_state=gradnorm.state_dict(),
                             extra={"ema_rollback": True,
                                    "easy_ade_trigger": easy_ade_curr},
                         )
@@ -9365,7 +9440,8 @@ def main(args):
                               avt, avv, tag="raw",
                               smooth_sched_step=smooth_sched.global_step,
                               global_hard_threshold=global_hard_threshold,
-                              diversity_boost_factor=diversity_boost_factor)
+                              diversity_boost_factor=diversity_boost_factor,
+                              gradnorm_state=gradnorm.state_dict())
 
             if em and ep >= 3:
                 re = evaluate_split(model, vl, dev,
@@ -9378,7 +9454,8 @@ def main(args):
                                   avt, avv, tag="ema",
                                   smooth_sched_step=smooth_sched.global_step,
                                   global_hard_threshold=global_hard_threshold,
-                                  diversity_boost_factor=diversity_boost_factor)
+                                  diversity_boost_factor=diversity_boost_factor,
+                                  gradnorm_state=gradnorm.state_dict())
 
         # Periodic checkpoint
         if ep % 10 == 0 or ep == args.num_epochs - 1:
@@ -9388,6 +9465,7 @@ def main(args):
                 smooth_sched_step=smooth_sched.global_step,
                 global_hard_threshold=global_hard_threshold,
                 diversity_boost_factor=diversity_boost_factor,
+                gradnorm_state=gradnorm.state_dict(),
                 extra={"phase": phase,
                        "alpha_hard": smooth_sched.get_alpha_hard(),
                        "diversity": div_score},
