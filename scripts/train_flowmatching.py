@@ -8562,6 +8562,8 @@ def _save_ckpt(path, ep, model, opt, sched, saver, tl, vl,
                global_hard_threshold: Optional[float] = None,
                diversity_boost_factor: float = 1.0,
                gradnorm_state: Optional[Dict] = None,
+               T_max_orig: Optional[int] = None,
+               phase4_frozen: bool = False,
                extra=None):
     m = _unwrap(model)
     ema = getattr(m, "_ema", None)
@@ -8596,7 +8598,11 @@ def _save_ckpt(path, ep, model, opt, sched, saver, tl, vl,
         # GradNorm phải "học lại từ đầu" (λ_aux reset về DEFAULT_LAMBDA,
         # dense window 200 step chạy lại).
         "gradnorm_state":   gradnorm_state,
-        "version":          "v59strategy_fixed_v4",
+        # [FIX-LR-1] Lưu T_max gốc để resume đúng schedule (không tính lại)
+        "T_max_orig":       T_max_orig,
+        # [FIX-PHASE4-1] Lưu trạng thái _phase4_frozen để resume không freeze lại
+        "phase4_frozen":    phase4_frozen,
+        "version":          "v59strategy_fixed_v5",
     }
     if extra:
         d.update(extra)
@@ -8625,7 +8631,9 @@ class Saver:
                smooth_sched_step: int = 0,
                global_hard_threshold: Optional[float] = None,
                diversity_boost_factor: float = 1.0,
-               gradnorm_state: Optional[Dict] = None):
+               gradnorm_state: Optional[Dict] = None,
+               T_max_orig: Optional[int] = None,
+               phase4_frozen: bool = False):
         sc  = _score(r)
         ade = r.get("ADE",     1e9)
         h72 = r.get("72h",     1e9)
@@ -8648,7 +8656,9 @@ class Saver:
                            smooth_sched_step=smooth_sched_step,
                            global_hard_threshold=global_hard_threshold,
                            diversity_boost_factor=diversity_boost_factor,
-                           gradnorm_state=gradnorm_state)
+                           gradnorm_state=gradnorm_state,
+                           T_max_orig=T_max_orig,
+                           phase4_frozen=phase4_frozen)
                 any_improved = True
 
         if sc < self.bs:
@@ -8659,7 +8669,9 @@ class Saver:
                        smooth_sched_step=smooth_sched_step,
                        global_hard_threshold=global_hard_threshold,
                        diversity_boost_factor=diversity_boost_factor,
-                       gradnorm_state=gradnorm_state)
+                       gradnorm_state=gradnorm_state,
+                       T_max_orig=T_max_orig,
+                       phase4_frozen=phase4_frozen)
             print(f"  [BEST] {tag} ep={ep} score={sc:.2f}"
                   f"  ADE={ade:.1f}  72h={h72:.0f}"
                   f"  ATE={ate:.1f}  CTE={cte:.1f}")
@@ -8858,6 +8870,8 @@ def main(args):
     total  = nstep * args.num_epochs
     wstp   = nstep * args.warmup_epochs
     sched  = get_cosine_schedule_with_warmup(opt, wstp, total, min_lr=1e-6)
+    # [FIX-LR-1] Lưu T_max gốc — để resume dùng lại thay vì tính từ --num_epochs mới
+    _T_max_orig = total
 
     # [G-A] GradNorm manager — equal-contribution scheme (FIX-GN-1)
     gradnorm = GradNormManager(
@@ -8898,6 +8912,13 @@ def main(args):
                 if k in ema.shadow: ema.shadow[k].copy_(v.to(dev))
         try: opt.load_state_dict(ck["optimizer_state"])
         except Exception as e: print(f"  Opt: {e}")
+
+        # [FIX-LR-1] Khôi phục T_max gốc nếu checkpoint có, tránh LR tính lại sai
+        T_max_from_ckpt = ck.get("T_max_orig")
+        if T_max_from_ckpt is not None:
+            _T_max_orig = T_max_from_ckpt
+            print(f"  [FIX-LR-1] Restored T_max_orig={_T_max_orig} from checkpoint")
+
         try: sched.load_state_dict(ck["scheduler_state"])
         except:
             for _ in range(ck.get("epoch", 0) * nstep): sched.step()
@@ -8966,6 +8987,12 @@ def main(args):
                       f"{diversity_boost_factor:.2f}x ({', '.join(applied)})")
             except Exception as e:
                 print(f"  [FIX-DIV-2] Lỗi khi restore diversity boost: {e}")
+
+        # [FIX-PHASE4-1] Khôi phục _phase4_frozen từ checkpoint
+        if "phase4_frozen" in ck and ck["phase4_frozen"]:
+            _phase4_frozen = True
+            print(f"  [FIX-PHASE4-1] Restored _phase4_frozen=True from checkpoint"
+                  f" — encoder đã frozen trước đó, sẽ không freeze lại")
 
         # [FIX-DIV-4] Override diversity_boost_factor sau khi restore.
         # Áp dụng dù checkpoint đã có factor>1 (giảm/tăng mức boost hiện
@@ -9264,7 +9291,9 @@ def main(args):
                           smooth_sched_step=smooth_sched.global_step,
                           global_hard_threshold=global_hard_threshold,
                           diversity_boost_factor=diversity_boost_factor,
-                          gradnorm_state=gradnorm.state_dict())
+                          gradnorm_state=gradnorm.state_dict(),
+                          T_max_orig=_T_max_orig,
+                          phase4_frozen=_phase4_frozen)
 
         # ── [G-E + FIX-EMA-2] EMA guard: kiểm tra easy_ADE sau mỗi epoch ──
         #
@@ -9441,7 +9470,9 @@ def main(args):
                               smooth_sched_step=smooth_sched.global_step,
                               global_hard_threshold=global_hard_threshold,
                               diversity_boost_factor=diversity_boost_factor,
-                              gradnorm_state=gradnorm.state_dict())
+                              gradnorm_state=gradnorm.state_dict(),
+                              T_max_orig=_T_max_orig,
+                              phase4_frozen=_phase4_frozen)
 
             if em and ep >= 3:
                 re = evaluate_split(model, vl, dev,
@@ -9455,7 +9486,9 @@ def main(args):
                                   smooth_sched_step=smooth_sched.global_step,
                                   global_hard_threshold=global_hard_threshold,
                                   diversity_boost_factor=diversity_boost_factor,
-                                  gradnorm_state=gradnorm.state_dict())
+                                  gradnorm_state=gradnorm.state_dict(),
+                                  T_max_orig=_T_max_orig,
+                                  phase4_frozen=_phase4_frozen)
 
         # Periodic checkpoint
         if ep % 10 == 0 or ep == args.num_epochs - 1:
@@ -9466,6 +9499,8 @@ def main(args):
                 global_hard_threshold=global_hard_threshold,
                 diversity_boost_factor=diversity_boost_factor,
                 gradnorm_state=gradnorm.state_dict(),
+                T_max_orig=_T_max_orig,
+                phase4_frozen=_phase4_frozen,
                 extra={"phase": phase,
                        "alpha_hard": smooth_sched.get_alpha_hard(),
                        "diversity": div_score},
