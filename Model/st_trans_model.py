@@ -1,3 +1,569 @@
+# # """
+# # Model/st_trans_model.py  ── ST-Trans Baseline
+# # ===============================================
+# # THUẬT TOÁN: Faiaz et al. (2026)
+# # "Physics-guided non-autoregressive transformer for lightweight
+# # cyclone track prediction in the Bay of Bengal"
+# # Expert Systems With Applications 317 (2026) 131972
+
+# # CHIẾN LƯỢC (theo paper §3):
+# #   - Input : obs_traj cuối (obs_len bước) → encode 8D features
+# #   - CNN   : reshape → [S, 1, 2, 4] grid → 2×2 conv → 1×2 conv → 64D
+# #   - Encoder: Transformer encoder (self-attention over S steps)
+# #   - Decoder: Non-autoregressive, learned horizon queries [H×dmodel]
+# #   - Output : toàn bộ H bước predict song song (không autoregressive)
+
+# # LOSS (§3.5.1 - Physics-guided composite):
+# #   L = L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
+# #   λ_speed = 0.1, λ_accel = 0.01, v_max = 80 km/h
+
+# # ADAPTED cho TCND_vn:
+# #   - Input features: lat, lon, speed, heading, year, month, day, hour
+# #     (giống 8D của paper, extract từ obs_traj + metadata)
+# #   - Dùng chung DataLoader của bạn
+# #   - Output: [pred_len, B, 2] normalised (cùng format với bài của bạn)
+# #   - Eval bằng cùng haversine ADE metrics (12h/24h/48h/72h)
+
+# # NOTE:
+# #   - Paper dùng S=3 (9h), H=16 (48h) ở resolution 3h
+# #   - Bạn dùng S=8 (obs_len), H=12 (pred_len) ở resolution 6h → 72h
+# #   - Điều chỉnh: S=obs_len, H=pred_len, giữ nguyên architecture
+# # """
+# # from __future__ import annotations
+
+# # import math
+# # from typing import Dict, List, Optional, Tuple
+
+# # import numpy as np
+# # import torch
+# # import torch.nn as nn
+# # import torch.nn.functional as F
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  Haversine helpers  (cùng convention với bài của bạn)
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
+# #     """Denormalise từ normalised space → degrees."""
+# #     out = arr.clone()
+# #     out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0   # lon
+# #     out[..., 1] = (arr[..., 1] * 50.0) / 10.0              # lat
+# #     return out
+
+
+# # def haversine_km(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
+# #     """Haversine distance [km]. p1, p2: [..., 2] degrees (lon, lat)."""
+# #     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
+# #     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
+# #     dlat = lat2 - lat1; dlon = lon2 - lon1
+# #     a = torch.sin(dlat/2).pow(2) + torch.cos(lat1)*torch.cos(lat2)*torch.sin(dlon/2).pow(2)
+# #     return 2.0 * 6371.0 * torch.asin(a.clamp(1e-12, 1.0).sqrt())
+
+
+# # HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 48: 7, 72: 11}
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  Feature extractor  ── lấy 8D features từ obs_traj
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # class ObsTrajFeatureExtractor(nn.Module):
+# #     """
+# #     Extract 8D features từ obs_traj [T_obs, B, 2] (normalised lat/lon).
+
+# #     Paper features:
+# #       1. lat_norm, lon_norm     (position)
+# #       2. speed_norm             (translation speed estimate)
+# #       3. heading_norm           (motion direction)
+# #       4. year_norm, month_norm, day_norm, hour_norm  (temporal)
+
+# #     Vì bạn không có temporal metadata trong batch, ta dùng:
+# #       1-2: lat, lon (từ obs_traj)
+# #       3-4: delta_lat, delta_lon (velocity)
+# #       5-6: delta2_lat, delta2_lon (acceleration)
+# #       7-8: step index (normalized), cumulative distance
+
+# #     → 8D vẫn đủ để encode kinematic history
+# #     """
+
+# #     def __init__(self, feat_dim: int = 8):
+# #         super().__init__()
+# #         self.feat_dim = feat_dim
+
+# #     def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
+# #         """
+# #         obs_traj: [T_obs, B, 2] normalised (lon, lat)
+# #         Returns:  [B, T_obs, 8]
+# #         """
+# #         T, B, _ = obs_traj.shape
+# #         device   = obs_traj.device
+
+# #         # Position
+# #         lon = obs_traj[:, :, 0]   # [T, B]
+# #         lat = obs_traj[:, :, 1]   # [T, B]
+
+# #         # Velocity (delta per step)
+# #         if T >= 2:
+# #             d_lon = torch.cat([obs_traj[1:, :, 0] - obs_traj[:-1, :, 0],
+# #                                torch.zeros(1, B, device=device)], dim=0)
+# #             d_lat = torch.cat([obs_traj[1:, :, 1] - obs_traj[:-1, :, 1],
+# #                                torch.zeros(1, B, device=device)], dim=0)
+# #         else:
+# #             d_lon = torch.zeros(T, B, device=device)
+# #             d_lat = torch.zeros(T, B, device=device)
+
+# #         # Acceleration (delta of delta)
+# #         if T >= 3:
+# #             dd_lon = torch.cat([d_lon[1:] - d_lon[:-1],
+# #                                 torch.zeros(1, B, device=device)], dim=0)
+# #             dd_lat = torch.cat([d_lat[1:] - d_lat[:-1],
+# #                                 torch.zeros(1, B, device=device)], dim=0)
+# #         else:
+# #             dd_lon = torch.zeros(T, B, device=device)
+# #             dd_lat = torch.zeros(T, B, device=device)
+
+# #         # Step index (0→1 normalized)
+# #         step_idx = torch.linspace(0, 1, T, device=device).unsqueeze(1).expand(T, B)
+
+# #         # Speed magnitude
+# #         speed = torch.sqrt(d_lon.pow(2) + d_lat.pow(2)).clamp(min=0)
+
+# #         # Stack: [T, B, 8]
+# #         features = torch.stack([lon, lat, d_lon, d_lat,
+# #                                  dd_lon, dd_lat, step_idx, speed], dim=-1)
+# #         return features.permute(1, 0, 2)   # [B, T_obs, 8]
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  CNN State Encoder  ── §3.3.2
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # class CNNStateEncoder(nn.Module):
+# #     """
+# #     Per-timestep CNN encoder.
+# #     Input: 8D feature vector → reshape [1, 2, 4] → conv → 64D.
+
+# #     Paper §3.3.2:
+# #       - Reshape 8D → [1, 2, 4] synthetic grid
+# #       - Conv1: 2×2 kernel, 1→32 channels, ReLU
+# #       - Conv2: 1×2 kernel, 32→32 channels, ReLU
+# #       - Flatten → 64D
+# #     """
+
+# #     def __init__(self, feat_dim: int = 8, out_dim: int = 64):
+# #         super().__init__()
+# #         self.feat_dim = feat_dim
+# #         self.out_dim  = out_dim
+
+# #         self.conv1 = nn.Conv2d(1, 32, kernel_size=(2, 2), stride=1, padding=0)
+# #         self.conv2 = nn.Conv2d(32, 32, kernel_size=(1, 2), stride=1, padding=0)
+
+# #         # After conv1: [B, 32, 1, 3], after conv2: [B, 32, 1, 2] → flatten=64
+# #         self.proj = nn.Linear(64, out_dim)
+
+# #     def forward(self, x: torch.Tensor) -> torch.Tensor:
+# #         """
+# #         x: [B, S, 8]
+# #         Returns: [B, S, out_dim]
+# #         """
+# #         B, S, _ = x.shape
+
+# #         # Process each timestep independently
+# #         x_flat = x.reshape(B * S, 1, 2, 4)   # [B*S, 1, 2, 4]
+
+# #         h = F.relu(self.conv1(x_flat))         # [B*S, 32, 1, 3]
+# #         h = F.relu(self.conv2(h))              # [B*S, 32, 1, 2]
+# #         h = h.flatten(1)                       # [B*S, 64]
+# #         h = self.proj(h)                       # [B*S, out_dim]
+
+# #         return h.reshape(B, S, self.out_dim)
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  Sinusoidal Positional Encoding
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # class SinusoidalPE(nn.Module):
+# #     def __init__(self, d_model: int, max_len: int = 200):
+# #         super().__init__()
+# #         pe = torch.zeros(max_len, d_model)
+# #         pos = torch.arange(max_len).unsqueeze(1).float()
+# #         div = torch.exp(torch.arange(0, d_model, 2).float() *
+# #                         (-math.log(10000.0) / d_model))
+# #         pe[:, 0::2] = torch.sin(pos * div)
+# #         pe[:, 1::2] = torch.cos(pos * div)
+# #         self.register_buffer("pe", pe.unsqueeze(0))   # [1, max_len, d_model]
+
+# #     def forward(self, x: torch.Tensor) -> torch.Tensor:
+# #         return x + self.pe[:, :x.size(1), :]
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  ST-Trans Main Model  ── §3.3.1
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # class STTrans(nn.Module):
+# #     """
+# #     Physics-guided Non-Autoregressive Transformer for TC track prediction.
+
+# #     Architecture (paper §3.3):
+# #       1. Feature extraction: obs_traj → 8D features
+# #       2. CNN state encoder: 8D → 64D per timestep
+# #       3. Linear projection: 64D → dmodel
+# #       4. Transformer encoder: self-attention over S history steps
+# #       5. Horizon queries: H learned queries [H, dmodel]
+# #       6. Transformer decoder: cross-attention → [H, dmodel]
+# #       7. Regression head: [H, dmodel] → [H, 2]
+
+# #     Physics loss (§3.5.1):
+# #       L = L_DPE + 0.05*L_MSE + 0.1*L_speed + 0.01*L_accel
+# #     """
+
+# #     def __init__(
+# #         self,
+# #         obs_len:    int   = 8,
+# #         pred_len:   int   = 12,
+# #         feat_dim:   int   = 8,
+# #         d_model:    int   = 64,
+# #         nhead:      int   = 4,
+# #         num_enc_layers: int = 1,
+# #         num_dec_layers: int = 3,
+# #         dim_ff:     int   = 512,
+# #         dropout:    float = 0.1,
+# #         # Physics loss weights (paper §3.5.1)
+# #         lambda_speed: float = 0.1,
+# #         lambda_accel: float = 0.01,
+# #         w_mse:        float = 0.05,
+# #         v_max_kmh:    float = 80.0,   # paper default
+# #         dt_h:         float = 6.0,    # 6h per step (your dataset)
+# #     ):
+# #         super().__init__()
+# #         self.obs_len    = obs_len
+# #         self.pred_len   = pred_len
+# #         self.d_model    = d_model
+# #         self.lambda_speed = lambda_speed
+# #         self.lambda_accel = lambda_accel
+# #         self.w_mse        = w_mse
+# #         # v_max in normalised units: 80 km/h * 6h = 480 km ≈ 480/111 ≈ 4.3 deg
+# #         # normalised: 4.3 / 5.0 ≈ 0.86 per step
+# #         self.v_max_norm = v_max_kmh * dt_h / (111.0 * 50.0)
+
+# #         # ── Feature extraction ────────────────────────────────────────────
+# #         self.feat_extractor = ObsTrajFeatureExtractor(feat_dim)
+# #         self.cnn_enc        = CNNStateEncoder(feat_dim, d_model)
+# #         self.input_proj     = nn.Linear(d_model, d_model)
+# #         self.enc_pe         = SinusoidalPE(d_model, max_len=obs_len + 10)
+
+# #         # ── Transformer encoder ───────────────────────────────────────────
+# #         enc_layer = nn.TransformerEncoderLayer(
+# #             d_model=d_model, nhead=nhead,
+# #             dim_feedforward=dim_ff, dropout=dropout,
+# #             activation="relu", batch_first=True,
+# #         )
+# #         self.transformer_enc = nn.TransformerEncoder(enc_layer,
+# #                                                       num_layers=num_enc_layers)
+
+# #         # ── Horizon queries (learned, paper §3.3.4) ───────────────────────
+# #         self.horizon_queries = nn.Parameter(
+# #             torch.randn(1, pred_len, d_model) * 0.02
+# #         )
+# #         self.dec_pe = SinusoidalPE(d_model, max_len=pred_len + 10)
+
+# #         # ── Transformer decoder ───────────────────────────────────────────
+# #         dec_layer = nn.TransformerDecoderLayer(
+# #             d_model=d_model, nhead=nhead,
+# #             dim_feedforward=dim_ff, dropout=dropout,
+# #             activation="relu", batch_first=True,
+# #         )
+# #         self.transformer_dec = nn.TransformerDecoder(dec_layer,
+# #                                                       num_layers=num_dec_layers)
+
+# #         # ── Regression head (paper §3.3.4: g(dτ) = W2·σ(W1·dτ+b1)+b2) ──
+# #         self.reg_head = nn.Sequential(
+# #             nn.Linear(d_model, d_model),
+# #             nn.ReLU(),
+# #             nn.Linear(d_model, 2),
+# #         )
+
+# #         self._init_weights()
+
+# #     def _init_weights(self):
+# #         for m in self.modules():
+# #             if isinstance(m, nn.Linear):
+# #                 nn.init.xavier_uniform_(m.weight, gain=0.5)
+# #                 if m.bias is not None:
+# #                     nn.init.zeros_(m.bias)
+
+# #     # ── Forward ───────────────────────────────────────────────────────────
+
+# #     def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
+# #         """
+# #         obs_traj: [T_obs, B, 2] normalised
+# #         Returns:  [pred_len, B, 2] normalised predictions
+# #         """
+# #         B = obs_traj.shape[1]
+
+# #         # 1. Extract 8D features
+# #         feat = self.feat_extractor(obs_traj)   # [B, S, 8]
+
+# #         # 2. CNN state encoder
+# #         h = self.cnn_enc(feat)                  # [B, S, d_model]
+# #         h = self.input_proj(h)                  # [B, S, d_model]
+# #         h = self.enc_pe(h)                      # [B, S, d_model]
+
+# #         # 3. Transformer encoder → memory
+# #         memory = self.transformer_enc(h)        # [B, S, d_model]
+
+# #         # 4. Horizon queries with positional encoding
+# #         Q = self.horizon_queries.expand(B, -1, -1)   # [B, H, d_model]
+# #         Q = self.dec_pe(Q)                            # [B, H, d_model]
+
+# #         # 5. Transformer decoder (non-autoregressive cross-attention)
+# #         D = self.transformer_dec(Q, memory)     # [B, H, d_model]
+
+# #         # 6. Regression head → [B, H, 2]
+# #         out = self.reg_head(D)                  # [B, H, 2]
+
+# #         # Return [pred_len, B, 2] (same format as your model)
+# #         return out.permute(1, 0, 2)
+
+# #     # ── Physics-guided loss (§3.5.1) ─────────────────────────────────────
+
+# #     def physics_loss(
+# #         self,
+# #         pred_norm: torch.Tensor,   # [T, B, 2] normalised
+# #         gt_norm:   torch.Tensor,   # [T, B, 2] normalised
+# #     ) -> Dict:
+# #         T = min(pred_norm.shape[0], gt_norm.shape[0])
+# #         pred = pred_norm[:T]
+# #         gt   = gt_norm[:T]
+
+# #         # Convert to degrees for haversine
+# #         pred_deg = _norm_to_deg(pred)
+# #         gt_deg   = _norm_to_deg(gt)
+
+# #         # L_DPE: mean great-circle distance (eq. 16)
+# #         dist = haversine_km(pred_deg, gt_deg)   # [T, B]
+# #         l_dpe = dist.mean()
+
+# #         # L_MSE: coordinate space MSE (eq. 17)
+# #         l_mse = F.mse_loss(pred, gt)
+
+# #         # L_speed: penalize speeds > v_max (eq. 18-20)
+# #         if T >= 2:
+# #             step_dist = torch.sqrt(
+# #                 (pred[1:, :, 0] - pred[:-1, :, 0]).pow(2) +
+# #                 (pred[1:, :, 1] - pred[:-1, :, 1]).pow(2)
+# #             )   # [T-1, B] in normalised units
+# #             excess_speed = F.relu(step_dist - self.v_max_norm)
+# #             l_speed = excess_speed.pow(2).mean()
+# #         else:
+# #             l_speed = pred_norm.new_zeros(())
+
+# #         # L_accel: penalize acceleration changes (eq. 21-22)
+# #         if T >= 3:
+# #             vel = pred[1:] - pred[:-1]        # [T-1, B, 2]
+# #             spd = vel.norm(dim=-1)             # [T-1, B]
+# #             accel = (spd[1:] - spd[:-1]).pow(2).mean()
+# #             l_accel = accel
+# #         else:
+# #             l_accel = pred_norm.new_zeros(())
+
+# #         # Total physics-guided loss (eq. 15)
+# #         total = (l_dpe
+# #                  + self.w_mse        * l_mse
+# #                  + self.lambda_speed * l_speed
+# #                  + self.lambda_accel * l_accel)
+
+# #         return dict(
+# #             total=total,
+# #             dpe=l_dpe.item(),
+# #             mse=l_mse.item(),
+# #             speed=l_speed.item(),
+# #             accel=l_accel.item(),
+# #         )
+
+# #     # ── Interface matching TCFlowMatching ─────────────────────────────────
+
+# #     def get_loss(self, batch_list) -> torch.Tensor:
+# #         return self.get_loss_breakdown(batch_list)["total"]
+
+# #     def get_loss_breakdown(self, batch_list) -> Dict:
+# #         obs_traj = batch_list[0]   # [T_obs, B, 2]
+# #         traj_gt  = batch_list[1]   # [T_gt, B, 2]
+
+# #         pred = self.forward(obs_traj)
+# #         return self.physics_loss(pred, traj_gt)
+
+# #     @torch.no_grad()
+# #     def sample(
+# #         self,
+# #         batch_list,
+# #         num_ensemble: int = 1,
+# #         **kwargs,
+# #     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+# #         """
+# #         Returns:
+# #             pred_mean : [T, B, 2] normalised
+# #             me_mean   : [T, B, 2] zeros
+# #             all_trajs : [1, T, B, 2]
+# #         """
+# #         obs_traj = batch_list[0]
+# #         pred = self.forward(obs_traj)
+# #         T, B, _ = pred.shape
+# #         me_mean   = torch.zeros(T, B, 2, device=pred.device)
+# #         all_trajs = pred.unsqueeze(0)
+# #         return pred, me_mean, all_trajs
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  Autoregressive variant  ── ST-Trans-AR (paper §3.4)
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # class STTransAR(nn.Module):
+# #     """
+# #     Autoregressive variant of ST-Trans (baseline trong paper §3.4).
+# #     Cùng encoder architecture, nhưng decoder predict từng bước một.
+# #     Dùng để so sánh với non-AR trong ablation study.
+# #     """
+
+# #     def __init__(
+# #         self,
+# #         obs_len:    int   = 8,
+# #         pred_len:   int   = 12,
+# #         feat_dim:   int   = 8,
+# #         d_model:    int   = 64,
+# #         nhead:      int   = 4,
+# #         num_enc_layers: int = 1,
+# #         dim_ff:     int   = 512,
+# #         dropout:    float = 0.1,
+# #         lambda_speed: float = 0.1,
+# #         lambda_accel: float = 0.01,
+# #         w_mse:        float = 0.05,
+# #         v_max_kmh:    float = 80.0,
+# #         dt_h:         float = 6.0,
+# #     ):
+# #         super().__init__()
+# #         self.obs_len    = obs_len
+# #         self.pred_len   = pred_len
+# #         self.d_model    = d_model
+# #         self.lambda_speed = lambda_speed
+# #         self.lambda_accel = lambda_accel
+# #         self.w_mse        = w_mse
+# #         self.v_max_norm = v_max_kmh * dt_h / (111.0 * 50.0)
+
+# #         self.feat_extractor = ObsTrajFeatureExtractor(feat_dim)
+# #         self.cnn_enc        = CNNStateEncoder(feat_dim, d_model)
+# #         self.input_proj     = nn.Linear(d_model, d_model)
+# #         self.enc_pe         = SinusoidalPE(d_model, max_len=obs_len + 10)
+
+# #         enc_layer = nn.TransformerEncoderLayer(
+# #             d_model=d_model, nhead=nhead,
+# #             dim_feedforward=dim_ff, dropout=dropout,
+# #             activation="relu", batch_first=True,
+# #         )
+# #         self.transformer_enc = nn.TransformerEncoder(enc_layer,
+# #                                                       num_layers=num_enc_layers)
+
+# #         # AR GRU decoder (simpler than full transformer decoder for AR)
+# #         self.ar_gru   = nn.GRUCell(2 + d_model, d_model)
+# #         self.reg_head = nn.Sequential(
+# #             nn.Linear(d_model, d_model),
+# #             nn.ReLU(),
+# #             nn.Linear(d_model, 2),
+# #         )
+
+# #         self._init_weights()
+
+# #     def _init_weights(self):
+# #         for m in self.modules():
+# #             if isinstance(m, nn.Linear):
+# #                 nn.init.xavier_uniform_(m.weight, gain=0.5)
+# #                 if m.bias is not None:
+# #                     nn.init.zeros_(m.bias)
+
+# #     def forward(self, obs_traj: torch.Tensor,
+# #                 gt_traj: Optional[torch.Tensor] = None,
+# #                 teacher_forcing: bool = True) -> torch.Tensor:
+# #         B = obs_traj.shape[1]
+# #         feat   = self.feat_extractor(obs_traj)
+# #         h      = self.cnn_enc(feat)
+# #         h      = self.input_proj(h)
+# #         h      = self.enc_pe(h)
+# #         memory = self.transformer_enc(h)            # [B, S, d_model]
+# #         ctx    = memory.mean(dim=1)                  # [B, d_model]
+
+# #         cur_pos = obs_traj[-1].clone()
+# #         hx      = ctx
+# #         preds   = []
+
+# #         for i in range(self.pred_len):
+# #             inp  = torch.cat([cur_pos, ctx], dim=-1)
+# #             hx   = self.ar_gru(inp, hx)
+# #             out  = self.reg_head(hx)
+# #             preds.append(out)
+
+# #             if teacher_forcing and gt_traj is not None and i < gt_traj.shape[0]:
+# #                 cur_pos = gt_traj[i]
+# #             else:
+# #                 cur_pos = out.detach()
+
+# #         return torch.stack(preds, dim=0)   # [pred_len, B, 2]
+
+# #     def physics_loss(self, pred_norm, gt_norm):
+# #         T = min(pred_norm.shape[0], gt_norm.shape[0])
+# #         pred = pred_norm[:T]; gt = gt_norm[:T]
+# #         pred_deg = _norm_to_deg(pred); gt_deg = _norm_to_deg(gt)
+# #         l_dpe   = haversine_km(pred_deg, gt_deg).mean()
+# #         l_mse   = F.mse_loss(pred, gt)
+# #         if T >= 2:
+# #             step_dist = (pred[1:] - pred[:-1]).norm(dim=-1)
+# #             l_speed = F.relu(step_dist - self.v_max_norm).pow(2).mean()
+# #         else:
+# #             l_speed = pred_norm.new_zeros(())
+# #         if T >= 3:
+# #             vel = pred[1:] - pred[:-1]
+# #             l_accel = (vel[1:].norm(dim=-1) - vel[:-1].norm(dim=-1)).pow(2).mean()
+# #         else:
+# #             l_accel = pred_norm.new_zeros(())
+# #         total = l_dpe + self.w_mse*l_mse + self.lambda_speed*l_speed + self.lambda_accel*l_accel
+# #         return dict(total=total, dpe=l_dpe.item(), mse=l_mse.item(),
+# #                     speed=l_speed.item(), accel=l_accel.item())
+
+# #     def get_loss(self, batch_list):
+# #         return self.get_loss_breakdown(batch_list)["total"]
+
+# #     def get_loss_breakdown(self, batch_list):
+# #         obs_traj = batch_list[0]; traj_gt = batch_list[1]
+# #         pred = self.forward(obs_traj, traj_gt, teacher_forcing=True)
+# #         return self.physics_loss(pred, traj_gt)
+
+# #     @torch.no_grad()
+# #     def sample(self, batch_list, **kwargs):
+# #         obs_traj = batch_list[0]
+# #         pred = self.forward(obs_traj, teacher_forcing=False)
+# #         T, B, _ = pred.shape
+# #         me_mean = torch.zeros(T, B, 2, device=pred.device)
+# #         return pred, me_mean, pred.unsqueeze(0)
+
+
+# # # ══════════════════════════════════════════════════════════════════════════════
+# # #  ADE metrics  (cùng format với bài của bạn)
+# # # ══════════════════════════════════════════════════════════════════════════════
+
+# # def compute_ade_per_horizon(
+# #     pred_norm: torch.Tensor,
+# #     gt_norm:   torch.Tensor,
+# # ) -> Dict[str, float]:
+# #     T = min(pred_norm.shape[0], gt_norm.shape[0])
+# #     pred_deg = _norm_to_deg(pred_norm[:T])
+# #     gt_deg   = _norm_to_deg(gt_norm[:T])
+# #     dist = haversine_km(pred_deg, gt_deg)
+# #     result = dict(ADE=float(dist.mean()), FDE=float(dist[-1].mean()))
+# #     for h, s in HORIZON_STEPS.items():
+# #         result[f"{h}h"] = float(dist[s].mean()) if s < T else float("nan")
+# #     return result
+
 # """
 # Model/st_trans_model.py  ── ST-Trans Baseline
 # ===============================================
@@ -6,177 +572,42 @@
 # cyclone track prediction in the Bay of Bengal"
 # Expert Systems With Applications 317 (2026) 131972
 
-# CHIẾN LƯỢC (theo paper §3):
-#   - Input : obs_traj cuối (obs_len bước) → encode 8D features
-#   - CNN   : reshape → [S, 1, 2, 4] grid → 2×2 conv → 1×2 conv → 64D
-#   - Encoder: Transformer encoder (self-attention over S steps)
-#   - Decoder: Non-autoregressive, learned horizon queries [H×dmodel]
-#   - Output : toàn bộ H bước predict song song (không autoregressive)
+# THAY ĐỔI SO VỚI PHIÊN BẢN TRƯỚC:
+#   ✅ Dùng cùng PaperEncoder (FNO3D + Mamba + Env_net) với paper baseline
+#      thay vì chỉ encode obs_traj qua CNN đơn giản.
+#   ✅ Thêm ATE / CTE metrics (Along-Track / Cross-Track Error)
+#   ✅ Interface nhất quán: forward(batch_list) thay vì forward(obs_traj)
+
+# KIẾN TRÚC MỚI:
+#   PaperEncoder(batch_list)   → raw_ctx [B, 512]          (context phong phú)
+#   obs_traj features          → obs_memory [B, S, d_model] (temporal structure)
+#   full_memory = cat([raw_ctx_token, obs_memory], dim=1)   [B, S+1, d_model]
+#   Transformer decoder (learned horizon queries) → [B, H, d_model]
+#   Regression head  → [H, B, 2]
 
 # LOSS (§3.5.1 - Physics-guided composite):
 #   L = L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
-#   λ_speed = 0.1, λ_accel = 0.01, v_max = 80 km/h
-
-# ADAPTED cho TCND_vn:
-#   - Input features: lat, lon, speed, heading, year, month, day, hour
-#     (giống 8D của paper, extract từ obs_traj + metadata)
-#   - Dùng chung DataLoader của bạn
-#   - Output: [pred_len, B, 2] normalised (cùng format với bài của bạn)
-#   - Eval bằng cùng haversine ADE metrics (12h/24h/48h/72h)
-
-# NOTE:
-#   - Paper dùng S=3 (9h), H=16 (48h) ở resolution 3h
-#   - Bạn dùng S=8 (obs_len), H=12 (pred_len) ở resolution 6h → 72h
-#   - Điều chỉnh: S=obs_len, H=pred_len, giữ nguyên architecture
 # """
 # from __future__ import annotations
 
 # import math
-# from typing import Dict, List, Optional, Tuple
+# from typing import Dict, Optional, Tuple
 
-# import numpy as np
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
 
-# # ══════════════════════════════════════════════════════════════════════════════
-# #  Haversine helpers  (cùng convention với bài của bạn)
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# def _norm_to_deg(arr: torch.Tensor) -> torch.Tensor:
-#     """Denormalise từ normalised space → degrees."""
-#     out = arr.clone()
-#     out[..., 0] = (arr[..., 0] * 50.0 + 1800.0) / 10.0   # lon
-#     out[..., 1] = (arr[..., 1] * 50.0) / 10.0              # lat
-#     return out
-
-
-# def haversine_km(p1: torch.Tensor, p2: torch.Tensor) -> torch.Tensor:
-#     """Haversine distance [km]. p1, p2: [..., 2] degrees (lon, lat)."""
-#     lon1 = torch.deg2rad(p1[..., 0]); lat1 = torch.deg2rad(p1[..., 1])
-#     lon2 = torch.deg2rad(p2[..., 0]); lat2 = torch.deg2rad(p2[..., 1])
-#     dlat = lat2 - lat1; dlon = lon2 - lon1
-#     a = torch.sin(dlat/2).pow(2) + torch.cos(lat1)*torch.cos(lat2)*torch.sin(dlon/2).pow(2)
-#     return 2.0 * 6371.0 * torch.asin(a.clamp(1e-12, 1.0).sqrt())
-
-
-# HORIZON_STEPS: Dict[int, int] = {12: 1, 24: 3, 48: 7, 72: 11}
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# #  Feature extractor  ── lấy 8D features từ obs_traj
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# class ObsTrajFeatureExtractor(nn.Module):
-#     """
-#     Extract 8D features từ obs_traj [T_obs, B, 2] (normalised lat/lon).
-
-#     Paper features:
-#       1. lat_norm, lon_norm     (position)
-#       2. speed_norm             (translation speed estimate)
-#       3. heading_norm           (motion direction)
-#       4. year_norm, month_norm, day_norm, hour_norm  (temporal)
-
-#     Vì bạn không có temporal metadata trong batch, ta dùng:
-#       1-2: lat, lon (từ obs_traj)
-#       3-4: delta_lat, delta_lon (velocity)
-#       5-6: delta2_lat, delta2_lon (acceleration)
-#       7-8: step index (normalized), cumulative distance
-
-#     → 8D vẫn đủ để encode kinematic history
-#     """
-
-#     def __init__(self, feat_dim: int = 8):
-#         super().__init__()
-#         self.feat_dim = feat_dim
-
-#     def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
-#         """
-#         obs_traj: [T_obs, B, 2] normalised (lon, lat)
-#         Returns:  [B, T_obs, 8]
-#         """
-#         T, B, _ = obs_traj.shape
-#         device   = obs_traj.device
-
-#         # Position
-#         lon = obs_traj[:, :, 0]   # [T, B]
-#         lat = obs_traj[:, :, 1]   # [T, B]
-
-#         # Velocity (delta per step)
-#         if T >= 2:
-#             d_lon = torch.cat([obs_traj[1:, :, 0] - obs_traj[:-1, :, 0],
-#                                torch.zeros(1, B, device=device)], dim=0)
-#             d_lat = torch.cat([obs_traj[1:, :, 1] - obs_traj[:-1, :, 1],
-#                                torch.zeros(1, B, device=device)], dim=0)
-#         else:
-#             d_lon = torch.zeros(T, B, device=device)
-#             d_lat = torch.zeros(T, B, device=device)
-
-#         # Acceleration (delta of delta)
-#         if T >= 3:
-#             dd_lon = torch.cat([d_lon[1:] - d_lon[:-1],
-#                                 torch.zeros(1, B, device=device)], dim=0)
-#             dd_lat = torch.cat([d_lat[1:] - d_lat[:-1],
-#                                 torch.zeros(1, B, device=device)], dim=0)
-#         else:
-#             dd_lon = torch.zeros(T, B, device=device)
-#             dd_lat = torch.zeros(T, B, device=device)
-
-#         # Step index (0→1 normalized)
-#         step_idx = torch.linspace(0, 1, T, device=device).unsqueeze(1).expand(T, B)
-
-#         # Speed magnitude
-#         speed = torch.sqrt(d_lon.pow(2) + d_lat.pow(2)).clamp(min=0)
-
-#         # Stack: [T, B, 8]
-#         features = torch.stack([lon, lat, d_lon, d_lat,
-#                                  dd_lon, dd_lat, step_idx, speed], dim=-1)
-#         return features.permute(1, 0, 2)   # [B, T_obs, 8]
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# #  CNN State Encoder  ── §3.3.2
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# class CNNStateEncoder(nn.Module):
-#     """
-#     Per-timestep CNN encoder.
-#     Input: 8D feature vector → reshape [1, 2, 4] → conv → 64D.
-
-#     Paper §3.3.2:
-#       - Reshape 8D → [1, 2, 4] synthetic grid
-#       - Conv1: 2×2 kernel, 1→32 channels, ReLU
-#       - Conv2: 1×2 kernel, 32→32 channels, ReLU
-#       - Flatten → 64D
-#     """
-
-#     def __init__(self, feat_dim: int = 8, out_dim: int = 64):
-#         super().__init__()
-#         self.feat_dim = feat_dim
-#         self.out_dim  = out_dim
-
-#         self.conv1 = nn.Conv2d(1, 32, kernel_size=(2, 2), stride=1, padding=0)
-#         self.conv2 = nn.Conv2d(32, 32, kernel_size=(1, 2), stride=1, padding=0)
-
-#         # After conv1: [B, 32, 1, 3], after conv2: [B, 32, 1, 2] → flatten=64
-#         self.proj = nn.Linear(64, out_dim)
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x: [B, S, 8]
-#         Returns: [B, S, out_dim]
-#         """
-#         B, S, _ = x.shape
-
-#         # Process each timestep independently
-#         x_flat = x.reshape(B * S, 1, 2, 4)   # [B*S, 1, 2, 4]
-
-#         h = F.relu(self.conv1(x_flat))         # [B*S, 32, 1, 3]
-#         h = F.relu(self.conv2(h))              # [B*S, 32, 1, 2]
-#         h = h.flatten(1)                       # [B*S, 64]
-#         h = self.proj(h)                       # [B*S, out_dim]
-
-#         return h.reshape(B, S, self.out_dim)
+# # ── Import shared encoder và metric helpers ──────────────────────────────────
+# from Model.paper_baseline_model import (
+#     PaperEncoder,
+#     _norm_to_deg,
+#     _ate_cte_tensors,
+#     haversine_km,
+#     compute_ade_per_horizon,
+#     compute_ate_cte_per_horizon,
+#     compute_full_metrics,
+#     HORIZON_STEPS,
+# )
 
 
 # # ══════════════════════════════════════════════════════════════════════════════
@@ -184,9 +615,9 @@
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class SinusoidalPE(nn.Module):
-#     def __init__(self, d_model: int, max_len: int = 200):
+#     def __init__(self, d_model: int, max_len: int = 300):
 #         super().__init__()
-#         pe = torch.zeros(max_len, d_model)
+#         pe  = torch.zeros(max_len, d_model)
 #         pos = torch.arange(max_len).unsqueeze(1).float()
 #         div = torch.exp(torch.arange(0, d_model, 2).float() *
 #                         (-math.log(10000.0) / d_model))
@@ -199,71 +630,144 @@
 
 
 # # ══════════════════════════════════════════════════════════════════════════════
-# #  ST-Trans Main Model  ── §3.3.1
+# #  Lightweight obs-traj encoder  (thay CNNStateEncoder cũ)
+# #  8D kinematic features → [B, S, d_model] sequence memory
+# # ══════════════════════════════════════════════════════════════════════════════
+
+# class ObsKinematicEncoder(nn.Module):
+#     """
+#     Encode obs_traj [T_obs, B, 2] → sequence memory [B, T_obs, d_model].
+
+#     Tính 8 kinematic features (position, velocity, acceleration, speed, step-idx)
+#     rồi project qua MLP → transformer encoder để capture temporal dependencies.
+#     """
+
+#     FEAT_DIM = 8
+
+#     def __init__(self, d_model: int = 64, nhead: int = 4,
+#                  num_layers: int = 1, dim_ff: int = 256, dropout: float = 0.1):
+#         super().__init__()
+#         # 8 → d_model projection
+#         self.proj = nn.Sequential(
+#             nn.Linear(self.FEAT_DIM, d_model),
+#             nn.ReLU(),
+#             nn.Linear(d_model, d_model),
+#         )
+#         self.pe = SinusoidalPE(d_model, max_len=64)
+#         enc_layer = nn.TransformerEncoderLayer(
+#             d_model=d_model, nhead=nhead,
+#             dim_feedforward=dim_ff, dropout=dropout,
+#             activation="relu", batch_first=True,
+#         )
+#         self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+#     @staticmethod
+#     def _extract_features(obs_traj: torch.Tensor) -> torch.Tensor:
+#         """obs_traj [T, B, 2] → features [B, T, 8]."""
+#         T, B, _ = obs_traj.shape
+#         device  = obs_traj.device
+
+#         lon = obs_traj[:, :, 0]
+#         lat = obs_traj[:, :, 1]
+
+#         if T >= 2:
+#             d_lon = torch.cat([obs_traj[1:, :, 0] - obs_traj[:-1, :, 0],
+#                                torch.zeros(1, B, device=device)], dim=0)
+#             d_lat = torch.cat([obs_traj[1:, :, 1] - obs_traj[:-1, :, 1],
+#                                torch.zeros(1, B, device=device)], dim=0)
+#         else:
+#             d_lon = torch.zeros(T, B, device=device)
+#             d_lat = torch.zeros(T, B, device=device)
+
+#         if T >= 3:
+#             dd_lon = torch.cat([d_lon[1:] - d_lon[:-1],
+#                                 torch.zeros(1, B, device=device)], dim=0)
+#             dd_lat = torch.cat([d_lat[1:] - d_lat[:-1],
+#                                 torch.zeros(1, B, device=device)], dim=0)
+#         else:
+#             dd_lon = torch.zeros(T, B, device=device)
+#             dd_lat = torch.zeros(T, B, device=device)
+
+#         step_idx = torch.linspace(0, 1, T, device=device).unsqueeze(1).expand(T, B)
+#         speed    = (d_lon.pow(2) + d_lat.pow(2)).sqrt()
+
+#         feat = torch.stack([lon, lat, d_lon, d_lat,
+#                             dd_lon, dd_lat, step_idx, speed], dim=-1)
+#         return feat.permute(1, 0, 2)   # [B, T, 8]
+
+#     def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
+#         """→ [B, T_obs, d_model]"""
+#         feat = self._extract_features(obs_traj)   # [B, T, 8]
+#         h    = self.proj(feat)                     # [B, T, d_model]
+#         h    = self.pe(h)
+#         return self.enc(h)                         # [B, T, d_model]
+
+
+# # ══════════════════════════════════════════════════════════════════════════════
+# #  ST-Trans Main Model
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class STTrans(nn.Module):
 #     """
 #     Physics-guided Non-Autoregressive Transformer for TC track prediction.
 
-#     Architecture (paper §3.3):
-#       1. Feature extraction: obs_traj → 8D features
-#       2. CNN state encoder: 8D → 64D per timestep
-#       3. Linear projection: 64D → dmodel
-#       4. Transformer encoder: self-attention over S history steps
-#       5. Horizon queries: H learned queries [H, dmodel]
-#       6. Transformer decoder: cross-attention → [H, dmodel]
-#       7. Regression head: [H, dmodel] → [H, 2]
+#     Kiến trúc (sau khi sửa để dùng cùng encoder với PaperBaseline):
+#       1. PaperEncoder(batch_list)  → raw_ctx [B, 512]
+#       2. Project raw_ctx → ctx_token [B, 1, d_model]  (global context token)
+#       3. ObsKinematicEncoder(obs_traj) → obs_memory [B, S, d_model]
+#       4. full_memory = cat([ctx_token, obs_memory], dim=1)  [B, S+1, d_model]
+#       5. Learned horizon queries [B, H, d_model] + dec_pe
+#       6. Transformer decoder (cross-attention) → [B, H, d_model]
+#       7. Regression head → [H, B, 2]
 
-#     Physics loss (§3.5.1):
+#     Loss: Physics-guided composite (§3.5.1)
 #       L = L_DPE + 0.05*L_MSE + 0.1*L_speed + 0.01*L_accel
 #     """
 
 #     def __init__(
 #         self,
-#         obs_len:    int   = 8,
-#         pred_len:   int   = 12,
-#         feat_dim:   int   = 8,
-#         d_model:    int   = 64,
-#         nhead:      int   = 4,
-#         num_enc_layers: int = 1,
-#         num_dec_layers: int = 3,
-#         dim_ff:     int   = 512,
-#         dropout:    float = 0.1,
-#         # Physics loss weights (paper §3.5.1)
-#         lambda_speed: float = 0.1,
-#         lambda_accel: float = 0.01,
-#         w_mse:        float = 0.05,
-#         v_max_kmh:    float = 80.0,   # paper default
-#         dt_h:         float = 6.0,    # 6h per step (your dataset)
+#         obs_len:        int   = 8,
+#         pred_len:       int   = 12,
+#         unet_in_ch:     int   = 13,
+#         d_model:        int   = 64,
+#         nhead:          int   = 4,
+#         num_enc_layers: int   = 1,
+#         num_dec_layers: int   = 3,
+#         dim_ff:         int   = 512,
+#         dropout:        float = 0.1,
+#         # Physics loss weights
+#         lambda_speed:   float = 0.1,
+#         lambda_accel:   float = 0.01,
+#         w_mse:          float = 0.05,
+#         v_max_kmh:      float = 80.0,
+#         dt_h:           float = 6.0,
 #     ):
 #         super().__init__()
-#         self.obs_len    = obs_len
-#         self.pred_len   = pred_len
-#         self.d_model    = d_model
+#         self.obs_len      = obs_len
+#         self.pred_len     = pred_len
+#         self.d_model      = d_model
 #         self.lambda_speed = lambda_speed
 #         self.lambda_accel = lambda_accel
 #         self.w_mse        = w_mse
-#         # v_max in normalised units: 80 km/h * 6h = 480 km ≈ 480/111 ≈ 4.3 deg
-#         # normalised: 4.3 / 5.0 ≈ 0.86 per step
-#         self.v_max_norm = v_max_kmh * dt_h / (111.0 * 50.0)
+#         # v_max trong normalised units
+#         self.v_max_norm   = v_max_kmh * dt_h / (111.0 * 50.0)
 
-#         # ── Feature extraction ────────────────────────────────────────────
-#         self.feat_extractor = ObsTrajFeatureExtractor(feat_dim)
-#         self.cnn_enc        = CNNStateEncoder(feat_dim, d_model)
-#         self.input_proj     = nn.Linear(d_model, d_model)
-#         self.enc_pe         = SinusoidalPE(d_model, max_len=obs_len + 10)
+#         # ── Shared encoder (cùng với PaperBaseline) ───────────────────────
+#         self.encoder = PaperEncoder(obs_len=obs_len, unet_in_ch=unet_in_ch)
 
-#         # ── Transformer encoder ───────────────────────────────────────────
-#         enc_layer = nn.TransformerEncoderLayer(
-#             d_model=d_model, nhead=nhead,
-#             dim_feedforward=dim_ff, dropout=dropout,
-#             activation="relu", batch_first=True,
+#         # Project raw_ctx [B, 512] → context token [B, 1, d_model]
+#         self.ctx_proj = nn.Sequential(
+#             nn.Linear(PaperEncoder.RAW_CTX_DIM, d_model),
+#             nn.LayerNorm(d_model),
 #         )
-#         self.transformer_enc = nn.TransformerEncoder(enc_layer,
-#                                                       num_layers=num_enc_layers)
 
-#         # ── Horizon queries (learned, paper §3.3.4) ───────────────────────
+#         # ── Obs trajectory kinematic encoder → temporal memory ────────────
+#         self.obs_enc = ObsKinematicEncoder(
+#             d_model=d_model, nhead=nhead,
+#             num_layers=num_enc_layers, dim_ff=dim_ff, dropout=dropout,
+#         )
+
+#         # ── Learned horizon queries (paper §3.3.4) ────────────────────────
 #         self.horizon_queries = nn.Parameter(
 #             torch.randn(1, pred_len, d_model) * 0.02
 #         )
@@ -275,10 +779,10 @@
 #             dim_feedforward=dim_ff, dropout=dropout,
 #             activation="relu", batch_first=True,
 #         )
-#         self.transformer_dec = nn.TransformerDecoder(dec_layer,
-#                                                       num_layers=num_dec_layers)
+#         self.transformer_dec = nn.TransformerDecoder(
+#             dec_layer, num_layers=num_dec_layers)
 
-#         # ── Regression head (paper §3.3.4: g(dτ) = W2·σ(W1·dτ+b1)+b2) ──
+#         # ── Regression head (paper §3.3.4) ───────────────────────────────
 #         self.reg_head = nn.Sequential(
 #             nn.Linear(d_model, d_model),
 #             nn.ReLU(),
@@ -296,80 +800,68 @@
 
 #     # ── Forward ───────────────────────────────────────────────────────────
 
-#     def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
+#     def forward(self, batch_list) -> torch.Tensor:
 #         """
-#         obs_traj: [T_obs, B, 2] normalised
-#         Returns:  [pred_len, B, 2] normalised predictions
+#         batch_list: cùng format với PaperBaseline (full batch với ảnh, env, ...)
+#         → pred [pred_len, B, 2] normalised
 #         """
-#         B = obs_traj.shape[1]
+#         obs_traj = batch_list[0]     # [T_obs, B, 2]
+#         B        = obs_traj.shape[1]
 
-#         # 1. Extract 8D features
-#         feat = self.feat_extractor(obs_traj)   # [B, S, 8]
+#         # 1. Rich context từ full encoder
+#         raw_ctx    = self.encoder(batch_list)          # [B, 512]
+#         ctx_token  = self.ctx_proj(raw_ctx).unsqueeze(1)  # [B, 1, d_model]
 
-#         # 2. CNN state encoder
-#         h = self.cnn_enc(feat)                  # [B, S, d_model]
-#         h = self.input_proj(h)                  # [B, S, d_model]
-#         h = self.enc_pe(h)                      # [B, S, d_model]
+#         # 2. Temporal obs memory
+#         obs_memory = self.obs_enc(obs_traj)            # [B, S, d_model]
 
-#         # 3. Transformer encoder → memory
-#         memory = self.transformer_enc(h)        # [B, S, d_model]
+#         # 3. Kết hợp context token + temporal memory
+#         full_memory = torch.cat([ctx_token, obs_memory], dim=1)  # [B, S+1, d_model]
 
-#         # 4. Horizon queries with positional encoding
-#         Q = self.horizon_queries.expand(B, -1, -1)   # [B, H, d_model]
-#         Q = self.dec_pe(Q)                            # [B, H, d_model]
+#         # 4. Horizon queries
+#         Q = self.horizon_queries.expand(B, -1, -1)    # [B, H, d_model]
+#         Q = self.dec_pe(Q)
 
-#         # 5. Transformer decoder (non-autoregressive cross-attention)
-#         D = self.transformer_dec(Q, memory)     # [B, H, d_model]
+#         # 5. Non-autoregressive decoder
+#         D   = self.transformer_dec(Q, full_memory)     # [B, H, d_model]
+#         out = self.reg_head(D)                         # [B, H, 2]
 
-#         # 6. Regression head → [B, H, 2]
-#         out = self.reg_head(D)                  # [B, H, 2]
-
-#         # Return [pred_len, B, 2] (same format as your model)
-#         return out.permute(1, 0, 2)
+#         return out.permute(1, 0, 2)                    # [pred_len, B, 2]
 
 #     # ── Physics-guided loss (§3.5.1) ─────────────────────────────────────
 
 #     def physics_loss(
 #         self,
-#         pred_norm: torch.Tensor,   # [T, B, 2] normalised
-#         gt_norm:   torch.Tensor,   # [T, B, 2] normalised
+#         pred_norm: torch.Tensor,
+#         gt_norm:   torch.Tensor,
 #     ) -> Dict:
-#         T = min(pred_norm.shape[0], gt_norm.shape[0])
+#         T    = min(pred_norm.shape[0], gt_norm.shape[0])
 #         pred = pred_norm[:T]
 #         gt   = gt_norm[:T]
 
-#         # Convert to degrees for haversine
 #         pred_deg = _norm_to_deg(pred)
 #         gt_deg   = _norm_to_deg(gt)
 
 #         # L_DPE: mean great-circle distance (eq. 16)
-#         dist = haversine_km(pred_deg, gt_deg)   # [T, B]
-#         l_dpe = dist.mean()
+#         l_dpe = haversine_km(pred_deg, gt_deg).mean()
 
-#         # L_MSE: coordinate space MSE (eq. 17)
+#         # L_MSE: coordinate MSE (eq. 17)
 #         l_mse = F.mse_loss(pred, gt)
 
-#         # L_speed: penalize speeds > v_max (eq. 18-20)
+#         # L_speed: penalise speeds > v_max (eq. 18-20)
 #         if T >= 2:
-#             step_dist = torch.sqrt(
-#                 (pred[1:, :, 0] - pred[:-1, :, 0]).pow(2) +
-#                 (pred[1:, :, 1] - pred[:-1, :, 1]).pow(2)
-#             )   # [T-1, B] in normalised units
-#             excess_speed = F.relu(step_dist - self.v_max_norm)
-#             l_speed = excess_speed.pow(2).mean()
+#             step_dist = (pred[1:] - pred[:-1]).norm(dim=-1)      # [T-1, B]
+#             l_speed   = F.relu(step_dist - self.v_max_norm).pow(2).mean()
 #         else:
 #             l_speed = pred_norm.new_zeros(())
 
-#         # L_accel: penalize acceleration changes (eq. 21-22)
+#         # L_accel: penalise acceleration changes (eq. 21-22)
 #         if T >= 3:
-#             vel = pred[1:] - pred[:-1]        # [T-1, B, 2]
-#             spd = vel.norm(dim=-1)             # [T-1, B]
-#             accel = (spd[1:] - spd[:-1]).pow(2).mean()
-#             l_accel = accel
+#             vel     = pred[1:] - pred[:-1]                        # [T-1, B, 2]
+#             l_accel = (vel[1:].norm(dim=-1) - vel[:-1].norm(dim=-1)).pow(2).mean()
 #         else:
 #             l_accel = pred_norm.new_zeros(())
 
-#         # Total physics-guided loss (eq. 15)
 #         total = (l_dpe
 #                  + self.w_mse        * l_mse
 #                  + self.lambda_speed * l_speed
@@ -383,17 +875,23 @@
 #             accel=l_accel.item(),
 #         )
 
-#     # ── Interface matching TCFlowMatching ─────────────────────────────────
+#     # ── Training / inference interface (nhất quán với PaperBaseline) ─────
 
 #     def get_loss(self, batch_list) -> torch.Tensor:
 #         return self.get_loss_breakdown(batch_list)["total"]
 
 #     def get_loss_breakdown(self, batch_list) -> Dict:
-#         obs_traj = batch_list[0]   # [T_obs, B, 2]
-#         traj_gt  = batch_list[1]   # [T_gt, B, 2]
+#         traj_gt = batch_list[1]
+#         pred    = self.forward(batch_list)
+#         bd      = self.physics_loss(pred, traj_gt)
 
-#         pred = self.forward(obs_traj)
-#         return self.physics_loss(pred, traj_gt)
+#         with torch.no_grad():
+#             ade_m = compute_ade_per_horizon(pred.detach(), traj_gt)
+#             atc_m = compute_ate_cte_per_horizon(pred.detach(), traj_gt)
+
+#         bd.update(ade_m)
+#         bd.update(atc_m)
+#         return bd
 
 #     @torch.no_grad()
 #     def sample(
@@ -402,77 +900,68 @@
 #         num_ensemble: int = 1,
 #         **kwargs,
 #     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-#         """
-#         Returns:
-#             pred_mean : [T, B, 2] normalised
-#             me_mean   : [T, B, 2] zeros
-#             all_trajs : [1, T, B, 2]
-#         """
-#         obs_traj = batch_list[0]
-#         pred = self.forward(obs_traj)
-#         T, B, _ = pred.shape
-#         me_mean   = torch.zeros(T, B, 2, device=pred.device)
-#         all_trajs = pred.unsqueeze(0)
-#         return pred, me_mean, all_trajs
+#         pred     = self.forward(batch_list)
+#         T, B, _  = pred.shape
+#         me_mean  = torch.zeros(T, B, 2, device=pred.device)
+#         return pred, me_mean, pred.unsqueeze(0)
 
 
 # # ══════════════════════════════════════════════════════════════════════════════
-# #  Autoregressive variant  ── ST-Trans-AR (paper §3.4)
+# #  ST-Trans-AR  ── Autoregressive variant (paper §3.4)
 # # ══════════════════════════════════════════════════════════════════════════════
 
 # class STTransAR(nn.Module):
 #     """
-#     Autoregressive variant of ST-Trans (baseline trong paper §3.4).
-#     Cùng encoder architecture, nhưng decoder predict từng bước một.
-#     Dùng để so sánh với non-AR trong ablation study.
+#     Autoregressive ST-Trans.
+#     Cùng encoder backbone với STTrans và PaperBaseline, decoder AR-GRU.
+#     Dùng để ablation so sánh với non-AR.
 #     """
 
 #     def __init__(
 #         self,
-#         obs_len:    int   = 8,
-#         pred_len:   int   = 12,
-#         feat_dim:   int   = 8,
-#         d_model:    int   = 64,
-#         nhead:      int   = 4,
-#         num_enc_layers: int = 1,
-#         dim_ff:     int   = 512,
-#         dropout:    float = 0.1,
-#         lambda_speed: float = 0.1,
-#         lambda_accel: float = 0.01,
-#         w_mse:        float = 0.05,
-#         v_max_kmh:    float = 80.0,
-#         dt_h:         float = 6.0,
+#         obs_len:        int   = 8,
+#         pred_len:       int   = 12,
+#         unet_in_ch:     int   = 13,
+#         d_model:        int   = 64,
+#         nhead:          int   = 4,
+#         num_enc_layers: int   = 1,
+#         dim_ff:         int   = 512,
+#         dropout:        float = 0.1,
+#         lambda_speed:   float = 0.1,
+#         lambda_accel:   float = 0.01,
+#         w_mse:          float = 0.05,
+#         v_max_kmh:      float = 80.0,
+#         dt_h:           float = 6.0,
 #     ):
 #         super().__init__()
-#         self.obs_len    = obs_len
-#         self.pred_len   = pred_len
-#         self.d_model    = d_model
+#         self.obs_len      = obs_len
+#         self.pred_len     = pred_len
+#         self.d_model      = d_model
 #         self.lambda_speed = lambda_speed
 #         self.lambda_accel = lambda_accel
 #         self.w_mse        = w_mse
-#         self.v_max_norm = v_max_kmh * dt_h / (111.0 * 50.0)
+#         self.v_max_norm   = v_max_kmh * dt_h / (111.0 * 50.0)
 
-#         self.feat_extractor = ObsTrajFeatureExtractor(feat_dim)
-#         self.cnn_enc        = CNNStateEncoder(feat_dim, d_model)
-#         self.input_proj     = nn.Linear(d_model, d_model)
-#         self.enc_pe         = SinusoidalPE(d_model, max_len=obs_len + 10)
-
-#         enc_layer = nn.TransformerEncoderLayer(
-#             d_model=d_model, nhead=nhead,
-#             dim_feedforward=dim_ff, dropout=dropout,
-#             activation="relu", batch_first=True,
+#         # ── Shared encoder ────────────────────────────────────────────────
+#         self.encoder  = PaperEncoder(obs_len=obs_len, unet_in_ch=unet_in_ch)
+#         self.ctx_proj = nn.Sequential(
+#             nn.Linear(PaperEncoder.RAW_CTX_DIM, d_model),
+#             nn.LayerNorm(d_model),
 #         )
-#         self.transformer_enc = nn.TransformerEncoder(enc_layer,
-#                                                       num_layers=num_enc_layers)
 
-#         # AR GRU decoder (simpler than full transformer decoder for AR)
+#         self.obs_enc = ObsKinematicEncoder(
+#             d_model=d_model, nhead=nhead,
+#             num_layers=num_enc_layers, dim_ff=dim_ff, dropout=dropout,
+#         )
+
+#         # ── AR-GRU decoder ────────────────────────────────────────────────
+#         # Input: cur_pos(2) + pooled_memory(d_model)
 #         self.ar_gru   = nn.GRUCell(2 + d_model, d_model)
 #         self.reg_head = nn.Sequential(
 #             nn.Linear(d_model, d_model),
 #             nn.ReLU(),
 #             nn.Linear(d_model, 2),
 #         )
-
 #         self._init_weights()
 
 #     def _init_weights(self):
@@ -482,27 +971,31 @@
 #                 if m.bias is not None:
 #                     nn.init.zeros_(m.bias)
 
-#     def forward(self, obs_traj: torch.Tensor,
-#                 gt_traj: Optional[torch.Tensor] = None,
-#                 teacher_forcing: bool = True) -> torch.Tensor:
-#         B = obs_traj.shape[1]
-#         feat   = self.feat_extractor(obs_traj)
-#         h      = self.cnn_enc(feat)
-#         h      = self.input_proj(h)
-#         h      = self.enc_pe(h)
-#         memory = self.transformer_enc(h)            # [B, S, d_model]
-#         ctx    = memory.mean(dim=1)                  # [B, d_model]
+#     def forward(
+#         self,
+#         batch_list,
+#         gt_traj:         Optional[torch.Tensor] = None,
+#         teacher_forcing: bool = True,
+#     ) -> torch.Tensor:
+#         obs_traj = batch_list[0]
+#         B        = obs_traj.shape[1]
 
+#         raw_ctx    = self.encoder(batch_list)               # [B, 512]
+#         ctx_token  = self.ctx_proj(raw_ctx).unsqueeze(1)    # [B, 1, d_model]
+#         obs_memory = self.obs_enc(obs_traj)                 # [B, S, d_model]
+#         full_mem   = torch.cat([ctx_token, obs_memory], dim=1)  # [B, S+1, d_model]
+
+#         # Pooled context for AR decoder
+#         ctx = full_mem.mean(dim=1)     # [B, d_model]
 #         cur_pos = obs_traj[-1].clone()
 #         hx      = ctx
 #         preds   = []
 
 #         for i in range(self.pred_len):
-#             inp  = torch.cat([cur_pos, ctx], dim=-1)
-#             hx   = self.ar_gru(inp, hx)
-#             out  = self.reg_head(hx)
+#             inp = torch.cat([cur_pos, ctx], dim=-1)
+#             hx  = self.ar_gru(inp, hx)
+#             out = self.reg_head(hx)
 #             preds.append(out)
-
 #             if teacher_forcing and gt_traj is not None and i < gt_traj.shape[0]:
 #                 cur_pos = gt_traj[i]
 #             else:
@@ -510,108 +1003,121 @@
 
 #         return torch.stack(preds, dim=0)   # [pred_len, B, 2]
 
-#     def physics_loss(self, pred_norm, gt_norm):
-#         T = min(pred_norm.shape[0], gt_norm.shape[0])
+#     def _physics_loss(self, pred_norm, gt_norm):
+#         T    = min(pred_norm.shape[0], gt_norm.shape[0])
 #         pred = pred_norm[:T]; gt = gt_norm[:T]
 #         pred_deg = _norm_to_deg(pred); gt_deg = _norm_to_deg(gt)
-#         l_dpe   = haversine_km(pred_deg, gt_deg).mean()
-#         l_mse   = F.mse_loss(pred, gt)
+#         l_dpe    = haversine_km(pred_deg, gt_deg).mean()
+#         l_mse    = F.mse_loss(pred, gt)
 #         if T >= 2:
 #             step_dist = (pred[1:] - pred[:-1]).norm(dim=-1)
-#             l_speed = F.relu(step_dist - self.v_max_norm).pow(2).mean()
+#             l_speed   = F.relu(step_dist - self.v_max_norm).pow(2).mean()
 #         else:
-#             l_speed = pred_norm.new_zeros(())
+#             l_speed   = pred_norm.new_zeros(())
 #         if T >= 3:
-#             vel = pred[1:] - pred[:-1]
+#             vel     = pred[1:] - pred[:-1]
 #             l_accel = (vel[1:].norm(dim=-1) - vel[:-1].norm(dim=-1)).pow(2).mean()
 #         else:
 #             l_accel = pred_norm.new_zeros(())
-#         total = l_dpe + self.w_mse*l_mse + self.lambda_speed*l_speed + self.lambda_accel*l_accel
+#         total = (l_dpe + self.w_mse * l_mse
+#                  + self.lambda_speed * l_speed + self.lambda_accel * l_accel)
 #         return dict(total=total, dpe=l_dpe.item(), mse=l_mse.item(),
 #                     speed=l_speed.item(), accel=l_accel.item())
 
-#     def get_loss(self, batch_list):
+#     def get_loss(self, batch_list) -> torch.Tensor:
 #         return self.get_loss_breakdown(batch_list)["total"]
 
-#     def get_loss_breakdown(self, batch_list):
-#         obs_traj = batch_list[0]; traj_gt = batch_list[1]
-#         pred = self.forward(obs_traj, traj_gt, teacher_forcing=True)
-#         return self.physics_loss(pred, traj_gt)
+#     def get_loss_breakdown(self, batch_list) -> Dict:
+#         traj_gt = batch_list[1]
+#         pred    = self.forward(batch_list, traj_gt, teacher_forcing=True)
+#         bd      = self._physics_loss(pred, traj_gt)
+#         with torch.no_grad():
+#             bd.update(compute_ade_per_horizon(pred.detach(), traj_gt))
+#             bd.update(compute_ate_cte_per_horizon(pred.detach(), traj_gt))
+#         return bd
 
 #     @torch.no_grad()
 #     def sample(self, batch_list, **kwargs):
-#         obs_traj = batch_list[0]
-#         pred = self.forward(obs_traj, teacher_forcing=False)
+#         pred    = self.forward(batch_list, teacher_forcing=False)
 #         T, B, _ = pred.shape
 #         me_mean = torch.zeros(T, B, 2, device=pred.device)
 #         return pred, me_mean, pred.unsqueeze(0)
-
-
-# # ══════════════════════════════════════════════════════════════════════════════
-# #  ADE metrics  (cùng format với bài của bạn)
-# # ══════════════════════════════════════════════════════════════════════════════
-
-# def compute_ade_per_horizon(
-#     pred_norm: torch.Tensor,
-#     gt_norm:   torch.Tensor,
-# ) -> Dict[str, float]:
-#     T = min(pred_norm.shape[0], gt_norm.shape[0])
-#     pred_deg = _norm_to_deg(pred_norm[:T])
-#     gt_deg   = _norm_to_deg(gt_norm[:T])
-#     dist = haversine_km(pred_deg, gt_deg)
-#     result = dict(ADE=float(dist.mean()), FDE=float(dist[-1].mean()))
-#     for h, s in HORIZON_STEPS.items():
-#         result[f"{h}h"] = float(dist[s].mean()) if s < T else float("nan")
-#     return result
-
 """
-Model/st_trans_model.py  ── ST-Trans Baseline
-===============================================
-THUẬT TOÁN: Faiaz et al. (2026)
-"Physics-guided non-autoregressive transformer for lightweight
-cyclone track prediction in the Bay of Bengal"
-Expert Systems With Applications 317 (2026) 131972
+Model/st_trans_v2_model.py  ── ST-Trans v2 (Physics-Steering-Gate + Easy/Hard Split)
+======================================================================================
+Mở rộng từ STTrans (Faiaz et al., 2026) với thiết kế loss hai nhánh:
 
-THAY ĐỔI SO VỚI PHIÊN BẢN TRƯỚC:
-  ✅ Dùng cùng PaperEncoder (FNO3D + Mamba + Env_net) với paper baseline
-     thay vì chỉ encode obs_traj qua CNN đơn giản.
-  ✅ Thêm ATE / CTE metrics (Along-Track / Cross-Track Error)
-  ✅ Interface nhất quán: forward(batch_list) thay vì forward(obs_traj)
+  EASY samples (bão thẳng, ~68% data):
+      Loss giữ nguyên 100% như ST-Trans gốc:
+        L_easy = L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
 
-KIẾN TRÚC MỚI:
-  PaperEncoder(batch_list)   → raw_ctx [B, 512]          (context phong phú)
-  obs_traj features          → obs_memory [B, S, d_model] (temporal structure)
-  full_memory = cat([raw_ctx_token, obs_memory], dim=1)   [B, S+1, d_model]
-  Transformer decoder (learned horizon queries) → [B, H, d_model]
-  Regression head  → [H, B, 2]
+  HARD samples (bão recurvature, ~32% data):
+      Loss mở rộng với 3 cải tiến:
+        L_hard = L_DPE_weighted   ← step-weighted, tập trung bước xa
+               + λ_speed*L_speed + λ_accel*L_accel
+               + w_heading*L_heading   ← cosine hướng, tổng quát
+               + w_recurv*L_recurv     ← auxiliary timing head
+               + w_gate_reg*L_gate_reg ← regularize gate không collapse
 
-LOSS (§3.5.1 - Physics-guided composite):
-  L = L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
+  PHYSICS STEERING GATE (chỉ active với hard samples):
+      pred_final[t] = α[t]*pred_learned[t] + (1−α[t])*pred_physics[t]
+      α[t] = sigmoid(gate(ctx, steer_t, step_t))
+      Không có error accumulation. Không thay đổi inference structure.
+
+EASY/HARD CLASSIFICATION:
+  Từ obs_traj (8 bước quan sát), tính:
+    curvature_index = mean(|angle_change[t]|) trên T-2 bước
+    speed_variance  = std(step_speed) / (mean(step_speed) + eps)
+  hard nếu curvature_index > threshold_curv
+       hoặc speed_variance  > threshold_spd
+  Threshold tính 1 lần trên train set (p70) và truyền vào model.
+
+INTERFACE: Tương thích 100% với STTrans gốc.
+  forward(batch_list)        → [pred_len, B, 2]
+  get_loss(batch_list)       → scalar tensor
+  get_loss_breakdown(batch_list) → dict
+  sample(batch_list)         → (pred, me_mean, pred.unsqueeze(0))
+
+BATCH_LIST:
+  [0] obs_traj  [T_obs, B, 2]   normalised lon/lat
+  [1] traj_gt   [T_pred, B, 2]  normalised lon/lat
+  [2] data3d    [B, C, H, W]    ERA5 patches (13 channels, 81×81)
+                                 u500 @ channel _U500_CH, v500 @ _V500_CH
+  [3+] env_data ...              PaperEncoder handles all
+
+NOTE về units:
+  Normalised space: ±1 span 50°, tức 1 unit ≈ 5556 km tại equator
+  u500 ERA5 đơn vị m/s → convert qua _MS_TO_NORM_PER_6H
+  Nếu u500/v500 không ở channel 0/1, đổi _U500_CH và _V500_CH
 """
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ── Import shared encoder và metric helpers ──────────────────────────────────
 from Model.paper_baseline_model import (
     PaperEncoder,
     _norm_to_deg,
-    _ate_cte_tensors,
     haversine_km,
     compute_ade_per_horizon,
     compute_ate_cte_per_horizon,
-    compute_full_metrics,
     HORIZON_STEPS,
 )
 
+# ── ERA5 channel config ───────────────────────────────────────────────────────
+_U500_CH = 0          # channel index của u500 trong data3d [B,C,H,W]
+_V500_CH = 1          # channel index của v500
+_DEG_SCALE = 25.0     # half-span: 1 norm unit = 25 degree  (50°/2)
+_MS_TO_NORM_PER_6H = (6.0 * 3600.0) / (111320.0 * _DEG_SCALE)
+# = (m/s) → (deg/6h) / 25 = normalised displacement per step
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Sinusoidal Positional Encoding
+#  Shared modules (copy từ STTrans gốc, không thay đổi)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class SinusoidalPE(nn.Module):
@@ -623,171 +1129,405 @@ class SinusoidalPE(nn.Module):
                         (-math.log(10000.0) / d_model))
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))   # [1, max_len, d_model]
+        self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.pe[:, :x.size(1), :]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Lightweight obs-traj encoder  (thay CNNStateEncoder cũ)
-#  8D kinematic features → [B, S, d_model] sequence memory
-# ══════════════════════════════════════════════════════════════════════════════
-
 class ObsKinematicEncoder(nn.Module):
-    """
-    Encode obs_traj [T_obs, B, 2] → sequence memory [B, T_obs, d_model].
-
-    Tính 8 kinematic features (position, velocity, acceleration, speed, step-idx)
-    rồi project qua MLP → transformer encoder để capture temporal dependencies.
-    """
-
+    """Encode obs_traj [T_obs,B,2] → [B,T,d_model]. Giống STTrans gốc."""
     FEAT_DIM = 8
 
-    def __init__(self, d_model: int = 64, nhead: int = 4,
-                 num_layers: int = 1, dim_ff: int = 256, dropout: float = 0.1):
+    def __init__(self, d_model=64, nhead=4, num_layers=1,
+                 dim_ff=256, dropout=0.1):
         super().__init__()
-        # 8 → d_model projection
         self.proj = nn.Sequential(
-            nn.Linear(self.FEAT_DIM, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, d_model),
-        )
-        self.pe = SinusoidalPE(d_model, max_len=64)
-        enc_layer = nn.TransformerEncoderLayer(
+            nn.Linear(self.FEAT_DIM, d_model), nn.ReLU(),
+            nn.Linear(d_model, d_model))
+        self.pe  = SinusoidalPE(d_model, max_len=64)
+        enc      = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_ff, dropout=dropout,
-            activation="relu", batch_first=True,
-        )
-        self.enc = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+            activation="relu", batch_first=True)
+        self.enc = nn.TransformerEncoder(enc, num_layers=num_layers)
 
     @staticmethod
-    def _extract_features(obs_traj: torch.Tensor) -> torch.Tensor:
-        """obs_traj [T, B, 2] → features [B, T, 8]."""
-        T, B, _ = obs_traj.shape
-        device  = obs_traj.device
-
-        lon = obs_traj[:, :, 0]
-        lat = obs_traj[:, :, 1]
-
+    def _feats(obs: torch.Tensor) -> torch.Tensor:
+        """[T,B,2] → [B,T,8]"""
+        T, B, _ = obs.shape
+        dev = obs.device
+        lon, lat = obs[:,:,0], obs[:,:,1]
         if T >= 2:
-            d_lon = torch.cat([obs_traj[1:, :, 0] - obs_traj[:-1, :, 0],
-                               torch.zeros(1, B, device=device)], dim=0)
-            d_lat = torch.cat([obs_traj[1:, :, 1] - obs_traj[:-1, :, 1],
-                               torch.zeros(1, B, device=device)], dim=0)
+            dl = torch.cat([obs[1:,:,0]-obs[:-1,:,0], torch.zeros(1,B,device=dev)], 0)
+            dt = torch.cat([obs[1:,:,1]-obs[:-1,:,1], torch.zeros(1,B,device=dev)], 0)
         else:
-            d_lon = torch.zeros(T, B, device=device)
-            d_lat = torch.zeros(T, B, device=device)
-
+            dl = dt = torch.zeros(T, B, device=dev)
         if T >= 3:
-            dd_lon = torch.cat([d_lon[1:] - d_lon[:-1],
-                                torch.zeros(1, B, device=device)], dim=0)
-            dd_lat = torch.cat([d_lat[1:] - d_lat[:-1],
-                                torch.zeros(1, B, device=device)], dim=0)
+            ddl = torch.cat([dl[1:]-dl[:-1], torch.zeros(1,B,device=dev)], 0)
+            ddt = torch.cat([dt[1:]-dt[:-1], torch.zeros(1,B,device=dev)], 0)
         else:
-            dd_lon = torch.zeros(T, B, device=device)
-            dd_lat = torch.zeros(T, B, device=device)
+            ddl = ddt = torch.zeros(T, B, device=dev)
+        si  = torch.linspace(0,1,T,device=dev).unsqueeze(1).expand(T,B)
+        spd = (dl**2 + dt**2).sqrt()
+        return torch.stack([lon,lat,dl,dt,ddl,ddt,si,spd],-1).permute(1,0,2)
 
-        step_idx = torch.linspace(0, 1, T, device=device).unsqueeze(1).expand(T, B)
-        speed    = (d_lon.pow(2) + d_lat.pow(2)).sqrt()
-
-        feat = torch.stack([lon, lat, d_lon, d_lat,
-                            dd_lon, dd_lat, step_idx, speed], dim=-1)
-        return feat.permute(1, 0, 2)   # [B, T, 8]
-
-    def forward(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        """→ [B, T_obs, d_model]"""
-        feat = self._extract_features(obs_traj)   # [B, T, 8]
-        h    = self.proj(feat)                     # [B, T, d_model]
-        h    = self.pe(h)
-        return self.enc(h)                         # [B, T, d_model]
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        h = self.proj(self._feats(obs))
+        return self.enc(self.pe(h))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ST-Trans Main Model
+#  Easy/Hard classifier (từ obs_traj, không cần gt)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class STTrans(nn.Module):
+def classify_hard_obs(
+    obs_traj: torch.Tensor,
+    threshold_curv: float,
+    threshold_spd:  float,
+) -> torch.Tensor:
     """
-    Physics-guided Non-Autoregressive Transformer for TC track prediction.
+    Classify từng sample trong batch là easy(0) hay hard(1).
 
-    Kiến trúc (sau khi sửa để dùng cùng encoder với PaperBaseline):
-      1. PaperEncoder(batch_list)  → raw_ctx [B, 512]
-      2. Project raw_ctx → ctx_token [B, 1, d_model]  (global context token)
-      3. ObsKinematicEncoder(obs_traj) → obs_memory [B, S, d_model]
-      4. full_memory = cat([ctx_token, obs_memory], dim=1)  [B, S+1, d_model]
-      5. Learned horizon queries [B, H, d_model] + dec_pe
-      6. Transformer decoder (cross-attention) → [B, H, d_model]
-      7. Regression head → [H, B, 2]
+    obs_traj: [T_obs, B, 2] normalised
 
-    Loss: Physics-guided composite (§3.5.1)
-      L = L_DPE + 0.05*L_MSE + 0.1*L_speed + 0.01*L_accel
+    Tiêu chí hard (hoặc):
+      1. curvature_index > threshold_curv
+         curvature_index = mean(|angle_change|) trên các bước obs
+         angle_change[t] = góc giữa velocity[t] và velocity[t-1] (degrees)
+
+      2. speed_cv > threshold_spd
+         speed_cv = std(step_speed) / (mean(step_speed) + 1e-6)
+         Coefficient of Variation của tốc độ
+
+    Trả về: [B] bool tensor (True = hard)
+
+    NOTE: Hàm này chạy với no_grad trong cả train và eval.
+    Không có gradient chảy qua đây.
+    """
+    T, B, _ = obs_traj.shape
+    device   = obs_traj.device
+
+    with torch.no_grad():
+        # Step velocities [T-1, B, 2]
+        if T < 2:
+            return torch.zeros(B, dtype=torch.bool, device=device)
+
+        vel = obs_traj[1:] - obs_traj[:-1]           # [T-1, B, 2]
+        spd = vel.norm(dim=-1)                         # [T-1, B]  speed per step
+
+        # Speed coefficient of variation [B]
+        spd_mean = spd.mean(0)                         # [B]
+        spd_std  = spd.std(0)                          # [B]
+        speed_cv = spd_std / (spd_mean + 1e-6)         # [B]
+
+        # Curvature index: mean angle change between consecutive velocity vectors
+        if T >= 3:
+            vel_n  = F.normalize(vel, dim=-1, eps=1e-8)  # [T-1, B, 2]
+            cos_a  = (vel_n[1:] * vel_n[:-1]).sum(-1)    # [T-2, B]
+            cos_a  = cos_a.clamp(-1.0, 1.0)
+            ang    = torch.acos(cos_a) * (180.0 / math.pi)  # [T-2, B] degrees
+            curv   = ang.mean(0)                             # [B]
+        else:
+            curv = torch.zeros(B, device=device)
+
+        # Hard nếu EITHER tiêu chí vượt ngưỡng
+        is_hard = (curv > threshold_curv) | (speed_cv > threshold_spd)
+
+    return is_hard  # [B] bool
+
+
+def compute_hard_thresholds(
+    train_loader,
+    device: torch.device,
+    percentile: float = 70.0,
+) -> Tuple[float, float]:
+    """
+    Tính threshold curvature và speed_cv trên toàn train set.
+    Gọi 1 lần trước khi train, cache kết quả.
+
+    Returns: (threshold_curv, threshold_spd)
+    """
+    all_curv = []
+    all_spd  = []
+
+    with torch.no_grad():
+        for batch in train_loader:
+            obs = batch[0].to(device)   # [T_obs, B, 2]
+            T, B, _ = obs.shape
+
+            if T < 2:
+                continue
+
+            vel = obs[1:] - obs[:-1]
+            spd = vel.norm(dim=-1)
+
+            spd_mean = spd.mean(0)
+            spd_std  = spd.std(0)
+            speed_cv = (spd_std / (spd_mean + 1e-6)).cpu().tolist()
+            all_spd.extend(speed_cv)
+
+            if T >= 3:
+                vel_n = F.normalize(vel, dim=-1, eps=1e-8)
+                cos_a = (vel_n[1:] * vel_n[:-1]).sum(-1).clamp(-1,1)
+                ang   = torch.acos(cos_a) * (180.0 / math.pi)
+                curv  = ang.mean(0).cpu().tolist()
+                all_curv.extend(curv)
+
+    if not all_curv:
+        return 15.0, 0.5   # fallback defaults
+
+    import numpy as np
+    thr_c = float(np.percentile(all_curv, percentile))
+    thr_s = float(np.percentile(all_spd,  percentile))
+    return thr_c, thr_s
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Physics Steering Gate
+# ══════════════════════════════════════════════════════════════════════════════
+
+class PhysicsSteeringGate(nn.Module):
+    """
+    Tính α[t] ∈ (0,1) cho từng bước của HARD samples.
+
+    pred_final[t] = α[t] * pred_learned[t] + (1−α[t]) * pred_physics[t]
+
+    α ≈ 1: tin model, α ≈ 0: tin physics (steering ERA5)
+
+    Khởi tạo bias = 2.0 → sigmoid(2) ≈ 0.88 → đầu tiên thiên về model.
+    Gate sẽ học giảm α khi nhận thấy recurvature pattern.
+
+    Input mỗi bước:
+      ctx:     [B_hard, d_model]  — pooled context của hard samples
+      steer:   [B_hard, 2]        — (u_norm, v_norm) tại current pos
+      step_t:  int                — index bước (0..pred_len-1)
+
+    Không có error accumulation: steer lấy từ ERA5 grid, không từ pred trước.
+    """
+    def __init__(self, ctx_dim: int = 64, steer_dim: int = 2,
+                 hidden: int = 32, pred_len: int = 12):
+        super().__init__()
+        self.step_emb = nn.Embedding(pred_len, 16)
+        self.gate_net = nn.Sequential(
+            nn.Linear(ctx_dim + 16 + steer_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        # Bias init: sigmoid(2.0) ≈ 0.88 → thiên về learned prediction
+        nn.init.constant_(self.gate_net[-1].bias, 2.0)
+        nn.init.zeros_(self.gate_net[-1].weight)
+
+    def forward(self, ctx: torch.Tensor, steer: torch.Tensor,
+                step_t: int) -> torch.Tensor:
+        """→ α: [B_hard, 1]"""
+        B    = ctx.shape[0]
+        dev  = ctx.device
+        s    = torch.tensor(step_t, dtype=torch.long, device=dev)
+        semb = self.step_emb(s).unsqueeze(0).expand(B, -1)
+        return torch.sigmoid(self.gate_net(torch.cat([ctx, semb, steer], -1)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Recurvature Timing Head (auxiliary cho hard samples)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class RecurvatureTimingHead(nn.Module):
+    """
+    Auxiliary classifier: predict bước recurvature (đổi hướng > threshold_deg).
+
+    Output logits [B_hard, pred_len+1]:
+      class 0     = không recurve
+      class k+1   = recurve tại step k (0-indexed)
+
+    Loss weight nhỏ (w_recurv=0.05) → chỉ là supervision phụ,
+    không ảnh hưởng đến loss chính.
+    """
+    def __init__(self, ctx_dim: int = 64, pred_len: int = 12, hidden: int = 64):
+        super().__init__()
+        self.pred_len = pred_len
+        self.clf = nn.Sequential(
+            nn.Linear(ctx_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, pred_len + 1),
+        )
+
+    def forward(self, ctx: torch.Tensor) -> torch.Tensor:
+        """ctx [B,d_model] → logits [B, pred_len+1]"""
+        return self.clf(ctx)
+
+    @staticmethod
+    def make_label(gt_norm: torch.Tensor, obs_norm: torch.Tensor,
+                   threshold_deg: float = 45.0) -> torch.Tensor:
+        """
+        gt_norm:  [T_pred, B, 2]
+        obs_norm: [T_obs,  B, 2]
+        → label [B] long  (0=no recurve, k+1=recurve at step k)
+        """
+        T_pred, B, _ = gt_norm.shape
+        dev   = gt_norm.device
+        label = torch.zeros(B, dtype=torch.long, device=dev)
+
+        # Ghép 1 bước cuối obs với gt để tính angle tại step 0
+        prev  = obs_norm[-1:]          # [1, B, 2]
+        full  = torch.cat([prev, gt_norm], 0)   # [T_pred+1, B, 2]
+
+        with torch.no_grad():
+            for t in range(T_pred - 1):
+                d_in  = full[t+1] - full[t]
+                d_out = full[t+2] - full[t+1]
+                n_in  = F.normalize(d_in,  dim=-1, eps=1e-8)
+                n_out = F.normalize(d_out, dim=-1, eps=1e-8)
+                cos   = (n_in * n_out).sum(-1).clamp(-1, 1)
+                ang   = torch.acos(cos) * (180.0 / math.pi)
+                mask  = (ang > threshold_deg) & (label == 0)
+                label[mask] = t + 1   # 1-indexed, 0=no recurve
+
+        return label
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Helper: steering từ ERA5 data3d
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_steering(data3d: Optional[torch.Tensor],
+                  obs_traj: torch.Tensor) -> Optional[torch.Tensor]:
+    """
+    Trả về (u_norm, v_norm) tại tâm ERA5 patch [B, 2] hoặc None.
+
+    u_norm, v_norm: normalised displacement per step (cùng đơn vị obs_traj).
+    Dùng center pixel của patch (vị trí bão là tâm patch).
+    """
+    if data3d is None or not isinstance(data3d, torch.Tensor):
+        return None
+    if data3d.dim() != 4:
+        return None
+
+    B, C, H, W = data3d.shape
+    if C <= max(_U500_CH, _V500_CH):
+        return None   # không đủ channels
+
+    cy, cx = H // 2, W // 2
+    u_ms   = data3d[:, _U500_CH, cy, cx]   # [B] m/s
+    v_ms   = data3d[:, _V500_CH, cy, cx]   # [B] m/s
+
+    # Latitude correction cho u (zonal)
+    lat_norm = obs_traj[-1, :, 1]          # [B] normalised lat
+    lat_deg  = lat_norm * _DEG_SCALE        # rough degree
+    cos_lat  = torch.cos(lat_deg * (math.pi / 180.0)).clamp(0.1, 1.0)
+
+    u_norm = (u_ms / cos_lat) * _MS_TO_NORM_PER_6H   # [B]
+    v_norm = v_ms * _MS_TO_NORM_PER_6H               # [B]
+
+    return torch.stack([u_norm, v_norm], dim=-1)      # [B, 2]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  STTransV2 — Main Model
+# ══════════════════════════════════════════════════════════════════════════════
+
+class STTransV2(nn.Module):
+    """
+    ST-Trans v2: Easy/Hard split loss + Physics Steering Gate.
+
+    EASY loss = ST-Trans gốc (unchanged):
+        L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
+
+    HARD loss = Extended:
+        L_DPE_weighted + λ_speed*L_speed + λ_accel*L_accel
+        + w_heading * L_heading
+        + w_recurv  * L_recurv  (auxiliary)
+        + w_gate    * L_gate_reg
+
+    Tổng: L = w_easy_frac*L_easy(easy_batch) + w_hard_frac*L_hard(hard_batch)
+    w_easy_frac, w_hard_frac không phải hyperparameter — đơn giản là
+    average losses trên 2 subsets. Không cần tune.
     """
 
     def __init__(
         self,
-        obs_len:        int   = 8,
-        pred_len:       int   = 12,
-        unet_in_ch:     int   = 13,
-        d_model:        int   = 64,
-        nhead:          int   = 4,
-        num_enc_layers: int   = 1,
-        num_dec_layers: int   = 3,
-        dim_ff:         int   = 512,
-        dropout:        float = 0.1,
-        # Physics loss weights
-        lambda_speed:   float = 0.1,
-        lambda_accel:   float = 0.01,
-        w_mse:          float = 0.05,
-        v_max_kmh:      float = 80.0,
-        dt_h:           float = 6.0,
+        obs_len:           int   = 8,
+        pred_len:          int   = 12,
+        unet_in_ch:        int   = 13,
+        d_model:           int   = 64,
+        nhead:             int   = 4,
+        num_enc_layers:    int   = 1,
+        num_dec_layers:    int   = 3,
+        dim_ff:            int   = 512,
+        dropout:           float = 0.1,
+        # Easy loss weights (ST-Trans gốc)
+        lambda_speed:      float = 0.1,
+        lambda_accel:      float = 0.01,
+        w_mse:             float = 0.05,
+        v_max_kmh:         float = 80.0,
+        dt_h:              float = 6.0,
+        # Hard loss extras
+        w_heading:         float = 0.3,
+        w_recurv:          float = 0.05,
+        w_gate_reg:        float = 0.01,
+        step_weight_slope: float = 0.1,
+        recurv_threshold:  float = 45.0,
+        # Easy/hard thresholds (set after compute_hard_thresholds)
+        threshold_curv:    float = 15.0,
+        threshold_spd:     float = 0.5,
+        # Gate config
+        gate_hidden:       int   = 32,
+        recurv_hidden:     int   = 64,
     ):
         super().__init__()
-        self.obs_len      = obs_len
-        self.pred_len     = pred_len
-        self.d_model      = d_model
-        self.lambda_speed = lambda_speed
-        self.lambda_accel = lambda_accel
-        self.w_mse        = w_mse
-        # v_max trong normalised units
-        self.v_max_norm   = v_max_kmh * dt_h / (111.0 * 50.0)
+        self.obs_len          = obs_len
+        self.pred_len         = pred_len
+        self.d_model          = d_model
+        self.lambda_speed     = lambda_speed
+        self.lambda_accel     = lambda_accel
+        self.w_mse            = w_mse
+        self.v_max_norm       = v_max_kmh * dt_h / (111.0 * _DEG_SCALE)
+        self.w_heading        = w_heading
+        self.w_recurv         = w_recurv
+        self.w_gate_reg       = w_gate_reg
+        self.recurv_threshold = recurv_threshold
+        self.threshold_curv   = threshold_curv
+        self.threshold_spd    = threshold_spd
 
-        # ── Shared encoder (cùng với PaperBaseline) ───────────────────────
-        self.encoder = PaperEncoder(obs_len=obs_len, unet_in_ch=unet_in_ch)
-
-        # Project raw_ctx [B, 512] → context token [B, 1, d_model]
+        # ── Encoder (giống STTrans gốc hoàn toàn) ────────────────────────
+        self.encoder  = PaperEncoder(obs_len=obs_len, unet_in_ch=unet_in_ch)
         self.ctx_proj = nn.Sequential(
             nn.Linear(PaperEncoder.RAW_CTX_DIM, d_model),
             nn.LayerNorm(d_model),
         )
-
-        # ── Obs trajectory kinematic encoder → temporal memory ────────────
         self.obs_enc = ObsKinematicEncoder(
             d_model=d_model, nhead=nhead,
-            num_layers=num_enc_layers, dim_ff=dim_ff, dropout=dropout,
-        )
+            num_layers=num_enc_layers, dim_ff=dim_ff, dropout=dropout)
 
-        # ── Learned horizon queries (paper §3.3.4) ────────────────────────
+        # ── Decoder (giống STTrans gốc hoàn toàn) ────────────────────────
         self.horizon_queries = nn.Parameter(
-            torch.randn(1, pred_len, d_model) * 0.02
-        )
+            torch.randn(1, pred_len, d_model) * 0.02)
         self.dec_pe = SinusoidalPE(d_model, max_len=pred_len + 10)
-
-        # ── Transformer decoder ───────────────────────────────────────────
         dec_layer = nn.TransformerDecoderLayer(
             d_model=d_model, nhead=nhead,
             dim_feedforward=dim_ff, dropout=dropout,
-            activation="relu", batch_first=True,
-        )
-        self.transformer_dec = nn.TransformerDecoder(
-            dec_layer, num_layers=num_dec_layers)
-
-        # ── Regression head (paper §3.3.4) ───────────────────────────────
+            activation="relu", batch_first=True)
+        self.transformer_dec = nn.TransformerDecoder(dec_layer,
+                                                     num_layers=num_dec_layers)
         self.reg_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, 2),
-        )
+            nn.Linear(d_model, d_model), nn.ReLU(),
+            nn.Linear(d_model, 2))
+
+        # ── Hard-only modules ─────────────────────────────────────────────
+        self.steering_gate = PhysicsSteeringGate(
+            ctx_dim=d_model, steer_dim=2,
+            hidden=gate_hidden, pred_len=pred_len)
+
+        self.recurv_head = RecurvatureTimingHead(
+            ctx_dim=d_model, pred_len=pred_len, hidden=recurv_hidden)
+
+        # Learnable step weights cho hard L_DPE_weighted
+        # w_t = softplus(raw_w[t]), init: 1.0 + t*slope
+        init_w   = torch.tensor(
+            [1.0 + t * step_weight_slope for t in range(pred_len)])
+        init_raw = torch.log(torch.expm1(init_w.clamp(min=1e-3)))
+        self.raw_step_weights = nn.Parameter(init_raw)
 
         self._init_weights()
 
@@ -797,70 +1537,134 @@ class STTrans(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.5)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+        # Re-set gate bias sau _init_weights
+        nn.init.constant_(self.steering_gate.gate_net[-1].bias, 2.0)
+        nn.init.zeros_(self.steering_gate.gate_net[-1].weight)
 
-    # ── Forward ───────────────────────────────────────────────────────────
+    @property
+    def step_weights(self) -> torch.Tensor:
+        """[pred_len] dương, không bao giờ âm."""
+        return F.softplus(self.raw_step_weights)
+
+    def set_thresholds(self, threshold_curv: float, threshold_spd: float):
+        """Cập nhật threshold sau khi tính từ train set."""
+        self.threshold_curv = threshold_curv
+        self.threshold_spd  = threshold_spd
+
+    # ── Encode: shared giữa easy và hard ─────────────────────────────────
+
+    def _encode(self, batch_list) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Chạy encoder 1 lần, trả về:
+          learned_pred: [B, pred_len, 2]  — output của reg_head
+          ctx_pooled:   [B, d_model]      — pooled context cho gate/recurv
+        """
+        obs_traj = batch_list[0]
+        B        = obs_traj.shape[1]
+
+        raw_ctx     = self.encoder(batch_list)
+        ctx_token   = self.ctx_proj(raw_ctx).unsqueeze(1)   # [B,1,d]
+        obs_memory  = self.obs_enc(obs_traj)                 # [B,T,d]
+        full_memory = torch.cat([ctx_token, obs_memory], 1)  # [B,T+1,d]
+        ctx_pooled  = full_memory.mean(1)                    # [B,d]
+
+        Q   = self.horizon_queries.expand(B, -1, -1)
+        Q   = self.dec_pe(Q)
+        D   = self.transformer_dec(Q, full_memory)           # [B,H,d]
+        lp  = self.reg_head(D)                              # [B,H,2]
+        return lp, ctx_pooled
+
+    # ── Apply gate (chỉ dùng cho hard samples) ───────────────────────────
+
+    def _apply_gate(
+        self,
+        learned_pred: torch.Tensor,   # [B_h, pred_len, 2]
+        ctx_pooled:   torch.Tensor,   # [B_h, d_model]
+        steer:        torch.Tensor,   # [B_h, 2]  hoặc None
+        obs_traj:     torch.Tensor,   # [T_obs, B_h, 2]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Blend learned_pred với physics prediction bằng gate.
+        Returns:
+          final_pred: [B_h, pred_len, 2]
+          alpha_mean: [1] scalar — trung bình alpha để log
+        """
+        B_h = learned_pred.shape[0]
+        dev = learned_pred.device
+
+        if steer is None:
+            # Không có ERA5 → dùng cuối obs velocity làm physics
+            if obs_traj.shape[0] >= 2:
+                steer = obs_traj[-1] - obs_traj[-2]   # [B_h, 2]
+            else:
+                steer = torch.zeros(B_h, 2, device=dev)
+
+        # Physics trajectory: persistence of steering
+        physics_steps = []
+        cur = obs_traj[-1].clone()   # [B_h, 2]
+        for _ in range(self.pred_len):
+            cur = cur + steer
+            physics_steps.append(cur.clone())
+        physics = torch.stack(physics_steps, dim=1)  # [B_h, pred_len, 2]
+
+        # Gate per step
+        final_steps = []
+        alphas      = []
+        for t in range(self.pred_len):
+            alpha = self.steering_gate(ctx_pooled, steer, t)  # [B_h, 1]
+            blended = alpha * learned_pred[:, t] + (1.0 - alpha) * physics[:, t]
+            final_steps.append(blended)
+            alphas.append(alpha.mean())
+
+        final_pred = torch.stack(final_steps, dim=1)        # [B_h, pred_len, 2]
+        alpha_mean = torch.stack(alphas).mean()
+        return final_pred, alpha_mean
+
+    # ── Forward (full batch, không phân easy/hard) ────────────────────────
 
     def forward(self, batch_list) -> torch.Tensor:
         """
-        batch_list: cùng format với PaperBaseline (full batch với ảnh, env, ...)
+        Inference: không có easy/hard split, không dùng gate.
+        Gate chỉ active trong training loss để tránh inference overhead.
         → pred [pred_len, B, 2] normalised
+
+        Lý do không dùng gate trong inference:
+        Gate nhỏ và thêm noise nếu không cần. Sau khi train,
+        learned_pred đã học được kiến thức của gate vì gate
+        backprop qua learned_pred trong hard loss.
         """
-        obs_traj = batch_list[0]     # [T_obs, B, 2]
-        B        = obs_traj.shape[1]
+        lp, _ = self._encode(batch_list)         # [B, pred_len, 2]
+        return lp.permute(1, 0, 2)               # [pred_len, B, 2]
 
-        # 1. Rich context từ full encoder
-        raw_ctx    = self.encoder(batch_list)          # [B, 512]
-        ctx_token  = self.ctx_proj(raw_ctx).unsqueeze(1)  # [B, 1, d_model]
+    # ── Loss easy: giữ nguyên 100% ST-Trans gốc ──────────────────────────
 
-        # 2. Temporal obs memory
-        obs_memory = self.obs_enc(obs_traj)            # [B, S, d_model]
+    def _loss_easy(self, pred: torch.Tensor, gt: torch.Tensor) -> Dict:
+        """
+        pred, gt: [T, B_easy, 2] normalised — chỉ easy samples
+        Công thức: L_DPE + 0.05*L_MSE + λ_speed*L_speed + λ_accel*L_accel
+        Không thêm gì — giữ nguyên ST-Trans gốc.
+        """
+        T  = min(pred.shape[0], gt.shape[0])
+        p  = pred[:T]
+        g  = gt[:T]
 
-        # 3. Kết hợp context token + temporal memory
-        full_memory = torch.cat([ctx_token, obs_memory], dim=1)  # [B, S+1, d_model]
+        pd = _norm_to_deg(p)
+        gd = _norm_to_deg(g)
 
-        # 4. Horizon queries
-        Q = self.horizon_queries.expand(B, -1, -1)    # [B, H, d_model]
-        Q = self.dec_pe(Q)
+        l_dpe  = haversine_km(pd, gd).mean()
+        l_mse  = F.mse_loss(p, g)
 
-        # 5. Non-autoregressive decoder
-        D   = self.transformer_dec(Q, full_memory)     # [B, H, d_model]
-        out = self.reg_head(D)                         # [B, H, 2]
-
-        return out.permute(1, 0, 2)                    # [pred_len, B, 2]
-
-    # ── Physics-guided loss (§3.5.1) ─────────────────────────────────────
-
-    def physics_loss(
-        self,
-        pred_norm: torch.Tensor,
-        gt_norm:   torch.Tensor,
-    ) -> Dict:
-        T    = min(pred_norm.shape[0], gt_norm.shape[0])
-        pred = pred_norm[:T]
-        gt   = gt_norm[:T]
-
-        pred_deg = _norm_to_deg(pred)
-        gt_deg   = _norm_to_deg(gt)
-
-        # L_DPE: mean great-circle distance (eq. 16)
-        l_dpe = haversine_km(pred_deg, gt_deg).mean()
-
-        # L_MSE: coordinate MSE (eq. 17)
-        l_mse = F.mse_loss(pred, gt)
-
-        # L_speed: penalise speeds > v_max (eq. 18-20)
         if T >= 2:
-            step_dist = (pred[1:] - pred[:-1]).norm(dim=-1)      # [T-1, B]
-            l_speed   = F.relu(step_dist - self.v_max_norm).pow(2).mean()
+            sd      = (p[1:] - p[:-1]).norm(dim=-1)
+            l_speed = F.relu(sd - self.v_max_norm).pow(2).mean()
         else:
-            l_speed = pred_norm.new_zeros(())
+            l_speed = p.new_zeros(())
 
-        # L_accel: penalise acceleration changes (eq. 21-22)
         if T >= 3:
-            vel     = pred[1:] - pred[:-1]                        # [T-1, B, 2]
-            l_accel = (vel[1:].norm(dim=-1) - vel[:-1].norm(dim=-1)).pow(2).mean()
+            v       = p[1:] - p[:-1]
+            l_accel = (v[1:].norm(-1) - v[:-1].norm(-1)).pow(2).mean()
         else:
-            l_accel = pred_norm.new_zeros(())
+            l_accel = p.new_zeros(())
 
         total = (l_dpe
                  + self.w_mse        * l_mse
@@ -868,177 +1672,280 @@ class STTrans(nn.Module):
                  + self.lambda_accel * l_accel)
 
         return dict(
-            total=total,
-            dpe=l_dpe.item(),
-            mse=l_mse.item(),
-            speed=l_speed.item(),
-            accel=l_accel.item(),
+            loss_easy=total,
+            easy_dpe=l_dpe.item(),
+            easy_mse=l_mse.item(),
+            easy_speed=l_speed.item(),
+            easy_accel=l_accel.item(),
         )
 
-    # ── Training / inference interface (nhất quán với PaperBaseline) ─────
+    # ── Loss hard: extended với gate + heading + recurv ───────────────────
 
-    def get_loss(self, batch_list) -> torch.Tensor:
-        return self.get_loss_breakdown(batch_list)["total"]
-
-    def get_loss_breakdown(self, batch_list) -> Dict:
-        traj_gt = batch_list[1]
-        pred    = self.forward(batch_list)
-        bd      = self.physics_loss(pred, traj_gt)
-
-        with torch.no_grad():
-            ade_m = compute_ade_per_horizon(pred.detach(), traj_gt)
-            atc_m = compute_ate_cte_per_horizon(pred.detach(), traj_gt)
-
-        bd.update(ade_m)
-        bd.update(atc_m)
-        return bd
-
-    @torch.no_grad()
-    def sample(
+    def _loss_hard(
         self,
-        batch_list,
-        num_ensemble: int = 1,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pred     = self.forward(batch_list)
-        T, B, _  = pred.shape
-        me_mean  = torch.zeros(T, B, 2, device=pred.device)
-        return pred, me_mean, pred.unsqueeze(0)
+        learned_pred: torch.Tensor,   # [B_hard, pred_len, 2] — trước gate
+        final_pred:   torch.Tensor,   # [B_hard, pred_len, 2] — sau gate
+        gt:           torch.Tensor,   # [T_pred, B_hard, 2]
+        ctx_pooled:   torch.Tensor,   # [B_hard, d_model]
+        obs_norm:     torch.Tensor,   # [T_obs, B_hard, 2]
+        alpha_mean:   torch.Tensor,   # scalar
+    ) -> Dict:
+        """
+        Hard loss:
+          L_DPE_weighted  ← step-weighted haversine (tập trung bước xa)
+          L_speed         ← như gốc
+          L_accel         ← như gốc
+          L_heading       ← cosine direction similarity
+          L_recurv        ← auxiliary cross-entropy (timing classifier)
+          L_gate_reg      ← regularize alpha không về 0 hoặc 1 cực đoan
+        """
+        T  = min(final_pred.shape[1], gt.shape[0])
+        fp = final_pred[:, :T]          # [B_h, T, 2]  — sau gate
+        lp = learned_pred[:, :T]        # [B_h, T, 2]  — trước gate
+        g  = gt[:T].permute(1, 0, 2)   # [B_h, T, 2]
 
+        # Permute sang [T, B_h, 2] cho tất cả loss calculations
+        fp_perm_dpe = fp.permute(1,0,2)   # [T,B_h,2]
+        gt_perm     = g.permute(1,0,2)    # [T,B_h,2]
+        fpd = _norm_to_deg(fp_perm_dpe)
+        gd  = _norm_to_deg(gt_perm)
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ST-Trans-AR  ── Autoregressive variant (paper §3.4)
-# ══════════════════════════════════════════════════════════════════════════════
+        # ── L_DPE step-weighted ──────────────────────────────────────────
+        sw = self.step_weights[:T]               # [T]
+        sw = sw / sw.sum() * T                   # normalize
+        hav = haversine_km(fpd, gd)             # [T, B_h]
+        l_dpe_w = (hav * sw.unsqueeze(1)).mean()
 
-class STTransAR(nn.Module):
-    """
-    Autoregressive ST-Trans.
-    Cùng encoder backbone với STTrans và PaperBaseline, decoder AR-GRU.
-    Dùng để ablation so sánh với non-AR.
-    """
-
-    def __init__(
-        self,
-        obs_len:        int   = 8,
-        pred_len:       int   = 12,
-        unet_in_ch:     int   = 13,
-        d_model:        int   = 64,
-        nhead:          int   = 4,
-        num_enc_layers: int   = 1,
-        dim_ff:         int   = 512,
-        dropout:        float = 0.1,
-        lambda_speed:   float = 0.1,
-        lambda_accel:   float = 0.01,
-        w_mse:          float = 0.05,
-        v_max_kmh:      float = 80.0,
-        dt_h:           float = 6.0,
-    ):
-        super().__init__()
-        self.obs_len      = obs_len
-        self.pred_len     = pred_len
-        self.d_model      = d_model
-        self.lambda_speed = lambda_speed
-        self.lambda_accel = lambda_accel
-        self.w_mse        = w_mse
-        self.v_max_norm   = v_max_kmh * dt_h / (111.0 * 50.0)
-
-        # ── Shared encoder ────────────────────────────────────────────────
-        self.encoder  = PaperEncoder(obs_len=obs_len, unet_in_ch=unet_in_ch)
-        self.ctx_proj = nn.Sequential(
-            nn.Linear(PaperEncoder.RAW_CTX_DIM, d_model),
-            nn.LayerNorm(d_model),
-        )
-
-        self.obs_enc = ObsKinematicEncoder(
-            d_model=d_model, nhead=nhead,
-            num_layers=num_enc_layers, dim_ff=dim_ff, dropout=dropout,
-        )
-
-        # ── AR-GRU decoder ────────────────────────────────────────────────
-        # Input: cur_pos(2) + pooled_memory(d_model)
-        self.ar_gru   = nn.GRUCell(2 + d_model, d_model)
-        self.reg_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.Linear(d_model, 2),
-        )
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
-    def forward(
-        self,
-        batch_list,
-        gt_traj:         Optional[torch.Tensor] = None,
-        teacher_forcing: bool = True,
-    ) -> torch.Tensor:
-        obs_traj = batch_list[0]
-        B        = obs_traj.shape[1]
-
-        raw_ctx    = self.encoder(batch_list)               # [B, 512]
-        ctx_token  = self.ctx_proj(raw_ctx).unsqueeze(1)    # [B, 1, d_model]
-        obs_memory = self.obs_enc(obs_traj)                 # [B, S, d_model]
-        full_mem   = torch.cat([ctx_token, obs_memory], dim=1)  # [B, S+1, d_model]
-
-        # Pooled context for AR decoder
-        ctx = full_mem.mean(dim=1)     # [B, d_model]
-        cur_pos = obs_traj[-1].clone()
-        hx      = ctx
-        preds   = []
-
-        for i in range(self.pred_len):
-            inp = torch.cat([cur_pos, ctx], dim=-1)
-            hx  = self.ar_gru(inp, hx)
-            out = self.reg_head(hx)
-            preds.append(out)
-            if teacher_forcing and gt_traj is not None and i < gt_traj.shape[0]:
-                cur_pos = gt_traj[i]
-            else:
-                cur_pos = out.detach()
-
-        return torch.stack(preds, dim=0)   # [pred_len, B, 2]
-
-    def _physics_loss(self, pred_norm, gt_norm):
-        T    = min(pred_norm.shape[0], gt_norm.shape[0])
-        pred = pred_norm[:T]; gt = gt_norm[:T]
-        pred_deg = _norm_to_deg(pred); gt_deg = _norm_to_deg(gt)
-        l_dpe    = haversine_km(pred_deg, gt_deg).mean()
-        l_mse    = F.mse_loss(pred, gt)
+        # ── L_speed (trên final_pred) ─────────────────────────────────────
+        fp_perm = fp.permute(1,0,2)   # [T, B_h, 2]
         if T >= 2:
-            step_dist = (pred[1:] - pred[:-1]).norm(dim=-1)
-            l_speed   = F.relu(step_dist - self.v_max_norm).pow(2).mean()
+            sd       = (fp_perm[1:] - fp_perm[:-1]).norm(-1)
+            l_speed  = F.relu(sd - self.v_max_norm).pow(2).mean()
         else:
-            l_speed   = pred_norm.new_zeros(())
+            l_speed  = fp.new_zeros(())
+
+        # ── L_accel (trên final_pred) ─────────────────────────────────────
         if T >= 3:
-            vel     = pred[1:] - pred[:-1]
-            l_accel = (vel[1:].norm(dim=-1) - vel[:-1].norm(dim=-1)).pow(2).mean()
+            vel     = fp_perm[1:] - fp_perm[:-1]
+            l_accel = (vel[1:].norm(-1) - vel[:-1].norm(-1)).pow(2).mean()
         else:
-            l_accel = pred_norm.new_zeros(())
-        total = (l_dpe + self.w_mse * l_mse
-                 + self.lambda_speed * l_speed + self.lambda_accel * l_accel)
-        return dict(total=total, dpe=l_dpe.item(), mse=l_mse.item(),
-                    speed=l_speed.item(), accel=l_accel.item())
+            l_accel = fp.new_zeros(())
+
+        # ── L_heading: cosine direction similarity ────────────────────────
+        # Không dùng gt_dir làm trục tham chiếu cố định (tránh overfit hướng)
+        # Chỉ so cosine giữa pred_dir và gt_dir → tổng quát mọi hướng
+        if T >= 2:
+            pred_dir = fp_perm[1:] - fp_perm[:-1]   # [T-1, B_h, 2]
+            gt_dir   = gt_perm[1:] - gt_perm[:-1]
+            pdn = F.normalize(pred_dir, dim=-1, eps=1e-8)
+            gdn = F.normalize(gt_dir,   dim=-1, eps=1e-8)
+            cos_sim   = (pdn * gdn).sum(-1).clamp(-1, 1)   # [T-1, B_h]
+            l_heading = ((1.0 - cos_sim) / 2.0).mean()     # in [0,1]
+        else:
+            l_heading = fp.new_zeros(())
+
+        # ── L_recurv: auxiliary timing prediction ─────────────────────────
+        recurv_logits = self.recurv_head(ctx_pooled)   # [B_h, pred_len+1]
+        try:
+            label = RecurvatureTimingHead.make_label(
+                gt,  # [T_pred, B_h, 2] — đúng shape cho make_label
+                obs_norm,  # [T_obs, B_h, 2] — đúng shape cho make_label
+                threshold_deg=self.recurv_threshold,
+            )
+            # Đảm bảo label shape match
+            if label.shape[0] == recurv_logits.shape[0]:
+                l_recurv = F.cross_entropy(recurv_logits, label)
+            else:
+                l_recurv = fp.new_zeros(())
+        except Exception:
+            l_recurv = fp.new_zeros(())
+
+        # ── L_gate_reg: giữ alpha trong vùng [0.2, 0.95] ─────────────────
+        # Tránh gate collapse hoàn toàn về 0 hoặc 1
+        # alpha_mean là mean alpha qua tất cả steps và samples (từ _apply_gate)
+        l_gate_reg = (F.relu(alpha_mean - 0.95) +
+                      F.relu(0.2 - alpha_mean))
+
+        # ── Total hard loss ───────────────────────────────────────────────
+        total = (l_dpe_w
+                 + self.lambda_speed * l_speed
+                 + self.lambda_accel * l_accel
+                 + self.w_heading    * l_heading
+                 + self.w_recurv     * l_recurv
+                 + self.w_gate_reg   * l_gate_reg)
+
+        return dict(
+            loss_hard    = total,
+            hard_dpe     = l_dpe_w.item(),
+            hard_speed   = l_speed.item(),
+            hard_accel   = l_accel.item(),
+            hard_heading = l_heading.item()
+                           if isinstance(l_heading, torch.Tensor)
+                           else float(l_heading),
+            hard_recurv  = l_recurv.item()
+                           if isinstance(l_recurv, torch.Tensor)
+                           else float(l_recurv),
+            hard_gate    = l_gate_reg.item()
+                           if isinstance(l_gate_reg, torch.Tensor)
+                           else 0.0,
+            alpha_mean   = alpha_mean.item()
+                           if isinstance(alpha_mean, torch.Tensor)
+                           else float(alpha_mean),
+            step_w_72h   = self.step_weights[-1].item(),
+        )
+
+    # ── get_loss_breakdown: main training entry point ─────────────────────
+
+    def get_loss_breakdown(self, batch_list) -> Dict:
+        """
+        1. Classify easy/hard từ obs_traj
+        2. Encode toàn bộ batch 1 lần
+        3. Tính L_easy trên easy subset
+        4. Apply gate + tính L_hard trên hard subset
+        5. Trả về combined loss và detailed breakdown
+        """
+        obs_traj = batch_list[0]   # [T_obs, B, 2]
+        traj_gt  = batch_list[1]   # [T_pred, B, 2]
+        B        = obs_traj.shape[1]
+        device   = obs_traj.device
+
+        # ── 1. Classify ───────────────────────────────────────────────────
+        is_hard = classify_hard_obs(
+            obs_traj, self.threshold_curv, self.threshold_spd)   # [B] bool
+        is_easy = ~is_hard
+
+        n_easy = is_easy.sum().item()
+        n_hard = is_hard.sum().item()
+
+        # ── 2. Encode toàn bộ batch 1 lần ────────────────────────────────
+        learned_pred, ctx_pooled = self._encode(batch_list)
+        # learned_pred: [B, pred_len, 2]
+        # ctx_pooled:   [B, d_model]
+
+        # ── 3. Easy loss ──────────────────────────────────────────────────
+        loss_easy_total = None
+        easy_details    = {}
+
+        if n_easy > 0:
+            # Slice easy samples
+            lp_easy = learned_pred[is_easy]          # [B_e, pred_len, 2]
+            gt_easy = traj_gt[:, is_easy, :]         # [T, B_e, 2]
+
+            # Convert [B_e, pred_len, 2] → [pred_len, B_e, 2] cho loss
+            pred_easy_perm = lp_easy.permute(1, 0, 2)
+
+            easy_res = self._loss_easy(pred_easy_perm, gt_easy)
+            loss_easy_total = easy_res["loss_easy"]
+            easy_details    = easy_res
+        else:
+            # Không có easy samples trong batch — dùng hard loss làm total
+            loss_easy_total = learned_pred.new_zeros((), requires_grad=False)
+
+        # ── 4. Hard loss ──────────────────────────────────────────────────
+        loss_hard_total = None
+        hard_details    = {}
+
+        if n_hard > 0:
+            lp_hard  = learned_pred[is_hard]          # [B_h, pred_len, 2]
+            gt_hard  = traj_gt[:, is_hard, :]         # [T, B_h, 2]
+            obs_hard = obs_traj[:, is_hard, :]        # [T_obs, B_h, 2]
+            ctx_hard = ctx_pooled[is_hard]            # [B_h, d_model]
+
+            # Get steering từ ERA5
+            data3d = None
+            if len(batch_list) > 2 and isinstance(batch_list[2], torch.Tensor):
+                d = batch_list[2]
+                if d.dim() == 4:
+                    data3d = d[is_hard]               # [B_h, C, H, W]
+
+            steer = _get_steering(data3d, obs_hard)  # [B_h, 2] or None
+
+            # Apply gate → final prediction
+            final_hard, alpha_mean = self._apply_gate(
+                lp_hard, ctx_hard, steer, obs_hard)  # [B_h, pred_len, 2]
+
+            hard_res = self._loss_hard(
+                learned_pred = lp_hard,
+                final_pred   = final_hard,
+                gt           = gt_hard,
+                ctx_pooled   = ctx_hard,
+                obs_norm     = obs_hard,
+                alpha_mean   = alpha_mean,
+            )
+            loss_hard_total = hard_res["loss_hard"]
+            hard_details    = hard_res
+        else:
+            loss_hard_total = learned_pred.new_zeros((), requires_grad=False)
+
+        # ── 5. Combine ────────────────────────────────────────────────────
+        # Đơn giản average 2 losses — không cần tune weight
+        # Nếu batch có cả easy và hard, contribution tự nhiên
+        # proportional với số lượng sample
+        if n_easy > 0 and n_hard > 0:
+            # Weighted average theo số samples
+            w_e = n_easy / B
+            w_h = n_hard / B
+            total = w_e * loss_easy_total + w_h * loss_hard_total
+        elif n_easy > 0:
+            total = loss_easy_total
+        else:
+            total = loss_hard_total
+
+        # ── 6. ADE metrics (no grad) ──────────────────────────────────────
+        # Dùng learned_pred (không có gate) để eval → inference-consistent
+        lp_perm = learned_pred.permute(1, 0, 2)   # [pred_len, B, 2]
+        with torch.no_grad():
+            ade_m = compute_ade_per_horizon(lp_perm.detach(), traj_gt)
+            atc_m = compute_ate_cte_per_horizon(lp_perm.detach(), traj_gt)
+
+        result = dict(
+            total   = total,
+            n_easy  = n_easy,
+            n_hard  = n_hard,
+            **easy_details,
+            **hard_details,
+            **ade_m,
+            **atc_m,
+        )
+        return result
 
     def get_loss(self, batch_list) -> torch.Tensor:
         return self.get_loss_breakdown(batch_list)["total"]
 
-    def get_loss_breakdown(self, batch_list) -> Dict:
-        traj_gt = batch_list[1]
-        pred    = self.forward(batch_list, traj_gt, teacher_forcing=True)
-        bd      = self._physics_loss(pred, traj_gt)
-        with torch.no_grad():
-            bd.update(compute_ade_per_horizon(pred.detach(), traj_gt))
-            bd.update(compute_ate_cte_per_horizon(pred.detach(), traj_gt))
-        return bd
-
     @torch.no_grad()
-    def sample(self, batch_list, **kwargs):
-        pred    = self.forward(batch_list, teacher_forcing=False)
+    def sample(self, batch_list, num_ensemble: int = 1, **kwargs):
+        pred    = self.forward(batch_list)
         T, B, _ = pred.shape
         me_mean = torch.zeros(T, B, 2, device=pred.device)
         return pred, me_mean, pred.unsqueeze(0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Factory
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_st_trans_v2(args, threshold_curv=15.0, threshold_spd=0.5) -> STTransV2:
+    return STTransV2(
+        obs_len           = getattr(args, 'obs_len',           8),
+        pred_len          = getattr(args, 'pred_len',          12),
+        unet_in_ch        = getattr(args, 'unet_in_ch',        13),
+        d_model           = getattr(args, 'd_model',           64),
+        nhead             = getattr(args, 'nhead',             4),
+        num_enc_layers    = getattr(args, 'num_enc_layers',    1),
+        num_dec_layers    = getattr(args, 'num_dec_layers',    3),
+        dim_ff            = getattr(args, 'dim_ff',            512),
+        dropout           = getattr(args, 'dropout',           0.1),
+        lambda_speed      = getattr(args, 'lambda_speed',      0.1),
+        lambda_accel      = getattr(args, 'lambda_accel',      0.01),
+        w_mse             = getattr(args, 'w_mse',             0.05),
+        v_max_kmh         = getattr(args, 'v_max_kmh',         80.0),
+        w_heading         = getattr(args, 'w_heading',         0.3),
+        w_recurv          = getattr(args, 'w_recurv',          0.05),
+        w_gate_reg        = getattr(args, 'w_gate_reg',        0.01),
+        step_weight_slope = getattr(args, 'step_weight_slope', 0.1),
+        recurv_threshold  = getattr(args, 'recurv_threshold',  45.0),
+        threshold_curv    = threshold_curv,
+        threshold_spd     = threshold_spd,
+        gate_hidden       = getattr(args, 'gate_hidden',       32),
+        recurv_hidden     = getattr(args, 'recurv_hidden',     64),
+    )
