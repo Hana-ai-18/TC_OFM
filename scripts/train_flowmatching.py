@@ -487,7 +487,7 @@ def main(args):
 
         # ── Periodic ckpt mỗi 10 epoch ──────────────────────────────────────
         # Đặt TRƯỚC val block để không bị skip khi early stop break
-        if ep % 10 == 0:
+        if ep % 5 == 0:
             _save(os.path.join(args.output_dir, f"ckpt_ep{ep:03d}.pth"),
                   ep, model, opt, sched, best_ade, ema,
                   patience_cnt=patience_cnt, scaler=scaler, args=args,
