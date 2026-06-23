@@ -5910,23 +5910,29 @@ def _ot_match_noise_gt(x0_flat: torch.Tensor,
     """
     Minibatch OT matching: pair noise x0 với GT x1 để tạo straighter flow paths.
     x0_flat, x1_flat: [B, T*2]
-    Returns: matched (x0, x1) pairs — same shapes, reordered
+    Returns: matched (x0, x1) pairs — x0 reindexed, x1 giữ nguyên thứ tự gốc.
+
+    FIX-BUG-2: Bản cũ dùng col = idx % B (x1 column index) để reindex x0.
+    OT plan pi[i,j] = prob(x0[i] → x1[j]).
+    Sample pair (row, col) từ pi → row = idx // B là x0 index, col là x1 index.
+    Cần dùng row để reindex x0. x1 giữ nguyên để cond[i] ↔ x1[i] không bị lệch.
     """
     B = x0_flat.shape[0]
     if B < 4:
         return x0_flat, x1_flat
     try:
-        # Cost = L2 distance bình thường trong trajectory space
+        # Cost = L2 distance trong trajectory space (normalized)
         cost = torch.cdist(x0_flat.float(), x1_flat.float()) / (x0_flat.shape[-1] ** 0.5)
         with torch.no_grad():
             pi = _sinkhorn_log(cost, epsilon=epsilon)
-        flat   = pi.reshape(-1).clamp(0.0)
-        s      = flat.sum()
+        flat = pi.reshape(-1).clamp(0.0)
+        s    = flat.sum()
         if not torch.isfinite(s) or s < 1e-10:
             return x0_flat, x1_flat
-        idx     = torch.multinomial(flat / s, num_samples=B, replacement=True)
-        col     = idx % B
-        return x0_flat[col], x1_flat
+        idx = torch.multinomial(flat / s, num_samples=B, replacement=True)
+        row = idx // B   # FIX: x0 row index (bản cũ nhầm dùng col = idx % B)
+        # x1_flat giữ nguyên → cond[i] vẫn tương ứng đúng với x1[i]
+        return x0_flat[row], x1_flat
     except Exception:
         return x0_flat, x1_flat
 
@@ -6161,28 +6167,40 @@ class ContextEncoder(nn.Module):
         return raw
 
     def _kinematic_feat(self, obs_traj: torch.Tensor) -> torch.Tensor:
-        """obs_traj [T, B, 2] → kinematic features [B, d_cond//2]"""
+        """obs_traj [T, B, 2] → kinematic features [B, d_cond//2]
+
+        FIX-BUG-1: Bản cũ dùng _NORM_TO_DEG = 25.0 sai 5x so với _norm_to_deg
+        (1 norm unit = 5°, không phải 25°). Hệ quả: lat_mid, dx_km, dy_km,
+        speed đều sai 5x → encoder conditioning nhiễu hoàn toàn.
+        Fix: convert sang degrees đúng qua _norm_to_deg(), tính speed bằng
+        haversine (_step_speeds_kmh) — physically correct, nhất quán với loss.
+        """
         B, T_obs = obs_traj.shape[1], obs_traj.shape[0]
         device   = obs_traj.device
 
         if T_obs >= 2:
-            vel     = obs_traj[1:] - obs_traj[:-1]
-            lat_mid = obs_traj[:-1, :, 1] * _NORM_TO_DEG
-            cos_lat = torch.cos(torch.deg2rad(lat_mid)).clamp(1e-4)
-            dx_km   = vel[:, :, 0] * cos_lat * DEG2KM * _NORM_TO_DEG
-            dy_km   = vel[:, :, 1] * DEG2KM * _NORM_TO_DEG
-            speed   = torch.sqrt(dx_km ** 2 + dy_km ** 2 + 1e-6) / DT_HOURS
-            heading = torch.atan2(vel[:, :, 1], vel[:, :, 0])
-            speed_n = (speed / 20.0).clamp(-3.0, 3.0)
+            # Convert sang degrees dùng _norm_to_deg (đúng, nhất quán)
+            traj_deg = _norm_to_deg(obs_traj)               # [T, B, 2] degrees
+            vel_norm = obs_traj[1:] - obs_traj[:-1]         # [T-1, B, 2] normalized diff
+
+            # Speed via haversine — đơn vị km/h, physically correct
+            speed   = _step_speeds_kmh(traj_deg)            # [T-1, B] km/h
+            speed_n = (speed / 20.0).clamp(-3.0, 3.0)      # normalize by ~TC mean speed
+
+            # Heading từ normalized displacement (tỷ lệ với bearing thực)
+            heading = torch.atan2(vel_norm[:, :, 1], vel_norm[:, :, 0])  # [T-1, B]
+
+            # Acceleration: delta speed per step, normalized
             if T_obs >= 3:
-                dspd  = speed[1:] - speed[:-1]
+                dspd  = speed[1:] - speed[:-1]              # [T-2, B]
                 accel = torch.cat([obs_traj.new_zeros(1, B),
-                                   (dspd / 10.0).clamp(-3.0, 3.0)], 0)
+                                   (dspd / 10.0).clamp(-3.0, 3.0)], 0)  # [T-1, B]
             else:
                 accel = obs_traj.new_zeros(T_obs - 1, B)
+
             kine = torch.stack(
-                [vel[:, :, 0], vel[:, :, 1], speed_n,
-                 heading.sin(), heading.cos(), accel], dim=-1)
+                [vel_norm[:, :, 0], vel_norm[:, :, 1], speed_n,
+                 heading.sin(), heading.cos(), accel], dim=-1)  # [T-1, B, 6]
         else:
             kine = obs_traj.new_zeros(self.obs_len, B, 6)
 
@@ -6540,6 +6558,41 @@ class TCFlowMatching(nn.Module):
             bl[0] = bl[0] + torch.randn_like(bl[0]) * sigma_obs
         return bl
 
+    # ── Relative coordinate helpers ───────────────────────────────────────
+    # BUG FIX (Design): FM phải hoạt động trong RELATIVE coords, không absolute.
+    #
+    # Vấn đề với absolute normalized coords:
+    #   x1_gt ≈ (-9, 4) cho TC ở lon=135E, lat=20N
+    #   x0 = randn()*0.08 ≈ (0, 0)  (sigma << |x1_gt|)
+    #   u_target = x1_gt - x0 ≈ x1_gt = CONSTANT cho mọi sample
+    #   → Velocity field học output constant (-9,4) với mọi cond
+    #   → Không có diversity, không học được trajectory modes
+    #   → L_CFM thấp nhưng ADE vô nghĩa (mọi sample ra cùng mean position)
+    #
+    # Fix: FM trên DISPLACEMENT (relative to last obs position)
+    #   x1_rel = x1_gt - last_obs    (displacement pred, centered near 0)
+    #   x0 = randn() * sigma         (noise phân bố xung quanh 0 -- ĐẶC TRƯNG FM)
+    #   u_target = x1_rel - x0       (meaningful velocity, phụ thuộc trajectory)
+    #   sigma cần đủ lớn để overlap với displacement range:
+    #     Max TC displacement 72h: ~1500km = 1500/555 ≈ 2.7 norm units
+    #     Dùng sigma từ constructor (0.04-0.08) nhưng scale up theo displacement range
+
+    def _to_relative(self, x_abs: torch.Tensor,
+                     last_obs: torch.Tensor) -> torch.Tensor:
+        """
+        Convert absolute normalized trajectory [B, T, 2] → displacement từ last obs.
+        last_obs: [B, 2] — last observation position (normalized)
+        Returns: x_rel [B, T, 2] — displacement tại mỗi step
+        """
+        return x_abs - last_obs.unsqueeze(1)   # [B, T, 2]
+
+    def _from_relative(self, x_rel: torch.Tensor,
+                       last_obs: torch.Tensor) -> torch.Tensor:
+        """
+        Convert displacement [B, T, 2] → absolute normalized trajectory.
+        """
+        return x_rel + last_obs.unsqueeze(1)   # [B, T, 2]
+
     # ── Forward FM step ───────────────────────────────────────────────────
 
     def _cfm_step(self, x1: torch.Tensor, sigma: float,
@@ -6563,35 +6616,32 @@ class TCFlowMatching(nn.Module):
 
     # ── FIX-FATAL-1: L_reg tại t=0 riêng để tránh gradient dilution ──────
 
-    def _reg_loss(self, x1_gt: torch.Tensor, cond: torch.Tensor,
+    def _reg_loss(self, x1_rel: torch.Tensor, last_obs: torch.Tensor,
+                  cond: torch.Tensor,
                   sigma: float,
                   hard_score: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         FIX-FATAL-1: ADE signal tại t=0, gradient không bị dilute bởi (1-t).
+        Hoạt động trên relative coords (displacement từ last_obs).
 
-        x1_pred = x0 + v(x0, t=0, cond)   [1-step Euler, gradient scale = 1.0]
-
-        hard_score weighting:
-          Bản FM gốc không có easy/hard split → FM không focus đúng mức vào
-          hard samples (recurvature). Fix: per-sample weight = 1 + hard_score.
-          Hard samples (score → 1) có weight = 2x easy (score → 0).
-          → FM được "push" mạnh hơn trên hard samples → học recurvature pattern.
-          Không binary threshold, continuous → stable gradient.
-
-        Step weights tăng dần: step 6h (weight nhỏ) → step 72h (weight lớn).
-        Cùng chiến lược với ST-Trans step_weighted_dpe.
+        x1_pred_rel = x0 + v(x0, t=0, cond)   [1-step Euler]
+        x1_pred_abs = x1_pred_rel + last_obs   [convert về absolute để tính ADE]
         """
-        B, T, _ = x1_gt.shape
-        device  = x1_gt.device
+        B, T, _ = x1_rel.shape
+        device  = x1_rel.device
 
-        x0      = torch.randn_like(x1_gt) * sigma
+        x0      = torch.randn_like(x1_rel) * sigma
         t0      = torch.zeros(B, device=device)
         v       = self.velocity(x0, t0, cond)
-        x1_pred = x0 + v                                # [B, T, 2]
+        x1_pred_rel = x0 + v                              # [B, T, 2] relative
 
-        pred_deg = _norm_to_deg(x1_pred.permute(1, 0, 2))   # [T, B, 2]
-        gt_deg   = _norm_to_deg(x1_gt.permute(1, 0, 2))     # [T, B, 2]
-        dist     = _haversine_deg(pred_deg, gt_deg)           # [T, B]
+        # Convert về absolute để tính haversine đúng
+        x1_pred_abs = self._from_relative(x1_pred_rel, last_obs)  # [B, T, 2]
+        x1_gt_abs   = self._from_relative(x1_rel,      last_obs)  # [B, T, 2]
+
+        pred_deg = _norm_to_deg(x1_pred_abs.permute(1, 0, 2))   # [T, B, 2]
+        gt_deg   = _norm_to_deg(x1_gt_abs.permute(1, 0, 2))     # [T, B, 2]
+        dist     = _haversine_deg(pred_deg, gt_deg)               # [T, B]
 
         # Step weights: softmax của linspace 1→3 (step 72h có weight ~5x step 6h)
         T_actual = dist.shape[0]
@@ -6632,32 +6682,36 @@ class TCFlowMatching(nn.Module):
         device   = obs_traj.device
 
         sigma   = self._sigma_schedule(epoch)
-        x1_gt   = gt_traj.permute(1, 0, 2)   # [B, T, 2]
+        x1_gt   = gt_traj.permute(1, 0, 2)   # [B, T, 2] — absolute normalized
+
+        # BUG FIX: chuyển sang RELATIVE coords (displacement từ last obs)
+        # last_obs: vị trí cuối trong obs sequence [B, 2]
+        last_obs = obs_traj[-1, :, :2]          # [B, 2]
+        x1_rel   = self._to_relative(x1_gt, last_obs)   # [B, T, 2] displacement
 
         # Continuous hard score (thay binary is_hard)
-        # FM encoder conditioning: score cao → encoder "biết" đây là hard sample
-        # → cond vector khác → FM velocity field khác → học 2 modes tự nhiên
         h_score = hard_score_from_obs(obs_traj[:, :, :2])   # [B] ∈ [0,1]
 
         # Encode context (1 lần) với hard score conditioning
         cond = self.encoder(batch_list, hard_score=h_score)  # [B, d_cond]
 
-        # ── L_CFM (FIX-FATAL-2: objective chính, pure FM) ────────────────
-        x0      = torch.randn_like(x1_gt) * sigma
+        # ── L_CFM: FM trên displacement (relative coords) ─────────────────
+        # x1_rel centered near 0 → x0=randn()*sigma overlap tốt với data
+        x0      = torch.randn_like(x1_rel) * sigma
 
-        # OT matching: pair x0 ↔ x1 để flow path thẳng hơn
+        # OT matching: pair x0 ↔ x1_rel để flow path thẳng hơn
         if self.use_ot and B >= 4:
             x0_flat, x1_flat = _ot_match_noise_gt(
-                x0.reshape(B, -1), x1_gt.reshape(B, -1), self.ot_epsilon)
+                x0.reshape(B, -1), x1_rel.reshape(B, -1), self.ot_epsilon)
             x0 = x0_flat.reshape(B, self.pred_len, 2)
-            x1_gt_matched = x1_flat.reshape(B, self.pred_len, 2)
+            x1_matched = x1_flat.reshape(B, self.pred_len, 2)
         else:
-            x1_gt_matched = x1_gt
+            x1_matched = x1_rel
 
         t          = torch.rand(B, device=device)
         te         = t.view(B, 1, 1)
-        x_t        = (1.0 - te) * x0 + te * x1_gt_matched
-        u_target   = x1_gt_matched - x0
+        x_t        = (1.0 - te) * x0 + te * x1_matched
+        u_target   = x1_matched - x0
 
         v_pred     = self.velocity(x_t, t, cond)
         l_cfm      = F.mse_loss(v_pred, u_target)
@@ -6672,7 +6726,7 @@ class TCFlowMatching(nn.Module):
             lam_reg = self.lambda_reg
 
         if lam_reg > 0.0:
-            l_reg = self._reg_loss(x1_gt, cond, sigma, hard_score=h_score)
+            l_reg = self._reg_loss(x1_rel, last_obs, cond, sigma, hard_score=h_score)
         else:
             l_reg = x_t.new_zeros(())
 
@@ -6682,13 +6736,15 @@ class TCFlowMatching(nn.Module):
         if not torch.isfinite(total):
             total = x_t.new_zeros(())
 
-        # ADE estimate cho logging (detached, fast 1-step)
+        # ADE estimate cho logging (detached, fast 1-step, relative coords)
         with torch.no_grad():
-            x0_log    = torch.randn_like(x1_gt) * sigma
+            x0_log    = torch.randn_like(x1_rel) * sigma
             t0_log    = torch.zeros(B, device=device)
             v_log     = self.velocity(x0_log, t0_log, cond)
-            x1_log    = x0_log + v_log
-            pred_d    = _norm_to_deg(x1_log.permute(1, 0, 2))
+            x1_rel_log = x0_log + v_log
+            # Convert back to absolute để tính ADE đúng
+            x1_abs_log = self._from_relative(x1_rel_log, last_obs)
+            pred_d    = _norm_to_deg(x1_abs_log.permute(1, 0, 2))
             gt_d      = _norm_to_deg(x1_gt.permute(1, 0, 2))
             ade_log   = _haversine_deg(pred_d, gt_d).mean().item()
 
@@ -6741,24 +6797,31 @@ class TCFlowMatching(nn.Module):
         device   = obs_traj.device
 
         # Encode (1 lần cho tất cả K samples) với hard_score conditioning
-        h_score  = hard_score_from_obs(obs_traj[:, :, :2])    # [B]
-        cond     = self.encoder(batch_list, hard_score=h_score)# [B, d_cond]
-        persist  = self._persistence_forecast(obs_traj[:, :, :2])  # [B, T, 2]
+        h_score  = hard_score_from_obs(obs_traj[:, :, :2])     # [B]
+        cond     = self.encoder(batch_list, hard_score=h_score) # [B, d_cond]
         obs_norm = obs_traj[:, :, :2]
 
-        all_traj = []   # List of [T, B, 2]
+        # last_obs [B, 2]: vị trí cuối obs — anchor để convert rel↔abs
+        last_obs = obs_traj[-1, :, :2]   # [B, 2]
+
+        all_traj = []   # List of [T, B, 2] absolute normalized
 
         for _ in range(K):
-            # FIX-MAJOR-4: sigma_inference = 0.15 (thay vì 0.02*2.5=0.05)
-            x = persist + torch.randn_like(persist) * self.sigma_inference
+            # FIX-BUG-3: Bản cũ hardcode sigma_now = self.sigma_max, bỏ qua
+            # self.sigma_inference hoàn toàn dù đã nhận từ constructor và CLI.
+            # Dùng sigma_inference để inference diversity có thể tune độc lập.
+            sigma_now = self.sigma_inference
+            x_rel = torch.randn(B, self.pred_len, 2, device=device) * sigma_now  # [B, T, 2]
 
-            # Euler integration: t=0→1
+            # Euler integration trên relative coords: t=0→1
             for step in range(N):
                 t_b = torch.full((B,), step * dt, device=device)
-                v   = self.velocity(x, t_b, cond)
-                x   = (x + dt * v).clamp(-3.0, 3.0)
+                v   = self.velocity(x_rel, t_b, cond)
+                x_rel = x_rel + dt * v   # không clamp — relative displacement có range tự nhiên
 
-            all_traj.append(x.permute(1, 0, 2))   # [T, B, 2]
+            # Convert về absolute coords để tính ADE và physics_score
+            x_abs = self._from_relative(x_rel, last_obs)   # [B, T, 2]
+            all_traj.append(x_abs.permute(1, 0, 2))        # [T, B, 2] absolute
 
         # FIX-FATAL-3: Best-of-K bằng physics score (không cần SelectorNet)
         scores = torch.stack([

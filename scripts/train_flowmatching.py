@@ -4261,10 +4261,10 @@ def main(args):
         for i, batch in enumerate(trl):
             bl = move(list(batch), device)
 
+            opt.zero_grad()
             with autocast(device_type="cuda", enabled=args.use_amp):
                 bd = model.get_loss_breakdown(bl, epoch=ep)
 
-            opt.zero_grad()
             scaler.scale(bd["total"]).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
