@@ -5184,27 +5184,45 @@ def load_lstm_model(ckpt_path: str, device, args):
         import traceback; traceback.print_exc()
         return None
 
-
 def load_sttrans_model(ckpt_path: str, device, args):
     if not ckpt_path or not os.path.exists(ckpt_path):
         print(f"  ⚠  ST-Trans checkpoint not found: {ckpt_path}")
         return None
     try:
-        sttrans_type = getattr(args, "sttrans_type", "sttrans")
-        if sttrans_type == "sttrans_ar":
-            from Model.st_trans_model import STTransAR as STTransModel
-        else:
-            from Model.st_trans_model import STTrans as STTransModel
-        model = STTransModel(obs_len=args.obs_len, pred_len=args.pred_len).to(device)
         ckpt  = torch.load(ckpt_path, map_location=device)
         state = _load_state_dict(ckpt)
-        res   = model.load_state_dict(state, strict=False)
-        if res.missing_keys:    print(f"  Missing   : {len(res.missing_keys)}")
-        if res.unexpected_keys: print(f"  Unexpected: {len(res.unexpected_keys)}")
-        ep  = ckpt.get("epoch","?") if isinstance(ckpt,dict) else "?"
-        tag = "STTransAR" if sttrans_type=="sttrans_ar" else "STTrans"
+        ep    = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
+
+        # Auto-detect STTransV2 vs STTrans gốc
+        is_v2 = any(k.startswith("steering_gate.") or 
+                    k.startswith("recurv_head.") or
+                    k.startswith("uw.") 
+                    for k in state.keys())
+
+        if is_v2 or getattr(args, "sttrans_type", "") == "sttrans_v2":
+            from Model.st_trans_model import STTransV2, build_st_trans_v2
+            model = build_st_trans_v2(args).to(device)
+            # load với strict=False vì threshold không phải nn.Parameter
+            res = model.load_state_dict(state, strict=False)
+            tag = "STTransV2"
+        else:
+            sttrans_type = getattr(args, "sttrans_type", "sttrans")
+            if sttrans_type == "sttrans_ar":
+                from Model.st_trans_model import STTransAR as STTransModel
+            else:
+                from Model.st_trans_model import STTrans as STTransModel
+            model = STTransModel(obs_len=args.obs_len, 
+                                 pred_len=args.pred_len).to(device)
+            res = model.load_state_dict(state, strict=False)
+            tag = "STTransAR" if sttrans_type == "sttrans_ar" else "STTrans"
+
+        if res.missing_keys:
+            print(f"  Missing   : {len(res.missing_keys)}")
+        if res.unexpected_keys:
+            print(f"  Unexpected: {len(res.unexpected_keys)}")
         print(f"  ✅ {tag} loaded (epoch={ep})")
         return model
+
     except Exception as e:
         print(f"  ❌ ST-Trans load failed: {e}")
         import traceback; traceback.print_exc()
