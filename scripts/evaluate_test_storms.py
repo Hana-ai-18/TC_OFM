@@ -5194,34 +5194,101 @@ def load_sttrans_model(ckpt_path: str, device, args):
         ep    = ckpt.get("epoch", "?") if isinstance(ckpt, dict) else "?"
 
         # Auto-detect STTransV2 vs STTrans gốc
-        is_v2 = any(k.startswith("steering_gate.") or 
+        is_v2 = any(k.startswith("steering_gate.") or
                     k.startswith("recurv_head.") or
-                    k.startswith("uw.") 
+                    k.startswith("uw.")
                     for k in state.keys())
 
         if is_v2 or getattr(args, "sttrans_type", "") == "sttrans_v2":
-            from Model.st_trans_model import STTransV2, build_st_trans_v2
-            model = build_st_trans_v2(args).to(device)
-            # load với strict=False vì threshold không phải nn.Parameter
+            from Model.st_trans_model import STTransV2
+
+            # ── Auto-detect hyperparams từ checkpoint ──
+            # d_model từ ctx_proj.0.weight shape[0]
+            d_model = int(state["ctx_proj.0.weight"].shape[0]) \
+                      if "ctx_proj.0.weight" in state else 64
+
+            # nhead: d_model / head_dim, head_dim thường = 32 hoặc 64
+            # in_proj_weight shape = [3*d_model, d_model] → nhead từ attention
+            attn_key = "obs_enc.enc.layers.0.self_attn.in_proj_weight"
+            if attn_key in state:
+                # nhead * head_dim = d_model, head_dim thường 32
+                nhead = max(1, d_model // 32)
+            else:
+                nhead = 4
+
+            # num_dec_layers: đếm transformer_dec.layers
+            num_dec_layers = sum(
+                1 for i in range(10)
+                if f"transformer_dec.layers.{i}.norm1.weight" in state
+            ) or 3
+
+            # dim_ff từ transformer_dec.layers.0.linear1.weight shape[0]
+            dim_ff_key = "transformer_dec.layers.0.linear1.weight"
+            dim_ff = int(state[dim_ff_key].shape[0]) \
+                     if dim_ff_key in state else 512
+
+            # obs_enc feat_dim: obs_enc.proj.0.weight shape[1]
+            obs_feat_key = "obs_enc.proj.0.weight"
+            obs_feat_dim = int(state[obs_feat_key].shape[1]) \
+                           if obs_feat_key in state else 8
+
+            # gate_hidden từ steering_gate.gate_net.0.weight shape[0]
+            gate_key = "steering_gate.gate_net.0.weight"
+            gate_hidden = int(state[gate_key].shape[0]) \
+                          if gate_key in state else 32
+
+            # recurv_hidden từ recurv_head.net.0.weight shape[0]
+            recurv_key = "recurv_head.net.0.weight"
+            recurv_hidden = int(state[recurv_key].shape[0]) \
+                            if recurv_key in state else 64
+
+            # threshold từ checkpoint nếu có
+            threshold_curv = ckpt.get("threshold_curv", 15.0) \
+                             if isinstance(ckpt, dict) else 15.0
+            threshold_spd  = ckpt.get("threshold_spd",  0.5) \
+                             if isinstance(ckpt, dict) else 0.5
+
+            print(f"  STTransV2 arch detected: d_model={d_model}, nhead={nhead}, "
+                  f"num_dec_layers={num_dec_layers}, dim_ff={dim_ff}, "
+                  f"obs_feat={obs_feat_dim}, gate_hidden={gate_hidden}, "
+                  f"recurv_hidden={recurv_hidden}")
+            print(f"  Thresholds: curv={threshold_curv:.3f}, spd={threshold_spd:.4f}")
+
+            model = STTransV2(
+                obs_len        = args.obs_len,
+                pred_len       = args.pred_len,
+                d_model        = d_model,
+                nhead          = nhead,
+                num_dec_layers = num_dec_layers,
+                dim_ff         = dim_ff,
+                gate_hidden    = gate_hidden,
+                recurv_hidden  = recurv_hidden,
+                threshold_curv = threshold_curv,
+                threshold_spd  = threshold_spd,
+            ).to(device)
+
             res = model.load_state_dict(state, strict=False)
-            tag = "STTransV2"
+            missing    = [k for k in res.missing_keys]
+            unexpected = res.unexpected_keys
+            if missing:    print(f"  Missing   : {len(missing)}")
+            if unexpected: print(f"  Unexpected: {len(unexpected)}")
+            print(f"  ✅ STTransV2 loaded (epoch={ep})")
+            return model
+
         else:
             sttrans_type = getattr(args, "sttrans_type", "sttrans")
             if sttrans_type == "sttrans_ar":
                 from Model.st_trans_model import STTransAR as STTransModel
             else:
                 from Model.st_trans_model import STTrans as STTransModel
-            model = STTransModel(obs_len=args.obs_len, 
+            model = STTransModel(obs_len=args.obs_len,
                                  pred_len=args.pred_len).to(device)
             res = model.load_state_dict(state, strict=False)
+            if res.missing_keys:    print(f"  Missing   : {len(res.missing_keys)}")
+            if res.unexpected_keys: print(f"  Unexpected: {len(res.unexpected_keys)}")
             tag = "STTransAR" if sttrans_type == "sttrans_ar" else "STTrans"
-
-        if res.missing_keys:
-            print(f"  Missing   : {len(res.missing_keys)}")
-        if res.unexpected_keys:
-            print(f"  Unexpected: {len(res.unexpected_keys)}")
-        print(f"  ✅ {tag} loaded (epoch={ep})")
-        return model
+            print(f"  ✅ {tag} loaded (epoch={ep})")
+            return model
 
     except Exception as e:
         print(f"  ❌ ST-Trans load failed: {e}")
