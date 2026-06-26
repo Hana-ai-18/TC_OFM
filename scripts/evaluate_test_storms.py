@@ -5184,6 +5184,85 @@ def load_lstm_model(ckpt_path: str, device, args):
         import traceback; traceback.print_exc()
         return None
 
+def load_fm_v2_compat(ckpt, state, device, args, ep, TCFlowMatching):
+    """
+    Load TCFlowMatching v2 với backward compat:
+    - vel_obs_enc [256, 48] (6 features) → expand thành [256, 56] (7 features, FIX-1)
+    """
+    print(f"  Architecture: v2 (ContextEncoder + VelocityTransformer)")
+ 
+    # Detect hyperparams
+    num_dec_layers = sum(
+        1 for i in range(10)
+        if f"velocity.decoder.layers.{i}.norm1.weight" in state
+    ) or 4
+    d_model  = int(state["velocity.traj_embed.weight"].shape[0]) \
+               if "velocity.traj_embed.weight" in state else 256
+    d_cond   = int(state["velocity.cond_proj.0.weight"].shape[0]) \
+               if "velocity.cond_proj.0.weight" in state else 256
+    dim_ff   = int(state["velocity.decoder.layers.0.linear1.weight"].shape[0]) \
+               if "velocity.decoder.layers.0.linear1.weight" in state else 512
+ 
+    print(f"  v2 arch: d_model={d_model}, d_cond={d_cond}, "
+          f"num_dec_layers={num_dec_layers}, dim_ff={dim_ff}")
+ 
+    model = TCFlowMatching(
+        pred_len=args.pred_len, obs_len=args.obs_len,
+        d_model=d_model, d_cond=d_cond,
+        num_dec_layers=num_dec_layers, dim_ff=dim_ff,
+        sigma_min=0.04, sigma_max=0.08,
+        use_ema=True, ema_decay=0.995,
+    ).to(device)
+ 
+    if hasattr(model, "init_ema"):
+        model.init_ema()
+ 
+    # ── VEL_OBS_ENC COMPAT: expand 48→56 nếu cần ──────────────────────
+    key = "encoder.vel_obs_enc.0.weight"
+    if key in state:
+        w_old = state[key]          # [256, 48] hoặc [256, 56]
+        obs_len = args.obs_len      # =8
+        expected = obs_len * 7      # =56
+ 
+        if w_old.shape[1] == obs_len * 6:
+            # Expand: thêm obs_len=8 columns cho log_speed feature
+            extra = torch.randn(w_old.shape[0], obs_len,
+                                device=w_old.device) * 0.01
+            state[key] = torch.cat([w_old, extra], dim=1)
+            print(f"  ✅ Expanded vel_obs_enc: {w_old.shape[1]} → {expected} cols")
+        elif w_old.shape[1] == expected:
+            print(f"  ✅ vel_obs_enc already {expected} cols")
+        else:
+            print(f"  ⚠ vel_obs_enc unexpected shape {w_old.shape}")
+ 
+    result     = model.load_state_dict(state, strict=False)
+    missing    = [k for k in result.missing_keys if "_ema" not in k]
+    unexpected = result.unexpected_keys
+    if missing:    print(f"  Missing   : {len(missing)}")
+    if unexpected: print(f"  Unexpected: {len(unexpected)}")
+ 
+    # Load EMA
+    ema_loaded = 0
+    if isinstance(ckpt, dict):
+        for ema_key in ["ema", "ema_shadow", "ema_state_dict"]:
+            if ema_key in ckpt and ckpt[ema_key]:
+                raw = model._orig_mod if hasattr(model, "_orig_mod") else model
+                ema = getattr(raw, "_ema", None)
+                if ema is not None and hasattr(ema, "shadow"):
+                    for k, v in ckpt[ema_key].items():
+                        if k in ema.shadow:
+                            ema.shadow[k].copy_(v.to(device))
+                            ema_loaded += 1
+                    if ema_loaded:
+                        print(f"  EMA: {ema_loaded} keys loaded ✓")
+                break
+ 
+    if not ema_loaded:
+        print("  ⚠ No EMA weights — using raw model weights")
+ 
+    print(f"  ✅ FM v2 loaded (epoch={ep})")
+    return model
+ 
 def load_sttrans_model(ckpt_path: str, device, args):
     if not ckpt_path or not os.path.exists(ckpt_path):
         print(f"  ⚠  ST-Trans checkpoint not found: {ckpt_path}")
