@@ -5795,10 +5795,15 @@ scripts/evaluate_test_storms.py
 
 Đánh giá TCFlowMatching v2.4 (và các models khác) trên test set.
 
-BUGS ĐÃ FIX:
+BUGS ĐÃ FIX (bản này):
   BUG-1+5: load_fm_v2_compat là dead code → fix: gọi đúng trong load_fm_model
   BUG-2:   infer_fm dùng importance_weight=True → TypeError → fix: bỏ kwarg đó
   BUG-4:   _version_from_path không parse filename → fix: thêm regex fallback
+  BUG-F:   infer_fm unpack cứng 3 giá trị → crash khi sample() trả 4 (xai path)
+           → fix: unpack an toàn với *rest
+  BUG-G:   infer_fm kiểm tra dim[0]==B để permute → sai với v2.4
+           → sample() luôn trả [T,B,2] — bỏ permute, chỉ clamp shape cuối
+  BUG-H:   gt_norm từ batch[1] có thể có extra features → slice [..,:2] trước add_batch
   COMPAT:  vel_obs_enc [256,48] → expand [256,56] khi load checkpoint cũ (6→7 features)
   EMA:     train_fm.py lưu key "ema" (không phải "ema_shadow")
 
@@ -5989,8 +5994,9 @@ class MultiStormAccumulator:
     def add_batch(self, pred_norm, gt_norm, storm_ids):
         T  = min(pred_norm.shape[0], gt_norm.shape[0])
         B  = pred_norm.shape[1]
-        pd = norm_to_deg(pred_norm[:T])
-        gd = norm_to_deg(gt_norm[:T])
+        # BUG-H FIX: chỉ lấy 2 features lon/lat
+        pd = norm_to_deg(pred_norm[:T, :, :2])
+        gd = norm_to_deg(gt_norm[:T,  :, :2])
         sid_map = defaultdict(list)
         for b, sid in enumerate(storm_ids[:B]):
             sid_map[sid].append(b)
@@ -6423,33 +6429,48 @@ def load_sttrans_model(ckpt_path, device, args):
 @torch.no_grad()
 def infer_fm(model, batch_list, args, device):
     """
-    BUG-2 FIX: Không truyền importance_weight (v2.4 không có param này).
-    Dùng ddim_steps=1 cho 1-shot inference.
+    BUG-2 FIX: Không truyền importance_weight.
+    BUG-F FIX: Unpack an toàn — sample() v2.4 trả (pred, zeros, all_t) hoặc
+               (pred, zeros, all_t, xai) nếu return_xai=True (không dùng ở đây).
+               Dùng *rest để bắt mọi số lượng return values.
+    BUG-G FIX: sample() v2.4 luôn trả pred shape [T, B, 2].
+               KHÔNG cần permute. Chỉ kiểm tra shape[-1] để slice.
+               (Code cũ kiểm tra shape[0]==B rồi permute → sai với v2.4 vì
+                shape[0] là T, không phải B.)
     """
     try:
         model.eval()
         ema = get_ema_obj(model); backup = None
         if ema is not None:
-            try: backup = ema.apply_to(model)
-            except Exception: pass
+            try:
+                backup = ema.apply_to(model)
+            except Exception as e:
+                print(f"    EMA apply failed ({e}), using raw weights")
+                backup = None
 
         if hasattr(model, "sample"):
-            # BUG-2 FIX: gọi thẳng, không có importance_weight
-            pred, _, _ = model.sample(
+            # BUG-F FIX: unpack an toàn với *rest
+            result = model.sample(
                 batch_list,
                 num_ensemble=args.fm_ensemble,
                 ddim_steps=args.fm_ode_steps,
             )
+            pred = result[0]  # luôn là phần tử đầu: [T, B, 2]
         else:
             pred = model(batch_list)
-            if pred.dim() == 3 and pred.shape[0] == batch_list[0].shape[1]:
+            # Fallback cho model cũ không có sample(): cần permute nếu [B, T, 2]
+            if pred.dim() == 3 and pred.shape[0] != batch_list[1].shape[0]:
                 pred = pred.permute(1, 0, 2)
 
         if backup is not None:
             try: ema.restore(model, backup)
             except Exception: pass
 
-        return pred[..., :2] if pred.shape[-1] > 2 else pred
+        # BUG-G FIX: pred từ sample() đã là [T, B, 2] — không permute
+        # Chỉ slice last dim nếu có extra features
+        if pred.dim() == 3 and pred.shape[-1] > 2:
+            pred = pred[..., :2]
+        return pred
 
     except Exception as e:
         print(f"    FM inference error: {e}")
@@ -6462,12 +6483,13 @@ def infer_lstm(model, batch_list, args, device):
     try:
         model.eval()
         if hasattr(model, "sample"):
-            pred, _, _ = model.sample(batch_list, num_ensemble=1)
+            result = model.sample(batch_list, num_ensemble=1)
+            pred   = result[0]
         else:
             pred = model(batch_list)
         if pred.dim() == 3 and pred.shape[0] == batch_list[0].shape[1]:
             pred = pred.permute(1, 0, 2)
-        return pred[..., :2]
+        return pred[..., :2] if pred.shape[-1] > 2 else pred
     except Exception as e:
         print(f"    LSTM inference error: {e}"); return None
 
@@ -6477,12 +6499,13 @@ def infer_sttrans(model, batch_list, args, device):
     try:
         model.eval()
         if hasattr(model, "sample"):
-            pred, _, _ = model.sample(batch_list, num_ensemble=1)
+            result = model.sample(batch_list, num_ensemble=1)
+            pred   = result[0]
         else:
             pred = model(batch_list)
         if pred.dim() == 3 and pred.shape[0] == batch_list[0].shape[1]:
             pred = pred.permute(1, 0, 2)
-        return pred[..., :2]
+        return pred[..., :2] if pred.shape[-1] > 2 else pred
     except Exception as e:
         print(f"    STTrans inference error: {e}"); return None
 
@@ -6632,7 +6655,12 @@ def run_evaluation(model, model_name, test_loader, device, args, infer_fn):
         B         = bl[0].shape[1]
         pred_norm = infer_fn(model, bl, args, device)
         if pred_norm is None: continue
-        gt_norm   = bl[1]
+
+        # BUG-H FIX: gt có thể có extra features → slice :2
+        gt_norm = bl[1]
+        if gt_norm.shape[-1] > 2:
+            gt_norm = gt_norm[..., :2]
+
         storm_ids = extract_storm_ids(batch, B)
         T = min(pred_norm.shape[0], gt_norm.shape[0])
         acc.add_batch(pred_norm[:T], gt_norm[:T], storm_ids)
