@@ -5790,22 +5790,20 @@
 #     main(args)
 
 """
-scripts/evaluate_test_storms.py
-═══════════════════════════════════════════════════════════════════════════════
-
-Đánh giá TCFlowMatching v2.4 (và các models khác) trên test set.
+scripts/evaluate_test_storms.py  — TC Model Evaluator v2.4-compat
+═══════════════════════════════════════════════════════════════════
 
 BUGS ĐÃ FIX (bản này):
   BUG-1+5: load_fm_v2_compat là dead code → fix: gọi đúng trong load_fm_model
   BUG-2:   infer_fm dùng importance_weight=True → TypeError → fix: bỏ kwarg đó
-  BUG-4:   _version_from_path không parse filename → fix: thêm regex fallback
+  BUG-4:   _version_from_path dùng r'\d+' không escape → SyntaxWarning → fix raw string
+  BUG-EMA: EMA shadow còn vel_obs_enc shape 48 → crash khi copy vào model 56
+           → fix: expand EMA shadow cùng logic với state_dict trước khi copy_()
   BUG-F:   infer_fm unpack cứng 3 giá trị → crash khi sample() trả 4 (xai path)
-           → fix: unpack an toàn với *rest
-  BUG-G:   infer_fm kiểm tra dim[0]==B để permute → sai với v2.4
-           → sample() luôn trả [T,B,2] — bỏ permute, chỉ clamp shape cuối
-  BUG-H:   gt_norm từ batch[1] có thể có extra features → slice [..,:2] trước add_batch
-  COMPAT:  vel_obs_enc [256,48] → expand [256,56] khi load checkpoint cũ (6→7 features)
-  EMA:     train_fm.py lưu key "ema" (không phải "ema_shadow")
+           → fix: lấy result[0]
+  BUG-G:   infer_fm permute sai chiều v2.4 — sample() luôn trả [T,B,2]
+           → fix: bỏ permute cho FM path
+  BUG-H:   gt_norm có thể có extra features → fix: slice [...,:2]
 
 Cách dùng:
     python scripts/evaluate_test_storms.py \
@@ -6081,7 +6079,7 @@ def _detect_fm_version(state):
 
 def _version_from_path(ckpt_path):
     """
-    BUG-4 FIX: parse v\d+ từ dir name hoặc filename.
+    BUG-4 FIX: dùng raw string r'v(\d+)' để tránh SyntaxWarning.
     'runs/fm_v24/best.pth'    -> 'v24'
     'best_model_v24.pth'      -> 'v24'
     'runs/v61/best_model.pth' -> 'v61'
@@ -6094,6 +6092,39 @@ def _version_from_path(ckpt_path):
     m = re.search(r'v(\d+)', fname)
     if m: return f"v{m.group(1)}"
     return "ours"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  EMA compat expand — dùng chung cho state_dict và EMA shadow
+# ─────────────────────────────────────────────────────────────────────────────
+
+_VEL_OBS_KEY = "encoder.vel_obs_enc.0.weight"
+
+
+def _expand_vel_obs_enc(sd: dict, obs_len: int, label: str = "state") -> dict:
+    """
+    BUG-EMA FIX: Expand vel_obs_enc từ obs_len*6 → obs_len*7 trong bất kỳ dict nào
+    (state_dict hoặc EMA shadow). Phải gọi hàm này cho CẢ HAI trước khi load.
+
+    Lý do crash:
+      - state_dict đã được expand 48→56 trước load_state_dict()
+      - Nhưng EMA shadow vẫn còn key cũ shape [256, 48]
+      - Khi ema.shadow[k].copy_(v.to(device)) → size mismatch RuntimeError
+    """
+    if _VEL_OBS_KEY not in sd:
+        return sd
+    w_old    = sd[_VEL_OBS_KEY]
+    expected = obs_len * 7
+    if w_old.shape[1] == obs_len * 6:
+        extra = torch.randn(w_old.shape[0], obs_len,
+                            device=w_old.device, dtype=w_old.dtype) * 0.01
+        sd[_VEL_OBS_KEY] = torch.cat([w_old, extra], dim=1)
+        print(f"  COMPAT [{label}]: vel_obs_enc {w_old.shape[1]} → {expected}")
+    elif w_old.shape[1] == expected:
+        print(f"  COMPAT [{label}]: vel_obs_enc already {expected} cols")
+    else:
+        print(f"  COMPAT [{label}]: vel_obs_enc unexpected shape {w_old.shape}, skip")
+    return sd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6127,16 +6158,15 @@ def _import_fm_class():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  FM v2 loader — compat expand vel_obs_enc 48→56
+#  FM v2 loader
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_fm_v2_compat(ckpt, state, device, args, ep, TCFlowMatching):
     """
-    Load TCFlowMatching v2.4 với backward compat:
-    - vel_obs_enc weight [256,48] (6 features, checkpoint cũ)
-      → expand thành [256,56] (7 features, sau FIX-1 log_speed)
+    Load TCFlowMatching v2.4 với backward compat vel_obs_enc 6→7 features.
 
-    EMA: train_fm.py v2.4 lưu key 'ema' (ưu tiên cao nhất).
+    BUG-EMA FIX: Expand EMA shadow dict TRƯỚC KHI copy_ vào model.
+    EMA shadow có cùng key set với model state_dict, nên cần cùng expand logic.
     """
     print("  Architecture: v2 (ContextEncoder + VelocityTransformer)")
 
@@ -6165,24 +6195,10 @@ def _load_fm_v2_compat(ckpt, state, device, args, ep, TCFlowMatching):
     if hasattr(model, "init_ema"):
         model.init_ema()
 
-    # ── COMPAT: expand vel_obs_enc nếu cần ──────────────────────────────
-    key = "encoder.vel_obs_enc.0.weight"
-    if key in state:
-        w_old    = state[key]
-        obs_len  = args.obs_len    # = 8
-        expected = obs_len * 7     # = 56
+    # ── Expand model state_dict ──────────────────────────────────────────
+    state = _expand_vel_obs_enc(state, args.obs_len, label="model")
 
-        if w_old.shape[1] == obs_len * 6:  # 48 → cần expand
-            extra = torch.randn(w_old.shape[0], obs_len,
-                                device=w_old.device) * 0.01
-            state[key] = torch.cat([w_old, extra], dim=1)
-            print(f"  COMPAT: vel_obs_enc expanded {w_old.shape[1]} → {expected}")
-        elif w_old.shape[1] == expected:
-            print(f"  COMPAT: vel_obs_enc already {expected} cols")
-        else:
-            print(f"  COMPAT: vel_obs_enc unexpected shape {w_old.shape}")
-
-    # ── Load weights ─────────────────────────────────────────────────────
+    # ── Load model weights ───────────────────────────────────────────────
     result = model.load_state_dict(state, strict=False)
     missing    = [k for k in result.missing_keys if "_ema" not in k]
     unexpected = result.unexpected_keys
@@ -6192,17 +6208,24 @@ def _load_fm_v2_compat(ckpt, state, device, args, ep, TCFlowMatching):
     if unexpected:
         print(f"  Unexpected keys: {len(unexpected)}")
 
-    # ── Load EMA (key='ema' theo train_fm.py v2.4) ──────────────────────
+    # ── Load EMA shadow (key='ema' theo train_fm.py v2.4) ───────────────
+    # BUG-EMA FIX: expand EMA shadow dict TRƯỚC copy_()
     ema_loaded = 0
     if isinstance(ckpt, dict):
         for ema_key in ["ema", "ema_shadow", "ema_state_dict"]:
             if ema_key in ckpt and ckpt[ema_key]:
+                ema_sd = dict(ckpt[ema_key])  # mutable copy
+                # Expand EMA shadow cùng logic với model state_dict
+                ema_sd = _expand_vel_obs_enc(ema_sd, args.obs_len, label="EMA")
                 ema = get_ema_obj(model)
                 if ema is not None and hasattr(ema, "shadow"):
-                    for k, v in ckpt[ema_key].items():
+                    for k, v in ema_sd.items():
                         if k in ema.shadow:
-                            ema.shadow[k].copy_(v.to(device))
-                            ema_loaded += 1
+                            try:
+                                ema.shadow[k].copy_(v.to(device))
+                                ema_loaded += 1
+                            except Exception as ce:
+                                print(f"  EMA copy failed [{k}]: {ce}")
                     if ema_loaded:
                         print(f"  EMA: {ema_loaded} keys loaded (key='{ema_key}')")
                 break
@@ -6273,7 +6296,10 @@ def _load_fm_v1(ckpt, state, device, args, ep, TCFlowMatching):
                 if ema is not None and hasattr(ema, "shadow"):
                     for k, v in ckpt[ema_key].items():
                         if k in ema.shadow:
-                            ema.shadow[k].copy_(v.to(device)); ema_loaded += 1
+                            try:
+                                ema.shadow[k].copy_(v.to(device))
+                                ema_loaded += 1
+                            except Exception: pass
                     if ema_loaded: print(f"  EMA: {ema_loaded} keys")
                 break
     if not ema_loaded:
@@ -6287,7 +6313,6 @@ def _load_fm_v1(ckpt, state, device, args, ep, TCFlowMatching):
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  load_fm_model — entry point
-#  BUG-1+5 FIX: gọi _load_fm_v2_compat thay vì _load_fm_v2 (dead code cũ)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_fm_model(ckpt_path, device, args):
@@ -6331,7 +6356,6 @@ def load_fm_model(ckpt_path, device, args):
         print(f"  FM version: {fm_version}")
 
         if fm_version == "v2":
-            # BUG-1+5 FIX: gọi hàm compat có expand logic
             return _load_fm_v2_compat(ckpt, state, device, args, ep, TCFlowMatching)
         else:
             return _load_fm_v1(ckpt, state, device, args, ep, TCFlowMatching)
@@ -6429,14 +6453,8 @@ def load_sttrans_model(ckpt_path, device, args):
 @torch.no_grad()
 def infer_fm(model, batch_list, args, device):
     """
-    BUG-2 FIX: Không truyền importance_weight.
-    BUG-F FIX: Unpack an toàn — sample() v2.4 trả (pred, zeros, all_t) hoặc
-               (pred, zeros, all_t, xai) nếu return_xai=True (không dùng ở đây).
-               Dùng *rest để bắt mọi số lượng return values.
-    BUG-G FIX: sample() v2.4 luôn trả pred shape [T, B, 2].
-               KHÔNG cần permute. Chỉ kiểm tra shape[-1] để slice.
-               (Code cũ kiểm tra shape[0]==B rồi permute → sai với v2.4 vì
-                shape[0] là T, không phải B.)
+    BUG-F FIX: sample() v2.4 trả tuple độ dài 3 hoặc 4 → lấy result[0].
+    BUG-G FIX: sample() luôn trả pred shape [T, B, 2] → không cần permute.
     """
     try:
         model.eval()
@@ -6449,16 +6467,16 @@ def infer_fm(model, batch_list, args, device):
                 backup = None
 
         if hasattr(model, "sample"):
-            # BUG-F FIX: unpack an toàn với *rest
+            # BUG-F FIX: unpack an toàn
             result = model.sample(
                 batch_list,
                 num_ensemble=args.fm_ensemble,
                 ddim_steps=args.fm_ode_steps,
             )
-            pred = result[0]  # luôn là phần tử đầu: [T, B, 2]
+            pred = result[0]  # [T, B, 2] — luôn đúng chiều với v2.4
         else:
             pred = model(batch_list)
-            # Fallback cho model cũ không có sample(): cần permute nếu [B, T, 2]
+            # Fallback cho model không có sample(): permute nếu [B, T, 2]
             if pred.dim() == 3 and pred.shape[0] != batch_list[1].shape[0]:
                 pred = pred.permute(1, 0, 2)
 
@@ -6466,8 +6484,8 @@ def infer_fm(model, batch_list, args, device):
             try: ema.restore(model, backup)
             except Exception: pass
 
-        # BUG-G FIX: pred từ sample() đã là [T, B, 2] — không permute
-        # Chỉ slice last dim nếu có extra features
+        # BUG-G FIX: không permute — sample() đã trả [T, B, 2]
+        # Chỉ slice last dim nếu extra features
         if pred.dim() == 3 and pred.shape[-1] > 2:
             pred = pred[..., :2]
         return pred
@@ -6700,10 +6718,8 @@ def get_args():
     p.add_argument("--lstm_type",     default="lstm", choices=["lstm","gru","rnn"])
     p.add_argument("--sttrans_type",  default="sttrans",
                    choices=["sttrans","sttrans_ar","sttrans_v2"])
-    p.add_argument("--fm_ensemble",   default=20,  type=int,
-                   help="K samples (v2.4 default=20)")
-    p.add_argument("--fm_ode_steps",  default=1,   type=int,
-                   help="1 cho 1-shot inference (v2.4)")
+    p.add_argument("--fm_ensemble",   default=20,  type=int)
+    p.add_argument("--fm_ode_steps",  default=1,   type=int)
     p.add_argument("--fm_type",       default="auto",
                    choices=["auto","tcfm","residual"])
     p.add_argument("--output_dir",    default="results/test_eval")
