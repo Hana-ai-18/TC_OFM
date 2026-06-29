@@ -8516,6 +8516,8 @@ def get_args():
     p.add_argument("--output_dir",       default="runs/xai_results")
     p.add_argument("--obs_len",          default=8,   type=int)
     p.add_argument("--pred_len",         default=12,  type=int)
+    p.add_argument("--batch_size",        default=60,  type=int,
+                   help="Batch size for eval DataLoader")
     p.add_argument("--num_workers",      default=2,   type=int)
     p.add_argument("--other_modal",      default="gph")
     p.add_argument("--delim",            default=" ")
@@ -8535,9 +8537,16 @@ def get_args():
     p.add_argument("--lambda_heading",   default=0.10, type=float)
     p.add_argument("--use_ot",           default=True, action="store_true")
     p.add_argument("--ot_epsilon",       default=0.05, type=float)
-    p.add_argument("--n_ensemble",       default=20,  type=int)
-    p.add_argument("--sigma_inference",  default=0.04, type=float)
-    p.add_argument("--n_inference_steps",default=1,   type=int)
+    p.add_argument("--n_ensemble",       default=30,  type=int,
+                   help="K ensemble samples (default 30 for v2.1-XAI)")
+    p.add_argument("--sigma_inference",  default=0.055, type=float,
+                   help="Inference sigma (0.055 for diversity, was 0.04)")
+    p.add_argument("--clip_min",         default=0.72, type=float,
+                   help="Speed calibration clip_min (0.72 for wider range)")
+    p.add_argument("--clip_max",         default=1.35, type=float,
+                   help="Speed calibration clip_max (1.35 for wider range)")
+    p.add_argument("--n_inference_steps",default=1,   type=int,
+                   help="NFE for FM inference (1=1-shot)")
     p.add_argument("--gpu_num",          default="0")
     p.add_argument("--run_crps",         action="store_true", default=False,
                    help="Compute CRPS (slow, requires n_ensemble² samples)")
@@ -8586,6 +8595,37 @@ def main(args):
     print(f"  Saved val ADE={ck.get('val_ade', '?')}  "
           f"ATE={ck.get('val_ate', '?')}  "
           f"CTE={ck.get('val_cte', '?')}")
+    # Override inference params (quick-win, no retrain needed)
+    # Evidence: XAI-8 24h ratio=1.61 → clip_min=0.72 needed (old 0.85 truncated)
+    # Evidence: XAI-4 72h_std=3.8km → sigma=0.055 for diversity
+    raw = _unwrap(model)
+    raw.sigma_inference = args.sigma_inference
+    raw.n_ensemble      = args.n_ensemble
+    print(f"  Inference override: sigma={args.sigma_inference}  "
+          f"K={args.n_ensemble}  clip=[{args.clip_min},{args.clip_max}]")
+
+    # Monkey-patch speed calibration clip range (inference-only quick-win)
+    _orig_calib = raw.speed_calibrate_pred.__func__ if hasattr(raw.speed_calibrate_pred, '__func__') else None
+    _clip_min, _clip_max = args.clip_min, args.clip_max
+    import types
+    def _patched_calib(self, pred_mean, last_obs, obs_norm,
+                       clip_min=_clip_min, clip_max=_clip_max):
+        from Model.flow_matching_model import _norm_to_deg, _step_speeds_kmh
+        import torch
+        obs_deg  = _norm_to_deg(obs_norm)
+        last_deg = _norm_to_deg(last_obs)
+        pred_deg = _norm_to_deg(pred_mean)
+        obs_spd  = _step_speeds_kmh(obs_deg)
+        T_sc = obs_spd.shape[0]
+        w    = torch.exp(torch.arange(T_sc, dtype=obs_spd.dtype, device=obs_spd.device) * 0.5)
+        obs_spd_ref = (obs_spd * (w / w.sum()).unsqueeze(1)).sum(0).clamp(min=3.0)
+        pts  = torch.cat([last_deg.unsqueeze(0), pred_deg], 0)
+        from Model.flow_matching_model import _step_speeds_kmh as _spd
+        pred_spd = _spd(pts)
+        pred_spd_ref = pred_spd[:min(4, pred_spd.shape[0])].mean(0).clamp(min=3.0)
+        scale = (obs_spd_ref / pred_spd_ref).clamp(0.0, 10.0).clamp(clip_min, clip_max)
+        return last_obs.unsqueeze(0) + (pred_mean - last_obs.unsqueeze(0)) * scale.view(1, -1, 1)
+    raw.speed_calibrate_pred = types.MethodType(_patched_calib, raw)
 
     # ── Load data ─────────────────────────────────────────────────────────
     loaders = {}
