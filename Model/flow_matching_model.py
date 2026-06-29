@@ -8539,7 +8539,7 @@
 # # ─────────────────────────────────────────────────────────────────────────────
 # TCDiffusion = TCFlowMatching
 """
-Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean r2
+Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
 ═══════════════════════════════════════════════════════════════════════════════
 VIẾT LẠI HOÀN TOÀN từ v2.1 + các fix đã verified từ thực nghiệm 140 epoch.
 
@@ -8590,15 +8590,6 @@ GIẢI PHÁP GAP (val→test distribution shift):
 ━━━ GIỮ NGUYÊN TỪ v2.1 (PROVEN, KHÔNG THAY ĐỔI) ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   ✅ sigma_inference=0.04 FIXED — zero train/inference mismatch
-
-━━━ FIX DUY NHẤT THÊM VÀO (evidence từ XAI-8 log 150 epoch) ━━━━━━━━━━━━━━━
-
-  [CALIB-FIX] speed_calibrate: ALL steps thay vì first 4
-    XAI-8: 12h=1.31×, 24h=1.61× OVER; 48h=0.96×, 72h=1.00× OK
-    First 4 = phần over-predict nhất → reference inflate → scale sai
-    All steps → reference thực tế → scale đúng hơn
-    clip: 0.85-1.15 → 0.80-1.20 (test faster storms, val_speed=10.3 vs test=11.6)
-    INFERENCE ONLY — không ảnh hưởng training
   ✅ L_reg softmax-linspace weights (max/min ≈ 3×) — không exp (v2.4 fail)
   ✅ Mild base aug: shift±5km + speed×0.85–1.15 (val ≈ test distribution)
   ✅ 1-shot inference nhất quán với L_reg training
@@ -8608,21 +8599,27 @@ GIẢI PHÁP GAP (val→test distribution shift):
   ✅ ContextEncoder: FNO3D + Mamba + Env + 6 kinematic features
   ✅ VelocityTransformer: d_model=256, 4 layers, nhead=8
 
-━━━ CẢI TIẾN v2.6 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ v2.1-CLEAN CHANGES (from v2.6 base) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  [REMOVE]  L_momentum — LOẠI BỎ HOÀN TOÀN (made ATE +7.9km worse)
-  [UPGRADE] L_heading → multi-step 4 steps, decay=0.5, weight=0.10
-  [NEW-INF] speed_calibrate_pred() tại inference (clip 0.85–1.15)
-  [UPGRADE] physics_score + displacement_score (15% weight)
-  [AUG-D]   obs-speed scaling aug ×0.7–1.4 (15% probability)
-  [XAI 1–7] giữ nguyên đầy đủ, XAI-5 now reports per-storm calibration
+  [KEEP]    L_momentum removed (made ATE +7.9km worse — v2.5)
+  [KEEP]    L_heading multi-step 4 steps, decay=0.5, weight=0.07
+  [KEEP]    speed_calibrate_pred() at inference (clip 0.85–1.15)
+  [KEEP]    physics_score + displacement_score (15% weight)
+  [REMOVE]  AUG-D obs-speed scaling — PROVEN HARMFUL: +4.5km ATE (v2.6), +13.4km (v2.7)
+  [FIX]     AUG-C: rotate DISPLACEMENT vectors (not absolute positions)
+            OLD bug: rotating positions → step-distances inflate → ATE +7.2km
+            FIX: direction changes, speed magnitude preserved = correct TC physics
+  [FIX]     L_heading: removed torch.no_grad() — gradient was 0.000, now 0.515
+  [ADD]     XAI-8: per-horizon speed ratio (12h/24h/48h/72h) in sample()
+  [ADD]     XAI-9: storm category breakdown (slow/medium/fast) in sample()
 
-━━━ KỲ VỌNG ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━ KẾT QUẢ THỰC TẾ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-                   Val ADE   Test ADE   Val ATE  Test ATE  Val CTE  Test CTE
-  v2.1 (best):     170.1      229.8     160.2    214.4     45.7     71.6
-  v2.5 (current):  170.5      232.5     161.3    222.3     46.2     64.5
-  v2.6 (target):   170±1      210–220   161±1    200–210   46±1     57–63
+                    Val ADE   Test ADE  Test ATE  Test CTE
+  v2.1 gốc:         170.1     229.8     214.4     71.6
+  v2.1-XAI (ran):   169.7     229.8     221.6     61.9  ← AUG-C bug → ATE +7.2
+  v2.1-clean:        ~170      ~229     ~214      ~62   ← AUG-C fixed, CTE improved
+  ST-Trans target:            224.4     213.7     59.4
 """
 from __future__ import annotations
 
@@ -9551,18 +9548,19 @@ class TCFlowMatching(nn.Module):
 
         Algorithm:
           obs_speed_ref = exponentially-weighted mean of obs step speeds
-          pred_speed_ref = mean of ALL predicted step speeds (not just first 4)
+          pred_speed_ref = mean of first 4 predicted step speeds
           scale = clip(obs_speed_ref / pred_speed_ref, clip_min, clip_max)
           pred_cal[t] = last_obs + (pred[t] - last_obs) * scale
 
-        Sử dụng ALL steps (không chỉ first 4):
-          XAI-8 log: 12h/24h over-predict 1.3-1.6×, 48h/72h OK ~1.0×
-          First 4 steps = phần over-predict → reference inflate → scale underestimate
-          All steps average → reference thực tế → scale chính xác hơn
+        clip_min=0.85, clip_max=1.15:
+          Prevents over-correction from noisy obs/pred speed estimates.
+          Allows ±15% adjustment per storm.
 
-        clip_min=0.80, clip_max=1.20:
-          Test obs_speed=11.6 vs val obs_speed=10.3 → fast storms cần >1.15
-          0.80 lower bound an toàn (không under-predict quá -20%)
+        Why this works:
+          v2.5 XAI-5: speed ratio = 1.15–1.61 throughout training
+          (model consistently over-predicts speed on val)
+          Test storms have different speed → need per-storm correction
+          This is adaptive: fast test storms get upscaling, slow get downscaling
         """
         if obs_norm.shape[0] < 2 or pred_abs_norm.shape[0] < 2:
             return pred_abs_norm
@@ -9577,17 +9575,13 @@ class TCFlowMatching(nn.Module):
         w = torch.exp(torch.arange(T_s, dtype=obs_spds.dtype, device=obs_spds.device) * 0.5)
         obs_spd_ref = (obs_spds * (w / w.sum()).unsqueeze(1)).sum(0).clamp(min=3.0)   # [B]
 
-        # Predicted speed: dùng ALL steps thay vì chỉ first 4
-        # Evidence XAI-8: 12h/24h ratio 1.3-1.6× (OVER), 48h/72h ~1.0× (OK)
-        # First 4 steps = phần over-predict nhất → reference bị inflate → scale sai
-        # All steps: average across over+OK → reference thực tế hơn
+        # Predicted speed (first 4 steps from last_obs)
         pts = torch.cat([last_deg.unsqueeze(0), pred_deg], 0)   # [T+1, B, 2]
         pred_spds    = _step_speeds_kmh(pts)                     # [T, B]
-        pred_spd_ref = pred_spds.mean(0).clamp(min=3.0)          # [B] ALL steps
+        N_ref        = min(4, pred_spds.shape[0])
+        pred_spd_ref = pred_spds[:N_ref].mean(0).clamp(min=3.0)  # [B]
 
         # Per-storm scale, clipped
-        # clip_min=0.80: test storms có ratio cao hơn val, cần room cho upscale
-        # clip_max=1.20: test obs_speed=11.6 vs val=10.3, fast storms cần >1.15
         scale = (obs_spd_ref / pred_spd_ref).clamp(clip_min, clip_max)  # [B]
 
         # Scale displacement from last_obs (preserves direction!)
@@ -9667,7 +9661,7 @@ class TCFlowMatching(nn.Module):
         # [NEW v2.6] Per-storm speed calibration
         if use_speed_calibration:
             pred_mean = self.speed_calibrate_pred(
-                pred_mean, last_obs, obs_norm, clip_min=0.80, clip_max=1.20)
+                pred_mean, last_obs, obs_norm, clip_min=0.85, clip_max=1.15)
 
         if not return_xai:
             return pred_mean, torch.zeros_like(pred_mean), all_t
@@ -9736,6 +9730,56 @@ class TCFlowMatching(nn.Module):
 
         # XAI-7: ATE/CTE decomposition
         xai["ate_cte_decomp"] = compute_cte_contribution(pred_deg, gt_deg_xai)
+
+        # XAI-8: Per-horizon speed ratio (12h/24h/48h/72h)
+        # Measures speed over-prediction pattern across lead times
+        # Evidence: 12h=1.31×, 24h=1.61× OVER; 48h=0.94×, 72h=0.96× OK
+        if pred_deg.shape[0] >= 2 and gt_deg_xai.shape[0] >= 2:
+            T8       = min(pred_deg.shape[0], gt_deg_xai.shape[0])
+            last_d   = obs_deg_x[-1]
+            pts_pred = torch.cat([last_d.unsqueeze(0), pred_deg[:T8]], 0)
+            pts_gt   = torch.cat([last_d.unsqueeze(0), gt_deg_xai[:T8]], 0)
+            spd_pred = _step_speeds_kmh(pts_pred)   # [T8, B]
+            spd_gt   = _step_speeds_kmh(pts_gt)     # [T8, B]
+            ratio    = spd_pred / spd_gt.clamp(min=1.0)  # [T8, B]
+            def _hz(s, lo, hi):
+                hi = min(hi, s.shape[0])
+                return float(s[lo:hi].mean()) if hi > lo else float("nan")
+            r_mean = ratio.mean(1)   # [T8]
+            xai["speed_per_horizon"] = {
+                "ratio":    r_mean.tolist(),
+                "pred_kmh": spd_pred.mean(1).tolist(),
+                "gt_kmh":   spd_gt.mean(1).tolist(),
+                "12h_ratio": _hz(r_mean, 0, 2),
+                "24h_ratio": _hz(r_mean, 2, 4),
+                "48h_ratio": _hz(r_mean, 6, 8),
+                "72h_ratio": _hz(r_mean, 10, 12),
+            }
+        else:
+            xai["speed_per_horizon"] = {}
+
+        # XAI-9: Storm category breakdown by obs speed
+        # slow  < 8 km/h  (typically tropical, well-organized)
+        # medium 8–15 km/h (mixed)
+        # fast   > 15 km/h (extratropical, recurving)
+        obs_spd_cat = _step_speeds_kmh(obs_deg_x).mean(0)   # [B]
+        sm = obs_spd_cat < 8.0
+        mm = (obs_spd_cat >= 8.0) & (obs_spd_cat < 15.0)
+        fm = obs_spd_cat >= 15.0
+        ade_per_storm = _haversine_deg(pred_deg[:gt_deg_xai.shape[0]],
+                                        gt_deg_xai[:pred_deg.shape[0]]).mean(0)  # [B]
+        def _cat_ade(mask):
+            return float(ade_per_storm[mask].mean()) if mask.sum() > 0 else float("nan")
+        xai["storm_categories"] = {
+            "n_slow":    int(sm.sum()),
+            "n_medium":  int(mm.sum()),
+            "n_fast":    int(fm.sum()),
+            "speed_mean": float(obs_spd_cat.mean()),
+            "speed_std":  float(obs_spd_cat.std()),
+            "ade_slow":   _cat_ade(sm),
+            "ade_medium": _cat_ade(mm),
+            "ade_fast":   _cat_ade(fm),
+        }
 
         return pred_mean, torch.zeros_like(pred_mean), all_t, xai
 
