@@ -8967,8 +8967,23 @@ def main():
 
     # ── Data ──────────────────────────────────────────────────────────────────
     try:
+        # _, loader = data_loader(
+        #     argparse.Namespace(dataset_root=args.dataset_root),
+        #     {"root": args.dataset_root, "type": args.split},
+        #     test=(args.split != "train"))
         _, loader = data_loader(
-            argparse.Namespace(dataset_root=args.dataset_root),
+            argparse.Namespace(
+                dataset_root=args.dataset_root,
+                obs_len=8,
+                pred_len=12,
+                num_workers=2,
+                other_modal="gph",
+                delim=" ",
+                skip=1,
+                min_ped=1,
+                threshold=0.002,
+                batch_size=64,
+            ),
             {"root": args.dataset_root, "type": args.split},
             test=(args.split != "train"))
         print(f"  {args.split}: {sum(1 for _ in loader)*loader.batch_size} sequences, "
