@@ -8747,6 +8747,9 @@ Chỉ cần: --checkpoint path/to/best_model.pth --dataset_root ...
 from __future__ import annotations
 
 import sys, os, argparse, time, json
+import sys, os, json, time
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from collections import defaultdict
 from typing import Dict
 
