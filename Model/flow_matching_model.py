@@ -14666,6 +14666,17 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
         v_base  = (obs_spd * w_obs.unsqueeze(1)).sum(0) / w_obs.sum()   # [B] weighted mean (unchanged)
 
         T_pred = traj_deg.shape[0]
+        # [BUGFIX] pred_spd = _step_speeds_kmh(traj_deg) trả về [T_pred-1, B]
+        # (khoảng cách GIỮA các bước LIÊN TIẾP của traj_deg — traj_deg[0]
+        # tới traj_deg[1], ..., traj_deg[T_pred-2] tới traj_deg[T_pred-1] —
+        # đúng T_pred-1 cặp, KHÔNG tính bước từ last_obs→traj_deg[0]).
+        # v_ref trước đây dùng horizon_idx độ dài T_pred (arange(1,T_pred+1))
+        # → shape [T_pred, B], lệch 1 so với pred_spd [T_pred-1, B] → crash
+        # ngay khi (pred_spd - v_ref) broadcast tại sample() đầu tiên sau
+        # epoch 0 (lỗi "size 11 vs 12" quan sát được trong log thực tế).
+        # FIX: horizon_idx chỉ cần T_pred-1 phần tử, khớp đúng số step-speed
+        # mà pred_spd thực sự có.
+        n_pred_spd = max(T_pred - 1, 1)
         if T_s >= 3:
             # Slope of obs speed via simple least-squares over last steps,
             # clamped to a modest range so it only nudges the reference,
@@ -14675,12 +14686,12 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
             denom  = (idx_c ** 2).sum().clamp(min=1e-6)
             slope  = (idx_c.unsqueeze(1) * (obs_spd - obs_spd.mean(0, keepdim=True))).sum(0) / denom  # [B] km/h per obs-step
             slope  = slope.clamp(-1.0, 1.0)   # conservative: avoid runaway extrapolation
-            horizon_idx = torch.arange(1, T_pred + 1, device=device, dtype=obs_spd.dtype)  # steps ahead of last obs
-            v_ref = (v_base.unsqueeze(0) + slope.unsqueeze(0) * horizon_idx.unsqueeze(1)).clamp(min=2.0)  # [T_pred, B]
+            horizon_idx = torch.arange(1, n_pred_spd + 1, device=device, dtype=obs_spd.dtype)  # [T_pred-1] steps ahead of last obs
+            v_ref = (v_base.unsqueeze(0) + slope.unsqueeze(0) * horizon_idx.unsqueeze(1)).clamp(min=2.0)  # [T_pred-1, B]
         else:
-            v_ref = v_base.unsqueeze(0).expand(T_pred, -1)
+            v_ref = v_base.unsqueeze(0).expand(n_pred_spd, -1)   # [T_pred-1, B]
 
-        pred_spd = _step_speeds_kmh(traj_deg)                    # [T_pred, B]
+        pred_spd = _step_speeds_kmh(traj_deg)                    # [T_pred-1, B] — matches v_ref now
         v_sigma  = v_ref.clamp(min=5.0) * 0.5
         speed_score = torch.exp(
             -((pred_spd - v_ref) / v_sigma).pow(2).mean(0) * 0.5)
