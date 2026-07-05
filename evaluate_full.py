@@ -342,7 +342,7 @@ def run_full_evaluation(model, loader, device,
     result["ate_per_step_mean"]  = [_m(per_storm["ate_per_step"][s])  for s in range(11)]
     result["cte_per_step_mean"]  = [_m(per_storm["cte_per_step"][s])  for s in range(11)]
 
-    # ── Per-storm-category (obs speed) ──────────────────────────────────
+    # ── By speed category ──────────────────────────────────────────────
     obs_spd_arr = np.array(per_storm["obs_speed"])
     ade_arr     = np.array(per_storm["ade"])
     ate_arr     = np.array(per_storm["ate"])
@@ -372,6 +372,27 @@ def run_full_evaluation(model, loader, device,
             "CTE": float(cte_arr[fast_m].mean()) if fast_m.any() else float("nan"),
         },
     }
+
+    # ── By TC intensity category (TD/TS/Cat1-5) ───────────────────────
+    # obs_speed (km/h) → Saffir-Simpson scale (1 min sustained wind proxy)
+    # Mapping từ track speed sang intensity category (approximate):
+    #   TC track speed ≠ wind speed, nhưng dùng làm proxy vì không có
+    #   wind speed trong dataset tc-ofm. Bins theo km/h track speed:
+    #   TD < 8, TS 8-15, Cat1 15-20, Cat2 20-25, Cat3 25-30, Cat4+ ≥30
+    # Reviewer note: ghi rõ đây là proxy từ track speed, không phải wind speed.
+    intensity_bins  = [0, 8, 15, 20, 25, 30, 9999]
+    intensity_names = ["TD", "TS", "Cat1", "Cat2", "Cat3", "Cat4+"]
+    result["by_intensity"] = {}
+    for i, cat in enumerate(intensity_names):
+        lo, hi = intensity_bins[i], intensity_bins[i+1]
+        mask = (obs_spd_arr >= lo) & (obs_spd_arr < hi)
+        result["by_intensity"][cat] = {
+            "n":   int(mask.sum()),
+            "ADE": float(ade_arr[mask].mean()) if mask.any() else float("nan"),
+            "ATE": float(ate_arr[mask].mean()) if mask.any() else float("nan"),
+            "CTE": float(cte_arr[mask].mean()) if mask.any() else float("nan"),
+            "speed_range_kmh": f"{lo}-{hi}",
+        }
 
     # ── CRPS (computed from collected samples) ──────────────────────────
     crps_per_step = []
@@ -481,6 +502,19 @@ def print_full_results(r: Dict, st_trans: Dict = ST_TRANS):
                   f"ADE={d.get('ADE',float('nan')):6.1f}  "
                   f"ATE={d.get('ATE',float('nan')):6.1f}  "
                   f"CTE={d.get('CTE',float('nan')):6.1f}")
+
+    # By TC intensity category
+    bi = r.get("by_intensity", {})
+    if bi:
+        print(f"\n  By TC intensity (track speed proxy):")
+        print(f"    {'Cat':<8} {'n':>4}  {'ADE':>7}  {'ATE':>7}  {'CTE':>7}  Speed(km/h)")
+        for cat, d in bi.items():
+            if d.get("n", 0) > 0:
+                print(f"    {cat:<8} {d['n']:>4}  "
+                      f"{d.get('ADE',float('nan')):>7.1f}  "
+                      f"{d.get('ATE',float('nan')):>7.1f}  "
+                      f"{d.get('CTE',float('nan')):>7.1f}  "
+                      f"{d.get('speed_range_kmh','')}")
 
     # Physical validity
     print(f"\n  Physical validity:  "

@@ -34,8 +34,7 @@ Giữ nguyên (proven):
   ✅ XAI logging mỗi 10 epoch
 """
 from __future__ import annotations
-import json
-import sys, os
+import json, sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import argparse, math, time
@@ -1096,6 +1095,151 @@ def main(args):
                 f"↑{-impr:+.1f}" if np.isfinite(impr) else "?")
         print(f"  {m_n:<10} {val_v:>10.2f} {test_v:>10.2f} {gap:>+10.2f} {v21_v:>12.1f}  {flag}")
     print("=" * 72)
+
+    # ── Auto evaluate_full + statistical_tests sau khi train xong ─────────
+    # Tự động chạy để không cần chạy tay khi train ngầm trên Kaggle.
+    # Kết quả lưu vào args.output_dir/eval/ và args.output_dir/stats/
+    _auto_eval(args, best_ckpt, device)
+
+
+def _auto_eval(args, best_ckpt: str, device):
+    """
+    Tự động chạy evaluate_full.py và statistical_tests.py sau khi train xong.
+    Tìm script trong cùng thư mục hoặc thư mục cha của train script.
+    Nếu không tìm thấy → bỏ qua, không làm crash training.
+    """
+    import subprocess, sys, json as _json
+
+    print("\n" + "="*72)
+    print("  AUTO EVALUATE + STATISTICAL TESTS")
+    print("="*72)
+
+    eval_dir  = os.path.join(args.output_dir, "eval")
+    stats_dir = os.path.join(args.output_dir, "stats")
+    os.makedirs(eval_dir,  exist_ok=True)
+    os.makedirs(stats_dir, exist_ok=True)
+
+    # Tìm evaluate_full.py: thử root project, thư mục cha scripts, cwd
+    script_dir  = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(script_dir, ".."))
+    candidates_eval = [
+        os.path.join(project_root, "evaluate_full.py"),
+        os.path.join(os.getcwd(),  "evaluate_full.py"),
+        os.path.join(script_dir,   "evaluate_full.py"),
+    ]
+    candidates_stat = [
+        os.path.join(project_root, "statistical_tests.py"),
+        os.path.join(os.getcwd(),  "statistical_tests.py"),
+        os.path.join(script_dir,   "statistical_tests.py"),
+    ]
+    eval_script = next((p for p in candidates_eval if os.path.exists(p)), None)
+    stat_script = next((p for p in candidates_stat if os.path.exists(p)), None)
+
+    # ── Step 1: evaluate_full.py ────────────────────────────────────────────
+    if eval_script is None:
+        print("  ⚠ evaluate_full.py không tìm thấy → bỏ qua auto-eval")
+        print(f"    Đặt file tại: {candidates_eval[0]}")
+    else:
+        print(f"  ▶ evaluate_full.py ({eval_script})")
+        ep = "best"
+        try:
+            import torch as _torch
+            ck_info = _torch.load(best_ckpt, map_location="cpu")
+            ep = ck_info.get("epoch", "best")
+        except Exception:
+            pass
+
+        cmd_eval = [
+            sys.executable, eval_script,
+            "--checkpoint",   best_ckpt,
+            "--dataset_root", args.dataset_root,
+            "--split",        "test",
+            "--output_dir",   eval_dir,
+            "--n_ensemble",   str(args.n_ensemble),
+            "--no_crps",      # tắt CRPS để chạy nhanh hơn (bật nếu cần)
+            "--gpu",          str(args.gpu_num),
+        ]
+        try:
+            result = subprocess.run(cmd_eval, capture_output=False, timeout=1800)
+            if result.returncode == 0:
+                print(f"  ✅ evaluate_full done → {eval_dir}/")
+            else:
+                print(f"  ❌ evaluate_full failed (code {result.returncode})")
+        except subprocess.TimeoutExpired:
+            print("  ⚠ evaluate_full timeout (30min) → bỏ qua")
+        except Exception as e:
+            print(f"  ⚠ evaluate_full error: {e}")
+
+    # ── Step 2: statistical_tests.py ────────────────────────────────────────
+    # Tìm JSON output từ evaluate_full
+    eval_json = None
+    if os.path.exists(eval_dir):
+        jsons = sorted([
+            os.path.join(eval_dir, f) for f in os.listdir(eval_dir)
+            if f.startswith("eval_test") and f.endswith(".json")
+        ])
+        if jsons:
+            eval_json = jsons[-1]  # file mới nhất
+
+    if stat_script is None:
+        print("  ⚠ statistical_tests.py không tìm thấy → bỏ qua")
+    elif eval_json is None:
+        print("  ⚠ Không tìm thấy eval JSON → bỏ qua statistical tests")
+        print(f"    Thử chạy lại evaluate_full.py trước")
+    else:
+        print(f"  ▶ statistical_tests.py ({stat_script})")
+        print(f"    FM result: {eval_json}")
+        cmd_stat = [
+            sys.executable, stat_script,
+            "--fm_results",       eval_json,
+            "--use_st_trans_ref",
+            "--fm_n_storms",      "420",
+            "--baseline_name",    "ST-Trans",
+            "--output_dir",       stats_dir,
+            "--n_bootstrap",      "10000",
+        ]
+        try:
+            result = subprocess.run(cmd_stat, capture_output=False, timeout=600)
+            if result.returncode == 0:
+                print(f"  ✅ statistical_tests done → {stats_dir}/")
+            else:
+                print(f"  ❌ statistical_tests failed (code {result.returncode})")
+        except subprocess.TimeoutExpired:
+            print("  ⚠ statistical_tests timeout (10min) → bỏ qua")
+        except Exception as e:
+            print(f"  ⚠ statistical_tests error: {e}")
+
+    # ── Summary JSON ─────────────────────────────────────────────────────────
+    summary_path = os.path.join(args.output_dir, "auto_eval_summary.json")
+    try:
+        summary = {
+            "checkpoint":    best_ckpt,
+            "eval_dir":      eval_dir,
+            "stats_dir":     stats_dir,
+            "eval_json":     eval_json,
+            "seed":          getattr(args, "seed", 42),
+            "ablation_name": getattr(args, "ablation_name", ""),
+        }
+        # Đọc kết quả ADE/ATE/CTE từ eval JSON nếu có
+        if eval_json and os.path.exists(eval_json):
+            with open(eval_json) as _f:
+                ev = _json.load(_f)
+            summary["test_ADE"] = ev.get("ADE")
+            summary["test_ATE"] = ev.get("ATE")
+            summary["test_CTE"] = ev.get("CTE")
+            summary["test_RMSE"] = ev.get("RMSE")
+            summary["crps_mean"] = ev.get("crps", {}).get("mean")
+        with open(summary_path, "w") as _f:
+            _json.dump(summary, _f, indent=2)
+        print(f"\n  Summary → {summary_path}")
+        if summary.get("test_ADE"):
+            print(f"  ADE={summary['test_ADE']:.2f}  "
+                  f"ATE={summary['test_ATE']:.2f}  "
+                  f"CTE={summary['test_CTE']:.2f}")
+    except Exception as e:
+        print(f"  Summary save failed: {e}")
+
+    print("="*72)
 
 
 if __name__ == "__main__":
