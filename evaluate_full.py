@@ -338,6 +338,9 @@ def run_full_evaluation(model, loader, device,
 
     # Boxplot data (raw arrays)
     result["boxplot_ade"] = per_storm["ade"]
+    # Per-storm arrays for statistical tests (ATE/CTE need per-storm, not just mean)
+    result["boxplot_ate"] = per_storm["ate"]
+    result["boxplot_cte"] = per_storm["cte"]
     result["dist_per_step_mean"] = [_m(per_storm["dist_per_step"][s]) for s in range(12)]
     result["ate_per_step_mean"]  = [_m(per_storm["ate_per_step"][s])  for s in range(11)]
     result["cte_per_step_mean"]  = [_m(per_storm["cte_per_step"][s])  for s in range(11)]
