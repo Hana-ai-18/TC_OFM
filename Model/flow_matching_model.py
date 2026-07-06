@@ -1,15 +1,4 @@
 """
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE PLACEMENT — copy sang đúng vị trí trước khi train:
-#
-#   SOURCE (download từ Claude):  flow_matching_model_v24_final.py
-#   KAGGLE TARGET:                /kaggle/working/Model/flow_matching_model.py
-#   LOCAL DEV:                    Model/flow_matching_model.py
-#
-#   cp flow_matching_model_v24_final.py /kaggle/working/Model/flow_matching_model.py
-# ─────────────────────────────────────────────────────────────────────────────
-
 Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
 ═══════════════════════════════════════════════════════════════════════════════
 VIẾT LẠI HOÀN TOÀN từ v2.1 + các fix đã verified từ thực nghiệm 140 epoch.
@@ -1255,17 +1244,25 @@ class TCFlowMatching(nn.Module):
 
         T = pred_abs_norm.shape[0]
         correction = (torch.sigmoid(self.speed_correction_logits[:T]) * 2.0
-                      ).to(pred_abs_norm.dtype).view(T, 1, 1)               # [T,1,1]
+                      ).to(pred_abs_norm.dtype)                              # [T]
 
         pts  = torch.cat([last_obs_norm.unsqueeze(0), pred_abs_norm], 0)    # [T+1, B, 2]
         disp = pts[1:] - pts[:-1]                                           # [T, B, 2]
-        disp_cal = disp * correction
 
-        out = torch.empty_like(pred_abs_norm)
-        cur = last_obs_norm
-        for t in range(T):
-            cur = cur + disp_cal[t]
-            out[t] = cur
+        # [v2.6] Scale CHỈ along-track component, cross-track KHÔNG ĐỔI.
+        # Lý do: gradient L_calib chỉ "thấy" ADE (scalar) → nếu scale full vector,
+        # correction học bias theo direction distribution của train/val TC.
+        # Test TC có direction khác → CTE tăng. Fix: chỉ scale along-track (speed),
+        # không scale cross-track (direction). Physics: speed error = along-track.
+        disp_norm  = disp.norm(dim=-1, keepdim=True).clamp(min=1e-8)       # [T, B, 1]
+        u_along    = disp / disp_norm                                       # [T, B, 2]
+        along_mag  = (disp * u_along).sum(dim=-1, keepdim=True)            # [T, B, 1]
+        cross_comp = disp - along_mag * u_along                             # [T, B, 2]
+        corr_view  = correction.view(T, 1, 1)
+        disp_cal   = cross_comp + along_mag * corr_view * u_along          # [T, B, 2]
+
+        # cumsum thay for-loop: torch.compile friendly, numerically identical
+        out = last_obs_norm.unsqueeze(0) + torch.cumsum(disp_cal, dim=0)
         return out
 
     # ── Sample (1-shot + speed calibration) ──────────────────────────────
@@ -1451,15 +1448,14 @@ class TCFlowMatching(nn.Module):
             "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
             "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
             "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
-            # [v2.4 FIX] các keys sau bị thiếu → head_w=[] và sigma_inf=nan trong log
             "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
             "sigma_inf":            float(self.sigma_inference),
             "log_sigma_reg":        float(self.log_sigma_reg.detach()),
             "log_sigma_heading":    float(self.log_sigma_heading.detach()),
             "log_sigma_calib":      float(self.log_sigma_calib.detach()),
-            "eff_lambda_reg":       float((0.5 * torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))).detach()),
-            "eff_lambda_heading":   float((0.5 * torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))).detach()),
-            "eff_lambda_calib":     float((0.5 * torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))).detach()),
+            "eff_lambda_reg":       float((0.5*torch.exp(-2.0*self.log_sigma_reg.clamp(-3))).detach()),
+            "eff_lambda_heading":   float((0.5*torch.exp(-2.0*self.log_sigma_heading.clamp(-3))).detach()),
+            "eff_lambda_calib":     float((0.5*torch.exp(-2.0*self.log_sigma_calib.clamp(-3))).detach()),
         }
 
         return pred_mean, torch.zeros_like(pred_mean), all_t, xai

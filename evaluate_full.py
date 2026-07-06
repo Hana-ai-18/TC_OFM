@@ -537,6 +537,93 @@ def print_full_results(r: Dict, st_trans: Dict = ST_TRANS):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Sigma sensitivity analysis (reviewer ablation)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def sigma_sensitivity(model, loader, device,
+                       sigma_values: list = [0.01, 0.02, 0.04, 0.06, 0.08],
+                       n_ensemble: int = 20) -> Dict:
+    """
+    Ablation: sensitivity của kết quả theo sigma_inference.
+    Chạy inference với nhiều sigma khác nhau trên cùng checkpoint.
+    → Justification cho sigma_inference=0.04 cố định (reviewer question).
+    """
+    raw = _unwrap(model)
+    orig_sigma = float(raw.sigma_inference)
+    results = {}
+    for sigma in sigma_values:
+        raw.sigma_inference = sigma  # temporarily override
+        all_ade = []
+        all_cte = []
+        for batch in loader:
+            bl = move(list(batch), device)
+            gt = bl[1]
+            try:
+                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
+            except Exception:
+                continue
+            T   = min(pred.shape[0], gt.shape[0])
+            pd  = _norm_to_deg(pred[:T])
+            gd  = _norm_to_deg(gt[:T, :, :2])
+            d   = _haversine_deg(pd, gd)
+            all_ade.extend(d.mean(0).tolist())
+            if T >= 2:
+                ate_v, cte_v = _ate_cte_full(pd, gd)
+                all_cte.extend(cte_v.abs().mean(0).tolist())
+        results[sigma] = {
+            "sigma":    sigma,
+            "ADE":      float(np.mean(all_ade)) if all_ade else float("nan"),
+            "CTE":      float(np.mean(all_cte)) if all_cte else float("nan"),
+            "n":        len(all_ade),
+        }
+        print(f"  sigma={sigma:.3f}: ADE={results[sigma]['ADE']:.2f}  CTE={results[sigma]['CTE']:.2f}")
+    raw.sigma_inference = orig_sigma  # restore
+    return results
+
+
+@torch.no_grad()
+def ensemble_size_eval(model, loader, device,
+                        k_values: list = [1, 3, 5, 10, 20, 40]) -> Dict:
+    """
+    Ablation: accuracy vs compute trade-off theo ensemble size K.
+    → Justification cho K=20 default.
+    → ESWA Table: shows diminishing returns beyond K=20.
+    """
+    raw = _unwrap(model)
+    results = {}
+    for k in k_values:
+        all_ade, all_ate, all_cte = [], [], []
+        t0 = time.time()
+        for batch in loader:
+            bl = move(list(batch), device)
+            gt = bl[1]
+            try:
+                pred, _, _ = model.sample(bl, num_ensemble=k)
+            except Exception:
+                continue
+            T   = min(pred.shape[0], gt.shape[0])
+            pd  = _norm_to_deg(pred[:T])
+            gd  = _norm_to_deg(gt[:T, :, :2])
+            d   = _haversine_deg(pd, gd)
+            all_ade.extend(d.mean(0).tolist())
+            if T >= 2:
+                ate_v, cte_v = _ate_cte_full(pd, gd)
+                all_ate.extend(ate_v.abs().mean(0).tolist())
+                all_cte.extend(cte_v.abs().mean(0).tolist())
+        elapsed = time.time() - t0
+        results[k] = {
+            "K": k, "ADE": float(np.mean(all_ade)) if all_ade else float("nan"),
+            "ATE": float(np.mean(all_ate)) if all_ate else float("nan"),
+            "CTE": float(np.mean(all_cte)) if all_cte else float("nan"),
+            "time_s": elapsed, "n": len(all_ade),
+        }
+        print(f"  K={k:3d}: ADE={results[k]['ADE']:.2f}  ATE={results[k]['ATE']:.2f}"
+              f"  CTE={results[k]['CTE']:.2f}  t={elapsed:.1f}s")
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Case study: cone of uncertainty
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -652,6 +739,12 @@ def main():
                    help="Collect case study data")
     p.add_argument("--n_cases",      type=int, default=6)
     p.add_argument("--gpu",          type=int, default=0)
+    p.add_argument("--test_year",    type=int, default=None,
+                   help="Filter test set by year (same as evaluate_test_storms.py)")
+    p.add_argument("--sigma_sensitivity", action="store_true", default=False,
+                   help="Run sigma_inference sensitivity analysis (reviewer ablation)")
+    p.add_argument("--ensemble_ablation",  action="store_true", default=False,
+                   help="Run ensemble size K ablation (K=1,3,5,10,20,40)")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -700,12 +793,27 @@ def main():
             print(f"  ⚠ EMA failed: {e}"); ema = None
 
     # ── Data ───────────────────────────────────────────────────────────────
-    import argparse as _argparse
-    _, loader = data_loader(
-        _argparse.Namespace(dataset_root=args.dataset_root),
-        {"root": args.dataset_root, "type": args.split},
-        test=(args.split != "train"),
+    import argparse as _ap
+    _loader_args = _ap.Namespace(
+        dataset_root = args.dataset_root,
+        obs_len      = 8,
+        pred_len     = 12,
+        batch_size   = 64,
+        num_workers  = 2,
+        test_year    = getattr(args, "test_year", None),
+        skip         = getattr(args, "skip", 1),
+        min_ped      = getattr(args, "min_ped", 1),
+        threshold    = getattr(args, "threshold", 0.002),
     )
+    try:
+        _, loader = data_loader(
+            _loader_args,
+            {"root": args.dataset_root, "type": args.split},
+            test=(args.split != "train"),
+        )
+    except Exception as _e:
+        print(f"  ❌ data_loader(type=\'{args.split}\') failed: {_e}")
+        raise
     print(f"  Data: {len(loader)} batches")
 
     # ── Full evaluation ─────────────────────────────────────────────────────
@@ -721,15 +829,18 @@ def main():
     print_full_results(result)
 
     # Timing benchmark: ms per inference step
-    model.eval()
-    with torch.no_grad():
-        dummy = [x for x in next(iter(loader))]
-        dummy = move(list(dummy), device)
-        t0 = time.time()
-        for _ in range(10):
-            model.sample(dummy, num_ensemble=args.n_ensemble)
-        ms_per_step = (time.time() - t0) / 10 * 1000
-    print(f"  Inference: {ms_per_step:.1f}ms per batch (K={args.n_ensemble})")
+    ms_per_step = float("nan")
+    try:
+        model.eval()
+        with torch.no_grad():
+            dummy = move(list(next(iter(loader))), device)
+            t0 = time.time()
+            for _ in range(10):
+                model.sample(dummy, num_ensemble=args.n_ensemble)
+            ms_per_step = (time.time() - t0) / 10 * 1000
+        print(f"  Inference: {ms_per_step:.1f}ms per batch (K={args.n_ensemble})")
+    except Exception as e:
+        print(f"  ⚠ Timing benchmark failed: {e}")
     result["inference_ms_per_batch"] = ms_per_step
     result["total_params"] = total_params
     result["model_mb"] = mem_mb
@@ -763,6 +874,21 @@ def main():
                   f"cone_72h={cone.get('radii_km', [0]*12)[-1]:.1f}km" if cone else "")
         result["case_studies"] = case_results
 
+    # ── Sigma sensitivity (nếu được yêu cầu) ─────────────────────────────────
+    if args.sigma_sensitivity:
+        print(f"\n  Running sigma_inference sensitivity analysis...")
+        sigma_results = sigma_sensitivity(model, loader, device,
+                                          sigma_values=[0.01, 0.02, 0.04, 0.06, 0.08],
+                                          n_ensemble=args.n_ensemble)
+        result["sigma_sensitivity"] = sigma_results
+
+    # ── Ensemble size ablation (nếu được yêu cầu) ─────────────────────────
+    if args.ensemble_ablation:
+        print(f"\n  Running ensemble size ablation K=1,3,5,10,20,40...")
+        ens_results = ensemble_size_eval(model, loader, device,
+                                          k_values=[1, 3, 5, 10, 20, 40])
+        result["ensemble_ablation"] = ens_results
+
     # ── Save ────────────────────────────────────────────────────────────────
     out_path = os.path.join(args.output_dir,
                              f"eval_{args.split}_ep{ep}.json")
@@ -773,7 +899,7 @@ def main():
     save_result["split"]       = args.split
 
     with open(out_path, "w") as f:
-        json.dump(save_result, f, indent=2)
+        json.dump(save_result, f, indent=2, default=str)
     print(f"  Saved → {out_path}")
 
     # Summary line for paper table

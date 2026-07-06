@@ -637,6 +637,8 @@ def get_args():
     p.add_argument("--resume",                 default=None)
     p.add_argument("--test_at_end",            action="store_true", default=True)
     p.add_argument("--no_test",                dest="test_at_end", action="store_false")
+    p.add_argument("--test_year",              default=None,   type=int,
+                   help="Filter test set by year (same as evaluate_test_storms.py)")
     # ── ESWA paper: reproducibility + ablation ────────────────────────────
     p.add_argument("--seed",                   type=int, default=42,
                    help="Random seed. Run 3-5 seeds for ESWA mean±std reporting.")
@@ -1028,8 +1030,10 @@ def main(args):
     try:
         _, test_loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
         print(f"  Test: {len(test_loader)} batches")
-    except Exception:
-        print("  No test set → using val"); test_loader = val_loader
+    except Exception as _e:
+        print(f"  ❌ Không load được test set: {_e}")
+        print(f"  ⚠  Dùng val set để test (kết quả val=test — CHÚ Ý khi báo cáo)")
+        test_loader = val_loader
 
     # Standard test
     r_test = evaluate(model, test_loader, device, tag="TEST (best ckpt)",
@@ -1199,11 +1203,18 @@ def _auto_eval(args, best_ckpt: str, device):
             "--n_bootstrap",      "10000",
         ]
         try:
-            result = subprocess.run(cmd_stat, capture_output=False, timeout=600)
+            result = subprocess.run(cmd_stat, capture_output=True,
+                                    timeout=600, text=True)
             if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if any(k in line for k in ["ADE","ATE","CTE","p_value",
+                                                "Cohen","Bootstrap","significant","==="]):
+                        print(f"    {line}")
                 print(f"  ✅ statistical_tests done → {stats_dir}/")
             else:
                 print(f"  ❌ statistical_tests failed (code {result.returncode})")
+                if result.stderr:
+                    print(f"    {result.stderr[-300:]}")
         except subprocess.TimeoutExpired:
             print("  ⚠ statistical_tests timeout (10min) → bỏ qua")
         except Exception as e:
