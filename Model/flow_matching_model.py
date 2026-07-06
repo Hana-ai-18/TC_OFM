@@ -579,7 +579,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
 #  Augmentation — GIỮ NGUYÊN từ v2.1-clean (đã proven qua thực nghiệm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def augment_batch(batch_list) -> list:
+def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
     """
     Distribution (4 active types + 2 no-op slots):
       A (25%): track shift ±5km             — shape unchanged, position varies
@@ -631,8 +631,13 @@ def augment_batch(batch_list) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
+        # ABLATION: disable_aug_c → skip recurvature entirely (falls through as
+        # a no-op, i.e. original sample), so the 'no_aug_c' variant is a true
+        # ablation rather than silently identical to the full model.
         T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-        if T_pred >= 4:
+        if disable_aug_c:
+            pass
+        elif T_pred >= 4:
             gt      = bl[1].clone()
             max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
             max_rad = max_deg * math.pi / 180.0
@@ -1190,6 +1195,13 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
+            # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
+            # These keep the autograd graph so a wrapper can rebuild `total`
+            # with some terms zeroed while preserving gradients to the network.
+            "_t_l_cfm":     l_cfm,
+            "_t_l_reg":     l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
+            "_t_l_heading": l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
+            "_t_l_calib":   l_calib,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,
@@ -1244,25 +1256,17 @@ class TCFlowMatching(nn.Module):
 
         T = pred_abs_norm.shape[0]
         correction = (torch.sigmoid(self.speed_correction_logits[:T]) * 2.0
-                      ).to(pred_abs_norm.dtype)                              # [T]
+                      ).to(pred_abs_norm.dtype).view(T, 1, 1)               # [T,1,1]
 
         pts  = torch.cat([last_obs_norm.unsqueeze(0), pred_abs_norm], 0)    # [T+1, B, 2]
         disp = pts[1:] - pts[:-1]                                           # [T, B, 2]
+        disp_cal = disp * correction
 
-        # [v2.6] Scale CHỈ along-track component, cross-track KHÔNG ĐỔI.
-        # Lý do: gradient L_calib chỉ "thấy" ADE (scalar) → nếu scale full vector,
-        # correction học bias theo direction distribution của train/val TC.
-        # Test TC có direction khác → CTE tăng. Fix: chỉ scale along-track (speed),
-        # không scale cross-track (direction). Physics: speed error = along-track.
-        disp_norm  = disp.norm(dim=-1, keepdim=True).clamp(min=1e-8)       # [T, B, 1]
-        u_along    = disp / disp_norm                                       # [T, B, 2]
-        along_mag  = (disp * u_along).sum(dim=-1, keepdim=True)            # [T, B, 1]
-        cross_comp = disp - along_mag * u_along                             # [T, B, 2]
-        corr_view  = correction.view(T, 1, 1)
-        disp_cal   = cross_comp + along_mag * corr_view * u_along          # [T, B, 2]
-
-        # cumsum thay for-loop: torch.compile friendly, numerically identical
-        out = last_obs_norm.unsqueeze(0) + torch.cumsum(disp_cal, dim=0)
+        out = torch.empty_like(pred_abs_norm)
+        cur = last_obs_norm
+        for t in range(T):
+            cur = cur + disp_cal[t]
+            out[t] = cur
         return out
 
     # ── Sample (1-shot + speed calibration) ──────────────────────────────
@@ -1445,17 +1449,9 @@ class TCFlowMatching(nn.Module):
 
         # [LEARN diagnostics] expose learned values for monitoring in train_fm
         xai["learned_params"] = {
-            "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
-            "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
-            "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
-            "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
-            "sigma_inf":            float(self.sigma_inference),
-            "log_sigma_reg":        float(self.log_sigma_reg.detach()),
-            "log_sigma_heading":    float(self.log_sigma_heading.detach()),
-            "log_sigma_calib":      float(self.log_sigma_calib.detach()),
-            "eff_lambda_reg":       float((0.5*torch.exp(-2.0*self.log_sigma_reg.clamp(-3))).detach()),
-            "eff_lambda_heading":   float((0.5*torch.exp(-2.0*self.log_sigma_heading.clamp(-3))).detach()),
-            "eff_lambda_calib":     float((0.5*torch.exp(-2.0*self.log_sigma_calib.clamp(-3))).detach()),
+            "speed_correction": (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
+            "reg_step_weights":  F.softmax(self.reg_step_logits, dim=0).tolist(),
+            "hard_score_weights": F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
         }
 
         return pred_mean, torch.zeros_like(pred_mean), all_t, xai

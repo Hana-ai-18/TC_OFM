@@ -62,15 +62,17 @@ def wilcoxon_test(x: np.ndarray, y: np.ndarray,
     diff_nonzero = diff[diff != 0]
     if len(diff_nonzero) < 10:
         return {"statistic": float("nan"), "p_value": float("nan"),
-                "n": len(diff), "significant": False}
+                "n": len(diff), "significant": False,
+                "significant_0.05": False, "significant_0.01": False}
 
     stat, p = stats.wilcoxon(diff_nonzero, alternative=alternative)
     return {
         "statistic": float(stat),
         "p_value":   float(p),
         "n":         int(len(diff_nonzero)),
-        "significant_0.05": p < 0.05,
-        "significant_0.01": p < 0.01,
+        "significant":      bool(p < 0.05),
+        "significant_0.05": bool(p < 0.05),
+        "significant_0.01": bool(p < 0.01),
     }
 
 
@@ -128,7 +130,7 @@ def bootstrap_ci(x: np.ndarray, y: np.ndarray,
         "ci_lower":        lower,
         "ci_upper":        upper,
         "ci_level":        ci,
-        "significant":     upper < 0,  # entire CI is negative → FM better
+        "significant":     bool(upper < 0),  # entire CI is negative → FM better
         "n_bootstrap":     n_bootstrap,
     }
 
@@ -233,10 +235,10 @@ def print_statistical_report(results: Dict, baseline_name: str = "ST-Trans"):
     for metric, r in results.items():
         ci     = r["bootstrap_ci"]
         ci_str = f"[{ci['ci_lower']:+.2f},{ci['ci_upper']:+.2f}]"
-        w_p    = r["wilcoxon"]["p_value"]
-        b_w    = r["bonferroni_wilcoxon"]["p_bonferroni"]
-        sig_w  = "**" if w_p < 0.01 else ("*" if w_p < 0.05 else "ns")
-        sig_b  = "**" if b_w < 0.01 else ("*" if b_w < 0.05 else "ns")
+        w_p    = r.get("wilcoxon", {}).get("p_value", float("nan"))
+        b_w    = r.get("bonferroni_wilcoxon", {}).get("p_bonferroni", float("nan"))
+        sig_w  = "**" if (w_p == w_p and w_p < 0.01) else ("*" if (w_p == w_p and w_p < 0.05) else "ns")
+        sig_b  = "**" if (b_w == b_w and b_w < 0.01) else ("*" if (b_w == b_w and b_w < 0.05) else "ns")
 
         print(f"  {metric:<8} "
               f"{r['fm_mean']:>10.2f} {r['baseline_mean']:>10.2f} "
@@ -253,8 +255,12 @@ def print_statistical_report(results: Dict, baseline_name: str = "ST-Trans"):
 
     # Summary statement for paper
     print(f"\n  ── PAPER STATEMENT ──")
-    sig_metrics = [m for m, r in results.items()
-                   if r["wilcoxon"]["significant_0.05"]]
+    sig_metrics = [
+        m for m, r in results.items()
+        if r.get("wilcoxon", {}).get(
+            "significant_0.05",
+            r.get("wilcoxon", {}).get("p_value", 1.0) < 0.05)
+    ]
     if sig_metrics:
         print(f"  FM significantly outperforms {baseline_name} on: {sig_metrics} "
               f"(Wilcoxon signed-rank, Bonferroni-corrected p<0.05)")
@@ -278,13 +284,22 @@ def load_from_json(path: str) -> Dict[str, np.ndarray]:
     # Try loading boxplot_ade first (per-storm ADE)
     if "boxplot_ade" in data and data["boxplot_ade"]:
         errors["ADE"] = np.array(data["boxplot_ade"])
-    elif "ADE" in data:
-        # Only scalar available — return as single-element array
+    elif "ADE" in data and data["ADE"] == data["ADE"]:  # not NaN
         errors["ADE"] = np.array([data["ADE"]])
-    # ATE, CTE: try to reconstruct from per-step
-    for metric in ["ATE", "CTE"]:
-        if metric in data:
-            errors[metric] = np.array([data[metric]])
+    # ATE, CTE: prefer per-storm arrays, fall back to scalar mean
+    for metric, box_key, scalar_key in [
+        ("ATE", "boxplot_ate", "ATE"),
+        ("CTE", "boxplot_cte", "CTE"),
+    ]:
+        if box_key in data and data[box_key]:
+            errors[metric] = np.array(data[box_key])
+        elif scalar_key in data and data[scalar_key] == data[scalar_key]:  # not NaN
+            errors[metric] = np.array([data[scalar_key]])
+    # Warn if only scalar data (statistical tests need per-storm for power)
+    n_ade = len(errors.get("ADE", []))
+    if n_ade < 10:
+        print(f"  ⚠ Only {n_ade} ADE values — statistical tests need per-storm data")
+        print(f"    Run evaluate_full.py with working checkpoint first")
     return errors
 
 
@@ -386,6 +401,8 @@ def main():
             return {k: _convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple)):
             return [_convert(v) for v in obj]
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
         elif isinstance(obj, (np.integer, np.int64, np.int32)):
             return int(obj)
         elif isinstance(obj, (np.floating, np.float64, np.float32)):

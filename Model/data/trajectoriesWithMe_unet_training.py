@@ -372,7 +372,10 @@ def seq_collate(data):
         }
         all_keys -= _skip_keys
 
-        for key in all_keys:
+        # sorted(): set iteration order is not stable across processes
+        # (hash randomization), which would give env_out a non-deterministic
+        # key order. Sorting fixes the order without changing any values.
+        for key in sorted(all_keys):
             vals = []
             for d in env_data_raw:
                 if isinstance(d, dict) and key in d:
@@ -488,7 +491,7 @@ class TrajectoryDataset(Dataset):
 
         all_files = [
             os.path.join(self.data1d_path, f)
-            for f in os.listdir(self.data1d_path)
+            for f in sorted(os.listdir(self.data1d_path))
             if f.endswith(".txt") and (test_year is None or str(test_year) in f)
         ]
 
@@ -806,7 +809,7 @@ class TrajectoryDataset(Dataset):
                 try:
                     candidates = [
                         os.path.join(folder, f)
-                        for f in os.listdir(folder)
+                        for f in sorted(os.listdir(folder))
                         if timestamp in f and f.endswith(".npy")
                     ]
                 except Exception:
