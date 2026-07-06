@@ -88,7 +88,6 @@ def data_loader(
     test: bool = False,
     test_year=None,
     batch_size: int | None = None,
-    seed: int | None = None,
 ):
     """
     Unified data loader for train / val / test splits.
@@ -151,17 +150,6 @@ def data_loader(
     is_train   = dset_type == "train" and not test
     drop_last  = is_train and len(dataset) > (batch_size or args.batch_size)
 
-    # Dedicated generator so shuffle order is independent of the global torch
-    # RNG that the model consumes (torch.rand/randn in CFM sampling, augment).
-    # Without this, batch order per epoch drifts with how many times the model
-    # touched the global RNG → not reproducible across runs / seeds.
-    # Falls back to args.seed if seed arg not passed.
-    _seed = seed if seed is not None else getattr(args, "seed", None)
-    gen = None
-    if _seed is not None and not test:
-        gen = torch.Generator()
-        gen.manual_seed(int(_seed))
-
     loader = DataLoader(
         dataset,
         batch_size         = batch_size or args.batch_size,
@@ -173,7 +161,6 @@ def data_loader(
         drop_last          = drop_last,
         pin_memory         = use_pin_memory,
         worker_init_fn     = _worker_init_fn if num_workers > 0 else None,
-        generator          = gen,
     )
     print(f"  {len(dataset)} sequences  "
           f"(workers={num_workers}, drop_last={drop_last})")

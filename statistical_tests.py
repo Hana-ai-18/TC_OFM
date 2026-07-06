@@ -70,9 +70,8 @@ def wilcoxon_test(x: np.ndarray, y: np.ndarray,
         "statistic": float(stat),
         "p_value":   float(p),
         "n":         int(len(diff_nonzero)),
-        "significant":      bool(p < 0.05),
-        "significant_0.05": bool(p < 0.05),
-        "significant_0.01": bool(p < 0.01),
+        "significant_0.05": p < 0.05,
+        "significant_0.01": p < 0.01,
     }
 
 
@@ -130,7 +129,7 @@ def bootstrap_ci(x: np.ndarray, y: np.ndarray,
         "ci_lower":        lower,
         "ci_upper":        upper,
         "ci_level":        ci,
-        "significant":     bool(upper < 0),  # entire CI is negative → FM better
+        "significant":     upper < 0,  # entire CI is negative → FM better
         "n_bootstrap":     n_bootstrap,
     }
 
@@ -255,12 +254,8 @@ def print_statistical_report(results: Dict, baseline_name: str = "ST-Trans"):
 
     # Summary statement for paper
     print(f"\n  ── PAPER STATEMENT ──")
-    sig_metrics = [
-        m for m, r in results.items()
-        if r.get("wilcoxon", {}).get(
-            "significant_0.05",
-            r.get("wilcoxon", {}).get("p_value", 1.0) < 0.05)
-    ]
+    sig_metrics = [m for m, r in results.items()
+                   if r.get("wilcoxon", {}).get("significant_0.05", False)]
     if sig_metrics:
         print(f"  FM significantly outperforms {baseline_name} on: {sig_metrics} "
               f"(Wilcoxon signed-rank, Bonferroni-corrected p<0.05)")
@@ -286,15 +281,10 @@ def load_from_json(path: str) -> Dict[str, np.ndarray]:
         errors["ADE"] = np.array(data["boxplot_ade"])
     elif "ADE" in data and data["ADE"] == data["ADE"]:  # not NaN
         errors["ADE"] = np.array([data["ADE"]])
-    # ATE, CTE: prefer per-storm arrays, fall back to scalar mean
-    for metric, box_key, scalar_key in [
-        ("ATE", "boxplot_ate", "ATE"),
-        ("CTE", "boxplot_cte", "CTE"),
-    ]:
-        if box_key in data and data[box_key]:
-            errors[metric] = np.array(data[box_key])
-        elif scalar_key in data and data[scalar_key] == data[scalar_key]:  # not NaN
-            errors[metric] = np.array([data[scalar_key]])
+    # ATE, CTE: try to reconstruct from per-step
+    for metric in ["ATE", "CTE"]:
+        if metric in data and data[metric] == data[metric]:  # not NaN
+            errors[metric] = np.array([data[metric]])
     # Warn if only scalar data (statistical tests need per-storm for power)
     n_ade = len(errors.get("ADE", []))
     if n_ade < 10:
@@ -401,8 +391,6 @@ def main():
             return {k: _convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple)):
             return [_convert(v) for v in obj]
-        elif isinstance(obj, (np.bool_, bool)):
-            return bool(obj)
         elif isinstance(obj, (np.integer, np.int64, np.int32)):
             return int(obj)
         elif isinstance(obj, (np.floating, np.float64, np.float32)):

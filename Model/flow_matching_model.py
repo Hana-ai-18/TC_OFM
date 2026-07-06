@@ -579,7 +579,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
 #  Augmentation — GIỮ NGUYÊN từ v2.1-clean (đã proven qua thực nghiệm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
+def augment_batch(batch_list) -> list:
     """
     Distribution (4 active types + 2 no-op slots):
       A (25%): track shift ±5km             — shape unchanged, position varies
@@ -631,13 +631,8 @@ def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
-        # ABLATION: disable_aug_c → skip recurvature entirely (falls through as
-        # a no-op, i.e. original sample), so the 'no_aug_c' variant is a true
-        # ablation rather than silently identical to the full model.
         T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-        if disable_aug_c:
-            pass
-        elif T_pred >= 4:
+        if T_pred >= 4:
             gt      = bl[1].clone()
             max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
             max_rad = max_deg * math.pi / 180.0
@@ -1195,13 +1190,6 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
-            # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
-            # These keep the autograd graph so a wrapper can rebuild `total`
-            # with some terms zeroed while preserving gradients to the network.
-            "_t_l_cfm":     l_cfm,
-            "_t_l_reg":     l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
-            "_t_l_heading": l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
-            "_t_l_calib":   l_calib,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,

@@ -662,11 +662,6 @@ def get_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(args):
-    # ── GPU selection FIRST — must run before ANY CUDA call, otherwise
-    #    setting CUDA_VISIBLE_DEVICES has no effect (context already created).
-    #    (torch.cuda.is_available() below initializes CUDA, so ordering matters.)
-    if "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     # ── Seed (ESWA: run with 3-5 seeds, report mean±std) ──────────────────
     import random
     random.seed(args.seed)
@@ -674,23 +669,14 @@ def main(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    # Determinism for clean 3-seed variance (ESWA mean±std).
-    # benchmark=False + deterministic=True remove cuDNN autotuner nondeterminism.
-    # warn_only=True: fall back (with a warning) for ops lacking a deterministic
-    # kernel instead of crashing — keeps training runnable on all GPUs.
-    try:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    except Exception as _e:
-        print(f"  [determinism] partial: {_e}")
     # Ablation: append name to output dir if provided
     if args.ablation_name:
         args.output_dir = f"{args.output_dir}_{args.ablation_name}"
     if args.seed != 42:
         args.output_dir = f"{args.output_dir}_seed{args.seed}"
 
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
     # Wall-clock tracking
@@ -782,20 +768,16 @@ def main(args):
         def _patched_glb(self, batch_list, epoch=0, **kwargs):
             bd = _orig_glb(self, batch_list, epoch=epoch, **kwargs)
             import math as _m
-            # Use GRAPH-CONNECTED tensors, NOT the detached float values in bd.
-            # (bd["l_reg"] etc. are Python floats from .item() and carry no
-            #  gradient — rebuilding total from them would sever backprop to
-            #  the network and only train the Kendall log_sigma params.)
-            l_cfm     = bd["_t_l_cfm"]
-            l_reg     = bd["_t_l_reg"]
-            l_heading = bd["_t_l_heading"]
-            l_calib   = bd["_t_l_calib"]
-            if _abl_flags["disable_l_reg"]:     l_reg     = l_reg * 0.0
-            if _abl_flags["disable_l_heading"]: l_heading = l_heading * 0.0
-            if _abl_flags["disable_l_calib"]:   l_calib   = l_calib * 0.0
+            device = bd["total"].device
+            l_reg     = torch.tensor(bd["l_reg"],     device=device)
+            l_heading = torch.tensor(bd["l_heading"], device=device)
+            l_calib   = torch.tensor(bd["l_calib"],   device=device)
+            if _abl_flags["disable_l_reg"]:     l_reg     = l_reg.new_zeros(())
+            if _abl_flags["disable_l_heading"]: l_heading = l_heading.new_zeros(())
+            if _abl_flags["disable_l_calib"]:   l_calib   = l_calib.new_zeros(())
             HALF = 0.5 * _m.log(2.0 * _m.pi)
             if _abl_flags["disable_learned_weights"]:
-                total = (l_cfm
+                total = (torch.tensor(bd["l_cfm"], device=device)
                          + bd["lam_reg"]   * 0.20 * l_reg
                          + bd["lam_dir"]   * 0.07 * l_heading
                          + bd["lam_calib"] * 0.10 * l_calib)
@@ -803,16 +785,14 @@ def main(args):
                 prec_r = torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))
                 prec_h = torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))
                 prec_c = torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))
-                total = (l_cfm
-                         + bd["lam_reg"]   * (0.5*prec_r*l_reg     + self.log_sigma_reg.clamp(min=-3.0)     + HALF)
-                         + bd["lam_dir"]   * (0.5*prec_h*l_heading + self.log_sigma_heading.clamp(min=-3.0) + HALF)
-                         + bd["lam_calib"] * (0.5*prec_c*l_calib   + self.log_sigma_calib.clamp(min=-3.0)   + HALF))
+                total = (torch.tensor(bd["l_cfm"], device=device)
+                         + bd["lam_reg"]   * (0.5*prec_r*l_reg     + self.log_sigma_reg.clamp(-3)     + HALF)
+                         + bd["lam_dir"]   * (0.5*prec_h*l_heading + self.log_sigma_heading.clamp(-3) + HALF)
+                         + bd["lam_calib"] * (0.5*prec_c*l_calib   + self.log_sigma_calib.clamp(-3)   + HALF))
             if not torch.isfinite(total):
                 total = total.new_zeros(())
-            bd.update({"total": total,
-                       "l_reg":     float(l_reg.detach()),
-                       "l_heading": float(l_heading.detach()),
-                       "l_calib":   float(l_calib.detach())})
+            bd.update({"total": total, "l_reg": float(l_reg),
+                       "l_heading": float(l_heading), "l_calib": float(l_calib)})
             return bd
         import types
         raw.get_loss_breakdown = types.MethodType(_patched_glb, raw)
@@ -882,7 +862,7 @@ def main(args):
 
         for i, batch in enumerate(trl):
             bl = move(list(batch), device)
-            bl_aug = augment_batch(bl, disable_aug_c=args.disable_aug_c)   # training augmentation
+            bl_aug = augment_batch(bl)   # training augmentation
 
             opt.zero_grad()
             with autocast(device_type="cuda", enabled=args.use_amp):
