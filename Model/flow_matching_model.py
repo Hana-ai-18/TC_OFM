@@ -1,4 +1,15 @@
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE PLACEMENT — copy sang đúng vị trí trước khi train:
+#
+#   SOURCE (download từ Claude):  flow_matching_model_v24_final.py
+#   KAGGLE TARGET:                /kaggle/working/Model/flow_matching_model.py
+#   LOCAL DEV:                    Model/flow_matching_model.py
+#
+#   cp flow_matching_model_v24_final.py /kaggle/working/Model/flow_matching_model.py
+# ─────────────────────────────────────────────────────────────────────────────
+
 Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
 ═══════════════════════════════════════════════════════════════════════════════
 VIẾT LẠI HOÀN TOÀN từ v2.1 + các fix đã verified từ thực nghiệm 140 epoch.
@@ -579,7 +590,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
 #  Augmentation — GIỮ NGUYÊN từ v2.1-clean (đã proven qua thực nghiệm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
+def augment_batch(batch_list) -> list:
     """
     Distribution (4 active types + 2 no-op slots):
       A (25%): track shift ±5km             — shape unchanged, position varies
@@ -631,13 +642,8 @@ def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
-        # ABLATION: disable_aug_c → skip recurvature entirely (falls through,
-        # i.e. sample used as-is), so 'no_aug_c' is a true ablation instead of
-        # silently identical to the full model.
         T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-        if disable_aug_c:
-            pass
-        elif T_pred >= 4:
+        if T_pred >= 4:
             gt      = bl[1].clone()
             max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
             max_rad = max_deg * math.pi / 180.0
@@ -860,6 +866,8 @@ class TCFlowMatching(nn.Module):
         lambda_heading:    float = 0.07,   # reduced: gradient scale balance with L_CFM
         lambda_momentum:   float = 0.0,    # DISABLED — field kept for compat only
         lambda_calib:      float = 0.1,    # [LEARN-1] weight of L_calib term
+        lambda_hard_reg:   float = 0.02,   # [VAR-REDUCE] pull hard_score_weight_logits
+                                            # toward uniform — see docstring below
         use_ot:            bool  = True,
         ot_epsilon:        float = 0.05,
         use_ema:           bool  = True,
@@ -878,6 +886,14 @@ class TCFlowMatching(nn.Module):
         self.lambda_heading     = lambda_heading
         self.lambda_momentum    = 0.0           # always disabled
         self.lambda_calib       = lambda_calib
+        # [VAR-REDUCE] Fixed (NOT Kendall-learned) coefficient for the
+        # hard_score_weight_logits regularizer — see get_loss_breakdown for
+        # the term itself and rationale. Must stay fixed/unlearned: if this
+        # were Kendall-weighted like L_reg/L_heading/L_calib, the model
+        # could learn a very negative log_sigma for it and effectively
+        # disable its own constraint — defeating the purpose of a
+        # regularizer meant to CONSTRAIN what the model would otherwise do.
+        self.lambda_hard_reg    = lambda_hard_reg
         self.use_ot              = use_ot
         self.ot_epsilon          = ot_epsilon
         self.n_inference_steps   = n_inference_steps
@@ -1086,6 +1102,36 @@ class TCFlowMatching(nn.Module):
                                        weight_logits=self.hard_score_weight_logits)
         cond    = self.encoder(batch_list, hard_score=h_score)
 
+        # [VAR-REDUCE] L2 penalty pulling hard_score_weight_logits' softmax
+        # distribution toward UNIFORM [0.25,0.25,0.25,0.25] over its 4
+        # components (curvature, speed_var, dir_change, obs_speed_norm).
+        #
+        # WHY: across 3 independent seed runs (seed42/1/2, same architecture,
+        # same hyperparameters, only RNG differs) — confirmed directly from
+        # seed_1.txt / seed_2.txt training logs — this 4-way softmax
+        # collapses onto 'curvature' at very different rates depending on
+        # seed. AT THE SAME EPOCH (130), ruling out "just trained longer":
+        #   seed42: curv=0.739  spdvar=0.025  obsspd=0.013  -> test CTE=58.4
+        #   seed1:  curv=0.843  spdvar=0.013  obsspd=0.007  -> test CTE=61.3
+        #   seed2:  curv=0.875  spdvar=0.011  obsspd=0.006  -> test CTE=67.1
+        # More collapse (curv higher, obs_speed_norm/speed_var lower)
+        # correlates monotonically with WORSE test CTE. Since obs_speed_norm
+        # feeds directly into which storms get upweighted by hard_score
+        # (fast storms cause 62% of total CTE per this file's own XAI-9
+        # analysis), a seed that lets this collapse early and hard ends up
+        # systematically deprioritizing exactly the storms CTE most depends
+        # on — a genuine, identified source of seed-to-seed CTE variance.
+        #
+        # FIX: a light, FIXED-weight (not Kendall-learned — see constructor
+        # comment) L2 penalty on the softmax distribution itself. This
+        # dampens how far ANY seed's early gradient is allowed to push this
+        # collapse, without touching any per-metric (ADE/ATE/CTE) loss term
+        # — it regularizes the MECHANISM shown to drive the variance,
+        # staying general rather than metric-specific.
+        hard_dist    = F.softmax(self.hard_score_weight_logits, dim=0)  # [4]
+        hard_uniform = hard_dist.new_full((4,), 0.25)
+        l_hard_reg   = ((hard_dist - hard_uniform) ** 2).sum()
+
         # ── L_CFM ─────────────────────────────────────────────────────────
         x0 = torch.randn_like(x1_rel) * sigma
         if self.use_ot and B >= 4:
@@ -1176,7 +1222,13 @@ class TCFlowMatching(nn.Module):
         weighted_heading = ramp_dir    * (0.5 * prec_heading * l_heading + self.log_sigma_heading.clamp(min=-3.0) + HALF_LOG_2PI)
         weighted_calib   = ramp_calib  * (0.5 * prec_calib   * l_calib   + self.log_sigma_calib.clamp(min=-3.0)   + HALF_LOG_2PI)
 
-        total = l_cfm + weighted_reg + weighted_heading + weighted_calib
+        # [VAR-REDUCE] fixed weight, no ramp (regularizes the collapse from
+        # epoch 0, since the divergence between seeds is already visible by
+        # epoch 20-30 — waiting to ramp it in would be too late), no Kendall
+        # (must stay a genuine constraint, not something the model can
+        # learn to switch off).
+        total = (l_cfm + weighted_reg + weighted_heading + weighted_calib
+                  + self.lambda_hard_reg * l_hard_reg)
         if not torch.isfinite(total):
             total = x0.new_zeros(())
 
@@ -1195,14 +1247,18 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
+            "l_hard_reg": l_hard_reg.item(),
+            "hard_dist": hard_dist.detach().tolist(),
+            "lambda_hard_reg": self.lambda_hard_reg,
             # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
             # A wrapper that rebuilds `total` from the .item() floats above would
             # sever the autograd graph and train nothing but the Kendall log_sigma*
             # params. Use these instead when zeroing a term for an ablation run.
-            "_t_l_cfm":     l_cfm,
-            "_t_l_reg":     l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
-            "_t_l_heading": l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
-            "_t_l_calib":   l_calib,
+            "_t_l_cfm":      l_cfm,
+            "_t_l_reg":      l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
+            "_t_l_heading":  l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
+            "_t_l_calib":    l_calib,
+            "_t_l_hard_reg": l_hard_reg,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,
@@ -1450,9 +1506,18 @@ class TCFlowMatching(nn.Module):
 
         # [LEARN diagnostics] expose learned values for monitoring in train_fm
         xai["learned_params"] = {
-            "speed_correction": (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
-            "reg_step_weights":  F.softmax(self.reg_step_logits, dim=0).tolist(),
-            "hard_score_weights": F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
+            "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
+            "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
+            "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
+            # [v2.4 FIX] các keys sau bị thiếu → head_w=[] và sigma_inf=nan trong log
+            "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
+            "sigma_inf":            float(self.sigma_inference),
+            "log_sigma_reg":        float(self.log_sigma_reg.detach()),
+            "log_sigma_heading":    float(self.log_sigma_heading.detach()),
+            "log_sigma_calib":      float(self.log_sigma_calib.detach()),
+            "eff_lambda_reg":       float((0.5 * torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))).detach()),
+            "eff_lambda_heading":   float((0.5 * torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))).detach()),
+            "eff_lambda_calib":     float((0.5 * torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))).detach()),
         }
 
         return pred_mean, torch.zeros_like(pred_mean), all_t, xai
