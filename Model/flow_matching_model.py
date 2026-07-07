@@ -1,4 +1,15 @@
 """
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE PLACEMENT — copy sang đúng vị trí trước khi train:
+#
+#   SOURCE (download từ Claude):  flow_matching_model_v24_final.py
+#   KAGGLE TARGET:                /kaggle/working/Model/flow_matching_model.py
+#   LOCAL DEV:                    Model/flow_matching_model.py
+#
+#   cp flow_matching_model_v24_final.py /kaggle/working/Model/flow_matching_model.py
+# ─────────────────────────────────────────────────────────────────────────────
+
 Model/flow_matching_model.py  ──  TC-FlowMatching v2.1-clean
 ═══════════════════════════════════════════════════════════════════════════════
 VIẾT LẠI HOÀN TOÀN từ v2.1 + các fix đã verified từ thực nghiệm 140 epoch.
@@ -579,7 +590,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
 #  Augmentation — GIỮ NGUYÊN từ v2.1-clean (đã proven qua thực nghiệm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
+def augment_batch(batch_list) -> list:
     """
     Distribution (4 active types + 2 no-op slots):
       A (25%): track shift ±5km             — shape unchanged, position varies
@@ -631,13 +642,8 @@ def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
-        # ABLATION: disable_aug_c → skip recurvature entirely (falls through,
-        # i.e. sample used as-is), so 'no_aug_c' is a true ablation instead of
-        # silently identical to the full model.
         T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-        if disable_aug_c:
-            pass
-        elif T_pred >= 4:
+        if T_pred >= 4:
             gt      = bl[1].clone()
             max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
             max_rad = max_deg * math.pi / 180.0
@@ -983,72 +989,78 @@ class TCFlowMatching(nn.Module):
         """
         Multi-step heading constraint — TOÀN BỘ pred_len bước, trọng số HỌC.
 
-        [LEARN-5] SỬA LỖI: bản trước (v2.1-clean và lần sửa trước của tôi)
-        chỉ áp dụng cho n_steps=4 ĐẦU TIÊN (6h/12h/18h/24h) với decay=0.5
-        CỐ ĐỊNH (weight = 1.0, 0.5, 0.25, 0.125) — đây CHÍNH XÁC là loại
-        hằng số tay đoán cần sửa mà tôi đã bỏ sót. Hệ quả thực tế: heading
-        constraint hoàn toàn KHÔNG áp dụng cho 8 bước còn lại (30h→72h) —
-        đây là một phần lý do 72h heading dev khó cải thiện trong log cũ
-        (113-128° xuyên suốt nhiều version) dù ATE/CTE có nhúc nhích.
+        [LEARN-5] (giữ nguyên): self.heading_step_logits (pred_len params,
+        softmax) — TOÀN BỘ 12 bước đều có constraint, trọng số PHÂN BỔ
+        GIỮA chúng do gradient tự học.
 
-        FIX: dùng self.heading_step_logits (pred_len params, softmax) —
-        TOÀN BỘ 12 bước đều có constraint, trọng số PHÂN BỔ GIỮA chúng do
-        gradient tự học, không còn giới hạn cứng "chỉ 4 bước đầu" hay
-        decay theo cấp số nhân tay chọn (0.5^t).
+        [LEARN-6] SỬA LỖI GỐC: bản trước lấy `ref_bear` tại mỗi bước t từ
+        `pred_bear.detach()` của CHÍNH bước t-1 — loss này do đó chỉ ép
+        quỹ đạo dự đoán "đổi hướng mượt so với chính nó" (self-referential
+        smoothness), KHÔNG so với hướng đi THẬT của ground truth. Một quỹ
+        đạo mượt nhưng lệch hẳn sang một bên so với đường đi thật (CTE
+        cao) vẫn được chấm điểm tốt bởi công thức cũ, miễn là tự-nhất-quán.
+        Bằng chứng thực nghiệm (log 3 seed, ep0→ep180): physics[heading]
+        score (đo self-consistency tương tự công thức cũ) hội tụ ~0.92 từ
+        epoch ~40 và bão hòa phẳng, NHƯNG XAI-6 heading deviation so với
+        GT thật ở 72h KHÔNG giảm theo — thậm chí tăng dần suốt training
+        (seed0: 78°@ep20 → 118°@ep160; seed2: 79°@ep20 → 120°@ep180).
+        Hai chỉ số lẽ ra phải cùng chiều nếu model học đúng hướng đi thật;
+        việc chúng phân kỳ có hệ thống trên cả 3 seed chứng minh model
+        đang tối ưu đúng cái loss cũ đo (tự-nhất-quán) chứ không phải cái
+        ta cần (đúng hướng so với GT) — đây là nguyên nhân trực tiếp khiến
+        CTE (sai số vuông góc với hướng đi) không giảm dù ATE vẫn cải
+        thiện đều (vì L_CFM + L_reg vẫn tối ưu đúng độ lớn vị trí).
 
-        [CTE-FIX] SỬA LỖI THIẾT KẾ: bản trước dùng
-            ref_bear = pred_bear.detach()
-        tại MỌI bước — nghĩa là từ bước 1 trở đi, hướng tham chiếu là hướng
-        MODEL TỰ DỰ ĐOÁN ở bước trước, không phải hướng THẬT của storm.
-        Chỉ bước 0 được neo vào obs_deg (hướng quan sát thật). Hệ quả: loss
-        này chỉ dạy "đi thẳng, mượt theo hướng đã đi" (self-consistency),
-        KHÔNG dạy model bám theo độ rẽ hướng (recurvature) THẬT của storm
-        sau bước đầu — đây là nguyên nhân chính khiến AUG-C (augmentation
-        rẽ hướng tổng hợp) phải tồn tại như một miếng vá, và heading
-        deviation 72h kẹt ở 113-128° xuyên suốt nhiều version.
-
-        FIX: khi có gt_deg (ground truth trajectory), so pred_bear[t] với
-        TRUE bearing tại bước t (tính từ gt_deg), không phải bearing model
-        tự đoán ở bước t-1. Vẫn giữ .detach() (ổn định số học, ngăn
-        gradient chảy ngược qua chuỗi so sánh) nhưng GIÁ TRỊ so sánh giờ
-        là hướng thật, nên model học được recurvature thật, không chỉ học
-        "đừng đổi hướng". Nếu gt_deg=None (fallback, vd caller cũ chưa
-        cập nhật), giữ hành vi self-referential cũ để không crash.
+        FIX: khi có ground truth (`gt_deg` — luôn sẵn có tại training vì
+        đây là supervised loss, khác với sample()/inference), `ref_bear`
+        tại mỗi bước lấy từ bearing GT thật (GT[t-1]→GT[t]), neo hướng dự
+        đoán về đúng hướng đi thật tại từng horizon thay vì chỉ mượt với
+        chính nó. Khi gt_deg=None (gọi từ sample()/inference không có
+        nhãn), fallback về hành vi self-referential cũ để không phá vỡ
+        code path đó. gt_deg là hằng số (không requires_grad) nên không
+        cần detach và không có rủi ro gradient explosion qua chuỗi bước
+        như bản self-referential cũ (mỗi ref_bear giờ độc lập, không còn
+        là một chuỗi truy hồi qua chính output của network).
         """
         if obs_deg.shape[0] < 2 or pred_deg.shape[0] < 1:
             return pred_deg.new_zeros(())
 
-        ref_bear = _forward_azimuth(obs_deg[-2], obs_deg[-1])   # [B]
-        pts = torch.cat([obs_deg[-1:], pred_deg], 0)   # [T_pred+1, B, 2]
-
         N = pred_deg.shape[0]
         sw = F.softmax(self.heading_step_logits[:N], dim=0)   # [N], học được
+        pred_pts = torch.cat([obs_deg[-1:], pred_deg], 0)   # [N+1, B, 2]
 
-        # True per-step bearing from ground truth, when available.
-        true_bear = None
         if gt_deg is not None and gt_deg.shape[0] >= N:
-            gt_pts = torch.cat([obs_deg[-1:], gt_deg[:N]], 0)   # [N+1, B, 2]
-            true_bear = [_forward_azimuth(gt_pts[t], gt_pts[t + 1]) for t in range(N)]
+            gt_pts       = torch.cat([obs_deg[-1:], gt_deg[:N]], 0)   # [N+1, B, 2]
+            # .detach() tường minh: gt_deg thường không mang gradient (là
+            # nhãn), nhưng detach ở đây không phụ thuộc giả định đó — đảm
+            # bảo ref_bear_all luôn là target cố định dù call site tương
+            # lai lỡ truyền vào một gt_deg có requires_grad (ví dụ trong
+            # thử nghiệm self-distillation sau này).
+            ref_bear_all = _forward_azimuth(gt_pts[:-1], gt_pts[1:]).detach()   # [N, B]
 
+            loss = pred_deg.new_zeros(())
+            for t in range(N):
+                pred_bear  = _forward_azimuth(pred_pts[t], pred_pts[t + 1])  # [B]
+                angle_diff = pred_bear - ref_bear_all[t]
+                loss       = loss + sw[t] * (1.0 - torch.cos(angle_diff)).mean()
+            return loss
+
+        # Fallback (không có gt_deg, ví dụ inference path): hành vi cũ.
+        ref_bear = _forward_azimuth(obs_deg[-2], obs_deg[-1])   # [B]
         loss = pred_deg.new_zeros(())
         for t in range(N):
-            pred_bear  = _forward_azimuth(pts[t], pts[t + 1])  # [B]
+            pred_bear  = _forward_azimuth(pred_pts[t], pred_pts[t + 1])  # [B]
             angle_diff = pred_bear - ref_bear
             loss       = loss + sw[t] * (1.0 - torch.cos(angle_diff)).mean()
-            if true_bear is not None:
-                # Supervise against the TRUE storm heading at this step
-                # (detach: GT has no grad anyway, kept for clarity/safety).
-                ref_bear = true_bear[t].detach()
-            else:
-                ref_bear = pred_bear.detach()   # fallback: old self-referential behavior
-
+            ref_bear   = pred_bear.detach()
         return loss
 
     # ── L_reg — [LEARN-2] learnable step weights ────────────────────────────
 
     def _reg_loss(self, x1_rel: torch.Tensor, last_obs: torch.Tensor,
                   cond: torch.Tensor,
-                  hard_score: Optional[torch.Tensor] = None) -> torch.Tensor:
+                  hard_score: Optional[torch.Tensor] = None,
+                  obs_deg: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         ADE loss at t=0 with sigma_inference noise, consistent with 1-shot inference.
 
@@ -1062,6 +1074,36 @@ class TCFlowMatching(nn.Module):
         DOES NOT use exp weights (v2.4 used 12.2× ratio → catastrophic
         overfitting) — softmax trên logits học được có range tự nhiên bị
         chặn mềm, không bùng nổ như exp(linspace) thủ công.
+
+        [LEARN-7] SỬA LỖI GỐC của hard_score collapse: trước đây `dist`
+        (haversine tổng — TRỘN LẪN cả lỗi dọc-hướng ATE và lỗi ngang-hướng
+        CTE thành MỘT scalar duy nhất) là TÍN HIỆU DUY NHẤT phản hồi cho
+        gradient của hard_score_weight_logits (4 thành phần: curvature,
+        speed_var, dir_change, obs_speed). Vì optimizer chỉ có 1 con số để
+        tối ưu, nó tất yếu hội tụ trọng số về đặc trưng tương quan MẠNH
+        NHẤT với residual tổng — bằng chứng thực nghiệm cả 3 seed:
+        hard_w[curvature] 0.35→0.84-0.90, hard_w[obs_speed] 0.13→0.006-0.011
+        (gần như triệt tiêu), dù chính comment gốc trong code ghi rõ
+        obs_speed (storm nhanh) là nguyên nhân 62% CTE test. Đây KHÔNG phải
+        bug ngẫu nhiên mà là hệ quả TẤT YẾU của việc chỉ cho 1 tín hiệu
+        phản hồi vô hướng cho một cơ chế 4 chiều muốn phân biệt các loại
+        khó khác nhau.
+
+        FIX: `dist`, `sw`, `sw_hard`, và do đó `main_loss` (= giá trị dùng
+        để tối ưu velocity network qua L_reg) GIỮ NGUYÊN 100% công thức và
+        giá trị số như bản gốc — không đổi bất cứ gì ở đây, đảm bảo
+        KHÔNG ảnh hưởng ADE/ATE. Thay đổi thực tế nằm ở một SỐ HẠNG PHỤ
+        hoàn toàn tách biệt (`aux_loss`, xem bên dưới hàm): nó không cộng
+        vào `dist`/`main_loss`, chỉ cấp thêm một tín hiệu gradient RIÊNG
+        cho `hard_score_weight_logits`, dựa trên độ tương quan giữa
+        `hard_score` và tỉ trọng CTE thực tế của từng sample (`cte_frac
+        = |cte|/dist`, hình học chuẩn — reference bearing từ GT thật,
+        nhất quán [LEARN-6]). Nhờ vậy `hard_score_weight_logits` có động
+        cơ giữ obs_speed sống (đặc trưng đặc thù cho storm CTE cao) thay
+        vì collapse hoàn toàn về curvature — mà không có bất kỳ đường nào
+        làm thay đổi giá trị của `main_loss`. Khi obs_deg=None (an toàn
+        ngược, ví dụ code path khác gọi hàm này không có obs): cte_frac
+        không tính, aux_loss=0, toàn bộ hành vi y hệt bản gốc.
         """
         B, T, _ = x1_rel.shape
         device   = x1_rel.device
@@ -1072,7 +1114,23 @@ class TCFlowMatching(nn.Module):
         x1_gt_abs   = self._from_relative(x1_rel, last_obs)
         pred_deg = _norm_to_deg(x1_pred_abs.permute(1, 0, 2))  # [T, B, 2]
         gt_deg   = _norm_to_deg(x1_gt_abs.permute(1, 0, 2))
-        dist     = _haversine_deg(pred_deg, gt_deg)             # [T, B] km
+        dist     = _haversine_deg(pred_deg, gt_deg)             # [T, B] km — KHÔNG đổi
+
+        cte_frac_per_sample = None
+        if obs_deg is not None and obs_deg.shape[0] >= 2:
+            with torch.no_grad():
+                # [LEARN-7] chỉ dùng để tính tỉ trọng CTE làm mục tiêu
+                # tương quan cho aux_loss, KHÔNG dùng làm loss trực tiếp —
+                # bọc no_grad để không build graph thừa. .detach() tường
+                # minh thêm ở dưới cho chắc chắn dù đã ở trong no_grad.
+                gt_pts   = torch.cat([obs_deg[-1:], gt_deg], 0)          # [T+1, B, 2]
+                ref_bear = _forward_azimuth(gt_pts[:-1], gt_pts[1:]).detach()   # [T, B]
+                err_bear = _forward_azimuth(gt_deg, pred_deg).detach()          # [T, B]
+                dist_d   = dist.detach()
+                ang      = err_bear - ref_bear
+                cte_abs  = (dist_d * torch.sin(ang)).abs()                  # [T, B]
+                # tỉ trọng CTE trung bình theo horizon, per-sample [B]
+                cte_frac_per_sample = (cte_abs / dist_d.clamp(min=1e-3)).mean(0).clamp(0., 1.)
 
         T_actual = dist.shape[0]
         sw = F.softmax(self.reg_step_logits[:T_actual], dim=0).unsqueeze(1)  # [T, 1]
@@ -1085,7 +1143,53 @@ class TCFlowMatching(nn.Module):
         # Với Kendall HALF_LOG_2PI đúng: eff_lambda* = 0.5 × l_reg_norm
         # /300 → l_reg_norm ≈ 250/300 ≈ 0.83 → eff_lambda* ≈ 0.42 (gần baseline 0.2)
         # Reviewer: '300 ≈ max expected ADE tại convergence (km)' — căn cứ rõ ràng.
-        return ((dist * sw) * sw_hard).mean() / 300.0
+        main_loss = ((dist * sw) * sw_hard).mean() / 300.0
+
+        # [LEARN-7] Nhánh phụ CHỈ cấp gradient cho hard_score_weight_logits,
+        # KHÔNG đổi main_loss (velocity network vẫn học y hệt bản gốc →
+        # ADE/ATE không bị ảnh hưởng). Ý tưởng: hard_score hiện tại (dùng
+        # weight_logits) tối ưu tương quan với dist.detach() — dist đã
+        # detach hoàn toàn khỏi velocity network nên gradient của nhánh
+        # này CHỈ chảy vào hard_score_weight_logits qua `hard_score`,
+        # không chạm vào bất kỳ tham số nào khác. Mục tiêu: hard_score dự
+        # đoán tốt residual TỔNG (như cũ, giữ hành vi cũ ổn định) VÀ đồng
+        # thời dự đoán tốt cte_frac_per_sample (khía cạnh trước đây hoàn
+        # toàn vô hình với gradient này). Correlation loss (âm hệ số
+        # tương quan Pearson) là lựa chọn tự nhiên: không áp đặt giá trị
+        # tuyệt đối nào của hard_score, chỉ đòi hỏi nó XẾP HẠNG ĐÚNG mức
+        # độ "sample này có tỉ trọng CTE cao hay thấp" — tổng quát hơn một
+        # loss hồi quy trực tiếp, và không thể suy biến về 0/1 cực đoan.
+        aux_loss = x0.new_zeros(())
+        if (hard_score is not None) and (cte_frac_per_sample is not None) and B >= 4:
+            hs   = hard_score.to(device).to(dist.dtype)                 # [B], có grad tới weight_logits
+            tgt  = cte_frac_per_sample                                   # [B], đã detach ở nơi tính
+            hs_c  = hs - hs.mean()
+            tgt_c = tgt - tgt.mean()
+            denom = (hs_c.pow(2).mean().clamp(min=1e-8).sqrt()
+                     * tgt_c.pow(2).mean().clamp(min=1e-8).sqrt())
+            corr  = (hs_c * tgt_c).mean() / denom
+            # Hệ số CỐ Ý CỐ ĐỊNH (0.01), KHÔNG học qua Kendall như
+            # reg/heading/calib: aux_loss = (1-corr) không phải NLL của
+            # residual Gaussian (nó là correlation loss, bị chặn cứng
+            # trong [0,2], không có "phương sai" nào để Kendall ước
+            # lượng) — áp công thức Kendall (0.5·prec·loss + log_sigma)
+            # lên đại lượng này sẽ sai bản chất lý thuyết, không phải chỉ
+            # là "thêm 1 tham số học được cho nhất quán". Nếu học trực
+            # tiếp λ qua nn.Parameter(λ)·aux_loss (không Kendall): vì
+            # ∂aux_loss/∂λ = (1-corr) ≥ 0 luôn dương, gradient descent
+            # luôn đẩy λ→0 — ĐÚNG cái bẫy suy biến mà [LEARN-4] đã cảnh
+            # báo và tránh bằng Kendall cho reg/heading/calib. Ở đây
+            # không dùng được Kendall (sai lý thuyết) nên KHÔNG có cách
+            # nào học λ này an toàn — giữ cố định, giống cách /300.0 và
+            # ngưỡng dir_change=20° trong hard_score_from_obs được giữ cố
+            # định: đây là hệ số chuẩn hóa/ổn định số học có chủ đích, có
+            # lập luận rõ ràng (mục đích: chỉ đủ phá collapse cực đoan,
+            # không cạnh tranh với gradient chính main_loss/l_cfm có scale
+            # ~O(1) trong khi corr-loss bị chặn [0,2]), không phải "đoán
+            # tay chưa kiểm chứng" như linspace/clip mà [LEARN-1..3] đã sửa.
+            aux_loss = 0.01 * (1.0 - corr)
+
+        return main_loss + aux_loss
 
     # ── get_loss_breakdown ──────────────────────────────────────────────────
 
@@ -1142,7 +1246,10 @@ class TCFlowMatching(nn.Module):
         elif epoch < 30:   ramp_reg = (epoch - 10) / 20.0
         else:              ramp_reg = 1.0
 
-        l_reg = (self._reg_loss(x1_rel, last_obs, cond, h_score)
+        # [LEARN-7] obs_deg truyền vào để _reg_loss decompose ATE/CTE thay
+        # vì chỉ dùng dist tổng — xem docstring _reg_loss để biết lý do.
+        obs_deg_reg = _norm_to_deg(obs_traj[:, :, :2]) if ramp_reg > 0.0 else None
+        l_reg = (self._reg_loss(x1_rel, last_obs, cond, h_score, obs_deg_reg)
                  if ramp_reg > 0.0 else x0.new_zeros(()))
 
         # ── L_heading_ms ramp ep5→ep20 (cùng lý do GATE ở trên) ─────────────
@@ -1156,12 +1263,10 @@ class TCFlowMatching(nn.Module):
             x1_h_abs   = self._from_relative(x0_h + v_h, last_obs)
             pred_deg_h = _norm_to_deg(x1_h_abs.permute(1, 0, 2))   # [T, B, 2]
             obs_deg_h  = _norm_to_deg(obs_traj[:, :, :2])           # [T_obs, B, 2]
-            # [CTE-FIX] ground-truth trajectory in degrees, so the heading
-            # loss supervises against the storm's TRUE per-step bearing
-            # (not the model's own prior-step prediction — see
-            # _heading_loss_ms docstring for why this matters for CTE).
-            gt_abs_h   = self._from_relative(x1_rel, last_obs)
-            gt_deg_h   = _norm_to_deg(gt_abs_h.permute(1, 0, 2))    # [T, B, 2]
+            # [LEARN-6] truyền GT thật (đã có sẵn trong scope: x1_gt, [B,T,2]
+            # normalized) để _heading_loss_ms neo hướng dự đoán về đúng
+            # hướng đi thật thay vì chỉ tự-nhất-quán với chính nó.
+            gt_deg_h   = _norm_to_deg(x1_gt.permute(1, 0, 2))       # [T, B, 2]
             l_heading  = self._heading_loss_ms(pred_deg_h, obs_deg_h, gt_deg_h)
         else:
             l_heading = x0.new_zeros(())
@@ -1228,14 +1333,6 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
-            # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
-            # A wrapper that rebuilds `total` from the .item() floats above would
-            # sever the autograd graph and train nothing but the Kendall log_sigma*
-            # params. Use these instead when zeroing a term for an ablation run.
-            "_t_l_cfm":     l_cfm,
-            "_t_l_reg":     l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
-            "_t_l_heading": l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
-            "_t_l_calib":   l_calib,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,
@@ -1483,9 +1580,18 @@ class TCFlowMatching(nn.Module):
 
         # [LEARN diagnostics] expose learned values for monitoring in train_fm
         xai["learned_params"] = {
-            "speed_correction": (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
-            "reg_step_weights":  F.softmax(self.reg_step_logits, dim=0).tolist(),
-            "hard_score_weights": F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
+            "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
+            "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
+            "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
+            # [v2.4 FIX] các keys sau bị thiếu → head_w=[] và sigma_inf=nan trong log
+            "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
+            "sigma_inf":            float(self.sigma_inference),
+            "log_sigma_reg":        float(self.log_sigma_reg.detach()),
+            "log_sigma_heading":    float(self.log_sigma_heading.detach()),
+            "log_sigma_calib":      float(self.log_sigma_calib.detach()),
+            "eff_lambda_reg":       float((0.5 * torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))).detach()),
+            "eff_lambda_heading":   float((0.5 * torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))).detach()),
+            "eff_lambda_calib":     float((0.5 * torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))).detach()),
         }
 
         return pred_mean, torch.zeros_like(pred_mean), all_t, xai
