@@ -236,10 +236,11 @@ class SWAHandler:
             if k in sd: sd[k].copy_(v)
 
     def save_avg_state(self, path: str, epoch: int, best_score: float,
-                       extra: Optional[dict] = None):
+                       extra: Optional[dict] = None, model_cfg=None):
         payload = {"epoch": epoch, "model": self.avg_state,
                    "best_score": best_score, "is_swa": True,
-                   "swa_updates": self.n_updates}
+                   "swa_updates": self.n_updates,
+                   "model_cfg": model_cfg}
         if extra: payload.update(extra)
         torch.save(payload, path)
 
@@ -548,7 +549,7 @@ def evaluate(model, loader, device, tag: str = "",
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _save(path, epoch, model, opt, sched, best_score,
-          ema=None, scaler=None, extra=None):
+          ema=None, scaler=None, extra=None, model_cfg=None):
     m   = _unwrap(model)
     esd = None
     if ema is not None:
@@ -559,6 +560,8 @@ def _save(path, epoch, model, opt, sched, best_score,
         "optimizer": opt.state_dict(), "scheduler": sched.epoch,
         "scaler": scaler.state_dict() if scaler is not None else None,
         "best_score": best_score, "best_ade": best_score, "ema": esd,
+        # [FIX] self-describing checkpoint — see call site comment in main()
+        "model_cfg": model_cfg,
     }
     if extra: payload.update(extra)
     torch.save(payload, path)
@@ -733,6 +736,32 @@ def main(args):
         n_inference_steps=args.n_inference_steps,
         sigma_inference=args.sigma_inference,
     ).to(device)
+
+    # [FIX] Checkpoints must self-describe their architecture. Without this,
+    # evaluate_full.py's `TCFlowMatching(**ck.get("model_cfg", {}))` silently
+    # falls back to ALL constructor defaults whenever model_cfg is missing —
+    # harmless only by coincidence when CLI defaults happen to match
+    # constructor defaults (true today for d_model/nhead/num_dec_layers), but
+    # a real correctness risk the moment anyone trains with a non-default
+    # architecture (e.g. --d_model 128): eval would silently reconstruct the
+    # WRONG architecture, load_state_dict(strict=False) would mismatch
+    # shapes silently degrade to partial loading instead of a clear error.
+    # This dict mirrors the constructor call above exactly.
+    model_cfg = dict(
+        pred_len=args.pred_len,        obs_len=args.obs_len,
+        unet_in_ch=args.unet_in_ch,   d_cond=args.d_cond,
+        d_model=args.d_model,          nhead=args.nhead,
+        num_dec_layers=args.num_dec_layers, dim_ff=args.dim_ff,
+        dropout=args.dropout,
+        sigma_min=args.sigma_min,      sigma_max=args.sigma_max,
+        lambda_reg=args.lambda_reg,    lambda_heading=args.lambda_heading,
+        lambda_momentum=0.0,
+        lambda_hard_reg=(0.0 if args.disable_hard_reg else args.lambda_hard_reg),
+        use_ot=args.use_ot,            ot_epsilon=args.ot_epsilon,
+        use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
+        n_inference_steps=args.n_inference_steps,
+        sigma_inference=args.sigma_inference,
+    )
 
     model.init_ema()
     ema = getattr(_unwrap(model), "_ema", None)
@@ -949,10 +978,12 @@ def main(args):
               f"  lr={lr_vel_used:.2e}"
               f"  t={time.perf_counter()-t0_ep:.0f}s")
 
-        _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler)
+        _save(last_ckpt, ep, model, opt, sched, best_score, ema, scaler,
+              model_cfg=model_cfg)
         if ep % 5 == 0:
             ep_ckpt = os.path.join(args.output_dir, f"ckpt_ep{ep:03d}.pth")
-            _save(ep_ckpt, ep, model, opt, sched, best_score, ema, scaler)
+            _save(ep_ckpt, ep, model, opt, sched, best_score, ema, scaler,
+                  model_cfg=model_cfg)
             print(f"  💾 {ep_ckpt}")
 
         # ── Val evaluation ───────────────────────────────────────────────
@@ -984,7 +1015,8 @@ def main(args):
                 best_score = score; patience_cnt = 0
                 _save(best_ckpt, ep, model, opt, sched, best_score, ema, scaler,
                       extra={"val_ade": r["ADE"], "val_ate": r["ATE"],
-                             "val_cte": r["CTE"], "patience_cnt": 0})
+                             "val_cte": r["CTE"], "patience_cnt": 0},
+                      model_cfg=model_cfg)
                 print(f"  ✅ Best! score={best_score:.2f}"
                       f"  ADE={r['ADE']:.1f} ATE={r['ATE']:.1f} CTE={r['CTE']:.1f}")
             else:
@@ -1006,7 +1038,8 @@ def main(args):
             if r_h["combined_score"] < best_hard and r_h["n_hard"] >= 10:
                 best_hard = r_h["combined_score"]
                 _save(hard_best_ckpt, ep, model, opt, sched, best_hard, ema, scaler,
-                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val"})
+                      extra={"hard_val_ade": r_h["ADE"], "selection_criterion": "hard_val"},
+                      model_cfg=model_cfg)
                 print(f"  💎 Hard-best! score={best_hard:.2f} ADE={r_h['ADE']:.1f}")
 
         # ── SWA eval ─────────────────────────────────────────────────────
@@ -1027,7 +1060,8 @@ def main(args):
                 swa.save_avg_state(swa_ckpt, ep, best_score,
                                    extra={"val_ade": r_swa["ADE"],
                                           "val_ate": r_swa["ATE"],
-                                          "val_cte": r_swa["CTE"]})
+                                          "val_cte": r_swa["CTE"]},
+                                   model_cfg=model_cfg)
                 import shutil; shutil.copy(swa_ckpt, best_ckpt)
                 print(f"  ✅ SWA best! score={best_score:.2f} ADE={r_swa['ADE']:.1f}")
 

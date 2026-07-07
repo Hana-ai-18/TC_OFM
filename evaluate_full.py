@@ -774,7 +774,17 @@ def main():
 
     # ── Load model ─────────────────────────────────────────────────────────
     ck = torch.load(args.checkpoint, map_location="cpu")
-    model_cfg = ck.get("model_cfg", {})
+    # model_cfg may be: missing (old checkpoints, pre-fix), present but None
+    # (checkpoint saved without passing model_cfg=), or a real dict — only
+    # the last case should override constructor defaults.
+    model_cfg = ck.get("model_cfg") or {}
+    if not model_cfg:
+        print("  ⚠ Checkpoint has no model_cfg — reconstructing with "
+              "constructor DEFAULTS. This is only correct if the checkpoint "
+              "was trained with default architecture args (d_model=256, "
+              "nhead=8, num_dec_layers=4, ...). If you trained with "
+              "non-default architecture flags, this will silently load the "
+              "WRONG architecture.")
     model = TCFlowMatching(**model_cfg).to(device)
     state = ck.get("model", ck)
     missing, unexpected = model.load_state_dict(state, strict=False)
