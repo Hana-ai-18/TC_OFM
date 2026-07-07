@@ -243,8 +243,13 @@ def run_full_evaluation(model, loader, device,
         "rmse": [], "mae": [],
         "obs_speed": [],
         "dist_per_step": [[] for _ in range(12)],   # [12 steps][storms]
-        "ate_per_step":  [[] for _ in range(11)],
-        "cte_per_step":  [[] for _ in range(11)],
+        # ATE/CTE per_storm arrays sized 12 (not 11) to align indices with
+        # dist_per_step / HORIZONS convention (index k = (k+1)*6h horizon).
+        # Index 0 ("6h") stays legitimately empty — there is no along/cross
+        # track decomposition at the very first predicted point (no prior
+        # heading reference exists yet); _m([]) correctly returns nan there.
+        "ate_per_step":  [[] for _ in range(12)],
+        "cte_per_step":  [[] for _ in range(12)],
         "final_dpe": [],
         "valid_speed": [], "valid_accel": [],
         "crps": [],   # per storm
@@ -288,9 +293,18 @@ def run_full_evaluation(model, loader, device,
         # Per-step dist
         for s in range(min(T, 12)):
             per_storm["dist_per_step"][s].extend(d[s].tolist())
-        for s in range(min(ate.shape[0], 11)):
-            per_storm["ate_per_step"][s].extend(ate[s].abs().tolist())
-            per_storm["cte_per_step"][s].extend(cte[s].abs().tolist())
+        # ate[i]/cte[i] (i=0..T-2) hold the error AT ORIGINAL STEP INDEX i+1
+        # (see _ate_cte_full: it uses gt[1:T]/pred[1:T], so ate[0] is the
+        # error at step index 1, not step index 0). Storing under key i+1
+        # keeps ate_per_step/cte_per_step aligned with dist_per_step's own
+        # indexing (index k = (k+1)*6h horizon, per HORIZONS dict) — before
+        # this fix, ate_per_step[s] held the WRONG horizon's data (off by
+        # one step) for every reported horizon, and "72h" (index 11) was
+        # silently dropped entirely (nan) because it was never populated.
+        for i in range(min(ate.shape[0], 11)):
+            k = i + 1
+            per_storm["ate_per_step"][k].extend(ate[i].abs().tolist())
+            per_storm["cte_per_step"][k].extend(cte[i].abs().tolist())
 
         # Physical validity
         phys = _physical_validity(pd, obs_deg_i)
@@ -332,18 +346,20 @@ def run_full_evaluation(model, loader, device,
     for hz, s in HORIZONS.items():
         d_s = per_storm["dist_per_step"][s] if s < 12 else []
         result["per_horizon"][hz] = _m(d_s)
-        if s < 11:
+        # Arrays are now aligned with dist_per_step's indexing (see fix
+        # above), so no offset/guard needed beyond bounds-checking. Index 0
+        # ("6h") legitimately has no ATE/CTE (no prior heading reference at
+        # the first predicted point) — _m([]) correctly returns nan there,
+        # not a bug. "72h" (index 11) is now correctly populated.
+        if s < 12:
             result["per_horizon_ate"][hz] = _m(per_storm["ate_per_step"][s])
             result["per_horizon_cte"][hz] = _m(per_storm["cte_per_step"][s])
 
     # Boxplot data (raw arrays)
     result["boxplot_ade"] = per_storm["ade"]
-    # Per-storm arrays for statistical tests (ATE/CTE need per-storm, not just mean)
-    result["boxplot_ate"] = per_storm["ate"]
-    result["boxplot_cte"] = per_storm["cte"]
     result["dist_per_step_mean"] = [_m(per_storm["dist_per_step"][s]) for s in range(12)]
-    result["ate_per_step_mean"]  = [_m(per_storm["ate_per_step"][s])  for s in range(11)]
-    result["cte_per_step_mean"]  = [_m(per_storm["cte_per_step"][s])  for s in range(11)]
+    result["ate_per_step_mean"]  = [_m(per_storm["ate_per_step"][s])  for s in range(12)]
+    result["cte_per_step_mean"]  = [_m(per_storm["cte_per_step"][s])  for s in range(12)]
 
     # ── By speed category ──────────────────────────────────────────────
     obs_spd_arr = np.array(per_storm["obs_speed"])

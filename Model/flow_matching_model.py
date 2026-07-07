@@ -631,9 +631,9 @@ def augment_batch(batch_list, disable_aug_c: bool = False) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
-        # ABLATION: disable_aug_c → skip recurvature entirely (falls through as
-        # a no-op, i.e. original sample), so the 'no_aug_c' variant is a true
-        # ablation rather than silently identical to the full model.
+        # ABLATION: disable_aug_c → skip recurvature entirely (falls through,
+        # i.e. sample used as-is), so 'no_aug_c' is a true ablation instead of
+        # silently identical to the full model.
         T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
         if disable_aug_c:
             pass
@@ -978,7 +978,8 @@ class TCFlowMatching(nn.Module):
 
     # ── Multi-step heading loss — [LEARN-5] learnable per-step weights ──────
 
-    def _heading_loss_ms(self, pred_deg: torch.Tensor, obs_deg: torch.Tensor) -> torch.Tensor:
+    def _heading_loss_ms(self, pred_deg: torch.Tensor, obs_deg: torch.Tensor,
+                          gt_deg: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Multi-step heading constraint — TOÀN BỘ pred_len bước, trọng số HỌC.
 
@@ -995,9 +996,24 @@ class TCFlowMatching(nn.Module):
         gradient tự học, không còn giới hạn cứng "chỉ 4 bước đầu" hay
         decay theo cấp số nhân tay chọn (0.5^t).
 
-        Detach ref tại mỗi step vẫn giữ nguyên (CRITICAL: ngăn gradient
-        explosion qua chuỗi 12 bước liên tiếp — đây là cơ chế ổn định
-        numerice, không phải "trọng số", nên không thuộc diện cần học).
+        [CTE-FIX] SỬA LỖI THIẾT KẾ: bản trước dùng
+            ref_bear = pred_bear.detach()
+        tại MỌI bước — nghĩa là từ bước 1 trở đi, hướng tham chiếu là hướng
+        MODEL TỰ DỰ ĐOÁN ở bước trước, không phải hướng THẬT của storm.
+        Chỉ bước 0 được neo vào obs_deg (hướng quan sát thật). Hệ quả: loss
+        này chỉ dạy "đi thẳng, mượt theo hướng đã đi" (self-consistency),
+        KHÔNG dạy model bám theo độ rẽ hướng (recurvature) THẬT của storm
+        sau bước đầu — đây là nguyên nhân chính khiến AUG-C (augmentation
+        rẽ hướng tổng hợp) phải tồn tại như một miếng vá, và heading
+        deviation 72h kẹt ở 113-128° xuyên suốt nhiều version.
+
+        FIX: khi có gt_deg (ground truth trajectory), so pred_bear[t] với
+        TRUE bearing tại bước t (tính từ gt_deg), không phải bearing model
+        tự đoán ở bước t-1. Vẫn giữ .detach() (ổn định số học, ngăn
+        gradient chảy ngược qua chuỗi so sánh) nhưng GIÁ TRỊ so sánh giờ
+        là hướng thật, nên model học được recurvature thật, không chỉ học
+        "đừng đổi hướng". Nếu gt_deg=None (fallback, vd caller cũ chưa
+        cập nhật), giữ hành vi self-referential cũ để không crash.
         """
         if obs_deg.shape[0] < 2 or pred_deg.shape[0] < 1:
             return pred_deg.new_zeros(())
@@ -1008,12 +1024,23 @@ class TCFlowMatching(nn.Module):
         N = pred_deg.shape[0]
         sw = F.softmax(self.heading_step_logits[:N], dim=0)   # [N], học được
 
+        # True per-step bearing from ground truth, when available.
+        true_bear = None
+        if gt_deg is not None and gt_deg.shape[0] >= N:
+            gt_pts = torch.cat([obs_deg[-1:], gt_deg[:N]], 0)   # [N+1, B, 2]
+            true_bear = [_forward_azimuth(gt_pts[t], gt_pts[t + 1]) for t in range(N)]
+
         loss = pred_deg.new_zeros(())
         for t in range(N):
             pred_bear  = _forward_azimuth(pts[t], pts[t + 1])  # [B]
             angle_diff = pred_bear - ref_bear
             loss       = loss + sw[t] * (1.0 - torch.cos(angle_diff)).mean()
-            ref_bear   = pred_bear.detach()   # CRITICAL: detach to prevent chain gradient
+            if true_bear is not None:
+                # Supervise against the TRUE storm heading at this step
+                # (detach: GT has no grad anyway, kept for clarity/safety).
+                ref_bear = true_bear[t].detach()
+            else:
+                ref_bear = pred_bear.detach()   # fallback: old self-referential behavior
 
         return loss
 
@@ -1129,7 +1156,13 @@ class TCFlowMatching(nn.Module):
             x1_h_abs   = self._from_relative(x0_h + v_h, last_obs)
             pred_deg_h = _norm_to_deg(x1_h_abs.permute(1, 0, 2))   # [T, B, 2]
             obs_deg_h  = _norm_to_deg(obs_traj[:, :, :2])           # [T_obs, B, 2]
-            l_heading  = self._heading_loss_ms(pred_deg_h, obs_deg_h)
+            # [CTE-FIX] ground-truth trajectory in degrees, so the heading
+            # loss supervises against the storm's TRUE per-step bearing
+            # (not the model's own prior-step prediction — see
+            # _heading_loss_ms docstring for why this matters for CTE).
+            gt_abs_h   = self._from_relative(x1_rel, last_obs)
+            gt_deg_h   = _norm_to_deg(gt_abs_h.permute(1, 0, 2))    # [T, B, 2]
+            l_heading  = self._heading_loss_ms(pred_deg_h, obs_deg_h, gt_deg_h)
         else:
             l_heading = x0.new_zeros(())
 
@@ -1196,8 +1229,9 @@ class TCFlowMatching(nn.Module):
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
             # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
-            # These keep the autograd graph so a wrapper can rebuild `total`
-            # with some terms zeroed while preserving gradients to the network.
+            # A wrapper that rebuilds `total` from the .item() floats above would
+            # sever the autograd graph and train nothing but the Kendall log_sigma*
+            # params. Use these instead when zeroing a term for an ablation run.
             "_t_l_cfm":     l_cfm,
             "_t_l_reg":     l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
             "_t_l_heading": l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),

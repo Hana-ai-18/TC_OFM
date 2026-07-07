@@ -1,15 +1,4 @@
 """
-
-# ─────────────────────────────────────────────────────────────────────────────
-# FILE PLACEMENT:
-#
-#   SOURCE:        train_fm_v24.py
-#   KAGGLE TARGET: /kaggle/working/train_fm.py    (root, cạnh Model/)
-#   LOCAL DEV:     train_fm.py
-#
-#   cp train_fm_v24.py /kaggle/working/train_fm.py
-# ─────────────────────────────────────────────────────────────────────────────
-
 scripts/train_fm.py  ──  TC-FlowMatching v2.1-XAI Training
 ═══════════════════════════════════════════════════════════════════════════════
 
@@ -24,17 +13,17 @@ Cải tiến từ v2.1 (dựa trên phân tích log 150 epochs):
   NO AUG-D: proven harmful (+4.5km ATE v2.6, +13.4km v2.7)
 
 Giữ nguyên (proven):
-  ✅ sigma_inference=0.04 FIXED
-  ✅ L_reg softmax-linspace weights
-  ✅ 2-group optimizer, encoder freeze 10ep
+  ✅ sigma_inference LEARNED (was 0.04 FIXED) — NLL-regularized, see model.py [LEARN-6]
+  ✅ L_reg softmax weights (uniform init — see model.py for why not late-heavy)
+  ✅ 2-group + learnable_extra optimizer, encoder freeze 10ep
   ✅ val loop NO augmentation
   ✅ 1-shot inference
   ✅ SWA sau plateau
-  ✅ Hard-val checkpoint (HVAL)
+  ✅ Hard-val checkpoint (HVAL) — now uses model's learned hard_score_weight_logits
   ✅ XAI logging mỗi 10 epoch
 """
 from __future__ import annotations
-import json, sys, os
+import sys, os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import argparse, math, time
@@ -104,10 +93,13 @@ def _ate_cte(pred_deg, gt_deg):
 def build_optimizer(model, lr_velocity, lr_encoder, weight_decay):
     raw = _unwrap(model)
 
-    # [CRITICAL FIX] v2.1-learn thêm 7 nhóm nn.Parameter trực tiếp trên
+    # [CRITICAL FIX] v2.1-learn thêm 9 nhóm nn.Parameter trực tiếp trên
     # TCFlowMatching (KHÔNG nằm trong raw.encoder hay raw.velocity):
     #   speed_correction_logits, reg_step_logits, hard_score_weight_logits,
-    #   heading_step_logits, log_sigma_reg, log_sigma_heading, log_sigma_calib
+    #   heading_step_logits, log_sigma_reg, log_sigma_heading, log_sigma_calib,
+    #   log_sigma_speed_ratio, log_sigma_sigma_nll, log_sigma_infer (sigma_inference)
+    #   — tất cả tự động cover qua set-difference bên dưới, không cần liệt kê tay
+    #   mỗi khi model.py thêm tham số học mới.
     #
     # BUG ĐÃ PHÁT HIỆN: optimizer cũ (2 param_groups: encoder + velocity)
     # KHÔNG cover các tham số này. loss.backward() vẫn tính đúng gradient
@@ -268,7 +260,8 @@ def evaluate_hard_val(model, val_loader, device, hard_threshold: float = 0.35,
     for batch in val_loader:
         bl = move(list(batch), device)
         B  = bl[0].shape[1]
-        h_score   = hard_score_from_obs(bl[0][:, :, :2])
+        h_score   = hard_score_from_obs(bl[0][:, :, :2],
+                                         weight_logits=getattr(_unwrap(model), "hard_score_weight_logits", None))
         hard_mask = h_score > hard_threshold
         if hard_mask.sum() == 0: continue
         hard_idx  = hard_mask.nonzero(as_tuple=True)[0]
@@ -515,23 +508,16 @@ def evaluate(model, loader, device, tag: str = "",
             # chúng — xem build_optimizer's 'learnable_extra' param group)
             lp = xai.get("learned_params", {})
             if lp:
-                sc_str  = ",".join(f"{v:.2f}" for v in lp.get("speed_correction", [])[:4])
-                rw_str  = ",".join(f"{v:.3f}" for v in lp.get("reg_step_weights", [])[:4])
-                hw_str  = ",".join(f"{v:.3f}" for v in lp.get("hard_score_weights", []))
-                hdw_str = ",".join(f"{v:.3f}" for v in lp.get("heading_step_weights", [])[:4])
-                sig_inf = lp.get("sigma_inf", float("nan"))
-                ls_r    = lp.get("log_sigma_reg",     float("nan"))
-                ls_h    = lp.get("log_sigma_heading",  float("nan"))
-                ls_c    = lp.get("log_sigma_calib",    float("nan"))
-                el_r    = lp.get("eff_lambda_reg",     float("nan"))
-                el_h    = lp.get("eff_lambda_heading", float("nan"))
-                el_c    = lp.get("eff_lambda_calib",   float("nan"))
+                sc_str = ",".join(f"{v:.2f}" for v in lp.get("speed_correction", [])[:4])
+                rw_str = ",".join(f"{v:.3f}" for v in lp.get("reg_step_weights", [])[:4])
+                hw_str = ",".join(f"{v:.3f}" for v in lp.get("hard_score_weights", []))
+                hd_str = ",".join(f"{v:.3f}" for v in lp.get("heading_step_weights", [])[:4])
+                sig_v  = lp.get("sigma_inference", float("nan"))
                 print(f"  [LEARN] speed_corr(12h-24h)=[{sc_str}]"
-                      f"  reg_w(12h-24h)=[{rw_str}]")
-                print(f"  [LEARN] hard_w(curv,spdvar,dirchg,obsspd)=[{hw_str}]"
-                      f"  head_w(12h-24h)=[{hdw_str}]  sigma_inf={sig_inf:.4f}")
-                print(f"  [LEARN] log_sigma: reg={ls_r:.3f}  heading={ls_h:.3f}  calib={ls_c:.3f}"
-                      f"  |  eff_lambda: reg={el_r:.3f}  heading={el_h:.3f}  calib={el_c:.3f}")
+                      f"  reg_w(12h-24h)=[{rw_str}]"
+                      f"  hard_w(curv,spdvar,dirchg,obsspd)=[{hw_str}]"
+                      f"  head_w(12h-24h)=[{hd_str}]"
+                      f"  sigma_inf={sig_v:.4f}")
 
             print(f"  {'─'*60}")
             result["xai"] = xai
@@ -590,16 +576,22 @@ def get_args():
     p.add_argument("--unet_in_ch",             default=13,     type=int)
     p.add_argument("--sigma_min",              default=0.04,   type=float)
     p.add_argument("--sigma_max",              default=0.08,   type=float)
-    p.add_argument("--lambda_reg",             default=0.2,    type=float)
+    p.add_argument("--lambda_reg",             default=0.2,    type=float,
+                   help="[DEAD] không còn dùng — cross-loss weight giờ HỌC qua "
+                        "model.log_sigma_reg (Kendall), giá trị này chỉ truyền vào "
+                        "constructor cho backward-compat, không ảnh hưởng training")
     p.add_argument("--lambda_heading",         default=0.07,   type=float,
-                   help="[v2.1-XAI] multi-step heading, bug fixed, weight=0.07")
+                   help="[DEAD] không còn dùng — xem model.log_sigma_heading; "
+                        "giữ arg này chỉ để không phá vỡ lệnh gọi script cũ")
     p.add_argument("--lambda_momentum",        default=0.0,    type=float,
                    help="[v2.6] DISABLED — hurt test ATE by +7.9km")
     p.add_argument("--use_ot",                 default=True,   action="store_true")
     p.add_argument("--no_ot",                  dest="use_ot",  action="store_false")
     p.add_argument("--ot_epsilon",             default=0.05,   type=float)
     p.add_argument("--n_ensemble",             default=20,     type=int)
-    p.add_argument("--sigma_inference",        default=0.04,   type=float)
+    p.add_argument("--sigma_inference",        default=0.04,   type=float,
+                   help="init value seed only — actual sigma_inference is LEARNED "
+                        "during training (Kendall-style NLL, see model.py [LEARN-6])")
     p.add_argument("--n_inference_steps",      default=1,      type=int)
     # Training
     p.add_argument("--num_epochs",             default=150,    type=int)
@@ -637,8 +629,6 @@ def get_args():
     p.add_argument("--resume",                 default=None)
     p.add_argument("--test_at_end",            action="store_true", default=True)
     p.add_argument("--no_test",                dest="test_at_end", action="store_false")
-    p.add_argument("--test_year",              default=None,   type=int,
-                   help="Filter test set by year (same as evaluate_test_storms.py)")
     # ── ESWA paper: reproducibility + ablation ────────────────────────────
     p.add_argument("--seed",                   type=int, default=42,
                    help="Random seed. Run 3-5 seeds for ESWA mean±std reporting.")
@@ -662,39 +652,16 @@ def get_args():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main(args):
-    # ── GPU selection FIRST — must run before ANY CUDA call, otherwise
-    #    setting CUDA_VISIBLE_DEVICES has no effect (context already created).
-    #    (torch.cuda.is_available() below initializes CUDA, so ordering matters.)
-    if "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
-    # ── Seed (ESWA: run with 3-5 seeds, report mean±std) ──────────────────
-    import random
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
-    # Determinism for clean 3-seed variance (ESWA mean±std).
-    # benchmark=False + deterministic=True remove cuDNN autotuner nondeterminism.
-    # warn_only=True: fall back (with a warning) for ops lacking a deterministic
-    # kernel instead of crashing — keeps training runnable on all GPUs.
-    try:
-        torch.backends.cudnn.benchmark = False
-        torch.backends.cudnn.deterministic = True
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    except Exception as _e:
-        print(f"  [determinism] partial: {_e}")
-    # Ablation: append name to output dir if provided
+    # Ablation / seed output_dir suffixing (no-op for default seed=42, no ablation)
     if args.ablation_name:
         args.output_dir = f"{args.output_dir}_{args.ablation_name}"
     if args.seed != 42:
         args.output_dir = f"{args.output_dir}_seed{args.seed}"
 
+    if torch.cuda.is_available():
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
-    # Wall-clock tracking
-    _wall_start = time.time()
     best_ckpt      = os.path.join(args.output_dir, "best_model.pth")
     hard_best_ckpt = os.path.join(args.output_dir, "hard_best_model.pth")
     swa_ckpt       = os.path.join(args.output_dir, "swa_model.pth")
@@ -703,10 +670,10 @@ def main(args):
     print("=" * 72)
     print("  TC-FlowMatching v2.1-XAI")
     print(f"  [AUG-C]  Recurvature ±20° (PROVEN -7.1km CTE in v2.5)")
-    print(f"  [L_HDG]  L_heading bug fixed, weight={args.lambda_heading}")
-    print(f"  [CALIB]  Speed calibration at inference (clip 0.85-1.15)")
+    print(f"  [L_HDG]  L_heading bug fixed, weight LEARNED (log_sigma_heading, Kendall)")
+    print(f"  [CALIB]  Speed calibration at inference — LEARNED per-horizon (was clip 0.85-1.15)")
     print(f"  [NO-D]   AUG-D removed (proven +4.5km ATE worse)")
-    print(f"  KEEP:    sigma_inf={args.sigma_inference} FIXED, L_reg linear, OT")
+    print(f"  KEEP:    sigma_inf LEARNED (init={args.sigma_inference}, was FIXED), L_reg uniform-init+learned, OT")
     print("=" * 72)
 
     # ── Data ──────────────────────────────────────────────────────────────
@@ -730,7 +697,7 @@ def main(args):
         num_dec_layers=args.num_dec_layers, dim_ff=args.dim_ff,
         dropout=args.dropout,
         sigma_min=args.sigma_min,      sigma_max=args.sigma_max,
-        lambda_reg=args.lambda_reg,    lambda_heading=args.lambda_heading,
+        lambda_reg=args.lambda_reg,    lambda_heading=args.lambda_heading,  # [DEAD] accepted for compat, ignored — see model.py
         lambda_momentum=0.0,
         use_ot=args.use_ot,            ot_epsilon=args.ot_epsilon,
         use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
@@ -747,21 +714,8 @@ def main(args):
     velocity_ids = {id(p) for p in raw.velocity.parameters()}
     n_extra = sum(p.numel() for p in raw.parameters()
                   if id(p) not in encoder_ids and id(p) not in velocity_ids)
-    n_total = n_enc + n_vel + n_extra
-    mem_mb  = sum(p.numel()*p.element_size() for p in model.parameters()) / 1e6
     print(f"\n  Encoder: {n_enc:,}  VelocityTrans: {n_vel:,}  "
-          f"LearnableExtra: {n_extra:,}  Total: {n_total:,}  Mem: {mem_mb:.1f}MB")
-    # Log computational footprint for ESWA paper Table E
-    footprint_info = {
-        "n_encoder": n_enc, "n_velocity": n_vel, "n_extra": n_extra,
-        "n_total": n_total, "mem_mb": mem_mb,
-        "seed": args.seed,
-        "ablation_name": args.ablation_name or "full",
-        "disable_l_heading": getattr(args, "disable_l_heading", False),
-        "disable_l_calib":   getattr(args, "disable_l_calib", False),
-        "disable_l_reg":     getattr(args, "disable_l_reg", False),
-        "disable_aug_c":     getattr(args, "disable_aug_c", False),
-    }
+          f"LearnableExtra: {n_extra:,}  Total: {n_enc+n_vel+n_extra:,}")
 
     # ── Ablation: patch get_loss_breakdown ─────────────────────────────────
     if any([args.disable_l_heading, args.disable_l_calib, args.disable_l_reg,
@@ -782,10 +736,10 @@ def main(args):
         def _patched_glb(self, batch_list, epoch=0, **kwargs):
             bd = _orig_glb(self, batch_list, epoch=epoch, **kwargs)
             import math as _m
-            # Use GRAPH-CONNECTED tensors, NOT the detached float values in bd.
+            # Use GRAPH-CONNECTED tensors, NOT the detached float values in bd
             # (bd["l_reg"] etc. are Python floats from .item() and carry no
             #  gradient — rebuilding total from them would sever backprop to
-            #  the network and only train the Kendall log_sigma params.)
+            #  the network and only train the Kendall log_sigma params).
             l_cfm     = bd["_t_l_cfm"]
             l_reg     = bd["_t_l_reg"]
             l_heading = bd["_t_l_heading"]
@@ -795,9 +749,11 @@ def main(args):
             if _abl_flags["disable_l_calib"]:   l_calib   = l_calib * 0.0
             HALF = 0.5 * _m.log(2.0 * _m.pi)
             if _abl_flags["disable_learned_weights"]:
+                # Fixed weights matching this model's own Kendall init values
+                # (log_sigma_reg/heading/calib are init-solved from 0.20/0.07/0.10)
                 total = (l_cfm
-                         + bd["lam_reg"]   * 0.20 * l_reg
-                         + bd["lam_dir"]   * 0.07 * l_heading
+                         + bd["lam_reg"]  * 0.20 * l_reg
+                         + bd["lam_dir"]  * 0.07 * l_heading
                          + bd["lam_calib"] * 0.10 * l_calib)
             else:
                 prec_r = torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))
@@ -861,8 +817,9 @@ def main(args):
     nstep = len(trl)
     print(f"\n  TRAINING ({nstep} steps/ep × {args.num_epochs} ep)")
     print(f"  Aug: shift±5km(25%) + speed×[0.85,1.15](20%) + recurv±20°(20%) + no-aug(35%)")
-    print(f"  Loss: L_CFM + L_reg(linear) + L_heading_ms(4steps,decay=0.5)")
-    print(f"  Inf:  1-shot sigma=0.04 + speed_calibrate(±15%) + top3 physics")
+    print(f"  Loss: L_CFM + L_reg(12-step LEARNED weights) + L_heading_ms(12-step LEARNED)"
+          f" + L_calib_ade(LEARNED) + L_speed_ratio(LEARNED) + L_sigma_nll(LEARNED)")
+    print(f"  Inf:  1-shot sigma=LEARNED + speed_calibrate(12-horizon LEARNED) + top3 physics")
     print()
 
     for ep in range(start_ep, start_ep + args.num_epochs):
@@ -914,7 +871,9 @@ def main(args):
                       f"  reg={bd['l_reg']:.4f}"
                       f"  h4s={bd['l_heading']:.4f}"
                       f"  lam_d={bd['lam_dir']:.2f}"
+                      f"  lam_c={bd.get('lam_calib', 0.0):.2f}"
                       f"  ade1={bd['ade_1step']:.0f}km"
+                      f"  sig={bd.get('learned_sigma_infer', float('nan')):.4f}"
                       f"  enc={enc_s}{swa_s}"
                       f"  lr={lr_vel:.2e}")
 
@@ -1013,24 +972,6 @@ def main(args):
                 import shutil; shutil.copy(swa_ckpt, best_ckpt)
                 print(f"  ✅ SWA best! score={best_score:.2f} ADE={r_swa['ADE']:.1f}")
 
-    # ── Wall-clock + footprint (ESWA Table E) ────────────────────────────
-    _wall_total = time.time() - _wall_start
-    print(f"\n  Training wall-clock: {_wall_total/3600:.2f}h ({_wall_total:.0f}s)")
-    try:
-        footprint_info.update({
-            "training_wall_clock_s": _wall_total,
-            "training_wall_clock_h": round(_wall_total/3600, 3),
-            "num_epochs": args.num_epochs,
-            "best_score": best_score,
-        })
-        import json as _json
-        fp_path = os.path.join(args.output_dir, "footprint.json")
-        with open(fp_path, "w") as _fp:
-            _json.dump(footprint_info, _fp, indent=2)
-        print(f"  Footprint saved → {fp_path}")
-    except Exception as _fe:
-        print(f"  Footprint save failed: {_fe}")
-
     # ── Test evaluation ───────────────────────────────────────────────────
     print(f"\n  Done! best_score={best_score:.2f}")
     if not args.test_at_end: return
@@ -1050,10 +991,8 @@ def main(args):
     try:
         _, test_loader = data_loader(args, {"root": args.dataset_root, "type": "test"}, test=True)
         print(f"  Test: {len(test_loader)} batches")
-    except Exception as _e:
-        print(f"  ❌ Không load được test set: {_e}")
-        print(f"  ⚠  Dùng val set để test (kết quả val=test — CHÚ Ý khi báo cáo)")
-        test_loader = val_loader
+    except Exception:
+        print("  No test set → using val"); test_loader = val_loader
 
     # Standard test
     r_test = evaluate(model, test_loader, device, tag="TEST (best ckpt)",
@@ -1120,163 +1059,11 @@ def main(args):
         print(f"  {m_n:<10} {val_v:>10.2f} {test_v:>10.2f} {gap:>+10.2f} {v21_v:>12.1f}  {flag}")
     print("=" * 72)
 
-    # ── Auto evaluate_full + statistical_tests sau khi train xong ─────────
-    # Tự động chạy để không cần chạy tay khi train ngầm trên Kaggle.
-    # Kết quả lưu vào args.output_dir/eval/ và args.output_dir/stats/
-    _auto_eval(args, best_ckpt, device)
-
-
-def _auto_eval(args, best_ckpt: str, device):
-    """
-    Tự động chạy evaluate_full.py và statistical_tests.py sau khi train xong.
-    Tìm script trong cùng thư mục hoặc thư mục cha của train script.
-    Nếu không tìm thấy → bỏ qua, không làm crash training.
-    """
-    import subprocess, sys, json as _json
-
-    print("\n" + "="*72)
-    print("  AUTO EVALUATE + STATISTICAL TESTS")
-    print("="*72)
-
-    eval_dir  = os.path.join(args.output_dir, "eval")
-    stats_dir = os.path.join(args.output_dir, "stats")
-    os.makedirs(eval_dir,  exist_ok=True)
-    os.makedirs(stats_dir, exist_ok=True)
-
-    # Tìm evaluate_full.py: thử root project, thư mục cha scripts, cwd
-    script_dir  = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.abspath(os.path.join(script_dir, ".."))
-    candidates_eval = [
-        os.path.join(project_root, "evaluate_full.py"),
-        os.path.join(os.getcwd(),  "evaluate_full.py"),
-        os.path.join(script_dir,   "evaluate_full.py"),
-    ]
-    candidates_stat = [
-        os.path.join(project_root, "statistical_tests.py"),
-        os.path.join(os.getcwd(),  "statistical_tests.py"),
-        os.path.join(script_dir,   "statistical_tests.py"),
-    ]
-    eval_script = next((p for p in candidates_eval if os.path.exists(p)), None)
-    stat_script = next((p for p in candidates_stat if os.path.exists(p)), None)
-
-    # ── Step 1: evaluate_full.py ────────────────────────────────────────────
-    if eval_script is None:
-        print("  ⚠ evaluate_full.py không tìm thấy → bỏ qua auto-eval")
-        print(f"    Đặt file tại: {candidates_eval[0]}")
-    else:
-        print(f"  ▶ evaluate_full.py ({eval_script})")
-        ep = "best"
-        try:
-            import torch as _torch
-            ck_info = _torch.load(best_ckpt, map_location="cpu")
-            ep = ck_info.get("epoch", "best")
-        except Exception:
-            pass
-
-        cmd_eval = [
-            sys.executable, eval_script,
-            "--checkpoint",   best_ckpt,
-            "--dataset_root", args.dataset_root,
-            "--split",        "test",
-            "--output_dir",   eval_dir,
-            "--n_ensemble",   str(args.n_ensemble),
-            "--no_crps",      # tắt CRPS để chạy nhanh hơn (bật nếu cần)
-            "--gpu",          str(args.gpu_num),
-        ]
-        try:
-            result = subprocess.run(cmd_eval, capture_output=False, timeout=1800)
-            if result.returncode == 0:
-                print(f"  ✅ evaluate_full done → {eval_dir}/")
-            else:
-                print(f"  ❌ evaluate_full failed (code {result.returncode})")
-        except subprocess.TimeoutExpired:
-            print("  ⚠ evaluate_full timeout (30min) → bỏ qua")
-        except Exception as e:
-            print(f"  ⚠ evaluate_full error: {e}")
-
-    # ── Step 2: statistical_tests.py ────────────────────────────────────────
-    # Tìm JSON output từ evaluate_full
-    eval_json = None
-    if os.path.exists(eval_dir):
-        jsons = sorted([
-            os.path.join(eval_dir, f) for f in os.listdir(eval_dir)
-            if f.startswith("eval_test") and f.endswith(".json")
-        ])
-        if jsons:
-            eval_json = jsons[-1]  # file mới nhất
-
-    if stat_script is None:
-        print("  ⚠ statistical_tests.py không tìm thấy → bỏ qua")
-    elif eval_json is None:
-        print("  ⚠ Không tìm thấy eval JSON → bỏ qua statistical tests")
-        print(f"    Thử chạy lại evaluate_full.py trước")
-    else:
-        print(f"  ▶ statistical_tests.py ({stat_script})")
-        print(f"    FM result: {eval_json}")
-        cmd_stat = [
-            sys.executable, stat_script,
-            "--fm_results",       eval_json,
-            "--use_st_trans_ref",
-            "--fm_n_storms",      "420",
-            "--baseline_name",    "ST-Trans",
-            "--output_dir",       stats_dir,
-            "--n_bootstrap",      "10000",
-        ]
-        try:
-            result = subprocess.run(cmd_stat, capture_output=True,
-                                    timeout=600, text=True)
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if any(k in line for k in ["ADE","ATE","CTE","p_value",
-                                                "Cohen","Bootstrap","significant","==="]):
-                        print(f"    {line}")
-                print(f"  ✅ statistical_tests done → {stats_dir}/")
-            else:
-                print(f"  ❌ statistical_tests failed (code {result.returncode})")
-                if result.stderr:
-                    print(f"    {result.stderr[-300:]}")
-        except subprocess.TimeoutExpired:
-            print("  ⚠ statistical_tests timeout (10min) → bỏ qua")
-        except Exception as e:
-            print(f"  ⚠ statistical_tests error: {e}")
-
-    # ── Summary JSON ─────────────────────────────────────────────────────────
-    summary_path = os.path.join(args.output_dir, "auto_eval_summary.json")
-    try:
-        summary = {
-            "checkpoint":    best_ckpt,
-            "eval_dir":      eval_dir,
-            "stats_dir":     stats_dir,
-            "eval_json":     eval_json,
-            "seed":          getattr(args, "seed", 42),
-            "ablation_name": getattr(args, "ablation_name", ""),
-        }
-        # Đọc kết quả ADE/ATE/CTE từ eval JSON nếu có
-        if eval_json and os.path.exists(eval_json):
-            with open(eval_json) as _f:
-                ev = _json.load(_f)
-            summary["test_ADE"] = ev.get("ADE")
-            summary["test_ATE"] = ev.get("ATE")
-            summary["test_CTE"] = ev.get("CTE")
-            summary["test_RMSE"] = ev.get("RMSE")
-            summary["crps_mean"] = ev.get("crps", {}).get("mean")
-        with open(summary_path, "w") as _f:
-            _json.dump(summary, _f, indent=2)
-        print(f"\n  Summary → {summary_path}")
-        if summary.get("test_ADE"):
-            print(f"  ADE={summary['test_ADE']:.2f}  "
-                  f"ATE={summary['test_ATE']:.2f}  "
-                  f"CTE={summary['test_CTE']:.2f}")
-    except Exception as e:
-        print(f"  Summary save failed: {e}")
-
-    print("="*72)
-
 
 if __name__ == "__main__":
     args = get_args()
-    np.random.seed(42); torch.manual_seed(42)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(42)
+    np.random.seed(args.seed); torch.manual_seed(args.seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(args.seed)
     if args.dataset_root == "TCND_vn":
         _auto = "/kaggle/input/datasets/kaggle1234uitvn/tc-ofm"
         if os.path.isdir(_auto):
