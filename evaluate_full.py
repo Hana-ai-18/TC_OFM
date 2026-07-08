@@ -224,7 +224,8 @@ def run_full_evaluation(model, loader, device,
                          n_ensemble: int  = 20,
                          ema:        Optional[EMAModel] = None,
                          collect_samples: bool = True,
-                         use_curvature_score: bool = False) -> Dict:
+                         use_curvature_score: bool = False,
+                         ddim_steps: Optional[int] = None) -> Dict:
     """
     Full evaluation. Returns per-storm arrays for downstream analysis.
     collect_samples=True: collects K ensemble samples for CRPS (memory-intensive).
@@ -235,6 +236,18 @@ def run_full_evaluation(model, loader, device,
       already-trained checkpoint — no retraining needed. See
       flow_matching_model.py's _physics_score docstring for the full
       rationale.
+    ddim_steps: [MULTI-STEP, opt-in] number of Euler integration steps for
+      sampling, overriding the checkpoint's trained n_inference_steps
+      (default 1 — single-shot x0+v). This mechanism already existed in
+      sample() but was never exercised (default always 1). Multi-step
+      integration is the theoretically-correct way to sample a CFM model
+      (v was trained to be valid at every t via the OT linear-path target,
+      not just t=0), and may increase ensemble diversity/CRPS — but ONLY
+      if the velocity field is meaningfully sensitive to x at each step;
+      if v has collapsed to be nearly x-independent (suspected root cause
+      of the low Spread/Skill ratio), multi-step will improve per-sample
+      trajectory accuracy without necessarily improving diversity. Must be
+      measured empirically, not assumed. None = use checkpoint default (1).
     """
     bk = None
     if ema is not None:
@@ -281,7 +294,8 @@ def run_full_evaluation(model, loader, device,
         # ── Standard prediction (mean of top-K) ──────────────────────────
         try:
             pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble,
-                                           use_curvature_score=use_curvature_score)
+                                           use_curvature_score=use_curvature_score,
+                                           ddim_steps=ddim_steps)
         except Exception as e:
             print(f"  [batch {i+1}/{n_batches}] sample error: {e}"); continue
 
@@ -491,6 +505,150 @@ def run_full_evaluation(model, loader, device,
 # ─────────────────────────────────────────────────────────────────────────────
 #  Printing
 # ─────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def per_storm_breakdown(model, loader, device,
+                         n_ensemble: int = 20,
+                         use_curvature_score: bool = False) -> Dict[str, Dict]:
+    """
+    [DEBUG] CTE/ATE/ADE broken down by REAL STORM NAME (not just speed
+    bucket), to answer: "are 1-2 specific storms in the test set dragging
+    up mean CTE for this checkpoint, and are they the SAME storms across
+    seeds or different?"
+
+    Storm identity comes from the dataset's tyID field (info["old"] =
+    [year, storm_name, idx]), which seq_collate already passes through as
+    the LAST element of each batch (bl[15]) — untouched by move() since
+    it's a list of dicts, not a tensor. This was previously computed but
+    never surfaced in evaluate_full.py's output; nothing else changes.
+
+    Returns: {storm_name: {"n": int, "ade": [...], "ate": [...],
+                            "cte": [...], "obs_speed": [...], "year": [...]}}
+    One list entry per WINDOW belonging to that storm (a storm usually
+    spans multiple windows/sequences in the test set).
+    """
+    model.eval()
+    per_storm = defaultdict(lambda: {"n": 0, "ade": [], "ate": [], "cte": [],
+                                       "obs_speed": [], "year": []})
+
+    for batch in loader:
+        bl = move(list(batch), device)
+        gt = bl[1]
+        obs = bl[0]
+        try:
+            tyid_list = bl[15]
+        except IndexError:
+            print("  ⚠ per_storm_breakdown: batch has no tyID field "
+                  "(bl[15]) — dataset/collate version mismatch, skipping "
+                  "storm-name attribution for this batch.")
+            continue
+
+        obs_deg_i = _norm_to_deg(obs[:, :, :2])
+        gt_deg_i  = _norm_to_deg(gt[:, :, :2])
+        obs_spd_i = _obs_speed(obs_deg_i)
+
+        try:
+            pred, _, _ = model.sample(bl, num_ensemble=n_ensemble,
+                                       use_curvature_score=use_curvature_score)
+        except Exception as e:
+            print(f"  per_storm_breakdown: sample error: {e}"); continue
+
+        T  = min(pred.shape[0], gt.shape[0])
+        pd = _norm_to_deg(pred[:T])
+        gd = gt_deg_i[:T]
+        d  = _haversine_deg(pd, gd)                # [T, B]
+        ate, cte = _ate_cte_full(pd, gd)            # [T-1, B]
+
+        B = obs.shape[1]
+        for b in range(B):
+            info = tyid_list[b] if b < len(tyid_list) else None
+            if not isinstance(info, dict) or "old" not in info:
+                name = "UNKNOWN"; year = "?"
+            else:
+                year = str(info["old"][0])
+                name = str(info["old"][1])
+            key = f"{name}_{year}"
+            rec = per_storm[key]
+            rec["n"] += 1
+            rec["ade"].append(float(d[:, b].mean()))
+            rec["ate"].append(float(ate[:, b].abs().mean()) if ate.shape[0] > 0 else 0.0)
+            rec["cte"].append(float(cte[:, b].abs().mean()) if cte.shape[0] > 0 else 0.0)
+            rec["obs_speed"].append(float(obs_spd_i[b]))
+            rec["year"].append(year)
+
+    return dict(per_storm)
+
+
+def print_per_storm_breakdown(per_storm: Dict[str, Dict], sort_by: str = "cte"):
+    """Print storms sorted by mean CTE descending — worst offenders first."""
+    if not per_storm:
+        print("  ⚠ No per-storm data (tyID unavailable or no batches processed)")
+        return
+    rows = []
+    for name, rec in per_storm.items():
+        if rec["n"] == 0:
+            continue
+        rows.append((
+            name, rec["n"],
+            float(np.mean(rec["ade"])), float(np.mean(rec["ate"])),
+            float(np.mean(rec["cte"])), float(np.mean(rec["obs_speed"])),
+        ))
+    idx = {"cte": 4, "ate": 3, "ade": 2}.get(sort_by, 4)
+    rows.sort(key=lambda r: r[idx], reverse=True)
+
+    print(f"\n  {'='*78}")
+    print(f"  PER-STORM BREAKDOWN (sorted by {sort_by.upper()}, worst first)")
+    print(f"  {'='*78}")
+    print(f"  {'Storm':<20} {'n':>4} {'ADE':>8} {'ATE':>8} {'CTE':>8} {'ObsSpd':>8}")
+    print(f"  {'-'*78}")
+    for name, n, ade, ate, cte, spd in rows:
+        print(f"  {name:<20} {n:>4} {ade:>8.1f} {ate:>8.1f} {cte:>8.1f} {spd:>8.1f}")
+    print(f"  {'='*78}\n")
+
+
+def compare_per_storm_across_checkpoints(results_by_seed: Dict[str, Dict[str, Dict]]):
+    """
+    [DEBUG] Side-by-side CTE per storm across multiple seeds/checkpoints,
+    to directly answer: "is the SAME storm bad for seed 0/1/2 but good for
+    seed 42, or is it different storms each time (i.e. no consistent
+    culprit — just aggregate variance)?"
+
+    results_by_seed: {"42": per_storm_dict_42, "0": per_storm_dict_0, ...}
+    """
+    all_storms = set()
+    for d in results_by_seed.values():
+        all_storms.update(d.keys())
+    seeds = list(results_by_seed.keys())
+
+    print(f"\n  {'='*100}")
+    print(f"  CROSS-SEED PER-STORM CTE COMPARISON")
+    print(f"  {'='*100}")
+    header = f"  {'Storm':<20}" + "".join(f"{'seed='+s:>14}" for s in seeds) + f"{'spread':>10}"
+    print(header)
+    print(f"  {'-'*100}")
+
+    rows = []
+    for storm in sorted(all_storms):
+        vals = []
+        for s in seeds:
+            rec = results_by_seed[s].get(storm)
+            vals.append(float(np.mean(rec["cte"])) if rec and rec["n"] > 0 else None)
+        valid = [v for v in vals if v is not None]
+        spread = (max(valid) - min(valid)) if len(valid) >= 2 else 0.0
+        rows.append((storm, vals, spread))
+
+    # Sort by spread descending — storms with the most seed-to-seed
+    # disagreement first (these are the "culprits" worth investigating).
+    rows.sort(key=lambda r: r[2], reverse=True)
+    for storm, vals, spread in rows:
+        val_str = "".join(f"{v:>14.1f}" if v is not None else f"{'---':>14}" for v in vals)
+        print(f"  {storm:<20}{val_str}{spread:>10.1f}")
+    print(f"  {'='*100}")
+    print(f"  Sorted by spread (max-min CTE across seeds) descending — top rows are")
+    print(f"  storms where checkpoints disagree most; these are the strongest")
+    print(f"  candidates for a genuine per-storm-difficulty explanation of the")
+    print(f"  aggregate CTE gap, as opposed to uniform variance across all storms.\n")
+
 
 def print_full_results(r: Dict, st_trans: Dict = ST_TRANS):
     n = r.get("n", 0)
@@ -782,6 +940,16 @@ def main():
                         "inference-time change on an already-trained "
                         "checkpoint — no retraining needed. Default False "
                         "preserves prior behavior exactly.")
+    p.add_argument("--ddim_steps", type=int, default=None,
+                   help="[MULTI-STEP, opt-in] Number of Euler integration "
+                        "steps for sampling (overrides checkpoint's "
+                        "n_inference_steps, default 1 = single-shot x0+v). "
+                        "Try e.g. 4, 8, 16 to test whether multi-step "
+                        "integration improves ensemble diversity (CRPS, "
+                        "Spread/Skill ratio) on an EXISTING checkpoint — "
+                        "no retraining needed. Effect is NOT guaranteed; "
+                        "measure and compare against the default before "
+                        "relying on it. None = use checkpoint default (1).")
     p.add_argument("--case_studies", action="store_true", default=True,
                    help="Collect case study data")
     p.add_argument("--n_cases",      type=int, default=6)
@@ -792,6 +960,13 @@ def main():
                    help="Run sigma_inference sensitivity analysis (reviewer ablation)")
     p.add_argument("--ensemble_ablation",  action="store_true", default=False,
                    help="Run ensemble size K ablation (K=1,3,5,10,20,40)")
+    p.add_argument("--per_storm",         action="store_true", default=False,
+                   help="[DEBUG] Break down ADE/ATE/CTE by real storm name "
+                        "(from dataset tyID) instead of only speed/intensity "
+                        "buckets. Prints storms sorted by CTE, worst first. "
+                        "Also saves per_storm_<split>_ep<N>.json for "
+                        "cross-checkpoint comparison (see compare_seeds.py "
+                        "usage in this file's docstring / README).")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -881,6 +1056,7 @@ def main():
         ema=ema,
         collect_samples=not args.no_crps,
         use_curvature_score=args.use_curvature_score,
+        ddim_steps=args.ddim_steps,
     )
 
     # Print
@@ -946,6 +1122,28 @@ def main():
         ens_results = ensemble_size_eval(model, loader, device,
                                           k_values=[1, 3, 5, 10, 20, 40])
         result["ensemble_ablation"] = ens_results
+
+    # ── Per-storm breakdown (nếu được yêu cầu) ─────────────────────────────
+    if args.per_storm:
+        print(f"\n  Running per-storm breakdown (by real storm name)...")
+        ps = per_storm_breakdown(model, loader, device,
+                                  n_ensemble=args.n_ensemble,
+                                  use_curvature_score=args.use_curvature_score)
+        print_per_storm_breakdown(ps, sort_by="cte")
+        # Saved SEPARATELY (not nested in the main eval JSON) so
+        # compare_per_storm_across_checkpoints() can load several of these
+        # by path and diff them across seeds/checkpoints directly.
+        ps_summary = {name: {"n": rec["n"],
+                              "ade": float(np.mean(rec["ade"])),
+                              "ate": float(np.mean(rec["ate"])),
+                              "cte": float(np.mean(rec["cte"])),
+                              "obs_speed": float(np.mean(rec["obs_speed"]))}
+                      for name, rec in ps.items() if rec["n"] > 0}
+        ps_path = os.path.join(args.output_dir,
+                                f"per_storm_{args.split}_ep{ep}.json")
+        with open(ps_path, "w") as f:
+            json.dump(ps_summary, f, indent=2)
+        print(f"  Saved per-storm breakdown → {ps_path}")
 
     # ── Save ────────────────────────────────────────────────────────────────
     out_path = os.path.join(args.output_dir,
