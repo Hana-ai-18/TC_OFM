@@ -223,10 +223,18 @@ def run_full_evaluation(model, loader, device,
                          tag:        str  = "TEST",
                          n_ensemble: int  = 20,
                          ema:        Optional[EMAModel] = None,
-                         collect_samples: bool = True) -> Dict:
+                         collect_samples: bool = True,
+                         use_curvature_score: bool = False) -> Dict:
     """
     Full evaluation. Returns per-storm arrays for downstream analysis.
     collect_samples=True: collects K ensemble samples for CRPS (memory-intensive).
+    use_curvature_score: [CURV-SCORE, opt-in] passed through to model.sample()
+      — re-ranks the K sampled candidates by how well their turning rate
+      matches the storm's OBSERVED turning rate, in addition to the 4
+      existing physics-score components. Pure inference-time change on an
+      already-trained checkpoint — no retraining needed. See
+      flow_matching_model.py's _physics_score docstring for the full
+      rationale.
     """
     bk = None
     if ema is not None:
@@ -272,7 +280,8 @@ def run_full_evaluation(model, loader, device,
 
         # ── Standard prediction (mean of top-K) ──────────────────────────
         try:
-            pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble)
+            pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble,
+                                           use_curvature_score=use_curvature_score)
         except Exception as e:
             print(f"  [batch {i+1}/{n_batches}] sample error: {e}"); continue
 
@@ -765,6 +774,14 @@ def main():
     p.add_argument("--no_ema",       action="store_true")
     p.add_argument("--no_crps",      action="store_true",
                    help="Skip CRPS computation (faster)")
+    p.add_argument("--use_curvature_score", action="store_true", default=False,
+                   help="[CURV-SCORE, opt-in] Re-rank sampled candidates by "
+                        "how well their turning rate matches the storm's "
+                        "OBSERVED turning rate (in addition to the 4 "
+                        "existing physics-score components). Pure "
+                        "inference-time change on an already-trained "
+                        "checkpoint — no retraining needed. Default False "
+                        "preserves prior behavior exactly.")
     p.add_argument("--case_studies", action="store_true", default=True,
                    help="Collect case study data")
     p.add_argument("--n_cases",      type=int, default=6)
@@ -863,6 +880,7 @@ def main():
         n_ensemble=args.n_ensemble,
         ema=ema,
         collect_samples=not args.no_crps,
+        use_curvature_score=args.use_curvature_score,
     )
 
     # Print
