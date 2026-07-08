@@ -723,7 +723,34 @@ def print_full_results(r: Dict, st_trans: Dict = ST_TRANS):
     if crps:
         print(f"  CRPS mean={crps.get('mean',float('nan')):.2f}km  "
               f"spread_mean={crps.get('spread_mean',float('nan')):.2f}km")
+        spread_ps = crps.get("spread_per_step", [])
+        dist_ps   = r.get("dist_per_step_mean", [])
         ss = crps.get("spread_skill_ratio", [])
+        if spread_ps:
+            # [DEBUG] Raw spread (km) and skill (km, = actual mean error at
+            # that step) per horizon, not just the ratio. Distinguishes two
+            # hypotheses for why Spread/Skill ratio decreases over horizon:
+            #  (a) spread itself barely grows with horizon (flat) while
+            #      skill grows fast -> points to loss imbalance / reg_step_
+            #      logits underweighting far horizons (L_reg, which
+            #      dominates L_cfm ~15-20x, gets only ~7-13% of its already-
+            #      small attention on horizons 8-12/30h-72h — see
+            #      flow_matching_model.py's reg_step_logits docstring).
+            #  (b) spread DOES grow with horizon but proportionally slower
+            #      than skill -> more consistent with sigma_inference being
+            #      too small to seed enough divergence in the first place.
+            # Both could be partially true; this print is the evidence
+            # needed to judge which dominates before deciding whether to
+            # spend a full retrain on Hướng 1 (sigma) vs Hướng 3 (loss
+            # rebalance, e.g. --log_sigma_reg_min_clamp).
+            hz_spread = {h: spread_ps[s] if s < len(spread_ps) else float("nan")
+                         for h, s in HORIZONS.items()}
+            hz_skill  = {h: dist_ps[s] if s < len(dist_ps) else float("nan")
+                         for h, s in HORIZONS.items()}
+            print(f"  Spread (km) by horizon: " +
+                  "  ".join(f"{h}={v:.1f}" for h, v in hz_spread.items()))
+            print(f"  Skill  (km) by horizon: " +
+                  "  ".join(f"{h}={v:.1f}" for h, v in hz_skill.items()))
         if ss:
             hz_ss = {h: ss[s] if s < len(ss) else float("nan")
                      for h, s in HORIZONS.items()}
