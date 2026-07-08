@@ -1,4 +1,3 @@
-
 """
 scripts/visual_evaluate_model_Me_v13.py
 ========================================
@@ -887,7 +886,7 @@ def visualize_forecast(args):
         errors_km=errors_km,
         title=(
             f"🌀 {t_name}  —  {fh}h FC  |  FM+PINN v13"
-            f"  (ens={args.num_ensemble}){snap_note}"
+            f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}){snap_note}"
         ),
         dt_str=dt_str,
     )
@@ -973,7 +972,7 @@ def visualize_case_study(args):
             obs_deg, gt_deg, pred_deg, pred_Me_n,
             all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
             errors_km=errors_km,
-            title=f"[{label}]  {t_name}{snap_note}",
+            title=f"[{label}]  {t_name}  (ode_steps={args.ode_steps}){snap_note}",
             dt_str=dt_str,
         )
         plot_spread_over_time(ax_err, ens_deg, errors_km, cliper_err, t_name)
