@@ -101,7 +101,8 @@ def _ate_cte(pred_deg, gt_deg):
 #  2-group optimizer (encoder freeze pattern from v2.1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_optimizer(model, lr_velocity, lr_encoder, weight_decay):
+def build_optimizer(model, lr_velocity, lr_encoder, weight_decay,
+                     lr_logits_scale: float = 0.2):
     raw = _unwrap(model)
 
     # [CRITICAL FIX] v2.1-learn thêm 7 nhóm nn.Parameter trực tiếp trên
@@ -121,23 +122,73 @@ def build_optimizer(model, lr_velocity, lr_encoder, weight_decay):
     # (set difference) làm group thứ 3 — cách này tự động cover MỌI
     # tham số mới thêm sau này vào TCFlowMatching mà không cần liệt kê
     # tên cụ thể, tránh lặp lại lỗi tương tự nếu code model còn đổi nữa.
+    #
+    # [VAR-REDUCE v2, THỬ NGHIỆM — giả thuyết chưa chứng minh chặt, xem dưới]
+    # SPLIT thêm learnable_extra thành 2 group:
+    #   - "softmax_logits" (reg_step_logits, hard_score_weight_logits,
+    #     heading_step_logits): các softmax nhỏ (4-12 chiều), khởi tạo
+    #     GIỐNG HỆT NHAU mọi seed (zeros hoặc hằng số cố định — xem model.py,
+    #     đã verify qua code, không phải suy đoán).
+    #     QUAN SÁT: qua 4 lần train độc lập (seed 42/0/1/2), 72h heading
+    #     deviation (đo trên 1 batch XAI cố định, KHÔNG phải test set) chia
+    #     thành 2 cụm — {42,1}≈107° thấp hơn {0,2}≈118° — tương quan với
+    #     test CTE ở r=0.811 (n=4). ĐÂY LÀ TƯƠNG QUAN ĐÁNG CHÚ Ý NHƯNG CHƯA
+    #     ĐỦ MẠNH để khẳng định chắc chắn (cần |r|>0.95 với n=4 mới coi là
+    #     gần chắc chắn không phải trùng hợp ngẫu nhiên) — coi đây là GIẢ
+    #     THUYẾT đáng thử nghiệm, không phải nguyên nhân đã xác định.
+    #     reg_step_logits có ramp GIÁN TIẾP qua ramp_reg (ep10→30, xem
+    #     get_loss_breakdown) — cửa sổ gradient-mạnh-sớm là ep10-30, KHÔNG
+    #     phải ep0-2. Cơ chế rủi ro: softmax không có ràng buộc tốc độ thay
+    #     đổi; một chênh lệch gradient nhỏ trong cửa sổ ep10-30 (do random
+    #     init của TOÀN mạng, không phải của chính logits) có thể bị khuếch
+    #     đại qua softmax trước khi tín hiệu tích lũy nhiều epoch kịp điều
+    #     chỉnh.
+    #     FIX (thử nghiệm): KHÔNG ép giá trị đích về uniform (đã thử ở
+    #     hard_score_weight_logits — làm chậm cả model, ADE/ATE tệ hơn vì
+    #     early-horizon/dễ-học THẬT SỰ xứng đáng trọng số cao hơn, ép
+    #     uniform chống lại tín hiệu thật). Thay vào đó CHỈ giảm LR cho
+    #     riêng nhóm này (mặc định x0.2 so với velocity) — logits vẫn tự do
+    #     hội tụ về BẤT KỲ đích nào tín hiệu thật dẫn tới, chỉ di chuyển
+    #     CHẬM HƠN. speed_correction_logits KHÔNG đưa vào nhóm này: nó dùng
+    #     sigmoid (độc lập từng phần tử) chứ không phải softmax (ràng buộc
+    #     tổng=1 giữa các phần tử) — không có cùng cơ chế khuếch đại lẫn
+    #     nhau nên không có cùng loại rủi ro.
+    #   - "learnable_extra" (mọi thứ còn lại: speed_correction_logits,
+    #     log_sigma_*): giữ nguyên LR như cũ, không đổi hành vi.
     encoder_ids  = {id(p) for p in raw.encoder.parameters()}
     velocity_ids = {id(p) for p in raw.velocity.parameters()}
     covered_ids  = encoder_ids | velocity_ids
-    other_params = [p for p in raw.parameters() if id(p) not in covered_ids]
+
+    softmax_logit_names = {"reg_step_logits", "hard_score_weight_logits",
+                            "heading_step_logits"}
+    softmax_logit_params, rest_extra_params = [], []
+    for name, p in raw.named_parameters():
+        if id(p) in covered_ids:
+            continue
+        short = name.rsplit(".", 1)[-1]
+        (softmax_logit_params if short in softmax_logit_names
+         else rest_extra_params).append(p)
 
     groups = [
         {"params": list(raw.encoder.parameters()),  "lr": lr_encoder,  "name": "encoder"},
         {"params": list(raw.velocity.parameters()), "lr": lr_velocity, "name": "velocity"},
     ]
-    if len(other_params) > 0:
+    if len(rest_extra_params) > 0:
         # Cùng lr với velocity: các tham số này tham gia trực tiếp vào
         # loss giống velocity (qua L_reg/L_heading/L_calib), không có lý
         # do để đóng băng theo encoder-freeze schedule.
-        groups.append({"params": other_params, "lr": lr_velocity, "name": "learnable_extra"})
-        print(f"  [build_optimizer] learnable_extra group: {len(other_params)} tensors "
-              f"({sum(p.numel() for p in other_params)} params) — "
-              f"speed_correction/reg_step/hard_score/heading_step/log_sigma*")
+        groups.append({"params": rest_extra_params, "lr": lr_velocity, "name": "learnable_extra"})
+        print(f"  [build_optimizer] learnable_extra group: {len(rest_extra_params)} tensors "
+              f"({sum(p.numel() for p in rest_extra_params)} params) — "
+              f"speed_correction/log_sigma*")
+    if len(softmax_logit_params) > 0:
+        groups.append({"params": softmax_logit_params,
+                        "lr": lr_velocity * lr_logits_scale,
+                        "name": "softmax_logits"})
+        print(f"  [build_optimizer] softmax_logits group: {len(softmax_logit_params)} tensors "
+              f"({sum(p.numel() for p in softmax_logit_params)} params) — "
+              f"reg_step/hard_score/heading_step @ lr×{lr_logits_scale} "
+              f"(slower convergence, less seed-init sensitivity)")
 
     return optim.AdamW(groups, weight_decay=weight_decay)
 
@@ -159,6 +210,18 @@ class TwoGroupScheduler:
         self.lr_enc_peak = lr_enc_peak
         self.enc_warmup  = encoder_warmup_epochs
         self.epoch       = 0
+        # [VAR-REDUCE v2 FIX] Without this, .step() below would overwrite
+        # EVERY non-"encoder" group's lr with lr_vel every epoch — silently
+        # erasing build_optimizer's lr_logits_scale after epoch 1 (the
+        # "softmax_logits" group's LR would only differ from velocity's for
+        # the very first .step() call, then get reset to lr_vel forever).
+        # Record each group's ORIGINAL ratio to lr_vel at construction time,
+        # so .step() can rescale proportionally instead of overwriting.
+        self._lr_ratio = {}
+        for pg in self.opt.param_groups:
+            name = pg.get("name")
+            if name not in (None, "encoder"):
+                self._lr_ratio[name] = pg["lr"] / lr_vel if lr_vel > 0 else 1.0
 
     def _cosine(self, ep_from, ep_to, lr_s, lr_e, ep):
         t = max(0., min(1., (ep - ep_from) / max(ep_to - ep_from, 1)))
@@ -178,7 +241,17 @@ class TwoGroupScheduler:
             lr_enc = self._cosine(self.freeze_end + self.enc_warmup, self.total,
                                   self.lr_enc_peak, self.lr_vel_min, ep)
         for pg in self.opt.param_groups:
-            pg["lr"] = lr_enc if pg.get("name") == "encoder" else lr_vel
+            name = pg.get("name")
+            if name == "encoder":
+                pg["lr"] = lr_enc
+            elif name in self._lr_ratio:
+                # Preserve this group's original ratio to lr_vel (e.g.
+                # softmax_logits at lr_logits_scale=0.2) through the same
+                # cosine schedule velocity follows, instead of resetting to
+                # lr_vel outright.
+                pg["lr"] = lr_vel * self._lr_ratio[name]
+            else:
+                pg["lr"] = lr_vel
         self.epoch += 1
         return lr_vel, lr_enc
 
@@ -616,6 +689,19 @@ def get_args():
     p.add_argument("--num_epochs",             default=150,    type=int)
     p.add_argument("--batch_size",             default=64,     type=int)
     p.add_argument("--lr",                     default=2e-4,   type=float)
+    p.add_argument("--lr_logits_scale",        default=0.2,    type=float,
+                   help="[VAR-REDUCE v2] LR multiplier (vs --lr) for the "
+                        "small softmax logits (reg_step_logits, "
+                        "hard_score_weight_logits, heading_step_logits). "
+                        "Slower convergence for these reduces how much a "
+                        "seed's early-training noise can lock them into an "
+                        "extreme configuration before the true signal "
+                        "(accumulated over many epochs) has a chance to "
+                        "shape them — without pulling their VALUE toward "
+                        "uniform (that was tried on hard_score_weight_logits "
+                        "and hurt ADE/ATE by fighting the genuine easier-to"
+                        "-learn-early-horizon signal). 1.0 = old behavior "
+                        "(same LR as velocity, i.e. disabled).")
     p.add_argument("--lr_min",                 default=1e-6,   type=float)
     p.add_argument("--warmup_epochs",          default=5,      type=int)
     p.add_argument("--weight_decay",           default=1e-4,   type=float)
@@ -865,7 +951,8 @@ def main(args):
 
     # ── Optimizer + Scheduler ─────────────────────────────────────────────
     opt    = build_optimizer(model, lr_velocity=args.lr, lr_encoder=0.0,
-                             weight_decay=args.weight_decay)
+                             weight_decay=args.weight_decay,
+                             lr_logits_scale=args.lr_logits_scale)
     scaler = GradScaler("cuda", enabled=args.use_amp)
     sched  = TwoGroupScheduler(
         opt=opt, warmup_epochs=args.warmup_epochs, total_epochs=args.num_epochs,

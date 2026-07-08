@@ -507,19 +507,15 @@ def hard_score_from_obs(obs_traj_norm: torch.Tensor,
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
-                    use_curvature_score: bool = False) -> torch.Tensor:
+def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Tensor:
     """
-    Best-of-K selection score. Four components (five when
-    use_curvature_score=True):
-      speed_score       : per-step speed vs obs reference
-      smooth_score       : trajectory smoothness (no sharp acceleration)
-      heading_score      : first-step direction matches obs
-      displacement_score : total path length consistent with obs speed
-      curvature_score    : [CURV-SCORE, opt-in] candidate's turning rate
-                            matches the storm's OBSERVED turning rate
+    Best-of-K selection score. Four components:
+      speed_score       (0.30): per-step speed vs obs reference
+      smooth_score      (0.25): trajectory smoothness (no sharp acceleration)
+      heading_score     (0.30): first-step direction matches obs
+      displacement_score(0.15): total path length consistent with obs speed
 
-    [v2.1-learn QUYẾT ĐỊNH] KHÔNG biến 4 exponent gốc thành learnable.
+    [v2.1-learn QUYẾT ĐỊNH] KHÔNG biến 4 exponent này thành learnable.
     Lý do: hàm này chạy dưới @torch.no_grad() để CHỌN trong số K candidates
     sinh từ CÙNG MỘT velocity network — đây là post-hoc re-ranking, không
     nằm trên đường gradient nào quay lại network hay bất kỳ tham số nào
@@ -530,21 +526,6 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     (vd qua REINFORCE / Gumbel-softmax cho discrete selection) — phạm vi
     đó rủi ro cao hơn lợi ích đo được, nên giữ nguyên 4 hằng số đã proven
     qua thực nghiệm thay vì đoán thêm một cơ chế chưa kiểm chứng.
-
-    [CURV-SCORE] Motivation: head_score above only checks the FIRST
-    predicted step's direction against the last observed vector — it is
-    blind to whether the candidate's curvature over the FULL horizon
-    matches the storm's actual recent turning behavior. smooth_score
-    actively penalizes ANY turning (favors straight paths), which works
-    AGAINST correctly-recurving candidates for storms that are genuinely
-    turning. This is a DIFFERENT, complementary signal: it does not ask
-    "is this candidate smooth" or "does step 0 match", it asks "does this
-    candidate's turning RATE match what the storm was ALREADY doing in
-    the observed history" — extrapolating observed curvature rather than
-    assuming straight-line motion. This is a pure INFERENCE-TIME re-ranking
-    change (no gradient, no effect on what the network learned), so it can
-    be A/B tested directly on existing checkpoints without retraining.
-    Opt-in (default False) to keep the proven 4-component score as default.
     """
     B      = traj_norm.shape[1]
     device = traj_norm.device
@@ -586,38 +567,6 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     else:
         head_score = torch.ones(B, device=device)
 
-    # ── Curvature score [CURV-SCORE, opt-in] ─────────────────────────────
-    # Estimate the storm's OBSERVED turning rate from its last 3 observed
-    # points, then check whether the candidate's OWN turning rate (over its
-    # full predicted horizon, near-term steps weighted more heavily since
-    # extrapolated curvature degrades further out) matches it. Unlike
-    # smooth_score, a candidate that turns AT THE SAME RATE the storm was
-    # already turning scores HIGH here, not low.
-    if use_curvature_score and obs_norm.shape[0] >= 3 and traj_deg.shape[0] >= 2:
-        obs_deg_c  = _norm_to_deg(obs_norm)
-        bear_obs_1 = _forward_azimuth(obs_deg_c[-3], obs_deg_c[-2])
-        bear_obs_2 = _forward_azimuth(obs_deg_c[-2], obs_deg_c[-1])
-        obs_turn_rate = ((bear_obs_2 - bear_obs_1 + 180.0) % 360.0) - 180.0   # [B], deg/step
-
-        bear0 = _forward_azimuth(obs_deg_c[-1], traj_deg[0])
-        if traj_deg.shape[0] >= 2:
-            chain = [_forward_azimuth(traj_deg[t], traj_deg[t + 1])
-                     for t in range(traj_deg.shape[0] - 1)]
-            pred_bears = torch.stack([bear0] + chain, 0)   # [T, B]
-        else:
-            pred_bears = bear0.unsqueeze(0)
-
-        if pred_bears.shape[0] >= 2:
-            pred_turn = ((pred_bears[1:] - pred_bears[:-1] + 180.0) % 360.0) - 180.0  # [T-1, B]
-            Tc = pred_turn.shape[0]
-            w_curv = torch.linspace(1.0, 0.3, Tc, device=device).unsqueeze(1)
-            turn_err = ((pred_turn - obs_turn_rate.unsqueeze(0)).abs() * w_curv).sum(0) / w_curv.sum()
-            curvature_score = torch.exp(-turn_err / 15.0)   # 15 deg/step soft scale
-        else:
-            curvature_score = torch.ones(B, device=device)
-    else:
-        curvature_score = torch.ones(B, device=device)
-
     # ── Displacement score ──────────────────────────────────────────────
     # Expected total path length ≈ obs_speed × T_pred × DT × 0.75
     # (0.75 factor: storms curve, so straight-line < path length estimate)
@@ -631,16 +580,6 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
     else:
         disp_score    = torch.ones(B, device=device)
 
-    if use_curvature_score:
-        # Rebalanced to make room for curvature_score (still sums to 1.00):
-        # speed 0.30->0.25, smooth 0.25->0.20, head 0.30->0.25, disp 0.15->0.10,
-        # curvature gets 0.20 (comparable weight to smooth_score, its
-        # natural "opposing force" for genuinely-turning storms).
-        return (speed_score.pow(0.25)
-                * smooth_score.pow(0.20)
-                * head_score.pow(0.25)
-                * disp_score.pow(0.10)
-                * curvature_score.pow(0.20)).clamp(min=1e-6)
     return (speed_score.pow(0.30)
             * smooth_score.pow(0.25)
             * head_score.pow(0.30)
@@ -927,8 +866,6 @@ class TCFlowMatching(nn.Module):
         lambda_heading:    float = 0.07,   # reduced: gradient scale balance with L_CFM
         lambda_momentum:   float = 0.0,    # DISABLED — field kept for compat only
         lambda_calib:      float = 0.1,    # [LEARN-1] weight of L_calib term
-        lambda_hard_reg:   float = 0.02,   # [VAR-REDUCE] pull hard_score_weight_logits
-                                            # toward uniform — see docstring below
         use_ot:            bool  = True,
         ot_epsilon:        float = 0.05,
         use_ema:           bool  = True,
@@ -947,14 +884,6 @@ class TCFlowMatching(nn.Module):
         self.lambda_heading     = lambda_heading
         self.lambda_momentum    = 0.0           # always disabled
         self.lambda_calib       = lambda_calib
-        # [VAR-REDUCE] Fixed (NOT Kendall-learned) coefficient for the
-        # hard_score_weight_logits regularizer — see get_loss_breakdown for
-        # the term itself and rationale. Must stay fixed/unlearned: if this
-        # were Kendall-weighted like L_reg/L_heading/L_calib, the model
-        # could learn a very negative log_sigma for it and effectively
-        # disable its own constraint — defeating the purpose of a
-        # regularizer meant to CONSTRAIN what the model would otherwise do.
-        self.lambda_hard_reg    = lambda_hard_reg
         self.use_ot              = use_ot
         self.ot_epsilon          = ot_epsilon
         self.n_inference_steps   = n_inference_steps
@@ -1163,36 +1092,6 @@ class TCFlowMatching(nn.Module):
                                        weight_logits=self.hard_score_weight_logits)
         cond    = self.encoder(batch_list, hard_score=h_score)
 
-        # [VAR-REDUCE] L2 penalty pulling hard_score_weight_logits' softmax
-        # distribution toward UNIFORM [0.25,0.25,0.25,0.25] over its 4
-        # components (curvature, speed_var, dir_change, obs_speed_norm).
-        #
-        # WHY: across 3 independent seed runs (seed42/1/2, same architecture,
-        # same hyperparameters, only RNG differs) — confirmed directly from
-        # seed_1.txt / seed_2.txt training logs — this 4-way softmax
-        # collapses onto 'curvature' at very different rates depending on
-        # seed. AT THE SAME EPOCH (130), ruling out "just trained longer":
-        #   seed42: curv=0.739  spdvar=0.025  obsspd=0.013  -> test CTE=58.4
-        #   seed1:  curv=0.843  spdvar=0.013  obsspd=0.007  -> test CTE=61.3
-        #   seed2:  curv=0.875  spdvar=0.011  obsspd=0.006  -> test CTE=67.1
-        # More collapse (curv higher, obs_speed_norm/speed_var lower)
-        # correlates monotonically with WORSE test CTE. Since obs_speed_norm
-        # feeds directly into which storms get upweighted by hard_score
-        # (fast storms cause 62% of total CTE per this file's own XAI-9
-        # analysis), a seed that lets this collapse early and hard ends up
-        # systematically deprioritizing exactly the storms CTE most depends
-        # on — a genuine, identified source of seed-to-seed CTE variance.
-        #
-        # FIX: a light, FIXED-weight (not Kendall-learned — see constructor
-        # comment) L2 penalty on the softmax distribution itself. This
-        # dampens how far ANY seed's early gradient is allowed to push this
-        # collapse, without touching any per-metric (ADE/ATE/CTE) loss term
-        # — it regularizes the MECHANISM shown to drive the variance,
-        # staying general rather than metric-specific.
-        hard_dist    = F.softmax(self.hard_score_weight_logits, dim=0)  # [4]
-        hard_uniform = hard_dist.new_full((4,), 0.25)
-        l_hard_reg   = ((hard_dist - hard_uniform) ** 2).sum()
-
         # ── L_CFM ─────────────────────────────────────────────────────────
         x0 = torch.randn_like(x1_rel) * sigma
         if self.use_ot and B >= 4:
@@ -1283,13 +1182,7 @@ class TCFlowMatching(nn.Module):
         weighted_heading = ramp_dir    * (0.5 * prec_heading * l_heading + self.log_sigma_heading.clamp(min=-3.0) + HALF_LOG_2PI)
         weighted_calib   = ramp_calib  * (0.5 * prec_calib   * l_calib   + self.log_sigma_calib.clamp(min=-3.0)   + HALF_LOG_2PI)
 
-        # [VAR-REDUCE] fixed weight, no ramp (regularizes the collapse from
-        # epoch 0, since the divergence between seeds is already visible by
-        # epoch 20-30 — waiting to ramp it in would be too late), no Kendall
-        # (must stay a genuine constraint, not something the model can
-        # learn to switch off).
-        total = (l_cfm + weighted_reg + weighted_heading + weighted_calib
-                  + self.lambda_hard_reg * l_hard_reg)
+        total = l_cfm + weighted_reg + weighted_heading + weighted_calib
         if not torch.isfinite(total):
             total = x0.new_zeros(())
 
@@ -1308,18 +1201,6 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
-            "l_hard_reg": l_hard_reg.item(),
-            "hard_dist": hard_dist.detach().tolist(),
-            "lambda_hard_reg": self.lambda_hard_reg,
-            # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
-            # A wrapper that rebuilds `total` from the .item() floats above would
-            # sever the autograd graph and train nothing but the Kendall log_sigma*
-            # params. Use these instead when zeroing a term for an ablation run.
-            "_t_l_cfm":      l_cfm,
-            "_t_l_reg":      l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
-            "_t_l_heading":  l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
-            "_t_l_calib":    l_calib,
-            "_t_l_hard_reg": l_hard_reg,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,
@@ -1395,7 +1276,6 @@ class TCFlowMatching(nn.Module):
                ddim_steps:            Optional[int]  = None,
                return_xai:            bool           = False,
                use_speed_calibration: bool           = True,
-               use_curvature_score:   bool           = False,
                **kwargs) -> Tuple:
         """
         1-shot inference with physics selection + learnable speed calibration.
@@ -1403,18 +1283,10 @@ class TCFlowMatching(nn.Module):
         Steps:
           1. Encode context once (hard_score + full encoder)
           2. Sample K=20 candidates: x0 ~ N(0, sigma_inf²), x_pred = x0 + v(x0, 0, cond)
-          3. Physics score each candidate (speed+smooth+heading+displacement
-             [+curvature if use_curvature_score=True])
+          3. Physics score each candidate (speed+smooth+heading+displacement)
           4. Weighted average of top-3 candidates
           5. Speed calibration per-horizon (LEARNED, not fixed clip)
           6. If return_xai=True: compute XAI-1 through XAI-9
-
-        use_curvature_score: [CURV-SCORE, opt-in, default False] adds a 5th
-          re-ranking component that favors candidates whose turning rate
-          matches the storm's OBSERVED turning rate, rather than only
-          checking step-0 direction (head_score) or penalizing all turning
-          (smooth_score). Pure inference-time change — no retraining needed,
-          can be A/B tested directly on any existing checkpoint.
 
         Returns:
           (pred_mean [T,B,2], zeros [T,B,2], all_traj [K,T,B,2])
@@ -1451,9 +1323,7 @@ class TCFlowMatching(nn.Module):
             x_abs = self._from_relative(x_rel, last_obs)
             all_traj.append(x_abs.permute(1, 0, 2))   # [T, B, 2]
 
-        scores  = torch.stack(
-            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
-             for t in all_traj], 0)   # [K, B]
+        scores  = torch.stack([_physics_score(t, obs_norm) for t in all_traj], 0)   # [K, B]
         all_t   = torch.stack(all_traj, 0)   # [K, T, B, 2]
         top_k   = min(3, K)
         top_idx = scores.topk(top_k, dim=0).indices   # [top_k, B]
@@ -1601,7 +1471,6 @@ class TCFlowMatching(nn.Module):
         sigmas: Optional[List[float]] = None,
         n_per_sigma: int = 4,
         use_speed_calibration: bool = True,
-        use_curvature_score:   bool = False,
     ) -> Tuple:
         """
         Multi-scale sigma ensemble at inference (DOES NOT affect training).
@@ -1628,9 +1497,7 @@ class TCFlowMatching(nn.Module):
                 x_abs = self._from_relative(x0 + v, last_obs)
                 all_traj.append(x_abs.permute(1, 0, 2))
 
-        scores  = torch.stack(
-            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
-             for t in all_traj], 0)
+        scores  = torch.stack([_physics_score(t, obs_norm) for t in all_traj], 0)
         all_t   = torch.stack(all_traj, 0)
         top_k   = min(5, len(all_traj))
         top_idx = scores.topk(top_k, dim=0).indices

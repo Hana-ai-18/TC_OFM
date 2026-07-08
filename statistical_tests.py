@@ -70,8 +70,9 @@ def wilcoxon_test(x: np.ndarray, y: np.ndarray,
         "statistic": float(stat),
         "p_value":   float(p),
         "n":         int(len(diff_nonzero)),
-        "significant_0.05": p < 0.05,
-        "significant_0.01": p < 0.01,
+        "significant":      bool(p < 0.05),
+        "significant_0.05": bool(p < 0.05),
+        "significant_0.01": bool(p < 0.01),
     }
 
 
@@ -281,9 +282,15 @@ def load_from_json(path: str) -> Dict[str, np.ndarray]:
         errors["ADE"] = np.array(data["boxplot_ade"])
     elif "ADE" in data and data["ADE"] == data["ADE"]:  # not NaN
         errors["ADE"] = np.array([data["ADE"]])
-    # ATE, CTE: try to reconstruct from per-step
-    for metric in ["ATE", "CTE"]:
-        if metric in data and data[metric] == data[metric]:  # not NaN
+    # ATE, CTE: prefer per-storm arrays (boxplot_ate/boxplot_cte, added to
+    # evaluate_full.py's output alongside boxplot_ade), fall back to the
+    # scalar mean only if the per-storm arrays are missing (e.g. older
+    # eval JSON from before this fix). Without the per-storm arrays,
+    # Wilcoxon signed-rank degenerates to nan (needs >=10 paired samples).
+    for metric, box_key in [("ATE", "boxplot_ate"), ("CTE", "boxplot_cte")]:
+        if box_key in data and data[box_key]:
+            errors[metric] = np.array(data[box_key])
+        elif metric in data and data[metric] == data[metric]:  # not NaN
             errors[metric] = np.array([data[metric]])
     # Warn if only scalar data (statistical tests need per-storm for power)
     n_ade = len(errors.get("ADE", []))
@@ -391,6 +398,8 @@ def main():
             return {k: _convert(v) for k, v in obj.items()}
         elif isinstance(obj, (list, tuple)):
             return [_convert(v) for v in obj]
+        elif isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
         elif isinstance(obj, (np.integer, np.int64, np.int32)):
             return int(obj)
         elif isinstance(obj, (np.floating, np.float64, np.float32)):

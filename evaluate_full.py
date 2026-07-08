@@ -357,6 +357,17 @@ def run_full_evaluation(model, loader, device,
 
     # Boxplot data (raw arrays)
     result["boxplot_ade"] = per_storm["ade"]
+    # [REGRESSION FIX] per-storm ATE/CTE arrays for statistical_tests.py.
+    # Without these, load_from_json() there falls back to a single scalar
+    # (the mean) for ATE/CTE, and Wilcoxon signed-rank degenerates to nan
+    # for both (needs >=10 paired samples). per_storm["ate"]/["cte"] are
+    # the per-storm MEAN-over-horizon values (one number per storm, from
+    # the "ate.abs().mean(0)" collection a few lines above in this
+    # function) — a different, coarser array than ate_per_step (which is
+    # per-horizon, pooled across storms). This is the one statistical
+    # tests need: one paired value per storm.
+    result["boxplot_ate"] = per_storm["ate"]
+    result["boxplot_cte"] = per_storm["cte"]
     result["dist_per_step_mean"] = [_m(per_storm["dist_per_step"][s]) for s in range(12)]
     result["ate_per_step_mean"]  = [_m(per_storm["ate_per_step"][s])  for s in range(12)]
     result["cte_per_step_mean"]  = [_m(per_storm["cte_per_step"][s])  for s in range(12)]
