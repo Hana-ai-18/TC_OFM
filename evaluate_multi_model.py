@@ -171,12 +171,27 @@ def load_st_trans(checkpoint: str, device,
 def evaluate_one_model(model, loader, device, model_name: str,
                         n_ensemble: int = 20) -> List[Dict]:
     """
-    Returns a list of per-window records:
-      {"model": name, "storm": storm_key, "window": idx, "ade": ..,
-       "ate": .., "cte": .., "obs_speed": ..}
-    One record per (storm, window) — this is the raw material for paired
-    statistical tests (Wilcoxon/t-test on matched (storm, window) pairs,
-    same design as the paper's Table 10).
+    Returns a list of PER-LEAD-TIME records:
+      {"model": name, "storm": storm_key, "window": idx, "lead_time": t,
+       "ade": .., "ate": .., "cte": .., "obs_speed": ..}
+    One record per (storm, window, lead_time) triple — matches the
+    paper's Table 10 pairing granularity (140 windows x 16 lead-times =
+    2240 matched pairs, i.e. paired PER FORECAST STEP, not averaged over
+    the whole trajectory first). An earlier version of this function
+    emitted one record per (storm, window) with ADE/ATE/CTE already
+    averaged over all lead-times — that is a coarser, methodologically
+    weaker pairing than the paper's own design (fewer, less granular
+    pairs => less statistical power, and not directly comparable to the
+    paper's n=2240 convention).
+
+    ade/ate/cte alignment: ate_cte_full() returns [T-1, B] arrays where
+    index i holds the error at ORIGINAL step index i+1 (see its own
+    docstring / evaluate_full.py's established convention — no ATE/CTE
+    is defined at the very first predicted step, since there's no prior
+    heading reference). To keep all three metrics referring to the EXACT
+    SAME lead-time in every emitted record, ADE is also read at the
+    matching original step index (d[t+1], not d[t]) rather than emitting
+    all T ADE values independently of ATE/CTE's T-1 range.
     """
     records = []
     is_fm = isinstance(model, TCFlowMatching) or hasattr(model, "sigma_inference")
@@ -204,6 +219,7 @@ def evaluate_one_model(model, loader, device, model_name: str,
         gd = _norm_to_deg(gt[:T, :, :2])
         d  = _haversine_deg(pd, gd)                  # [T, B]
         ate, cte = ate_cte_full(pd, gd)               # [T-1, B]
+        T_valid = ate.shape[0]                        # number of lead-times with ATE/CTE defined
 
         obs_deg = _norm_to_deg(obs[:, :, :2])
         if obs_deg.shape[0] >= 2:
@@ -220,15 +236,18 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 storm_key = f"{info['old'][1]}_{info['old'][0]}"
             else:
                 storm_key = f"UNKNOWN_batch{bi}"
-            records.append({
-                "model":     model_name,
-                "storm":     storm_key,
-                "window":    b,
-                "ade":       float(d[:, b].mean()),
-                "ate":       float(ate[:, b].abs().mean()) if ate.shape[0] > 0 else 0.0,
-                "cte":       float(cte[:, b].abs().mean()) if cte.shape[0] > 0 else 0.0,
-                "obs_speed": float(obs_speed[b]),
-            })
+            for i in range(T_valid):
+                lead_time = i + 1  # original step index (see docstring)
+                records.append({
+                    "model":     model_name,
+                    "storm":     storm_key,
+                    "window":    b,
+                    "lead_time": lead_time,
+                    "ade":       float(d[lead_time, b]),
+                    "ate":       float(ate[i, b].abs()),
+                    "cte":       float(cte[i, b].abs()),
+                    "obs_speed": float(obs_speed[b]),
+                })
     return records
 
 

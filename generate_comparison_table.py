@@ -71,14 +71,26 @@ def load_records(path: str) -> List[Dict]:
 def build_paired_arrays(records: List[Dict], model_a: str, model_b: str,
                          metric: str):
     """
-    Match records by (storm, window) key present in BOTH model_a and
-    model_b. Returns (x, y) arrays in matched order, or (None, None) if
-    fewer than 10 matched pairs exist (not enough for Wilcoxon).
+    Match records by (storm, window, lead_time) key present in BOTH
+    model_a and model_b — pairs at the PER-LEAD-TIME level, matching the
+    paper's Table 10 granularity (n=2240 = 140 windows x 16 lead-times).
+    An earlier version keyed on (storm, window) only, using values
+    already averaged over all lead-times — that produced fewer, coarser
+    pairs (one per window instead of one per forecast step) and is not
+    directly comparable to the paper's own n convention. Falls back
+    gracefully to (storm, window) keys if records lack a "lead_time"
+    field (e.g. from an older evaluate_multi_model.py run).
+    Returns (x, y) arrays in matched order, or (None, None) if fewer
+    than 10 matched pairs exist (not enough for Wilcoxon).
     """
-    by_key_a = {(r["storm"], r["window"]): r[metric]
-                for r in records if r["model"] == model_a}
-    by_key_b = {(r["storm"], r["window"]): r[metric]
-                for r in records if r["model"] == model_b}
+    has_lead_time = any("lead_time" in r for r in records)
+    if has_lead_time:
+        key_fn = lambda r: (r["storm"], r["window"], r.get("lead_time"))
+    else:
+        key_fn = lambda r: (r["storm"], r["window"])
+
+    by_key_a = {key_fn(r): r[metric] for r in records if r["model"] == model_a}
+    by_key_b = {key_fn(r): r[metric] for r in records if r["model"] == model_b}
     common = sorted(set(by_key_a) & set(by_key_b))
     if len(common) < 10:
         return None, None, len(common)
