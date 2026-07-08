@@ -160,13 +160,19 @@ def print_table(rows: List[Dict], metric: str, baseline_model: str):
     print(f"  {'='*118}")
     print(f"  {'Comparison':<26} {'n (pairs)':>10} {'Mean diff (km)':>15} "
           f"{'Cohen d':>9} {'Wilcoxon p':>12} {'Wilcoxon p(Bonf.)':>18} "
-          f"{'t-test p':>10} {'t-test p(Bonf.)':>16}")
+          f"{'t-test p':>12} {'t-test p(Bonf.)':>16}")
     print(f"  {'-'*118}")
     for r in rows:
+        # [FIX] t-test p/p(Bonf.) previously printed with .6f — for very
+        # small p-values (e.g. 1.83E-24, common with n=415+ paired tests),
+        # 6 decimal places rounds to "0.000000", which is misleading: the
+        # true p-value is not zero, just too small for fixed-point display
+        # at that precision. Using the SAME scientific notation as
+        # Wilcoxon p (.2E) avoids this and keeps both columns comparable.
         print(f"  {r['comparison']:<26} {r['n_pairs']:>10} "
               f"{r['mean_diff_km']:>15.4f} {r['cohens_d']:>9.4f} "
               f"{r['wilcoxon_p']:>12.2E} {r['wilcoxon_p_bonf']:>18.2E} "
-              f"{r['ttest_p']:>10.6f} {r['ttest_p_bonf']:>16.6f}")
+              f"{r['ttest_p']:>12.2E} {r['ttest_p_bonf']:>16.2E}")
     print(f"  {'='*118}\n")
 
 
@@ -180,10 +186,11 @@ def print_latex(rows: List[Dict], metric: str, baseline_model: str):
           r"Wilcoxon $p$ & Wilcoxon $p$ (Bonf.) & $t$-test $p$ & $t$-test $p$ (Bonf.) \\")
     print(f"  \\hline")
     for r in rows:
+        # Same fix as print_table — scientific notation for t-test p too.
         print(f"  {r['comparison']} & {r['n_pairs']} & "
               f"{r['mean_diff_km']:.4f} & {r['cohens_d']:.4f} & "
               f"{r['wilcoxon_p']:.2E} & {r['wilcoxon_p_bonf']:.2E} & "
-              f"{r['ttest_p']:.6f} & {r['ttest_p_bonf']:.6f} \\\\")
+              f"{r['ttest_p']:.2E} & {r['ttest_p_bonf']:.2E} \\\\")
     print(f"  \\hline")
     print(f"  \\end{{tabular}}")
     print(f"  \\end{{table}}\n")
