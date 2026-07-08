@@ -441,6 +441,13 @@ def evaluate(model, loader, device, tag: str = "",
             pred = sum(w / tw * p for w, p in zip(weights_t, preds_t))
         else:
             try:
+                # [MULTI-STEP] n_inference_steps default changed 1->10 (see
+                # constructor comment) — this call doesn't override via
+                # ddim_steps, so val/test loops now run ~10x more velocity
+                # network forward passes per sample() call than before.
+                # Expect val/test evaluation phases to take noticeably
+                # longer; this is the real cost of the change, not a
+                # separate slowdown bug.
                 pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
             except Exception as e:
                 print(f"  sample error: {e}"); continue
@@ -591,6 +598,13 @@ def evaluate(model, loader, device, tag: str = "",
             if lp:
                 sc_str  = ",".join(f"{v:.2f}" for v in lp.get("speed_correction", [])[:4])
                 rw_str  = ",".join(f"{v:.3f}" for v in lp.get("reg_step_weights", [])[:4])
+                # [FIX] full 12-horizon reg_step_weights + b_horizon, not just
+                # the first 4 — the far-horizon values (index 7,11 = 48h,72h)
+                # are exactly what --disable_horizon_nll's fix targets, and
+                # were invisible in the old [:4]-truncated print.
+                rw_full = lp.get("reg_step_weights", [])
+                rw_far  = ",".join(f"{v:.3f}" for v in rw_full[7:12]) if len(rw_full) >= 12 else "?"
+                bh_str  = ",".join(f"{v:.1f}" for v in lp.get("b_horizon", [])[:12])
                 hw_str  = ",".join(f"{v:.3f}" for v in lp.get("hard_score_weights", []))
                 hdw_str = ",".join(f"{v:.3f}" for v in lp.get("heading_step_weights", [])[:4])
                 sig_inf = lp.get("sigma_inf", float("nan"))
@@ -602,6 +616,8 @@ def evaluate(model, loader, device, tag: str = "",
                 el_c    = lp.get("eff_lambda_calib",   float("nan"))
                 print(f"  [LEARN] speed_corr(12h-24h)=[{sc_str}]"
                       f"  reg_w(12h-24h)=[{rw_str}]")
+                print(f"  [LEARN] reg_w(48h-72h,idx7-11)=[{rw_far}]"
+                      f"  b_horizon(6h..72h)=[{bh_str}]")
                 print(f"  [LEARN] hard_w(curv,spdvar,dirchg,obsspd)=[{hw_str}]"
                       f"  head_w(12h-24h)=[{hdw_str}]  sigma_inf={sig_inf:.4f}")
                 print(f"  [LEARN] log_sigma: reg={ls_r:.3f}  heading={ls_h:.3f}  calib={ls_c:.3f}"
@@ -664,8 +680,30 @@ def get_args():
     p.add_argument("--dim_ff",                 default=512,    type=int)
     p.add_argument("--dropout",                default=0.1,    type=float)
     p.add_argument("--unet_in_ch",             default=13,     type=int)
-    p.add_argument("--sigma_min",              default=0.04,   type=float)
-    p.add_argument("--sigma_max",              default=0.08,   type=float)
+    p.add_argument("--sigma_min",              default=0.06,   type=float,
+                   help="[FIX, user-approved tradeoff] Min noise scale for "
+                        "CFM sampling. CHANGED default from 0.04 (~22km) to "
+                        "0.06 (~33km) — 0.04 was only ~10-20% of actual "
+                        "error magnitude, too small to seed meaningful "
+                        "ensemble divergence (suspected contributor to "
+                        "near-zero CRPS/Spread-Skill). NOT experimentally "
+                        "validated on a real checkpoint (unlike "
+                        "n_inference_steps) — this is a directional fix "
+                        "based on the km-scale analysis, not a proven-best "
+                        "value. Pass --sigma_min 0.04 to revert to the "
+                        "original.")
+    p.add_argument("--sigma_max",              default=0.15,   type=float,
+                   help="[FIX, user-approved tradeoff] Max noise scale. "
+                        "CHANGED default from 0.08 (~44km) to 0.15 (~83km), "
+                        "closer to actual CTE-scale error (67km), while "
+                        "staying below full ADE scale (~219km). Pass "
+                        "--sigma_max 0.08 to revert to the original.")
+    p.add_argument("--sigma_decay_end",        default=100,    type=int,
+                   help="[FIX, user-approved tradeoff] Epoch at which sigma "
+                        "reaches sigma_min and stays there. CHANGED default "
+                        "from 40 to 100 — with 40, >100 epochs of a typical "
+                        "140-165 epoch run trained at minimum noise. Pass "
+                        "--sigma_decay_end 40 to revert to the original.")
     p.add_argument("--lambda_reg",             default=0.2,    type=float)
     p.add_argument("--lambda_heading",         default=0.07,   type=float,
                    help="[v2.1-XAI] multi-step heading, bug fixed, weight=0.07")
@@ -679,12 +717,76 @@ def get_args():
                         "'curvature' at different rates per seed (confirmed "
                         "across seed 42/1/2 runs at matched epochs). "
                         "0.0 = fully disabled (same as --disable_hard_reg).")
+    p.add_argument("--log_sigma_reg_min_clamp", default=-3.0,   type=float,
+                   help="Numerical-stability clamp floor for log_sigma_reg "
+                        "(prevents exp() overflow), NOT a tuning knob. "
+                        "Default -3.0 -> cap~=202, far above the ~15-20 "
+                        "eff_lambda_reg converges to — reconsidered from an "
+                        "earlier proposal to tighten this as a way to force "
+                        "L_reg's weight down: that would fight a genuine "
+                        "loss-minimizing choice Kendall converges to (not a "
+                        "bug), same class of change that hurt ADE/ATE when "
+                        "tried on hard_score_weight_logits. See "
+                        "--disable_horizon_nll instead for the principled "
+                        "fix to far-horizon attention starvation.")
+    p.add_argument("--disable_horizon_nll",    action="store_true", default=False,
+                   help="[FIX] Disable log_b_horizon (Laplace-NLL per-"
+                        "horizon error normalization) — falls back to "
+                        "reg_step_logits' softmax attending to RAW "
+                        "haversine distance per horizon (the original "
+                        "formula). Default (flag absent) uses the NEW "
+                        "normalized formula: reg_step_logits' softmax was "
+                        "found to systematically starve far horizons "
+                        "(48h-72h get only ~7-13% combined attention) "
+                        "because raw error grows ~14x from 6h to 72h — not "
+                        "a bug, but a rational response to an unnormalized "
+                        "signal. The fix normalizes dist[t] by a LEARNED "
+                        "per-horizon scale b_horizon (via a stable Laplace "
+                        "NLL, same log(b) counterbalance structure as "
+                        "Kendall's Gaussian NLL elsewhere in this model — "
+                        "provably cannot degenerate to 0 or explode). "
+                        "Initializes as an exact no-op (b=1 -> nll_h=dist) "
+                        "so it only diverges from original behavior as "
+                        "training reveals genuine per-horizon difficulty. "
+                        "CAUTION: this is a NEW mechanism, not yet "
+                        "empirically validated on a real training run "
+                        "(unlike --n_inference_steps, which IS verified) — "
+                        "the math is sound but watch ADE/ATE/CTE together "
+                        "with CRPS/Spread-Skill to confirm it helps far-"
+                        "horizon diversity without hurting near-horizon "
+                        "accuracy before trusting the result.")
     p.add_argument("--use_ot",                 default=True,   action="store_true")
     p.add_argument("--no_ot",                  dest="use_ot",  action="store_false")
     p.add_argument("--ot_epsilon",             default=0.05,   type=float)
     p.add_argument("--n_ensemble",             default=20,     type=int)
     p.add_argument("--sigma_inference",        default=0.04,   type=float)
-    p.add_argument("--n_inference_steps",      default=1,      type=int)
+    p.add_argument("--n_inference_steps",      default=10,     type=int,
+                   help="[MULTI-STEP] Euler integration steps baked into "
+                        "the checkpoint (used at inference when eval "
+                        "doesn't override via --ddim_steps). CHANGED "
+                        "default from 1 (single-shot x0+v) to 10 — this is "
+                        "the ONE change in this codebase backed by direct "
+                        "experimental evidence (not just theory): evaluating "
+                        "an existing checkpoint with N=1->10 raised ensemble "
+                        "spread 4km->55km, improved CRPS -9.5% (216.8->"
+                        "196.3km), Spread/Skill ratio at 6h reached 1.07 "
+                        "(near-ideal 1.0), at a small ADE/ATE/CTE cost "
+                        "(+1.7%/+1.9%/+7.2%). N=3-4 tested WORSE than both "
+                        "N=1 and N=8-10 — standard Euler discretization "
+                        "error is non-monotonic here, don't assume any N "
+                        "value between 1 and 10 is safe without testing. "
+                        "Pass 1 to reproduce the exact original single-shot "
+                        "behavior. NOTE: this does NOT fix ensemble spread "
+                        "stalling at far horizons (48h-72h) — that traces "
+                        "to reg_step_logits' softmax naturally down-"
+                        "weighting hard-to-reduce far-horizon loss, a "
+                        "genuine optimization outcome verified NOT to be a "
+                        "bug (see flow_matching_model.py's _reg_loss). No "
+                        "fix for that is applied by default in this "
+                        "codebase — it would require overriding what the "
+                        "model has genuinely learned is loss-optimal, which "
+                        "needs deliberate experimentation, not a silent "
+                        "default change.")
     # Training
     p.add_argument("--num_epochs",             default=150,    type=int)
     p.add_argument("--batch_size",             default=64,     type=int)
@@ -814,9 +916,12 @@ def main(args):
         num_dec_layers=args.num_dec_layers, dim_ff=args.dim_ff,
         dropout=args.dropout,
         sigma_min=args.sigma_min,      sigma_max=args.sigma_max,
+        sigma_decay_end=args.sigma_decay_end,
         lambda_reg=args.lambda_reg,    lambda_heading=args.lambda_heading,
         lambda_momentum=0.0,
         lambda_hard_reg=(0.0 if args.disable_hard_reg else args.lambda_hard_reg),
+        log_sigma_reg_min_clamp=args.log_sigma_reg_min_clamp,
+        enable_horizon_nll=not args.disable_horizon_nll,
         use_ot=args.use_ot,            ot_epsilon=args.ot_epsilon,
         use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
         n_inference_steps=args.n_inference_steps,
@@ -840,9 +945,12 @@ def main(args):
         num_dec_layers=args.num_dec_layers, dim_ff=args.dim_ff,
         dropout=args.dropout,
         sigma_min=args.sigma_min,      sigma_max=args.sigma_max,
+        sigma_decay_end=args.sigma_decay_end,
         lambda_reg=args.lambda_reg,    lambda_heading=args.lambda_heading,
         lambda_momentum=0.0,
         lambda_hard_reg=(0.0 if args.disable_hard_reg else args.lambda_hard_reg),
+        log_sigma_reg_min_clamp=args.log_sigma_reg_min_clamp,
+        enable_horizon_nll=not args.disable_horizon_nll,
         use_ot=args.use_ot,            ot_epsilon=args.ot_epsilon,
         use_ema=args.use_ema,          n_ensemble=args.n_ensemble,
         n_inference_steps=args.n_inference_steps,

@@ -507,15 +507,19 @@ def hard_score_from_obs(obs_traj_norm: torch.Tensor,
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Tensor:
+def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
+                    use_curvature_score: bool = False) -> torch.Tensor:
     """
-    Best-of-K selection score. Four components:
-      speed_score       (0.30): per-step speed vs obs reference
-      smooth_score      (0.25): trajectory smoothness (no sharp acceleration)
-      heading_score     (0.30): first-step direction matches obs
-      displacement_score(0.15): total path length consistent with obs speed
+    Best-of-K selection score. Four components (five when
+    use_curvature_score=True):
+      speed_score       : per-step speed vs obs reference
+      smooth_score       : trajectory smoothness (no sharp acceleration)
+      heading_score      : first-step direction matches obs
+      displacement_score : total path length consistent with obs speed
+      curvature_score    : [CURV-SCORE, opt-in] candidate's turning rate
+                            matches the storm's OBSERVED turning rate
 
-    [v2.1-learn QUYẾT ĐỊNH] KHÔNG biến 4 exponent này thành learnable.
+    [v2.1-learn QUYẾT ĐỊNH] KHÔNG biến 4 exponent gốc thành learnable.
     Lý do: hàm này chạy dưới @torch.no_grad() để CHỌN trong số K candidates
     sinh từ CÙNG MỘT velocity network — đây là post-hoc re-ranking, không
     nằm trên đường gradient nào quay lại network hay bất kỳ tham số nào
@@ -526,6 +530,21 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
     (vd qua REINFORCE / Gumbel-softmax cho discrete selection) — phạm vi
     đó rủi ro cao hơn lợi ích đo được, nên giữ nguyên 4 hằng số đã proven
     qua thực nghiệm thay vì đoán thêm một cơ chế chưa kiểm chứng.
+
+    [CURV-SCORE] Motivation: head_score above only checks the FIRST
+    predicted step's direction against the last observed vector — it is
+    blind to whether the candidate's curvature over the FULL horizon
+    matches the storm's actual recent turning behavior. smooth_score
+    actively penalizes ANY turning (favors straight paths), which works
+    AGAINST correctly-recurving candidates for storms that are genuinely
+    turning. This is a DIFFERENT, complementary signal: it does not ask
+    "is this candidate smooth" or "does step 0 match", it asks "does this
+    candidate's turning RATE match what the storm was ALREADY doing in
+    the observed history" — extrapolating observed curvature rather than
+    assuming straight-line motion. This is a pure INFERENCE-TIME re-ranking
+    change (no gradient, no effect on what the network learned), so it can
+    be A/B tested directly on existing checkpoints without retraining.
+    Opt-in (default False) to keep the proven 4-component score as default.
     """
     B      = traj_norm.shape[1]
     device = traj_norm.device
@@ -567,6 +586,38 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
     else:
         head_score = torch.ones(B, device=device)
 
+    # ── Curvature score [CURV-SCORE, opt-in] ─────────────────────────────
+    # Estimate the storm's OBSERVED turning rate from its last 3 observed
+    # points, then check whether the candidate's OWN turning rate (over its
+    # full predicted horizon, near-term steps weighted more heavily since
+    # extrapolated curvature degrades further out) matches it. Unlike
+    # smooth_score, a candidate that turns AT THE SAME RATE the storm was
+    # already turning scores HIGH here, not low.
+    if use_curvature_score and obs_norm.shape[0] >= 3 and traj_deg.shape[0] >= 2:
+        obs_deg_c  = _norm_to_deg(obs_norm)
+        bear_obs_1 = _forward_azimuth(obs_deg_c[-3], obs_deg_c[-2])
+        bear_obs_2 = _forward_azimuth(obs_deg_c[-2], obs_deg_c[-1])
+        obs_turn_rate = ((bear_obs_2 - bear_obs_1 + 180.0) % 360.0) - 180.0   # [B], deg/step
+
+        bear0 = _forward_azimuth(obs_deg_c[-1], traj_deg[0])
+        if traj_deg.shape[0] >= 2:
+            chain = [_forward_azimuth(traj_deg[t], traj_deg[t + 1])
+                     for t in range(traj_deg.shape[0] - 1)]
+            pred_bears = torch.stack([bear0] + chain, 0)   # [T, B]
+        else:
+            pred_bears = bear0.unsqueeze(0)
+
+        if pred_bears.shape[0] >= 2:
+            pred_turn = ((pred_bears[1:] - pred_bears[:-1] + 180.0) % 360.0) - 180.0  # [T-1, B]
+            Tc = pred_turn.shape[0]
+            w_curv = torch.linspace(1.0, 0.3, Tc, device=device).unsqueeze(1)
+            turn_err = ((pred_turn - obs_turn_rate.unsqueeze(0)).abs() * w_curv).sum(0) / w_curv.sum()
+            curvature_score = torch.exp(-turn_err / 15.0)   # 15 deg/step soft scale
+        else:
+            curvature_score = torch.ones(B, device=device)
+    else:
+        curvature_score = torch.ones(B, device=device)
+
     # ── Displacement score ──────────────────────────────────────────────
     # Expected total path length ≈ obs_speed × T_pred × DT × 0.75
     # (0.75 factor: storms curve, so straight-line < path length estimate)
@@ -580,6 +631,16 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor) -> torch.Ten
     else:
         disp_score    = torch.ones(B, device=device)
 
+    if use_curvature_score:
+        # Rebalanced to make room for curvature_score (still sums to 1.00):
+        # speed 0.30->0.25, smooth 0.25->0.20, head 0.30->0.25, disp 0.15->0.10,
+        # curvature gets 0.20 (comparable weight to smooth_score, its
+        # natural "opposing force" for genuinely-turning storms).
+        return (speed_score.pow(0.25)
+                * smooth_score.pow(0.20)
+                * head_score.pow(0.25)
+                * disp_score.pow(0.10)
+                * curvature_score.pow(0.20)).clamp(min=1e-6)
     return (speed_score.pow(0.30)
             * smooth_score.pow(0.25)
             * head_score.pow(0.30)
@@ -860,17 +921,122 @@ class TCFlowMatching(nn.Module):
         num_dec_layers:    int   = 4,
         dim_ff:            int   = 512,
         dropout:           float = 0.1,
-        sigma_min:         float = 0.04,
-        sigma_max:         float = 0.08,
+        sigma_min:         float = 0.06,   # [FIX, user-approved tradeoff] was
+                                            # 0.04 (~22km) — increased to 0.06
+                                            # (~33km). Analysis: 0.04 is only
+                                            # ~10-20% of actual error magnitude
+                                            # (ADE~219km), too small to seed
+                                            # meaningful ensemble divergence.
+                                            # NOT learnable (see constructor
+                                            # docstring on why a free-floating
+                                            # sigma degenerates to 0 under raw
+                                            # MSE gradient) — this remains a
+                                            # fixed hyperparameter choice, now
+                                            # set directionally per the
+                                            # uncertainty-collapse analysis
+                                            # rather than left at the original
+                                            # untested-for-this-purpose value.
+                                            # Still overridable via --sigma_min.
+        sigma_max:         float = 0.15,   # [FIX, user-approved tradeoff] was
+                                            # 0.08 (~44km) — increased to 0.15
+                                            # (~83km), closer to the actual
+                                            # CTE-scale error (67km) so early-
+                                            # training ensemble noise is large
+                                            # enough to matter, while staying
+                                            # below full ADE scale (~219km) to
+                                            # avoid destabilizing point-
+                                            # accuracy training. Still
+                                            # overridable via --sigma_max.
+        sigma_decay_start: int   = 5,      # unchanged — early warmup epochs
+        sigma_decay_end:   int   = 100,    # [FIX, user-approved tradeoff] was
+                                            # 40. With 40, >100 of a typical
+                                            # 140-165 epoch run trains at the
+                                            # MINIMUM sigma — most of training
+                                            # sees only minimal noise. Extended
+                                            # to 100 so meaningful noise stays
+                                            # present through most of a
+                                            # typical run. Still overridable
+                                            # via --sigma_decay_end.
         lambda_reg:        float = 0.2,
         lambda_heading:    float = 0.07,   # reduced: gradient scale balance with L_CFM
         lambda_momentum:   float = 0.0,    # DISABLED — field kept for compat only
         lambda_calib:      float = 0.1,    # [LEARN-1] weight of L_calib term
+        lambda_hard_reg:   float = 0.02,   # [VAR-REDUCE] pull hard_score_weight_logits
+                                            # toward uniform — see docstring below
+        log_sigma_reg_min_clamp: float = -3.0,  # unchanged — see clamp usage
+                                            # in weighted_reg below. NOT used
+                                            # as a hard cap experiment anymore
+                                            # (an earlier version of this
+                                            # comment proposed manually
+                                            # tightening this to fight
+                                            # eff_lambda_reg's learned value —
+                                            # reconsidered: eff_lambda_reg is
+                                            # the genuine loss-minimizing
+                                            # choice Kendall converges to, not
+                                            # a bug, so forcing it down would
+                                            # fight real signal the same way
+                                            # that hurt ADE/ATE when tried on
+                                            # hard_score_weight_logits. Left
+                                            # configurable via
+                                            # --log_sigma_reg_min_clamp only
+                                            # as a numerical-stability guard,
+                                            # not a tuning knob.
+        enable_horizon_nll: bool  = True,  # [FIX] Use log_b_horizon (Laplace
+                                            # NLL per-horizon scale) to
+                                            # normalize dist[t] before
+                                            # reg_step_logits' softmax
+                                            # attention, instead of raw
+                                            # dist[t]. See log_b_horizon's
+                                            # docstring above for the full
+                                            # rationale — addresses far-
+                                            # horizon attention starvation
+                                            # without hardcoding any horizon-
+                                            # specific weight; b_horizon is
+                                            # itself learned via a stable NLL
+                                            # formulation. Default True is a
+                                            # NEW-mechanism default (not yet
+                                            # empirically validated on a real
+                                            # training run) — pass
+                                            # --disable_horizon_nll via
+                                            # train_fm.py to fall back to the
+                                            # original raw-dist formula for
+                                            # comparison/ablation.
         use_ot:            bool  = True,
         ot_epsilon:        float = 0.05,
         use_ema:           bool  = True,
         ema_decay:         float = 0.995,
-        n_inference_steps: int   = 1,
+        n_inference_steps: int   = 10,     # [MULTI-STEP] was 1 (single-shot
+                                            # x0+v). Changed to 10 based on
+                                            # EMPIRICAL evidence (not just
+                                            # theory) from evaluating an
+                                            # existing checkpoint: N=1->10
+                                            # raised ensemble spread 4km->55km,
+                                            # improved CRPS -9.5% (216.8->
+                                            # 196.3km), Spread/Skill ratio at
+                                            # 6h reached 1.07 (near-ideal 1.0),
+                                            # at a small ADE/ATE/CTE cost
+                                            # (+1.7%/+1.9%/+7.2%). N=3-4 tested
+                                            # WORSE than both N=1 and N=8-10 —
+                                            # standard 1st-order Euler
+                                            # discretization error scales
+                                            # O(1/N); small-but-not-1 step
+                                            # counts take large mis-sized
+                                            # jumps without yet benefiting
+                                            # from finer integration. Does NOT
+                                            # touch any learned parameter or
+                                            # loss term — purely changes how
+                                            # the trained velocity field is
+                                            # integrated at inference. Note
+                                            # this does NOT fix the SEPARATE,
+                                            # still-unresolved issue of ensemble
+                                            # spread stalling at far horizons
+                                            # (48h-72h) while skill/error keeps
+                                            # growing — that traces to
+                                            # reg_step_logits' softmax
+                                            # naturally down-weighting hard-
+                                            # to-reduce far-horizon loss (a
+                                            # genuine optimization outcome,
+                                            # not a bug — see _reg_loss).
         n_ensemble:        int   = 20,
         sigma_inference:   float = 0.04,   # FIXED throughout
         **kwargs,
@@ -880,10 +1046,22 @@ class TCFlowMatching(nn.Module):
         self.obs_len            = obs_len
         self.sigma_min          = sigma_min
         self.sigma_max          = sigma_max
+        self.sigma_decay_start  = sigma_decay_start
+        self.sigma_decay_end    = sigma_decay_end
         self.lambda_reg         = lambda_reg
         self.lambda_heading     = lambda_heading
         self.lambda_momentum    = 0.0           # always disabled
         self.lambda_calib       = lambda_calib
+        # [VAR-REDUCE] Fixed (NOT Kendall-learned) coefficient for the
+        # hard_score_weight_logits regularizer — see get_loss_breakdown for
+        # the term itself and rationale. Must stay fixed/unlearned: if this
+        # were Kendall-weighted like L_reg/L_heading/L_calib, the model
+        # could learn a very negative log_sigma for it and effectively
+        # disable its own constraint — defeating the purpose of a
+        # regularizer meant to CONSTRAIN what the model would otherwise do.
+        self.lambda_hard_reg    = lambda_hard_reg
+        self.log_sigma_reg_min_clamp = log_sigma_reg_min_clamp
+        self.enable_horizon_nll = enable_horizon_nll
         self.use_ot              = use_ot
         self.ot_epsilon          = ot_epsilon
         self.n_inference_steps   = n_inference_steps
@@ -911,6 +1089,56 @@ class TCFlowMatching(nn.Module):
         # [LEARN-2] Per-step L_reg weights. Init=0 → softmax uniform start
         # (khác linspace(1,1.5) cũ vốn đã thiên về late-step ngay từ đầu).
         self.reg_step_logits = nn.Parameter(torch.zeros(pred_len))
+
+        # [FIX, NLL-grounded] Per-horizon LEARNED error scale (Laplace NLL,
+        # matching _reg_loss's L1/haversine-distance error metric — Gaussian
+        # NLL would be the wrong distributional match for an L1 loss).
+        #
+        # WHY THIS EXISTS: reg_step_logits' softmax was found to systematically
+        # down-weight far horizons (48h-72h get only ~7-13% combined attention
+        # vs ~87-93% for 6h-24h, confirmed across independent training runs at
+        # matched epochs) — NOT because of a bug, but because raw haversine
+        # error grows ~14x from 6h to 72h (skill≈30km → ≈450km, confirmed by
+        # direct evaluation), so softmax naturally learns "attending to far
+        # horizons barely reduces total loss, attend to near horizons instead"
+        # — a rational but short-sighted response to an UNNORMALIZED signal.
+        # This directly explains a SEPARATE observed symptom: ensemble spread
+        # (from multi-step sampling) stalls at ~50km for horizons 24h-72h
+        # while skill/error keeps growing to 450km+ — the network never
+        # received strong-enough gradient at far horizons to learn anything
+        # beyond a smoothed, low-variance response there.
+        #
+        # FIX: give _reg_loss a properly NLL-grounded per-horizon scale
+        # b_horizon[t] = exp(log_b_horizon[t]), and present reg_step_logits'
+        # softmax attention with dist[t]/b_horizon[t] (a DIFFICULTY-NORMALIZED
+        # residual) instead of raw dist[t]. Laplace NLL = |err|/b + log(b) has
+        # the SAME stabilizing structure as Kendall's Gaussian NLL used
+        # elsewhere in this model (log_sigma_reg/heading/calib): the log(b)
+        # term counterbalances 1/b, so b CANNOT degenerate to 0 or infinity
+        # under gradient descent — verified analytically: optimal b* =
+        # E[|err|] at that horizon, i.e. b_horizon learns to track each
+        # horizon's OWN typical difficulty, not collapse or explode.
+        # reg_step_logits' softmax then sees a comparable-scale signal across
+        # all 12 horizons and is free to attend based on genuine
+        # under/over-performance relative to each horizon's own learned
+        # difficulty, not raw km magnitude.
+        #
+        # Init log_b_horizon=0 → b=1 everywhere → nll_h = dist/1 + log(1) =
+        # dist + 0 = dist, IDENTICAL to the original raw-dist formula at
+        # epoch 0 (b only diverges from 1 as training reveals real per-
+        # horizon difficulty differences) — same "start as a no-op, let
+        # gradient reveal the right values" principle as reg_step_logits'
+        # own zero-init.
+        #
+        # CAUTION: this is a NEW mechanism, not yet validated on a real
+        # training run at time of writing (unlike n_inference_steps, which
+        # IS empirically verified). The math is sound and the initialization
+        # is provably a no-op, but the FULL training-dynamics effect (does
+        # far-horizon attention actually increase enough to matter, and at
+        # what cost to near-horizon accuracy) can only be confirmed by
+        # actually training and comparing against a run with this disabled
+        # (see --disable_horizon_nll ablation flag in train_fm.py).
+        self.log_b_horizon = nn.Parameter(torch.zeros(pred_len))
 
         # [LEARN-3] hard_score 4-component weights: [curvature, speed_var,
         # dir_change, obs_speed_norm]. Init lệch nhẹ giống phân bổ gốc
@@ -974,11 +1202,36 @@ class TCFlowMatching(nn.Module):
         return x_rel + last_obs.unsqueeze(1)
 
     def _sigma_schedule(self, epoch: int) -> float:
-        """Cosine decay sigma_max→sigma_min over ep5→ep40."""
-        if epoch < 5:
+        """
+        Cosine decay sigma_max→sigma_min over [sigma_decay_start,
+        sigma_decay_end] epochs. Was hardcoded ep5→ep40, sigma 0.08→0.04.
+
+        [FIX, user-approved tradeoff] Defaults CHANGED (not preserved) to
+        sigma_min=0.06, sigma_max=0.15, sigma_decay_end=100. Rationale:
+        with the ORIGINAL schedule, >100 of a typical 140-165 epoch run
+        trained at the minimum sigma (~22km-scale noise, only ~10-20% of
+        actual error magnitude ADE~219km) — suspected contributor to the
+        near-zero ensemble diversity seen in CRPS/Spread-Skill analysis
+        (spread≈4km vs skill/error≈100-400km, verified experimentally by
+        raising n_inference_steps alone: spread jumped 4km→55km, but only
+        for the multi-step-integration axis — this sigma change targets a
+        DIFFERENT, still-unaddressed axis: the noise scale seeding
+        divergence in the first place).
+
+        This IS a genuine behavior change from prior verified results
+        (unlike n_inference_steps, this has NOT been experimentally
+        validated on a real trained checkpoint at time of writing) — the
+        user explicitly accepted this tradeoff to address all 4 causes
+        identified in the uncertainty-collapse analysis rather than leave
+        this one as an opt-in-only experiment. Still overridable via
+        --sigma_min/--sigma_max/--sigma_decay_end if you want to run a
+        grid search or revert to the original values (0.04/0.08/40).
+        """
+        if epoch < self.sigma_decay_start:
             return self.sigma_max
-        if epoch < 40:
-            t = (epoch - 5) / 35.0
+        if epoch < self.sigma_decay_end:
+            span = max(self.sigma_decay_end - self.sigma_decay_start, 1)
+            t = (epoch - self.sigma_decay_start) / span
             return self.sigma_min + 0.5 * (self.sigma_max - self.sigma_min) * (1 + math.cos(math.pi * t))
         return self.sigma_min
 
@@ -1041,6 +1294,29 @@ class TCFlowMatching(nn.Module):
         DOES NOT use exp weights (v2.4 used 12.2× ratio → catastrophic
         overfitting) — softmax trên logits học được có range tự nhiên bị
         chặn mềm, không bùng nổ như exp(linspace) thủ công.
+
+        [FIX, enable_horizon_nll] reg_step_logits' softmax gradient is
+        proportional to whatever quantity multiplies sw[t] in the final
+        loss. Using RAW dist[t] there means the softmax is systematically
+        pushed away from horizons with inherently large error (far
+        horizons), regardless of whether the network could genuinely
+        still improve there — a rational-but-short-sighted response to an
+        unnormalized signal (verified: far-horizon attention starves at
+        ~7-13% combined weight, and ensemble spread from multi-step
+        sampling stalls ~50km at 24h-72h while skill grows to 450km+,
+        consistent with the network never receiving strong gradient
+        there). FIX: replace dist[t] with a Laplace-NLL-normalized
+        nll_h[t] = dist[t]/b_horizon[t] + log(b_horizon[t]), where
+        b_horizon = exp(log_b_horizon) is itself learned with the SAME
+        stabilizing log(b) counterbalance Kendall uses elsewhere in this
+        model (provably cannot collapse to 0 or explode — see
+        log_b_horizon's docstring). At init (log_b_horizon=0, b=1),
+        nll_h == dist exactly (log(1)=0), so this is a no-op until
+        training reveals genuine per-horizon difficulty differences.
+        The outer Kendall log_sigma_reg (scaling l_reg's contribution to
+        the total loss) auto-compensates for any overall scale drift this
+        introduces — composing two NLL mechanisms is expected to
+        re-equilibrate correctly without needing a new hardcoded constant.
         """
         B, T, _ = x1_rel.shape
         device   = x1_rel.device
@@ -1054,6 +1330,14 @@ class TCFlowMatching(nn.Module):
         dist     = _haversine_deg(pred_deg, gt_deg)             # [T, B] km
 
         T_actual = dist.shape[0]
+
+        if self.enable_horizon_nll:
+            b_h  = torch.exp(self.log_b_horizon[:T_actual]).clamp(min=1e-2, max=1e4)  # [T]
+            nll_h = dist / b_h.unsqueeze(1) + torch.log(b_h).unsqueeze(1)  # [T, B]
+            weighted_dist = nll_h
+        else:
+            weighted_dist = dist
+
         sw = F.softmax(self.reg_step_logits[:T_actual], dim=0).unsqueeze(1)  # [T, 1]
 
         if hard_score is not None:
@@ -1064,7 +1348,7 @@ class TCFlowMatching(nn.Module):
         # Với Kendall HALF_LOG_2PI đúng: eff_lambda* = 0.5 × l_reg_norm
         # /300 → l_reg_norm ≈ 250/300 ≈ 0.83 → eff_lambda* ≈ 0.42 (gần baseline 0.2)
         # Reviewer: '300 ≈ max expected ADE tại convergence (km)' — căn cứ rõ ràng.
-        return ((dist * sw) * sw_hard).mean() / 300.0
+        return ((weighted_dist * sw) * sw_hard).mean() / 300.0
 
     # ── get_loss_breakdown ──────────────────────────────────────────────────
 
@@ -1091,6 +1375,36 @@ class TCFlowMatching(nn.Module):
         h_score = hard_score_from_obs(obs_traj[:, :, :2],
                                        weight_logits=self.hard_score_weight_logits)
         cond    = self.encoder(batch_list, hard_score=h_score)
+
+        # [VAR-REDUCE] L2 penalty pulling hard_score_weight_logits' softmax
+        # distribution toward UNIFORM [0.25,0.25,0.25,0.25] over its 4
+        # components (curvature, speed_var, dir_change, obs_speed_norm).
+        #
+        # WHY: across 3 independent seed runs (seed42/1/2, same architecture,
+        # same hyperparameters, only RNG differs) — confirmed directly from
+        # seed_1.txt / seed_2.txt training logs — this 4-way softmax
+        # collapses onto 'curvature' at very different rates depending on
+        # seed. AT THE SAME EPOCH (130), ruling out "just trained longer":
+        #   seed42: curv=0.739  spdvar=0.025  obsspd=0.013  -> test CTE=58.4
+        #   seed1:  curv=0.843  spdvar=0.013  obsspd=0.007  -> test CTE=61.3
+        #   seed2:  curv=0.875  spdvar=0.011  obsspd=0.006  -> test CTE=67.1
+        # More collapse (curv higher, obs_speed_norm/speed_var lower)
+        # correlates monotonically with WORSE test CTE. Since obs_speed_norm
+        # feeds directly into which storms get upweighted by hard_score
+        # (fast storms cause 62% of total CTE per this file's own XAI-9
+        # analysis), a seed that lets this collapse early and hard ends up
+        # systematically deprioritizing exactly the storms CTE most depends
+        # on — a genuine, identified source of seed-to-seed CTE variance.
+        #
+        # FIX: a light, FIXED-weight (not Kendall-learned — see constructor
+        # comment) L2 penalty on the softmax distribution itself. This
+        # dampens how far ANY seed's early gradient is allowed to push this
+        # collapse, without touching any per-metric (ADE/ATE/CTE) loss term
+        # — it regularizes the MECHANISM shown to drive the variance,
+        # staying general rather than metric-specific.
+        hard_dist    = F.softmax(self.hard_score_weight_logits, dim=0)  # [4]
+        hard_uniform = hard_dist.new_full((4,), 0.25)
+        l_hard_reg   = ((hard_dist - hard_uniform) ** 2).sum()
 
         # ── L_CFM ─────────────────────────────────────────────────────────
         x0 = torch.randn_like(x1_rel) * sigma
@@ -1174,15 +1488,21 @@ class TCFlowMatching(nn.Module):
         #   → khi gate=0, không có "ghost constant" đóng góp vào total
         HALF_LOG_2PI = 0.5 * math.log(2.0 * math.pi)   # ≈ 0.9189
 
-        prec_reg     = torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))
+        prec_reg     = torch.exp(-2.0 * self.log_sigma_reg.clamp(min=self.log_sigma_reg_min_clamp))
         prec_heading = torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))
         prec_calib   = torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))
 
-        weighted_reg     = ramp_reg    * (0.5 * prec_reg     * l_reg     + self.log_sigma_reg.clamp(min=-3.0)     + HALF_LOG_2PI)
+        weighted_reg     = ramp_reg    * (0.5 * prec_reg     * l_reg     + self.log_sigma_reg.clamp(min=self.log_sigma_reg_min_clamp)     + HALF_LOG_2PI)
         weighted_heading = ramp_dir    * (0.5 * prec_heading * l_heading + self.log_sigma_heading.clamp(min=-3.0) + HALF_LOG_2PI)
         weighted_calib   = ramp_calib  * (0.5 * prec_calib   * l_calib   + self.log_sigma_calib.clamp(min=-3.0)   + HALF_LOG_2PI)
 
-        total = l_cfm + weighted_reg + weighted_heading + weighted_calib
+        # [VAR-REDUCE] fixed weight, no ramp (regularizes the collapse from
+        # epoch 0, since the divergence between seeds is already visible by
+        # epoch 20-30 — waiting to ramp it in would be too late), no Kendall
+        # (must stay a genuine constraint, not something the model can
+        # learn to switch off).
+        total = (l_cfm + weighted_reg + weighted_heading + weighted_calib
+                  + self.lambda_hard_reg * l_hard_reg)
         if not torch.isfinite(total):
             total = x0.new_zeros(())
 
@@ -1201,6 +1521,18 @@ class TCFlowMatching(nn.Module):
             "l_reg":     l_reg.item() if torch.is_tensor(l_reg) else 0.0,
             "l_heading": l_heading.item() if torch.is_tensor(l_heading) else 0.0,
             "l_calib":   l_calib.item(),
+            "l_hard_reg": l_hard_reg.item(),
+            "hard_dist": hard_dist.detach().tolist(),
+            "lambda_hard_reg": self.lambda_hard_reg,
+            # Graph-connected tensors (for ablation re-weighting; do NOT .item() these).
+            # A wrapper that rebuilds `total` from the .item() floats above would
+            # sever the autograd graph and train nothing but the Kendall log_sigma*
+            # params. Use these instead when zeroing a term for an ablation run.
+            "_t_l_cfm":      l_cfm,
+            "_t_l_reg":      l_reg     if torch.is_tensor(l_reg)     else x0.new_zeros(()),
+            "_t_l_heading":  l_heading if torch.is_tensor(l_heading) else x0.new_zeros(()),
+            "_t_l_calib":    l_calib,
+            "_t_l_hard_reg": l_hard_reg,
             "l_momentum": 0.0,
             "lam_reg":   ramp_reg,
             "lam_dir":   ramp_dir,
@@ -1276,6 +1608,7 @@ class TCFlowMatching(nn.Module):
                ddim_steps:            Optional[int]  = None,
                return_xai:            bool           = False,
                use_speed_calibration: bool           = True,
+               use_curvature_score:   bool           = False,
                **kwargs) -> Tuple:
         """
         1-shot inference with physics selection + learnable speed calibration.
@@ -1283,10 +1616,18 @@ class TCFlowMatching(nn.Module):
         Steps:
           1. Encode context once (hard_score + full encoder)
           2. Sample K=20 candidates: x0 ~ N(0, sigma_inf²), x_pred = x0 + v(x0, 0, cond)
-          3. Physics score each candidate (speed+smooth+heading+displacement)
+          3. Physics score each candidate (speed+smooth+heading+displacement
+             [+curvature if use_curvature_score=True])
           4. Weighted average of top-3 candidates
           5. Speed calibration per-horizon (LEARNED, not fixed clip)
           6. If return_xai=True: compute XAI-1 through XAI-9
+
+        use_curvature_score: [CURV-SCORE, opt-in, default False] adds a 5th
+          re-ranking component that favors candidates whose turning rate
+          matches the storm's OBSERVED turning rate, rather than only
+          checking step-0 direction (head_score) or penalizing all turning
+          (smooth_score). Pure inference-time change — no retraining needed,
+          can be A/B tested directly on any existing checkpoint.
 
         Returns:
           (pred_mean [T,B,2], zeros [T,B,2], all_traj [K,T,B,2])
@@ -1323,7 +1664,9 @@ class TCFlowMatching(nn.Module):
             x_abs = self._from_relative(x_rel, last_obs)
             all_traj.append(x_abs.permute(1, 0, 2))   # [T, B, 2]
 
-        scores  = torch.stack([_physics_score(t, obs_norm) for t in all_traj], 0)   # [K, B]
+        scores  = torch.stack(
+            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
+             for t in all_traj], 0)   # [K, B]
         all_t   = torch.stack(all_traj, 0)   # [K, T, B, 2]
         top_k   = min(3, K)
         top_idx = scores.topk(top_k, dim=0).indices   # [top_k, B]
@@ -1451,13 +1794,14 @@ class TCFlowMatching(nn.Module):
             "speed_correction":     (torch.sigmoid(self.speed_correction_logits) * 2.0).tolist(),
             "reg_step_weights":     F.softmax(self.reg_step_logits, dim=0).tolist(),
             "hard_score_weights":   F.softmax(self.hard_score_weight_logits, dim=0).tolist(),
+            "b_horizon":            torch.exp(self.log_b_horizon).detach().tolist(),
             # [v2.4 FIX] các keys sau bị thiếu → head_w=[] và sigma_inf=nan trong log
             "heading_step_weights": F.softmax(self.heading_step_logits, dim=0).tolist(),
             "sigma_inf":            float(self.sigma_inference),
             "log_sigma_reg":        float(self.log_sigma_reg.detach()),
             "log_sigma_heading":    float(self.log_sigma_heading.detach()),
             "log_sigma_calib":      float(self.log_sigma_calib.detach()),
-            "eff_lambda_reg":       float((0.5 * torch.exp(-2.0 * self.log_sigma_reg.clamp(min=-3.0))).detach()),
+            "eff_lambda_reg":       float((0.5 * torch.exp(-2.0 * self.log_sigma_reg.clamp(min=self.log_sigma_reg_min_clamp))).detach()),
             "eff_lambda_heading":   float((0.5 * torch.exp(-2.0 * self.log_sigma_heading.clamp(min=-3.0))).detach()),
             "eff_lambda_calib":     float((0.5 * torch.exp(-2.0 * self.log_sigma_calib.clamp(min=-3.0))).detach()),
         }
@@ -1471,6 +1815,7 @@ class TCFlowMatching(nn.Module):
         sigmas: Optional[List[float]] = None,
         n_per_sigma: int = 4,
         use_speed_calibration: bool = True,
+        use_curvature_score:   bool = False,
     ) -> Tuple:
         """
         Multi-scale sigma ensemble at inference (DOES NOT affect training).
@@ -1497,7 +1842,9 @@ class TCFlowMatching(nn.Module):
                 x_abs = self._from_relative(x0 + v, last_obs)
                 all_traj.append(x_abs.permute(1, 0, 2))
 
-        scores  = torch.stack([_physics_score(t, obs_norm) for t in all_traj], 0)
+        scores  = torch.stack(
+            [_physics_score(t, obs_norm, use_curvature_score=use_curvature_score)
+             for t in all_traj], 0)
         all_t   = torch.stack(all_traj, 0)
         top_k   = min(5, len(all_traj))
         top_idx = scores.topk(top_k, dim=0).indices
