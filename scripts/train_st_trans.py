@@ -1,4 +1,3 @@
-
 """
 scripts/train_st_trans.py  ── ST-Trans Baseline Training
 =========================================================
@@ -230,6 +229,9 @@ def get_args():
     p.add_argument("--output_dir",   default="runs/st_trans", type=str)
     p.add_argument("--metrics_csv",  default="metrics.csv",   type=str)
     p.add_argument("--gpu_num",      default="0",             type=str)
+    p.add_argument("--seed",         default=42,  type=int,
+                   help="Random seed. Run 3-5 seeds for ESWA mean±std reporting, "
+                        "same convention as train_flowmatching.py.")
 
     # DataLoader compat (cùng với train_paper_baseline)
     p.add_argument("--delim",        default=" ")
@@ -246,6 +248,12 @@ def get_args():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(args):
+    # Seed/ablation output_dir suffixing (no-op for default seed=42) —
+    # same convention as train_flowmatching.py, so multi-seed runs don't
+    # overwrite each other.
+    if args.seed != 42:
+        args.output_dir = f"{args.output_dir}_seed{args.seed}"
+
     if torch.cuda.is_available():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -429,12 +437,42 @@ def main(args):
             if ade < best_ade:
                 best_ade     = ade
                 patience_cnt = 0
+                # [FIX] STTrans (non_ar) and STTransAR have DIFFERENT
+                # constructor signatures — STTransAR has no num_dec_layers
+                # (it uses a GRU-cell decoder, not a Transformer decoder).
+                # Saving the wrong key set would raise TypeError if this
+                # model_cfg is later used to reconstruct the model.
+                if args.model_type == "non_ar":
+                    _model_cfg = {
+                        "obs_len":        args.obs_len,
+                        "pred_len":       args.pred_len,
+                        "unet_in_ch":     args.unet_in_ch,
+                        "d_model":        args.d_model,
+                        "nhead":          args.nhead,
+                        "num_enc_layers": args.num_enc_layers,
+                        "num_dec_layers": args.num_dec_layers,
+                        "dim_ff":         args.dim_ff,
+                        "dropout":        args.dropout,
+                    }
+                else:
+                    _model_cfg = {
+                        "obs_len":        args.obs_len,
+                        "pred_len":       args.pred_len,
+                        "unet_in_ch":     args.unet_in_ch,
+                        "d_model":        args.d_model,
+                        "nhead":          args.nhead,
+                        "num_enc_layers": args.num_enc_layers,
+                        "dim_ff":         args.dim_ff,
+                        "dropout":        args.dropout,
+                    }
                 torch.save({
                     "epoch"      : epoch,
                     "model_state": model.state_dict(),
                     "best_ade"   : best_ade,
                     "model_type" : args.model_type,
                     "paper"      : "Faiaz et al. 2026",
+                    "seed"       : args.seed,
+                    "model_cfg"  : _model_cfg,
                 }, best_ckpt)
                 print(f"  ✅ Best ADE {best_ade:.1f} km  (epoch {epoch})")
             else:
@@ -452,6 +490,7 @@ def main(args):
                 "model_state": model.state_dict(),
                 "train_loss" : avg_train,
                 "val_dpe"    : avg_val_dpe,
+                "seed"       : args.seed,
             }, os.path.join(args.output_dir, f"ckpt_ep{epoch:04d}.pth"))
 
     total_h = (time.perf_counter() - train_start) / 3600
@@ -471,8 +510,8 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args()
-    np.random.seed(42)
-    torch.manual_seed(42)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed_all(args.seed)
     main(args)
