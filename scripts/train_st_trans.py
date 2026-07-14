@@ -257,6 +257,18 @@ def main(args):
     if torch.cuda.is_available():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # [FIX] Print device/GPU diagnostics immediately — without this, a
+    # silent CPU fallback (or a slow/shared GPU) is only noticed hours
+    # into training when epoch timing looks off, instead of in the first
+    # few seconds. This does not change any training behavior.
+    print(f"  Device: {device}")
+    if torch.cuda.is_available():
+        print(f"  GPU: {torch.cuda.get_device_name(0)}  "
+              f"(CUDA {torch.version.cuda}, {torch.cuda.device_count()} visible)")
+    else:
+        print(f"  ⚠ No GPU detected — training on CPU will be MUCH slower "
+              f"(often 10-50x). If you expected a GPU here, check Kaggle's "
+              f"Accelerator setting for this session.")
     os.makedirs(args.output_dir, exist_ok=True)
 
     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)

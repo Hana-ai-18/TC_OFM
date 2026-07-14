@@ -230,6 +230,9 @@ def get_args():
     p.add_argument("--output_dir",   default="runs/paper_baseline", type=str)
     p.add_argument("--metrics_csv",  default="metrics.csv",         type=str)
     p.add_argument("--gpu_num",      default="0",                   type=str)
+    p.add_argument("--seed",         default=42,  type=int,
+                   help="Random seed. Run 3-5 seeds for ESWA mean±std reporting, "
+                        "same convention as train_flowmatching.py.")
 
     # DataLoader compat
     p.add_argument("--delim",        default=" ")
@@ -247,9 +250,25 @@ def get_args():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main(args):
+    # Seed/ablation output_dir suffixing (no-op for default seed=42) —
+    # same convention as train_flowmatching.py, so multi-seed runs don't
+    # overwrite each other.
+    if args.seed != 42:
+        args.output_dir = f"{args.output_dir}_seed{args.seed}"
+
     if torch.cuda.is_available():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_num)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # [FIX] Same diagnostic as train_st_trans.py — print device/GPU info
+    # immediately so a silent CPU fallback is caught in seconds, not hours.
+    print(f"  Device: {device}")
+    if torch.cuda.is_available():
+        print(f"  GPU: {torch.cuda.get_device_name(0)}  "
+              f"(CUDA {torch.version.cuda}, {torch.cuda.device_count()} visible)")
+    else:
+        print(f"  ⚠ No GPU detected — training on CPU will be MUCH slower "
+              f"(often 10-50x). If you expected a GPU here, check Kaggle's "
+              f"Accelerator setting for this session.")
     os.makedirs(args.output_dir, exist_ok=True)
 
     metrics_csv = os.path.join(args.output_dir, args.metrics_csv)
@@ -415,6 +434,20 @@ def main(args):
                     "best_ade"   : best_ade,
                     "model_type" : args.model_type,
                     "paper"      : "Rahman et al. 2025",
+                    "seed"       : args.seed,
+                    # [FIX] full architecture config, so evaluate_multi_model.py
+                    # (or any future eval script) can reconstruct the exact
+                    # model instead of falling back to CLI defaults, which is
+                    # only correct by coincidence when trained with defaults.
+                    "model_cfg"  : {
+                        "model_type": args.model_type,
+                        "pred_len":   args.pred_len,
+                        "obs_len":    args.obs_len,
+                        "hidden_dim": args.hidden_dim,
+                        "n_layers":   args.n_layers,
+                        "unet_in_ch": args.unet_in_ch,
+                        "dropout":    args.dropout,
+                    },
                 }, best_ckpt)
                 print(f"  ✅ Best ADE {best_ade:.1f} km  (epoch {epoch})")
             else:
@@ -433,6 +466,7 @@ def main(args):
                 "model_state": model.state_dict(),
                 "train_mse"  : avg_train,
                 "val_mse"    : avg_val,
+                "seed"       : args.seed,
             }, os.path.join(args.output_dir, f"ckpt_ep{epoch:04d}.pth"))
 
     total_h = (time.perf_counter() - train_start) / 3600
@@ -452,8 +486,8 @@ def main(args):
 
 if __name__ == "__main__":
     args = get_args()
-    np.random.seed(42)
-    torch.manual_seed(42)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
+        torch.cuda.manual_seed_all(args.seed)
     main(args)
