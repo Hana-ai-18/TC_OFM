@@ -651,7 +651,7 @@ def _physics_score(traj_norm: torch.Tensor, obs_norm: torch.Tensor,
 #  Augmentation — GIỮ NGUYÊN từ v2.1-clean (đã proven qua thực nghiệm)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def augment_batch(batch_list) -> list:
+def augment_batch(batch_list, disable_c: bool = False) -> list:
     """
     Distribution (4 active types + 2 no-op slots):
       A (25%): track shift ±5km             — shape unchanged, position varies
@@ -667,6 +667,19 @@ def augment_batch(batch_list) -> list:
       - mixup (phi vật lý, v2.4 proof)
       - speed scale >×1.5 trên GT (too far from real)
       - exp L_reg weights (v2.4 catastrophic, ADE=291km)
+
+    disable_c: [FIX, ablation support] default False = EXACT original
+      behavior, không đổi gì cho bất kỳ lời gọi nào không truyền tham
+      số này (mọi call site cũ vẫn chạy y hệt trước). Khi True (dùng
+      bởi train_flowmatching.py's --disable_aug_c), nhánh C (recurvature,
+      0.45<=r<0.65) rơi xuống no-op giống hệt nhánh D-E thay vì xoay
+      displacement vectors — tỉ lệ r vẫn giữ nguyên 6 khoảng như cũ
+      (không re-sample r, không đổi phân phối của A/B/D-E/F), chỉ đổi
+      HÀNH VI của đúng khoảng recurvature. Trước khi có tham số này,
+      --disable_aug_c hoàn toàn KHÔNG có tác dụng (train_flowmatching.py
+      gọi augment_batch(bl) không qua flag nào), tức mọi run trước đó
+      dùng cờ này (nếu có) thực ra đã train VỚI AUG-C bật, không phải
+      không có — cần re-run nếu muốn có kết quả no_aug_c thật.
     """
     bl = list(batch_list)
     if not torch.is_tensor(bl[0]):
@@ -703,33 +716,38 @@ def augment_batch(batch_list) -> list:
         # which inflated step-distances → model learned "recurvature=faster"
         # → ATE +7.2km artifact. Fixed by rotating displacement vectors:
         # direction changes, step magnitude preserved = correct TC physics.
-        T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
-        if T_pred >= 4:
-            gt      = bl[1].clone()
-            max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
-            max_rad = max_deg * math.pi / 180.0
-            pts  = torch.cat([anchor, gt], 0)   # [T_pred+1, B, 2]
-            disp = pts[1:] - pts[:-1]           # [T_pred, B, 2]
-            for t in range(T_pred):
-                progress = (t / max(T_pred - 1, 1)) ** 1.5
-                a = max_rad * progress
-                c, s = math.cos(a), math.sin(a)
-                rot = torch.tensor([[c, -s], [s, c]], dtype=gt.dtype, device=device)
-                disp[t] = (rot @ disp[t].unsqueeze(-1)).squeeze(-1)
-            gt_new = gt.clone()
-            gt_new[0] = anchor[0] + disp[0]
-            for t in range(1, T_pred):
-                gt_new[t] = gt_new[t - 1] + disp[t]
-            bl[1] = gt_new
-            # Rotate last 3 obs DISPLACEMENTS by 30% of max (continuity)
-            T_obs   = obs.shape[0]
-            obs_aug = obs.clone()
-            cp = math.cos(max_rad * 0.3); sp = math.sin(max_rad * 0.3)
-            rp = torch.tensor([[cp, -sp], [sp, cp]], dtype=obs.dtype, device=device)
-            for t_obs in range(max(1, T_obs - 3), T_obs):
-                d = obs_aug[t_obs, :, :2] - obs_aug[t_obs - 1, :, :2]
-                obs_aug[t_obs, :, :2] = obs_aug[t_obs - 1, :, :2] + (rp @ d.unsqueeze(-1)).squeeze(-1)
-            bl[0] = obs_aug
+        if disable_c:
+            # [FIX, ablation support] disable_c=True: same slot as D-E
+            # (no augmentation) — see docstring above.
+            pass
+        else:
+            T_pred = bl[1].shape[0] if torch.is_tensor(bl[1]) else 0
+            if T_pred >= 4:
+                gt      = bl[1].clone()
+                max_deg = (torch.rand(1).item() - 0.5) * 40.0   # -20° to +20°
+                max_rad = max_deg * math.pi / 180.0
+                pts  = torch.cat([anchor, gt], 0)   # [T_pred+1, B, 2]
+                disp = pts[1:] - pts[:-1]           # [T_pred, B, 2]
+                for t in range(T_pred):
+                    progress = (t / max(T_pred - 1, 1)) ** 1.5
+                    a = max_rad * progress
+                    c, s = math.cos(a), math.sin(a)
+                    rot = torch.tensor([[c, -s], [s, c]], dtype=gt.dtype, device=device)
+                    disp[t] = (rot @ disp[t].unsqueeze(-1)).squeeze(-1)
+                gt_new = gt.clone()
+                gt_new[0] = anchor[0] + disp[0]
+                for t in range(1, T_pred):
+                    gt_new[t] = gt_new[t - 1] + disp[t]
+                bl[1] = gt_new
+                # Rotate last 3 obs DISPLACEMENTS by 30% of max (continuity)
+                T_obs   = obs.shape[0]
+                obs_aug = obs.clone()
+                cp = math.cos(max_rad * 0.3); sp = math.sin(max_rad * 0.3)
+                rp = torch.tensor([[cp, -sp], [sp, cp]], dtype=obs.dtype, device=device)
+                for t_obs in range(max(1, T_obs - 3), T_obs):
+                    d = obs_aug[t_obs, :, :2] - obs_aug[t_obs - 1, :, :2]
+                    obs_aug[t_obs, :, :2] = obs_aug[t_obs - 1, :, :2] + (rp @ d.unsqueeze(-1)).squeeze(-1)
+                bl[0] = obs_aug
 
     elif r < 0.90:
         # D-E slot: no augmentation

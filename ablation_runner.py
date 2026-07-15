@@ -351,15 +351,30 @@ class AblationModel(TCFlowMatching):
         return self.get_loss_breakdown(batch_list, epoch=epoch)["total"]
 
     def augment_batch(self, batch_list, device):
-        """Override to disable AUG-C if requested."""
-        if self._abl.get("disable_aug_c", False):
-            # augment_batch() handles all 3 aug types internally via random.
-            # To disable AUG-C (recurvature), we call the base augment_batch
-            # but patch the random threshold so AUG-C (r >= 0.45) never fires.
-            # Simplest approach: call without aug (return batch as-is).
-            # ADE/CTE difference vs full model isolates AUG-C contribution.
+        """
+        Override to disable AUG-C if requested.
+
+        [FIX] Trước đây khi disable_aug_c=True, hàm này tắt TOÀN BỘ 6
+        nhánh augment (A/B/C/D-E/F), không chỉ riêng AUG-C (nhánh C,
+        recurvature) — comment cũ tự thừa nhận đây là "simplest approach"
+        chứ không phải đúng ý nghĩa tên biến disable_aug_c. Giờ
+        augment_batch() (flow_matching_model.py) đã có tham số disable_c
+        thật (thêm cùng lúc với fix --disable_aug_c ở train_flowmatching.py
+        — trước đó --disable_aug_c ở train_flowmatching.py cũng hoàn toàn
+        không có tác dụng vì cùng lý do), dùng đúng nó để chỉ tắt nhánh C,
+        giữ nguyên A/B/D-E/F — khớp đúng ý nghĩa "w/o AUG-C" trong
+        ABLATION_VARIANTS["no_aug_c"]'s desc, và nhất quán với
+        train_flowmatching.py's --disable_aug_c giờ đã hoạt động đúng.
+
+        disable_all_aug (variant "no_aug"): vẫn giữ hành vi tắt TOÀN BỘ
+        augmentation như cũ — đây là ablation "no_aug" thật (w/o ALL
+        augmentation A+B+C), khác no_aug_c ở chỗ tắt cả A/B/D-E/F, không
+        chỉ riêng C.
+        """
+        if self._abl.get("disable_all_aug", False):
             return [b.clone() if torch.is_tensor(b) else b for b in batch_list]
-        return augment_batch(batch_list)
+        return augment_batch(batch_list,
+                             disable_c=self._abl.get("disable_aug_c", False))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

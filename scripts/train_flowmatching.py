@@ -982,9 +982,31 @@ def main(args):
         "disable_aug_c":     getattr(args, "disable_aug_c", False),
         "disable_hard_reg":  getattr(args, "disable_hard_reg", False),
         "lambda_hard_reg":   getattr(args, "lambda_hard_reg", 0.02),
+        # [FIX] 2 ablation flags dưới đây đã có mặt trong model_cfg (nên
+        # checkpoint vẫn load lại đúng kiến trúc), nhưng bị BỎ SÓT khỏi
+        # footprint_info — tức file auto_eval_summary.json / bất kỳ chỗ
+        # nào đọc footprint_info sẽ KHÔNG biết run này có --no_ot hay
+        # --disable_horizon_nll hay không, dễ gây nhầm lẫn khi tra cứu
+        # lại nhiều run cùng lúc (đặc biệt 3 ablation seed=0 chạy song
+        # song: no_ot / no_horizon_nll / no_hard_reg).
+        "disable_horizon_nll": getattr(args, "disable_horizon_nll", False),
+        "use_ot":              getattr(args, "use_ot", True),
     }
 
     # ── Ablation: patch get_loss_breakdown ─────────────────────────────────
+    # [FIX] --disable_horizon_nll và --no_ot đều là cấu hình model-level
+    # thật (nằm trong model_cfg, ảnh hưởng constructor TCFlowMatching),
+    # nhưng không thuộc nhóm ablation "patch get_loss_breakdown" bên dưới
+    # (chúng không cần patch gì — enable_horizon_nll/use_ot đã được
+    # constructor xử lý trực tiếp). Trước đây 2 flag này hoàn toàn
+    # KHÔNG được log ra console — chạy --no_ot hay --disable_horizon_nll
+    # sẽ không in dòng [ABLATION] nào, dễ tưởng nhầm flag không có tác
+    # dụng dù model_cfg (và do đó checkpoint) vẫn đúng. Thêm log riêng.
+    if args.disable_horizon_nll or not args.use_ot:
+        print(f"  [ABLATION] Model-level: "
+              f"{'no_horizon_nll(raw dist, no log_b_horizon) ' if args.disable_horizon_nll else ''}"
+              f"{'no_OT(random x0/x1 pairing) ' if not args.use_ot else ''}")
+
     if any([args.disable_l_heading, args.disable_l_calib, args.disable_l_reg,
             args.disable_aug_c, args.disable_learned_weights, args.disable_hard_reg]):
         print(f"  [ABLATION] Disabled: "
@@ -1123,7 +1145,18 @@ def main(args):
 
         for i, batch in enumerate(trl):
             bl = move(list(batch), device)
-            bl_aug = augment_batch(bl)   # training augmentation
+            bl_aug = augment_batch(bl, disable_c=args.disable_aug_c)   # training augmentation
+            # [FIX] Bug thật đã tìm ra: trước đây augment_batch(bl) được
+            # gọi KHÔNG qua flag nào — --disable_aug_c chỉ được ghi vào
+            # footprint_info/console log ("[ABLATION] Disabled: AUG-C")
+            # nhưng KHÔNG có tác dụng thật, vì augment_batch() (định nghĩa
+            # trong flow_matching_model.py) không nhận tham số nào để tắt
+            # riêng nhánh C (recurvature). Đã thêm tham số disable_c vào
+            # augment_batch() (default=False, giữ nguyên hành vi cũ cho
+            # MỌI call site khác không truyền tham số này) và truyền đúng
+            # args.disable_aug_c vào đây. Mọi checkpoint no_aug_c/ablation
+            # đã train TRƯỚC fix này thực chất đã train VỚI AUG-C bật —
+            # cần re-run --disable_aug_c để có kết quả ablation thật.
 
             opt.zero_grad()
             with autocast(device_type="cuda", enabled=args.use_amp):
