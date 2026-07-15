@@ -402,15 +402,15 @@ def ode_steps_sweep(model, loader, device,
     unrelated to pred_len=16 from the reference paper -- same
     distinction flagged before, restated so this output isn't misread.
 
-    [BỔ SUNG, per-lead-time] Trước đây d.mean(0) gộp trung bình qua
-    TOÀN BỘ T lead-time (6h..72h) trước khi lưu -- mỗi storm chỉ đóng
-    góp 1 con số duy nhất, không có cách nào biết N ảnh hưởng CTE tại
-    72h khác gì tại 6h. Giờ vẫn giữ "*_mean"/"*_std" tổng thể (tương
-    thích ngược với print_ode_sweep/plot_ode_n_sweep, KHÔNG đổi hành vi
-    hiện có), nhưng THÊM "by_lead_time" -- dict {lead_time: {ADE/ATE/
-    CTE mean}} dùng CÙNG convention 1-indexed (1=6h...T=72h) đã thống
-    nhất với evaluate_multi_model.py, để build bảng/plot per-horizon
-    cho riêng ablation N nếu cần sau này.
+    [BỔ SUNG, per-lead-time SPREAD] Trước đây collect_spread chỉ tính
+    tại all_t[:, -1, :, :2] (BƯỚC CUỐI CÙNG duy nhất, tức 72h khi
+    pred_len=12) — không biết model bắt đầu phân tán từ lúc nào (có
+    thể tăng vọt sớm ở 24h là dấu hiệu bất thường mà con số cuối cùng
+    không lộ ra). Giờ tính spread cho MỌI lead-time (không chỉ bước
+    cuối), gộp vào by_lead_time["spread"] cùng cách với ADE/ATE/CTE.
+    "spread_mean" tổng thể (chỉ bước cuối) VẪN GIỮ NGUYÊN không đổi —
+    tương thích ngược 100% với print_ode_sweep/plot_ode_n_sweep, chỉ
+    thêm dữ liệu mới vào by_lead_time.
     """
     model.eval()
     results = {}
@@ -423,6 +423,7 @@ def ode_steps_sweep(model, loader, device,
         by_lt_ade = defaultdict(list)
         by_lt_ate = defaultdict(list)
         by_lt_cte = defaultdict(list)
+        by_lt_spread = defaultdict(list)
         t_start = time.time()
 
         for batch in loader:
@@ -463,22 +464,38 @@ def ode_steps_sweep(model, loader, device,
 
             if collect_spread and all_t is not None and all_t.shape[0] >= 2:
                 K = all_t.shape[0]
-                last = _norm_to_deg(all_t[:, -1, :, :2])   # [K, B, 2]
                 idx1 = torch.randperm(K)[:min(K, 10)]
                 idx2 = torch.randperm(K)[:min(K, 10)]
-                for a, b in zip(idx1.tolist(), idx2.tolist()):
-                    if a != b:
-                        dab = _haversine_deg(last[a:a+1], last[b:b+1]).squeeze(0)
-                        all_spread.append(float(dab.mean()))
+                pairs = [(a, b) for a, b in zip(idx1.tolist(), idx2.tolist()) if a != b]
+
+                # Bước cuối cùng — GIỮ NGUYÊN cho all_spread/spread_mean
+                # (tương thích ngược, không đổi hành vi hiện có).
+                last = _norm_to_deg(all_t[:, -1, :, :2])   # [K, B, 2]
+                for a, b in pairs:
+                    dab = _haversine_deg(last[a:a+1], last[b:b+1]).squeeze(0)
+                    all_spread.append(float(dab.mean()))
+
+                # [BỔ SUNG] MỌI lead-time — cùng cặp (a,b) đã chọn ngẫu
+                # nhiên ở trên để nhất quán across steps trong 1 batch,
+                # không re-sample cặp mới cho mỗi step0 (tránh nhiễu
+                # thêm không cần thiết).
+                T_all = all_t.shape[1]
+                for step0 in range(T_all):
+                    step_pts = _norm_to_deg(all_t[:, step0, :, :2])  # [K, B, 2]
+                    for a, b in pairs:
+                        dab = _haversine_deg(step_pts[a:a+1], step_pts[b:b+1]).squeeze(0)
+                        by_lt_spread[step0 + 1].append(float(dab.mean()))
 
         elapsed = time.time() - t_start
         by_lead_time = {}
-        all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys()) | set(by_lt_cte.keys()))
+        all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys())
+                         | set(by_lt_cte.keys()) | set(by_lt_spread.keys()))
         for lt in all_lts:
             by_lead_time[lt] = {
                 "ADE": float(np.mean(by_lt_ade[lt])) if by_lt_ade.get(lt) else float("nan"),
                 "ATE": float(np.mean(by_lt_ate[lt])) if by_lt_ate.get(lt) else float("nan"),
                 "CTE": float(np.mean(by_lt_cte[lt])) if by_lt_cte.get(lt) else float("nan"),
+                "spread": float(np.mean(by_lt_spread[lt])) if by_lt_spread.get(lt) else float("nan"),
                 "n":   len(by_lt_ade.get(lt, [])),
             }
 

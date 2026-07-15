@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import random
 import argparse
 from datetime import datetime, timedelta
@@ -527,16 +528,32 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range, use_satellite_bg=True):
             [lon_range[0], lon_range[1], lat_range[0], lat_range[1]],
             crs=ccrs.PlateCarree(),
         )
-        # [BỔ SUNG] Nền ảnh vệ tinh/địa hình thật (Natural Earth shaded
-        # relief, cùng nguồn dữ liệu cartopy dùng nội bộ — không cần tải
-        # thêm gì ngoài, hoạt động offline). Giống style ảnh minh họa
-        # (nền địa hình/vệ tinh thật) thay vì chỉ tô màu phẳng OCEAN/LAND.
+        # [FIX] stock_img() trước đây dùng ảnh Natural Earth độ phân
+        # giải THẤP (toàn cầu ~5400x2700px) — khi zoom vào 1 vùng nhỏ
+        # (vài độ kinh/vĩ), ảnh bị mờ/vỡ hạt rõ rệt (đúng như quan sát
+        # được). Đổi sang NaturalEarthFeature scale "10m" (chi tiết
+        # nhất cartopy hỗ trợ, ~1:10,000,000, đủ sắc nét khi zoom cận
+        # cảnh 1 khu vực) cho land/ocean thay vì ảnh raster toàn cầu.
+        # Cần internet ở LẦN ĐẦU để cartopy tải + cache asset (~vài MB,
+        # lưu local sau đó, các lần chạy sau OFFLINE vẫn dùng được nếu
+        # cache còn). Nếu tải 10m thất bại (không có mạng, chưa cache),
+        # tự động lùi về 50m rồi tới màu phẳng — không bao giờ crash vì
+        # thiếu nền bản đồ.
+        drew_bg = False
         if use_satellite_bg:
-            try:
-                ax.stock_img()
-            except Exception:
-                use_satellite_bg = False  # fallback nếu không tải được asset
-        if not use_satellite_bg:
+            for scale in ("10m", "50m"):
+                try:
+                    ax.add_feature(cfeature.NaturalEarthFeature(
+                        "physical", "land", scale,
+                        facecolor="#E8E4D8", edgecolor="none"), zorder=1)
+                    ax.add_feature(cfeature.NaturalEarthFeature(
+                        "physical", "ocean", scale,
+                        facecolor="#C8DCF0", edgecolor="none"), zorder=0)
+                    drew_bg = True
+                    break
+                except Exception:
+                    continue
+        if not drew_bg:
             ax.add_feature(cfeature.OCEAN.with_scale("50m"),
                            facecolor=STYLE["ocean_color"], zorder=0)
             ax.add_feature(cfeature.LAND.with_scale("50m"),
@@ -572,11 +589,32 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range, use_satellite_bg=True):
     return ax
 
 
+def _inset_range(pred_deg, ens_deg):
+    """
+    [MỚI] Tính (lon_range, lat_range) hẹp, zoom RIÊNG vào vùng dự báo
+    (pred_deg + toàn bộ ensemble members) — dùng cho inset zoom, khác
+    hẳn cách tính margin của map chính (vốn phải bao trùm cả obs/gt để
+    không cắt mất track thật, nên margin lớn khi sai số dự báo lớn).
+    Margin ở đây CỐ ĐỊNH theo % độ trải dài của chính vùng dự báo (30%
+    mỗi chiều), với sàn 0.3° — đủ nhỏ để ensemble spread luôn chiếm
+    phần lớn khung nhìn, bất kể map chính phải zoom xa cỡ nào.
+    """
+    pts = pred_deg if ens_deg is None else np.vstack([pred_deg, ens_deg.reshape(-1, 2)])
+    lon_span = pts[:, 0].max() - pts[:, 0].min()
+    lat_span = pts[:, 1].max() - pts[:, 1].min()
+    margin_lon = max(lon_span * 0.30, 0.3)
+    margin_lat = max(lat_span * 0.30, 0.3)
+    lon_range = (pts[:, 0].min() - margin_lon, pts[:, 0].max() + margin_lon)
+    lat_range = (pts[:, 1].min() - margin_lat, pts[:, 1].max() + margin_lat)
+    return lon_range, lat_range
+
+
 def _plot_on_ax(
     ax, lon_range, lat_range,
     obs_deg, gt_deg, pred_deg, pred_Me_deg,
     all_trajs_deg=None, errors_km=None,
     title="", dt_str="", pred_label="FM (mean)",
+    ref_spread_km=None,
 ):
     transform = ccrs.PlateCarree() if HAS_CARTOPY else None
     # Viền TRẮNG quanh chữ/marker (đảo ngược so với bản dark, vốn viền
@@ -706,7 +744,21 @@ def _plot_on_ax(
                     members_at_t = all_trajs_deg[:, si, :]           # [K, 2]
                     mean_at_t    = members_at_t.mean(axis=0, keepdims=True)
                     d_to_mean    = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
-                    lines.append(f" {lh}h: {d_to_mean.std():.0f} km")
+                    this_spread  = d_to_mean.std()
+                    # [BỔ SUNG, optional] Nếu có ref_spread_km (đọc từ
+                    # Table 4/5 — trung bình toàn test set ~420 storm-
+                    # window), in kèm để đối chiếu "spread của RITA cụ
+                    # thể này" vs "spread trung bình toàn test set".
+                    # KHÔNG thay thế số 1-storm bằng số tổng hợp — chỉ
+                    # thêm bên cạnh để biết RITA có bất thường
+                    # (cao/thấp hẳn so với trung bình) hay không. 2 con
+                    # số dùng KHÁC công thức (std-to-mean vs pairwise
+                    # mean) nên không so sánh tuyệt đối 1:1 được, chỉ
+                    # mang tính tham khảo mức độ (order of magnitude).
+                    ref_str = ""
+                    if ref_spread_km and lh in ref_spread_km:
+                        ref_str = f" (ref: {ref_spread_km[lh]:.0f})"
+                    lines.append(f" {lh}h: {this_spread:.0f} km{ref_str}")
 
         ax.text(
             0.02, 0.03, "\n".join(lines),
@@ -1218,6 +1270,49 @@ def visualize_forecast(args):
     print(f"  TC-FM Visualize (paper style)  |  {t_name}  @  {t_date}")
     print(f"{'=' * 65}\n")
 
+    # [MỚI, optional] Đọc ode_steps_sweep.json nếu được truyền, lấy
+    # spread tại đúng N khớp với --ode_steps đang dùng — để không so
+    # sánh nhầm N khác nhau (spread phụ thuộc RẤT NHIỀU vào N, xem
+    # Table 4). Giờ lấy ĐỦ CẢ 3 MỐC (24h/48h/72h) từ by_lead_time's
+    # "spread" field (đã bổ sung — trước đây chỉ có tại bước cuối
+    # cùng). Fallback về spread_mean (chỉ 72h) nếu file JSON cũ chưa
+    # có "spread" trong by_lead_time (tương thích ngược với file sinh
+    # ra trước khi có fix per-lead-time spread).
+    ref_spread_km = None
+    if args.ode_sweep_json:
+        try:
+            with open(args.ode_sweep_json) as f:
+                sweep_data = json.load(f)
+            entry = sweep_data.get(str(args.ode_steps), sweep_data.get(args.ode_steps))
+            if entry:
+                ref_spread_km = {}
+                by_lt = entry.get("by_lead_time", {})
+                for si, lh in [(3, 24), (7, 48), (11, 72)]:
+                    lt_key = si + 1  # 0-indexed step -> 1-indexed lead_time
+                    lt_entry = by_lt.get(str(lt_key), by_lt.get(lt_key))
+                    if lt_entry and lt_entry.get("spread") is not None:
+                        val = lt_entry["spread"]
+                        if not (isinstance(val, float) and val != val):  # NaN check
+                            ref_spread_km[lh] = val
+                # Fallback: file JSON cũ chưa có "spread" trong
+                # by_lead_time — dùng spread_mean (chỉ 72h) như trước.
+                if not ref_spread_km and entry.get("spread_mean") is not None:
+                    val = entry["spread_mean"]
+                    if not (isinstance(val, float) and val != val):
+                        fh_ref = args.pred_len * 6
+                        ref_spread_km = {fh_ref: val}
+                        print(f"  ⚠ ode_sweep_json chưa có spread per-lead-time "
+                              f"(file cũ) — chỉ dùng spread_mean tại {fh_ref}h.\n")
+                if ref_spread_km:
+                    print(f"  [ref] spread trung bình test set tại N={args.ode_steps}: "
+                          f"{ref_spread_km} (n={entry.get('n_storms', '?')} storm-window)\n")
+                else:
+                    print(f"  ⚠ ode_sweep_json không có spread hợp lệ cho N={args.ode_steps}\n")
+            else:
+                print(f"  ⚠ ode_sweep_json không có entry cho N={args.ode_steps}\n")
+        except Exception as e:
+            print(f"  ⚠ Không đọc được --ode_sweep_json: {e}\n")
+
     model, dset = load_model_and_data(args, device, args.dset_type)
 
     target, matched_obs_len, actual_date = find_target(
@@ -1282,12 +1377,25 @@ def visualize_forecast(args):
     lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
 
     # [FIX] Theo yêu cầu mới nhất: bỏ panel Spread vs Error, map chiếm
-    # full width. (Trước đó có 1 bản đổi ngược lại — bỏ map giữ Spread —
-    # đã bị revert theo yêu cầu này.)
-    # Figure to hơn (14x13, trước là 11x12) + tỷ lệ ngang rộng hơn nhờ
-    # lon_range đã mở, theo đúng yêu cầu "kéo bề ngang to ra".
-    fig    = plt.figure(figsize=(14, 13), facecolor=STYLE["bg_color"])
-    ax_map = make_map_ax(fig, 111, lon_range, lat_range)
+    # phần lớn width. Figure to hơn (14x13, trước là 11x12) + tỷ lệ
+    # ngang rộng hơn nhờ lon_range đã mở, theo đúng yêu cầu "kéo bề
+    # ngang to ra".
+    #
+    # [BỔ SUNG] Inset zoom cận cảnh (subplot nhỏ bên phải map chính):
+    # khi sai số dự báo THẬT rất lớn (model lệch hướng nhiều trăm-nghìn
+    # km so với track thật), map chính buộc phải trải khung nhìn rất
+    # rộng để chứa đủ cả obs/gt/pred — khiến ensemble spread (thường
+    # chỉ vài chục km) không thể nhìn thấy rõ dù dữ liệu hoàn toàn
+    # không co cụm (đây là vấn đề TỶ LỆ, đã xác nhận qua box "Spread
+    # (1σ)" luôn có số thật != 0). Inset này zoom RIÊNG vào vùng dự
+    # báo (pred + ensemble, margin nhỏ cố định ~1.5x max spread thay vì
+    # margin theo track dài), để ensemble luôn nhìn rõ được bất kể map
+    # chính phải zoom xa cỡ nào.
+    fig = plt.figure(figsize=(18, 13), facecolor=STYLE["bg_color"])
+    gs  = fig.add_gridspec(1, 3, width_ratios=[2, 2, 1], wspace=0.12)
+    ax_map   = make_map_ax(fig, gs[0, :2], lon_range, lat_range)
+    ax_inset = make_map_ax(fig, gs[0, 2],
+                           *_inset_range(pred_deg, ens_deg))
 
     dt_str    = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
     fh        = args.pred_len * 6
@@ -1303,6 +1411,15 @@ def visualize_forecast(args):
             f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}){snap_note}"
         ),
         dt_str=dt_str,
+        ref_spread_km=ref_spread_km,
+    )
+    _plot_on_ax(
+        ax_inset, *_inset_range(pred_deg, ens_deg),
+        obs_deg, gt_deg, pred_deg, pred_Me_n,
+        all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
+        errors_km=None,   # không lặp lại error summary box trong inset — chỉ cần cone
+        title="Zoom: Predicted + Spread",
+        dt_str="",
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1590,6 +1707,14 @@ if __name__ == "__main__":
     p.add_argument("--min_ped",        type=int,   default=1)
     p.add_argument("--threshold",      type=float, default=0.002)
     p.add_argument("--other_modal",    default="gph")
+    p.add_argument("--ode_sweep_json", default=None,
+                   help="[MỚI, optional] Đường dẫn ode_steps_sweep.json từ "
+                        "ablation_runner.py --mode ode_steps — nếu truyền, "
+                        "box 'Spread (1σ)' trên map sẽ in kèm số tham chiếu "
+                        "(trung bình toàn test set, ~420 storm-window) bên "
+                        "cạnh spread của riêng storm đang xem, để biết storm "
+                        "này có bất thường so với trung bình hay không. "
+                        "Không truyền thì giữ nguyên hành vi cũ (chỉ 1 số).")
 
     # --mode multi_model: mỗi checkpoint optional, chỉ vẽ model được truyền
     p.add_argument("--fm_checkpoint",       default=None)
