@@ -192,10 +192,14 @@ def detect_pred_len(ckpt_path):
     """
     Infer pred_len from the pos_enc shape stored in the checkpoint.
     [FIX-7] Wrapped in try/except so unusual checkpoint layouts don't crash.
+    [FIX-8] Checkpoint thật lưu weights dưới key "model" (xác nhận qua
+    evaluate_multi_model.py's load_fm() và train_flowmatching.py's
+    _save()), KHÔNG PHẢI "model_state_dict"/"model_state" — 2 key đó
+    không tồn tại trong checkpoint FM thật.
     """
     try:
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        sd = ck.get("model_state_dict", ck.get("model_state", ck))
+        sd = ck.get("model", ck.get("model_state_dict", ck.get("model_state", ck)))
         for key in ["net.pos_enc", "denoiser.pos_enc", "pos_enc"]:
             if key in sd:
                 return sd[key].shape[1]
@@ -650,10 +654,30 @@ def _plot_on_ax(
     # 9. Error summary box
     if errors_km is not None:
         n     = len(errors_km)
-        lines = [f"Mean: {errors_km.mean():.0f} km"]
+        lines = [f"Mean ADE: {errors_km.mean():.0f} km"]
         for si, lh in [(3, 24), (7, 48), (11, 72)]:
             if si < n:
                 lines.append(f" {lh}h: {errors_km[si]:.0f} km")
+
+        # [BỔ SUNG, quan trọng] Spread (km) tại các mốc — in TRỰC TIẾP
+        # lên map thay vì chỉ dựa vào việc nhìn cone bằng mắt (dễ đánh
+        # lừa vì cone thật ~30km trông rất mảnh trên khung map rộng
+        # hàng trăm-nghìn km khi track dài). Đây là bằng chứng ĐỊNH
+        # LƯỢNG rằng ensemble không co cụm, không phụ thuộc vào cách
+        # margin/zoom vẽ map. Tính bằng std khoảng cách Haversine giữa
+        # từng ensemble member và mean tại đúng lead-time đó — cùng đơn
+        # vị/ý nghĩa với "Ensemble spread (1σ)" đã dùng ở
+        # plot_spread_over_time() trước khi panel đó bị bỏ.
+        if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
+            lines.append("")
+            lines.append("Spread (1σ):")
+            for si, lh in [(3, 24), (7, 48), (11, 72)]:
+                if si < all_trajs_deg.shape[1]:
+                    members_at_t = all_trajs_deg[:, si, :]           # [K, 2]
+                    mean_at_t    = members_at_t.mean(axis=0, keepdims=True)
+                    d_to_mean    = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
+                    lines.append(f" {lh}h: {d_to_mean.std():.0f} km")
+
         ax.text(
             0.02, 0.03, "\n".join(lines),
             transform=ax.transAxes, fontsize=8, va="bottom",
@@ -893,7 +917,11 @@ def load_model_generic(model_path: str, model_type: str, device,
 
     if model_type == "fm":
         model = TCFlowMatching(**(model_cfg or dict(pred_len=pred_len, obs_len=obs_len))).to(device)
-        state = ck.get("model_state_dict", ck.get("model_state", ck.get("model", ck)))
+        # [FIX] "model" là key thật (xác nhận qua evaluate_multi_model.py
+        # và train_flowmatching.py) — đặt đầu tiên cho rõ ràng, dù về
+        # mặt chức năng thứ tự cũ vẫn ra đúng kết quả (2 key đầu luôn
+        # miss nên tự rơi xuống "model").
+        state = ck.get("model", ck.get("model_state_dict", ck.get("model_state", ck)))
     elif model_type == "st_trans":
         if model_cfg:
             model = STTrans(**model_cfg).to(device)
@@ -1063,10 +1091,32 @@ def load_model_and_data(args, device, dset_type="test"):
         print(f"  pred_len: {args.pred_len} → {detected}")
         args.pred_len = detected
 
-    model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
-    ck    = torch.load(args.model_path, map_location=device, weights_only=False)
-    sd    = ck.get("model_state_dict", ck.get("model_state", ck))
-    model.load_state_dict(sd, strict=False)
+    ck = torch.load(args.model_path, map_location=device, weights_only=False)
+
+    # [FIX-8, FIX-9] 2 bug đã tìm và sửa (xem chi tiết trong
+    # visual_evaluate_mode_ME.py's cùng hàm — copy nguyên văn fix sang
+    # đây để 2 file nhất quán):
+    # (1) model_cfg từ checkpoint bị bỏ qua hoàn toàn trước đây.
+    # (2) key "model_state_dict"/"model_state" không tồn tại trong
+    #     checkpoint thật (key đúng là "model") — khiến state_dict gần
+    #     như không load được tensor nào, model chạy random-init.
+    model_cfg = ck.get("model_cfg") or {}
+    if not model_cfg:
+        print("  ⚠ Checkpoint không có model_cfg — dùng constructor "
+              "DEFAULTS + pred_len/obs_len từ CLI. Chỉ đúng nếu checkpoint "
+              "train với kiến trúc mặc định.")
+        model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
+    else:
+        model = TCFlowMatching(**model_cfg).to(device)
+
+    sd = ck.get("model", ck.get("model_state_dict", ck.get("model_state", ck)))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    n_total = sum(1 for _ in model.state_dict())
+    print(f"  load_state_dict: {n_total - len(missing)}/{n_total} tensors khớp "
+          f"| {len(missing)} missing | {len(unexpected)} unexpected")
+    if len(missing) > n_total * 0.5:
+        print(f"  ❌ CẢNH BÁO: hơn 50% tensor KHÔNG load được — model gần như "
+              f"chắc chắn đang chạy random-init, không phải checkpoint thật.")
     model.eval()
     print("  Model loaded\n")
 
@@ -1127,16 +1177,30 @@ def visualize_forecast(args):
         print(f"    +{(i + 1) * 6:3d}h : {e:6.1f} km{mark}")
     print(f"    Mean  : {errors_km.mean():.1f} km\n")
 
-    all_deg   = np.vstack([obs_deg, gt_deg, pred_deg, ens_deg.reshape(-1, 2)])
-    margin    = 4.5
-    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
-    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
+    all_deg = np.vstack([obs_deg, gt_deg, pred_deg, ens_deg.reshape(-1, 2)])
 
-    fig    = plt.figure(figsize=(20, 10), facecolor=STYLE["bg_color"])
-    gs     = fig.add_gridspec(1, 3, wspace=0.10)
-    ax_map = make_map_ax(fig, gs[0, :2], lon_range, lat_range)
-    ax_err = fig.add_subplot(gs[0, 2])
-    ax_err.set_facecolor(STYLE["bg_color"])
+    # [FIX, quan trọng] Margin cố định 4.5° (~500km) trước đây khiến map
+    # LUÔN rộng hơn track rất nhiều — với track dài (ví dụ 724km ở 72h),
+    # tổng khung nhìn ra >1700km trong khi ensemble spread thật chỉ
+    # 27-34km, khiến ensemble "biến mất" trực quan dù dữ liệu HOÀN TOÀN
+    # KHÔNG co cụm (đã xác nhận bằng panel Spread vs Error trước khi bị
+    # bỏ theo yêu cầu). Đây là vấn đề TỶ LỆ HIỂN THỊ, không phải model.
+    # Sửa: margin giờ tỷ lệ theo độ trải dài thật của track (10% mỗi
+    # chiều), với sàn 1.0° (đủ hiển thị coastline quanh 1 điểm nếu track
+    # rất ngắn) và trần 4.5° (giữ hành vi cũ cho track thật sự dài, tránh
+    # zoom quá sát mất context địa lý).
+    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
+    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
+    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
+    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
+    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
+
+    # [FIX] Theo yêu cầu mới nhất: bỏ panel Spread vs Error, map chiếm
+    # full width. (Trước đó có 1 bản đổi ngược lại — bỏ map giữ Spread —
+    # đã bị revert theo yêu cầu này.)
+    fig    = plt.figure(figsize=(11, 12), facecolor=STYLE["bg_color"])
+    ax_map = make_map_ax(fig, 111, lon_range, lat_range)
 
     dt_str    = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
     fh        = args.pred_len * 6
@@ -1153,7 +1217,6 @@ def visualize_forecast(args):
         ),
         dt_str=dt_str,
     )
-    plot_spread_over_time(ax_err, ens_deg, errors_km, cliper_err, t_name)
 
     os.makedirs(args.output_dir, exist_ok=True)
     out = os.path.join(args.output_dir, f"forecast_{fh}h_{t_name}_{t_date}.png")
