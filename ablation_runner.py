@@ -523,6 +523,143 @@ def print_ode_sweep(results: Dict):
     print(f"  keep improving spread or plateau/regress past N=10.\n")
 
 
+def _infer_seed_local(checkpoint_path: str, ck: dict) -> str:
+    """
+    Copy nguyên văn logic của evaluate_multi_model.py's _infer_seed() /
+    evaluate_full.py's _infer_seed_local() (không import chéo — mỗi file
+    tự chứa theo đúng nguyên tắc đã áp dụng xuyên suốt dự án). Ưu tiên
+    đọc field "seed" lưu sẵn trong checkpoint, fallback parse
+    "seed<N>" từ đường dẫn.
+    """
+    if isinstance(ck, dict) and "seed" in ck:
+        return str(ck["seed"])
+    import re
+    m = re.search(r"seed[_-]?(\d+)", checkpoint_path)
+    if m:
+        return m.group(1)
+    return "unknown"
+
+
+def run_ode_steps_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
+                                    split: str, steps_list: List[int],
+                                    device, args) -> Dict:
+    """
+    [MỚI] Chạy ode_steps_sweep() (N-sweep) trên NHIỀU checkpoint (nhiều
+    seed của CÙNG 1 kiến trúc FM), rồi gộp thành mean±std theo seed cho
+    mỗi N — CÙNG PATTERN đã dùng cho evaluate_full.py's
+    run_ensemble_ablation_multi_seed() (K-sweep multi-seed), chỉ đổi
+    ensemble_size_eval() -> ode_steps_sweep() và field "K" -> "n_steps",
+    "ADE"/"ATE"/"CTE"/"spread" -> "ADE_mean"/"ATE_mean"/"CTE_mean"/
+    "spread_mean" (khớp đúng schema thật của ode_steps_sweep(), khác
+    ensemble_size_eval() ở việc có hậu tố "_mean").
+
+    Trả về dict cùng SCHEMA với ode_steps_sweep() (key=n_steps, value=
+    dict có ADE_mean/ATE_mean/CTE_mean/spread_mean/by_lead_time) để
+    generate_paper_report.py's build_ode_n_table() dùng lại được
+    NGUYÊN VẸN — chỉ khác là mỗi giá trị giờ là MEAN qua các seed, có
+    thêm "_std" bên cạnh mỗi field.
+    """
+    from Model.data.loader_training import data_loader
+    import argparse as _ap
+    per_seed_results = {}   # seed -> {n_steps: {...}}
+    for ckpt_path in checkpoints:
+        print(f"\n  {'='*70}\n  Loading checkpoint: {ckpt_path}\n  {'='*70}")
+        ck = torch.load(ckpt_path, map_location="cpu")
+        model_cfg = ck.get("model_cfg") or {}
+        if not model_cfg:
+            print("  ⚠ Checkpoint has no model_cfg — dùng constructor defaults.")
+        model = TCFlowMatching(**model_cfg).to(device)
+        state = ck.get("model", ck)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"  ⚠ load_state_dict: {len(missing)} missing, "
+                  f"{len(unexpected)} unexpected keys")
+
+        if not getattr(args, "no_ema", False) and ck.get("ema"):
+            try:
+                ema = EMAModel(model)
+                for k, v in ck["ema"].items():
+                    if k in ema.shadow:
+                        ema.shadow[k].copy_(v.to(device))
+                print(f"  EMA loaded ({len(ema.shadow)} params)")
+            except Exception as e:
+                print(f"  ⚠ EMA failed: {e}")
+
+        seed = _infer_seed_local(ckpt_path, ck)
+        print(f"  seed={seed}  epoch={ck.get('epoch', '?')}")
+
+        # Cùng argparse.Namespace đầy đủ field đã proven đúng ở
+        # evaluate_full.py's run_ensemble_ablation_multi_seed() —
+        # ablation_runner.py's --checkpoint CLI cũng không có đủ
+        # obs_len/pred_len/batch_size/... nên không thể copy vars(args).
+        _loader_args = _ap.Namespace(
+            dataset_root = dataset_root,
+            obs_len      = 8,
+            pred_len     = 12,
+            batch_size   = 64,
+            num_workers  = 2,
+            test_year    = getattr(args, "test_year", None),
+            skip         = getattr(args, "skip", 1),
+            min_ped      = getattr(args, "min_ped", 1),
+            threshold    = getattr(args, "threshold", 0.002),
+        )
+        _, loader = data_loader(_loader_args, {"root": dataset_root, "type": split},
+                                test=(split != "train"))
+        print(f"  Data: {len(loader)} batches")
+
+        model.eval()
+        results = ode_steps_sweep(model, loader, device, steps_list=steps_list,
+                                   n_ensemble=getattr(args, "n_ensemble", 20))
+        per_seed_results[seed] = results
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Gộp: mean±std qua các seed, cho từng N
+    n_seeds = len(per_seed_results)
+    print(f"\n  Gộp kết quả qua {n_seeds} seed: {list(per_seed_results.keys())}")
+    merged = {}
+    for n_steps in steps_list:
+        entry = {}
+        for field in ("ADE_mean", "ATE_mean", "CTE_mean", "spread_mean", "time_s", "n_storms"):
+            vals = [per_seed_results[s][n_steps][field] for s in per_seed_results
+                    if n_steps in per_seed_results[s]
+                    and not np.isnan(per_seed_results[s][n_steps].get(field, float("nan")))]
+            entry[field] = float(np.mean(vals)) if vals else float("nan")
+            if field in ("ADE_mean", "ATE_mean", "CTE_mean", "spread_mean"):
+                entry[f"{field}_std"] = float(np.std(vals)) if len(vals) > 1 else 0.0
+        entry["n_seeds"] = n_seeds
+        entry["n_steps"] = n_steps
+
+        # Gộp by_lead_time qua các seed — cùng cách seed-mean-rồi-
+        # mean/std đã dùng ở evaluate_full.py's phần tương ứng.
+        all_lts = set()
+        for s in per_seed_results:
+            if n_steps in per_seed_results[s]:
+                all_lts |= set(per_seed_results[s][n_steps].get("by_lead_time", {}).keys())
+        by_lead_time_merged = {}
+        for lt in sorted(all_lts):
+            for metric in ("ADE", "ATE", "CTE"):
+                seed_vals = [per_seed_results[s][n_steps]["by_lead_time"][lt][metric]
+                            for s in per_seed_results
+                            if n_steps in per_seed_results[s]
+                            and lt in per_seed_results[s][n_steps].get("by_lead_time", {})
+                            and not np.isnan(per_seed_results[s][n_steps]["by_lead_time"][lt].get(metric, float("nan")))]
+                by_lead_time_merged.setdefault(lt, {})
+                by_lead_time_merged[lt][metric] = float(np.mean(seed_vals)) if seed_vals else float("nan")
+                by_lead_time_merged[lt][f"{metric}_std"] = float(np.std(seed_vals)) if len(seed_vals) > 1 else 0.0
+        entry["by_lead_time"] = by_lead_time_merged
+
+        merged[n_steps] = entry
+        print(f"  N={n_steps:3d}: ADE={entry['ADE_mean']:.2f}±{entry['ADE_mean_std']:.2f}  "
+              f"ATE={entry['ATE_mean']:.2f}±{entry['ATE_mean_std']:.2f}  "
+              f"CTE={entry['CTE_mean']:.2f}±{entry['CTE_mean_std']:.2f}  "
+              f"spread={entry['spread_mean']:.2f}±{entry['spread_mean_std']:.2f}km")
+
+    return merged
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Summarize ablation results from JSON files
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,7 +850,15 @@ def main():
     p.add_argument("--mode", choices=["ode_steps", "summarize", "multi_seed",
                                        "eval_variant"],
                    default="ode_steps")
-    p.add_argument("--checkpoint",        type=str, default=None)
+    p.add_argument("--checkpoint",        type=str, default=None,
+                   help="1 checkpoint duy nhất — dùng cho --mode ode_steps "
+                        "(single-seed) hoặc --mode eval_variant.")
+    p.add_argument("--checkpoints",       type=str, nargs="+", default=None,
+                   help="[MỚI] Nhiều checkpoint (nhiều seed CÙNG 1 kiến "
+                        "trúc) — CHỈ dùng được với --mode ode_steps, chạy "
+                        "N-sweep trên từng checkpoint rồi gộp mean±std "
+                        "theo seed, lưu ode_steps_sweep.json rồi thoát "
+                        "sớm. Không thể dùng cùng lúc với --checkpoint.")
     p.add_argument("--checkpoint_pattern",type=str, default=None,
                    help="For multi_seed: runs/seed{seed}/best_model.pth")
     p.add_argument("--seeds",             type=int, nargs="+", default=[0,1,2])
@@ -739,6 +884,34 @@ def main():
     # ── Summarize mode ────────────────────────────────────────────────────
     if args.mode == "summarize":
         summarize_ablations(args.ablation_dir)
+        return
+
+    # ── [MỚI] Multi-seed ODE steps sweep — rẽ nhánh sớm, TRƯỚC bước tạo
+    # loader chung bên dưới (nhánh này tự tạo loader riêng cho từng
+    # checkpoint/seed bên trong run_ode_steps_sweep_multi_seed) ─────────
+    if args.checkpoints:
+        if args.checkpoint:
+            print("  ⚠ Truyền cả --checkpoint và --checkpoints — dùng "
+                  "--checkpoints (nhiều seed), bỏ qua --checkpoint.")
+        if args.mode != "ode_steps":
+            print("  ❌ --checkpoints chỉ hỗ trợ cùng --mode ode_steps "
+                  "(các mode khác gắn với 1 checkpoint duy nhất, dùng "
+                  "--checkpoint thay vì --checkpoints cho chúng).")
+            return
+        if args.dataset_root is None:
+            print("  ERROR: --dataset_root required"); return
+        print(f"\n  Multi-seed ODE steps sweep | {len(args.checkpoints)} checkpoints")
+        print(f"  Split: {args.split} | Device: {device} | N values: {args.ode_steps_list}")
+        print("="*72)
+        merged = run_ode_steps_sweep_multi_seed(
+            args.checkpoints, args.dataset_root, args.split,
+            args.ode_steps_list, device, args)
+        out_path = os.path.join(args.output_dir, "ode_steps_sweep.json")
+        with open(out_path, "w") as f:
+            json.dump(merged, f, indent=2)
+        print(f"\n  Saved multi-seed ODE steps sweep → {out_path}")
+        print(f"  Dùng file này với generate_paper_report.py's --ode_sweep "
+              f"(schema khớp với build_ode_n_table() cần).")
         return
 
     # ── Need data and checkpoint for other modes ──────────────────────────

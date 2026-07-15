@@ -972,11 +972,15 @@ def build_ode_n_table(ode_sweep: Dict) -> List[Dict]:
     """
     TABLE 4 (mới) — ADE/ATE/CTE/spread theo từng N (số bước tích phân
     ODE), đọc CÙNG file JSON với plot_ode_n_sweep() (từ
-    ablation_runner.py --mode ode_steps --ode_steps_list ...).
-    Không phải mean±std theo seed (sweep này thường chỉ chạy trên 1
-    checkpoint, không phải multi-seed) — chỉ là bảng số trực tiếp từ
-    kết quả sweep, kèm delta so với N nhỏ nhất (mốc tham chiếu) để thấy
-    rõ trade-off ADE/ATE/CTE tăng nhẹ nhưng spread tăng mạnh khi N lớn.
+    ablation_runner.py --mode ode_steps --ode_steps_list ..., single-
+    seed qua --checkpoint hoặc multi-seed qua --checkpoints — 2 luồng
+    ra CÙNG SCHEMA "ADE_mean"/"ATE_mean"/"CTE_mean"/"spread_mean", chỉ
+    khác multi-seed có thêm "n_seeds"/"*_std"/"by_lead_time" mà bảng
+    này KHÔNG đọc — vẫn hiển thị đúng số liệu chính, không lỗi).
+    Không phải mean±std theo seed CHO BẢNG NÀY (dù input JSON có thể đã
+    là kết quả gộp qua seed) — bảng chỉ là số trực tiếp từ ode_sweep,
+    kèm delta so với N nhỏ nhất (mốc tham chiếu) để thấy rõ trade-off
+    ADE/ATE/CTE tăng nhẹ nhưng spread tăng mạnh khi N lớn.
     """
     ns = sorted(int(k) for k in ode_sweep.keys())
     ref = ode_sweep.get(str(ns[0]), ode_sweep.get(ns[0], {})) if ns else {}
@@ -1325,6 +1329,10 @@ def main():
             ode_sweep_data = load_json(args.ode_sweep)
             ode_n_rows = build_ode_n_table(ode_sweep_data)
             print_ode_n_table(ode_n_rows)
+        else:
+            print(f"\n  ℹ TABLE 4 (ODE N-sweep) bị bỏ qua — thiếu --ode_sweep. "
+                  f"Chạy trước: ablation_runner.py --mode ode_steps --output_dir "
+                  f"<dir>, rồi truyền --ode_sweep <dir>/ode_steps_sweep.json vào lệnh này.\n")
 
         ensemble_k_rows = []
         if args.eval_full_json:
@@ -1332,6 +1340,16 @@ def main():
             ensemble_k_rows = build_ensemble_k_table(eval_full_data)
             if ensemble_k_rows:
                 print_ensemble_k_table(ensemble_k_rows)
+            else:
+                print(f"\n  ⚠ TABLE 5 (Ensemble K-sweep) bị bỏ qua — file "
+                      f"{args.eval_full_json} không có key 'ensemble_ablation'. "
+                      f"Chạy trước: evaluate_full.py --ensemble_ablation (hoặc "
+                      f"--checkpoints ... --ensemble_ablation cho multi-seed).\n")
+        else:
+            print(f"\n  ℹ TABLE 5 (Ensemble K-sweep) bị bỏ qua — thiếu "
+                  f"--eval_full_json. Chạy trước: evaluate_full.py "
+                  f"--ensemble_ablation, rồi truyền --eval_full_json <file .json> "
+                  f"vào lệnh này.\n")
 
         out = {
             "main_table":        main_rows,
