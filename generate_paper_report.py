@@ -143,7 +143,17 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
     that would conflate within-seed forecast variance (storm-to-storm
     difficulty) with between-seed variance (training instability), and
     the latter is what a paper table's "±" is meant to communicate.
+
+    [BỔ SUNG] Ngoài cột "overall" (gộp mọi lead_time), giờ có thêm cột
+    "final_step" (chỉ 72h, tức lead_time == HORIZON_LEAD_TIMES["72h"]).
+    Đây là con số quan trọng cho paper vì 72h là horizon dự báo XA NHẤT
+    — sai số ở đây thường được dùng làm tiêu chí so sánh chính giữa các
+    kiến trúc (khác với "overall mean" vốn bị pha loãng bởi các horizon
+    gần, dễ dự báo hơn). Cùng cách tính seed-mean-rồi-mean/std như cột
+    overall, chỉ lọc thêm điều kiện lead_time == 72h trước khi gộp theo
+    seed.
     """
+    final_lt = HORIZON_LEAD_TIMES.get("72h")
     rows = []
     for model in models:
         model_recs = [r for r in records if r["model"] == model]
@@ -151,19 +161,27 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
             print(f"  ⚠ No records for model={model}, skipping")
             continue
         by_seed = defaultdict(lambda: {"ade": [], "ate": [], "cte": []})
+        by_seed_final = defaultdict(lambda: {"ade": [], "ate": [], "cte": []})
         for r in model_recs:
             s = r.get("seed", "unknown")
             for m in ("ade", "ate", "cte"):
                 if m in r and r[m] is not None:
                     by_seed[s][m].append(r[m])
+                    if r.get("lead_time") == final_lt:
+                        by_seed_final[s][m].append(r[m])
 
         seed_means = {"ade": [], "ate": [], "cte": []}
+        seed_means_final = {"ade": [], "ate": [], "cte": []}
         n_seeds = 0
         for seed, vals in sorted(by_seed.items()):
             n_seeds += 1
             for m in ("ade", "ate", "cte"):
                 if vals[m]:
                     seed_means[m].append(float(np.mean(vals[m])))
+        for seed, vals in sorted(by_seed_final.items()):
+            for m in ("ade", "ate", "cte"):
+                if vals[m]:
+                    seed_means_final[m].append(float(np.mean(vals[m])))
 
         row = {"model": model, "n_seeds": n_seeds,
                "n_records": len(model_recs)}
@@ -172,22 +190,34 @@ def build_main_table(records: List[Dict], models: List[str]) -> List[Dict]:
             row[f"{m}_mean"] = float(np.mean(vals)) if vals else float("nan")
             row[f"{m}_std"]  = float(np.std(vals))  if vals else float("nan")
             row[f"{m}_per_seed"] = vals
+
+            vals_f = seed_means_final[m]
+            row[f"{m}_final_mean"] = float(np.mean(vals_f)) if vals_f else float("nan")
+            row[f"{m}_final_std"]  = float(np.std(vals_f))  if vals_f else float("nan")
         rows.append(row)
     return rows
 
 
 def print_main_table(rows: List[Dict]):
-    print(f"\n  {'='*90}")
-    print(f"  TABLE 1 — MAIN RESULTS (mean ± std across seeds)")
-    print(f"  {'='*90}")
-    print(f"  {'Model':<12} {'#seeds':>7} {'ADE (km)':>16} {'ATE (km)':>16} {'CTE (km)':>16}")
-    print(f"  {'-'*90}")
+    print(f"\n  {'='*140}")
+    print(f"  TABLE 1 — MAIN RESULTS (mean ± std across seeds) — overall vs final step (72h)")
+    print(f"  {'='*140}")
+    print(f"  {'Model':<12} {'#seeds':>7} "
+          f"{'ADE overall':>16} {'ADE@72h':>16} "
+          f"{'ATE overall':>16} {'ATE@72h':>16} "
+          f"{'CTE overall':>16} {'CTE@72h':>16}")
+    print(f"  {'-'*140}")
     for r in rows:
         print(f"  {r['model']:<12} {r['n_seeds']:>7} "
               f"{r['ade_mean']:>9.2f}±{r['ade_std']:<5.2f} "
+              f"{r['ade_final_mean']:>9.2f}±{r['ade_final_std']:<5.2f} "
               f"{r['ate_mean']:>9.2f}±{r['ate_std']:<5.2f} "
-              f"{r['cte_mean']:>9.2f}±{r['cte_std']:<5.2f}")
-    print(f"  {'='*90}\n")
+              f"{r['ate_final_mean']:>9.2f}±{r['ate_final_std']:<5.2f} "
+              f"{r['cte_mean']:>9.2f}±{r['cte_std']:<5.2f} "
+              f"{r['cte_final_mean']:>9.2f}±{r['cte_final_std']:<5.2f}")
+    print(f"  {'='*140}")
+    print(f"  'overall' = mean qua mọi lead_time (6h-72h) | '@72h' = chỉ final step "
+          f"(horizon dự báo xa nhất, thường dùng làm tiêu chí so sánh chính)\n")
 
 
 def print_main_table_latex(rows: List[Dict]):
@@ -246,8 +276,17 @@ def build_pooled_paired_arrays(records: List[Dict], model_a: str, model_b: str,
     else:
         key_fn = lambda r: (r["storm"], r["window"])
 
-    by_key_a = {key_fn(r): r[metric] for r in records if r["model"] == model_a}
-    by_key_b = {key_fn(r): r[metric] for r in records if r["model"] == model_b}
+    by_key_a = {key_fn(r): r[metric] for r in records
+                if r["model"] == model_a and r.get(metric) is not None}
+    by_key_b = {key_fn(r): r[metric] for r in records
+                if r["model"] == model_b and r.get(metric) is not None}
+    # [FIX] r.get(metric) is not None: ate/cte là None ở lead_time=1 (6h)
+    # cho MỌI model (không định nghĩa được toán học ở bước dự báo đầu
+    # tiên — cần bước trước đó để biết hướng đi). Không lọc None ở đây
+    # sẽ khiến common-key set chứa cặp (None, None) hoặc lỗi khi ép
+    # np.array (None lẫn trong mảng float => dtype=object, các phép
+    # tính thống kê phía sau âm thầm ra NaN/lỗi khó dò thay vì bị loại
+    # đúng chỗ). ADE không bị ảnh hưởng (luôn có giá trị, không phải None).
     common = sorted(set(by_key_a) & set(by_key_b), key=lambda k: str(k))
     if len(common) < 10:
         return None, None, len(common)
@@ -350,54 +389,84 @@ def print_significance_table_latex(rows: List[Dict], metric: str, baseline_model
 #  Table 3: per-horizon table (FM vs strongest baseline)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pick_strongest_baseline(main_rows: List[Dict], exclude: str = "FM") -> str:
-    """Lowest pooled mean ADE among non-FM models."""
-    candidates = [r for r in main_rows if r["model"] != exclude]
-    if not candidates:
-        return None
-    best = min(candidates, key=lambda r: r["ade_mean"])
-    return best["model"]
-
-
-def build_per_horizon_table(records: List[Dict], model_a: str, model_b: str,
+def build_per_horizon_table(records: List[Dict], models: List[str],
                              zero_indexed: bool = False) -> List[Dict]:
     """
-    Mean ADE (pooled across all seeds/storms/windows) at each named
-    horizon, for model_a and model_b, plus the diff.
+    TABLE 3 (mới) — mean±std ADE/ATE/CTE across seeds, cho TỪNG model,
+    TÁCH RIÊNG theo từng horizon (6h/12h/24h/48h/72h). Giống hệt cách
+    Table 1 tính mean±std (nhóm theo seed trước, rồi mean/std của các
+    seed-mean — không phải mean±std của raw per-record errors, để không
+    lẫn variance storm-to-storm với variance seed-to-seed) — chỉ khác ở
+    chỗ Table 1 gộp toàn bộ horizon lại, còn bảng này tách riêng từng
+    horizon để thấy độ ổn định của mỗi model đổi thế nào theo lead time.
+
+    Thay thế bản cũ (chỉ so FM vs 1 baseline mạnh nhất) — giờ show ĐỦ
+    mọi model đã evaluate, không giới hạn số lượng so sánh.
+
+    ATE/CTE là None ở lead_time=1 (6h, xem evaluate_multi_model.py's
+    docstring) — bị lọc ra trước khi tính mean/std, is not None cho mỗi
+    (model, seed, horizon, metric) riêng biệt.
     """
     offset = -1 if zero_indexed else 0
     rows = []
     for h, lt in HORIZON_LEAD_TIMES.items():
         lt_key = lt + offset
-        a_vals = [r["ade"] for r in records
-                  if r["model"] == model_a and r.get("lead_time") == lt_key]
-        b_vals = [r["ade"] for r in records
-                  if r["model"] == model_b and r.get("lead_time") == lt_key]
-        rows.append({
-            "horizon": h,
-            f"{model_a}_ade": float(np.mean(a_vals)) if a_vals else float("nan"),
-            f"{model_a}_n":   len(a_vals),
-            f"{model_b}_ade": float(np.mean(b_vals)) if b_vals else float("nan"),
-            f"{model_b}_n":   len(b_vals),
-        })
+        row = {"horizon": h}
+        for model in models:
+            by_seed = defaultdict(lambda: {"ade": [], "ate": [], "cte": []})
+            for r in records:
+                if r["model"] != model or r.get("lead_time") != lt_key:
+                    continue
+                s = r.get("seed", "unknown")
+                for m in ("ade", "ate", "cte"):
+                    if r.get(m) is not None:
+                        by_seed[s][m].append(r[m])
+
+            seed_means = {"ade": [], "ate": [], "cte": []}
+            n_seeds = 0
+            for seed, vals in sorted(by_seed.items()):
+                n_seeds += 1
+                for m in ("ade", "ate", "cte"):
+                    if vals[m]:
+                        seed_means[m].append(float(np.mean(vals[m])))
+
+            for m in ("ade", "ate", "cte"):
+                vals = seed_means[m]
+                row[f"{model}_{m}_mean"] = float(np.mean(vals)) if vals else float("nan")
+                row[f"{model}_{m}_std"]  = float(np.std(vals))  if vals else float("nan")
+            row[f"{model}_n_seeds"] = n_seeds
+        rows.append(row)
     return rows
 
 
-def print_per_horizon_table(rows: List[Dict], model_a: str, model_b: str):
-    print(f"\n  {'='*70}")
-    print(f"  TABLE 3 — PER-HORIZON ADE: {model_a} vs {model_b} (strongest baseline)")
-    print(f"  {'='*70}")
-    print(f"  {'Horizon':<10} {model_a+' ADE':>14} {'n':>6} {model_b+' ADE':>14} {'n':>6}")
-    print(f"  {'-'*70}")
+def print_per_horizon_table(rows: List[Dict], models: List[str], metric: str = "ade"):
+    """In bảng cho 1 metric tại 1 thời điểm (gọi 3 lần cho ade/ate/cte nếu cần)."""
+    metric_upper = metric.upper()
+    col_w = 20
+    print(f"\n  {'='*(12 + col_w * len(models))}")
+    print(f"  TABLE 3 — PER-HORIZON {metric_upper} (mean±std across seeds, mọi model)")
+    print(f"  {'='*(12 + col_w * len(models))}")
+    header = f"  {'Horizon':<10}" + "".join(f"{m:>{col_w}}" for m in models)
+    print(header)
+    print(f"  {'-'*(12 + col_w * len(models))}")
+    any_missing = False
     for r in rows:
-        print(f"  {r['horizon']:<10} {r.get(f'{model_a}_ade', float('nan')):>14.2f} "
-              f"{r.get(f'{model_a}_n', 0):>6} "
-              f"{r.get(f'{model_b}_ade', float('nan')):>14.2f} "
-              f"{r.get(f'{model_b}_n', 0):>6}")
-    print(f"  {'='*70}")
-    if rows and any(r.get(f"{model_a}_n", 0) == 0 for r in rows):
-        print(f"  ⚠ Some horizons have n=0 for {model_a} — check that "
-              f"'lead_time' field convention matches --lead_time_zero_indexed.\n")
+        line = f"  {r['horizon']:<10}"
+        for model in models:
+            mean = r.get(f"{model}_{metric}_mean", float("nan"))
+            std  = r.get(f"{model}_{metric}_std", float("nan"))
+            n    = r.get(f"{model}_n_seeds", 0)
+            if n == 0:
+                any_missing = True
+            cell = f"{mean:.1f}±{std:.1f}" if n > 0 else "n/a"
+            line += f"{cell:>{col_w}}"
+        print(line)
+    print(f"  {'='*(12 + col_w * len(models))}")
+    if any_missing:
+        print(f"  ⚠ Một số model/horizon không có dữ liệu (n_seeds=0) — "
+              f"kiểm tra lại checkpoint đã evaluate đủ seed cho model đó chưa, "
+              f"hoặc metric={metric} không định nghĩa ở horizon 6h (đúng với "
+              f"ate/cte, xem evaluate_multi_model.py's docstring).\n")
     else:
         print()
 
@@ -441,8 +510,12 @@ def plot_error_vs_leadtime(records: List[Dict], output_dir: str,
         for model in models:
             means = []
             for lt in lead_times:
+                # [FIX] ate/cte là None ở lead_time=1 (6h) — lọc trước
+                # khi np.mean, tránh TypeError/NaN âm thầm khi None lẫn
+                # trong list truyền vào np.mean.
                 vals = [r[metric] for r in records
-                        if r["model"] == model and r["lead_time"] == lt]
+                        if r["model"] == model and r["lead_time"] == lt
+                        and r.get(metric) is not None]
                 means.append(np.mean(vals) if vals else np.nan)
             hours = [lt * 6 for lt in lead_times]
             ax.plot(hours, means, "o-", color=MODEL_COLORS.get(model, "#333"),
@@ -473,7 +546,8 @@ def plot_error_vs_leadtime_grid(records: List[Dict], output_dir: str):
             means = []
             for lt in lead_times:
                 vals = [r[metric] for r in records
-                        if r["model"] == model and r["lead_time"] == lt]
+                        if r["model"] == model and r["lead_time"] == lt
+                        and r.get(metric) is not None]
                 means.append(np.mean(vals) if vals else np.nan)
             hours = [lt * 6 for lt in lead_times]
             ax.plot(hours, means, "o-", color=MODEL_COLORS.get(model, "#333"),
@@ -512,7 +586,8 @@ def plot_error_boxplots(records: List[Dict], output_dir: str,
                      "cte": "Cross-Track Error"}
 
     for ax, metric in zip(axes, metrics):
-        data = [[r[metric] for r in records if r["model"] == m] for m in models]
+        data = [[r[metric] for r in records
+                 if r["model"] == m and r.get(metric) is not None] for m in models]
         colors = [MODEL_COLORS.get(m, "#888") for m in models]
         bp = ax.boxplot(data, tick_labels=models, patch_artist=True, showfliers=True,
                         flierprops=dict(marker=".", markersize=2, alpha=0.4))
@@ -551,7 +626,9 @@ def plot_boxplot_by_horizon(records: List[Dict], output_dir: str,
 
     for ax, hz in zip(axes, horizons):
         lt = HORIZON_LEAD_TIMES_FULL.get(hz)
-        data = [[r[metric] for r in records if r["model"] == m and r["lead_time"] == lt]
+        data = [[r[metric] for r in records
+                 if r["model"] == m and r["lead_time"] == lt
+                 and r.get(metric) is not None]
                 for m in models]
         colors = [MODEL_COLORS.get(m, "#888") for m in models]
         bp = ax.boxplot(data, tick_labels=models, patch_artist=True, showfliers=True,
@@ -566,6 +643,240 @@ def plot_boxplot_by_horizon(records: List[Dict], output_dir: str,
     plt.suptitle(f"{metric.upper()} Distribution by Horizon", fontsize=13, fontweight="bold")
     plt.tight_layout()
     out = os.path.join(output_dir, f"boxplot_by_horizon_{metric}.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {out}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  [MỚI] Violin plot — chi tiết hơn boxplot, thấy được hình dạng phân phối
+#  (đa đỉnh, lệch...) mà boxplot không thể hiện được.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_error_violin(records: List[Dict], output_dir: str,
+                       metrics=("ade", "ate", "cte")):
+    """
+    [MỚI, FM-specific] Violin plot phân phối lỗi theo model — bổ sung
+    cho plot_error_boxplots(). Boxplot chỉ cho biết median/IQR/outlier;
+    violin cho thấy CẢ HÌNH DẠNG phân phối (đa đỉnh/lệch/độ rộng) — quan
+    trọng khi argue rằng FM's error distribution không chỉ có mean/median
+    thấp hơn mà còn ÍT ĐUÔI DÀI hơn (ít trường hợp dự báo cực tệ), điều
+    boxplot dễ bỏ sót nếu chỉ nhìn median.
+    """
+    models = _present_models(records)
+    fig, axes = plt.subplots(1, len(metrics), figsize=(6 * len(metrics), 5))
+    if len(metrics) == 1:
+        axes = [axes]
+
+    metric_titles = {"ade": "Direct Position Error", "ate": "Along-Track Error",
+                     "cte": "Cross-Track Error"}
+
+    for ax, metric in zip(axes, metrics):
+        data = [[r[metric] for r in records
+                 if r["model"] == m and r.get(metric) is not None] for m in models]
+        # violinplot lỗi nếu 1 nhóm rỗng hoặc toàn giá trị giống hệt nhau
+        # (variance=0) — lọc trước để không crash cả figure vì 1 model lỗi.
+        valid_idx = [i for i, d in enumerate(data) if len(d) >= 2 and np.std(d) > 0]
+        if not valid_idx:
+            print(f"  ⚠ plot_error_violin: không đủ dữ liệu hợp lệ cho metric={metric}, skip")
+            continue
+        valid_data = [data[i] for i in valid_idx]
+        valid_models = [models[i] for i in valid_idx]
+        colors = [MODEL_COLORS.get(m, "#888") for m in valid_models]
+
+        parts = ax.violinplot(valid_data, showmeans=True, showmedians=True)
+        for pc, c in zip(parts["bodies"], colors):
+            pc.set_facecolor(c)
+            pc.set_alpha(0.55)
+            pc.set_edgecolor("black")
+            pc.set_linewidth(0.6)
+        for key in ("cmeans", "cmedians", "cbars", "cmins", "cmaxes"):
+            if key in parts:
+                parts[key].set_edgecolor("black")
+                parts[key].set_linewidth(0.8)
+
+        ax.set_xticks(range(1, len(valid_models) + 1))
+        ax.set_xticklabels(valid_models)
+        ax.set_title(metric_titles.get(metric, metric.upper()), fontsize=11, fontweight="bold")
+        ax.set_ylabel(f"{metric.upper()} (km)", fontsize=10)
+        ax.grid(True, axis="y", alpha=0.3, linestyle="--")
+
+    plt.suptitle("Error Distribution Shape (Violin Plot)", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    out = os.path.join(output_dir, "error_violin.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {out}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  [MỚI] Scatter: obs_speed (tốc độ bão quan sát) vs lỗi dự báo — kiểm
+#  tra model có yếu đi rõ rệt với bão di chuyển nhanh không (motivation
+#  gốc cho speed_correction/speed-calib trong kiến trúc FM).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_speed_vs_error(records: List[Dict], output_dir: str, metric="ade"):
+    """
+    [MỚI] Scatter obs_speed (km/h, tốc độ di chuyển bão quan sát được
+    trước thời điểm dự báo) vs lỗi dự báo, 1 panel mỗi model, kèm
+    đường hồi quy tuyến tính đơn giản để thấy xu hướng. Cần field
+    "obs_speed" trong records (evaluate_multi_model.py đã ghi sẵn).
+    Đây là cơ sở thực nghiệm trực tiếp cho lý do kiến trúc FM có riêng
+    cơ chế speed_correction_logits — nếu lỗi tăng rõ theo obs_speed ở
+    baseline nhưng phẳng hơn ở FM, đó là bằng chứng trực quan cho việc
+    speed-calibration có tác dụng.
+    """
+    models = _present_models(records)
+    has_speed = any(r.get("obs_speed") is not None for r in records)
+    if not has_speed:
+        print(f"  ⚠ plot_speed_vs_error: records không có field 'obs_speed', skip")
+        return None
+
+    n_models = len(models)
+    fig, axes = plt.subplots(1, n_models, figsize=(5 * n_models, 5), sharey=True)
+    if n_models == 1:
+        axes = [axes]
+
+    for ax, model in zip(axes, models):
+        xs = [r["obs_speed"] for r in records
+              if r["model"] == model and r.get("obs_speed") is not None
+              and r.get(metric) is not None]
+        ys = [r[metric] for r in records
+              if r["model"] == model and r.get("obs_speed") is not None
+              and r.get(metric) is not None]
+        color = MODEL_COLORS.get(model, "#888")
+        if xs:
+            ax.scatter(xs, ys, s=6, alpha=0.25, color=color)
+            if len(xs) >= 2 and np.std(xs) > 0:
+                z = np.polyfit(xs, ys, 1)
+                xline = np.linspace(min(xs), max(xs), 50)
+                ax.plot(xline, np.poly1d(z)(xline), "-", color="black", linewidth=1.5)
+        ax.set_title(model, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Observed storm speed (km/h)", fontsize=9)
+        ax.grid(True, alpha=0.3, linestyle="--")
+    axes[0].set_ylabel(f"{metric.upper()} (km)", fontsize=10)
+
+    plt.suptitle(f"{metric.upper()} vs Observed Storm Speed", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    out = os.path.join(output_dir, f"speed_vs_{metric}.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {out}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  [MỚI] Trực quan hoá thống kê: histogram phân phối (FM - baseline) diff,
+#  minh hoạ trực quan cho Table 2's Wilcoxon/t-test/Cohen's d.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_significance_diff_hist(records: List[Dict], baseline_model: str,
+                                  compare_against: List[str], metric: str,
+                                  output_dir: str):
+    """
+    [MỚI] Với mỗi so sánh (baseline_model vs other), vẽ histogram phân
+    phối (baseline_model - other) trên đúng các cặp ĐÃ GHÉP giống hệt
+    cách build_significance_table() ghép (cùng seed/storm/window/
+    lead_time) — không phải diff của 2 phân phối marginal độc lập.
+    Đường thẳng đứng đỏ đánh dấu diff=0 (không khác biệt); nếu phần lớn
+    khối histogram nằm bên trái 0, đó là minh chứng trực quan cho
+    "baseline_model thắng" khớp với mean_diff<0 trong Table 2.
+
+    Dùng lại build_pooled_paired_arrays() (không viết lại logic ghép
+    cặp) để đảm bảo con số trên hình KHỚP CHÍNH XÁC với Table 2, không
+    lệch do 2 cách ghép cặp khác nhau.
+    """
+    others = [m for m in compare_against if m != baseline_model]
+    if not others:
+        return None
+    n_panels = len(others)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 5), sharey=True)
+    if n_panels == 1:
+        axes = [axes]
+
+    saved_any = False
+    for ax, other in zip(axes, others):
+        x, y, n = build_pooled_paired_arrays(records, baseline_model, other, metric)
+        if x is None:
+            ax.text(0.5, 0.5, f"Không đủ cặp ghép\n(n={n} < 10)",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=9)
+            ax.set_title(f"{baseline_model} vs {other}", fontsize=11, fontweight="bold")
+            continue
+        diff = x - y
+        ax.hist(diff, bins=40, color=MODEL_COLORS.get(baseline_model, "#D62728"),
+                alpha=0.7, edgecolor="black", linewidth=0.3)
+        ax.axvline(0, color="red", linestyle="--", linewidth=1.5, label="diff = 0")
+        ax.axvline(diff.mean(), color="black", linestyle="-", linewidth=1.5,
+                   label=f"mean diff = {diff.mean():.2f}")
+        ax.set_title(f"{baseline_model} vs {other} (n={n})", fontsize=11, fontweight="bold")
+        ax.set_xlabel(f"{metric.upper()} diff ({baseline_model} − {other}) [km]", fontsize=9)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3, linestyle="--")
+        saved_any = True
+
+    if not saved_any:
+        plt.close()
+        print(f"  ⚠ plot_significance_diff_hist: không có so sánh nào đủ dữ liệu cho metric={metric}")
+        return None
+
+    axes[0].set_ylabel("Số lượng cặp (count)", fontsize=10)
+    plt.suptitle(f"Phân phối sai khác theo cặp — {metric.upper()} "
+                f"({baseline_model} vs baseline khác)", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    out = os.path.join(output_dir, f"significance_diff_hist_{metric}.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {out}")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  [MỚI] Loss-comparison-style (giống Fig.6 paper tham chiếu): so sánh
+#  ADE/ATE/CTE giữa các model theo lead time, dạng lưới 2x3 hoặc 1x3
+#  tách theo split — ở đây ta chỉ có 1 split (test), nên rút gọn còn
+#  1x3, khác plot_error_vs_leadtime_grid() ở chỗ trục y KHÔNG share và
+#  có thêm vùng tô bóng ±std giữa các seed (nếu có multi-seed).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_error_vs_leadtime_with_band(records: List[Dict], output_dir: str):
+    """
+    [MỚI] Giống plot_error_vs_leadtime_grid() nhưng có thêm dải bóng mờ
+    ±1 std (tính qua CÁC SEED, không phải qua storm) quanh mỗi đường —
+    trực quan hoá cùng lúc cả xu hướng theo lead-time (đường) LẪN độ ổn
+    định giữa các seed (dải bóng), gần với phong cách Fig.6 của paper
+    tham chiếu (nhiều đường + error band) hơn bản line-only hiện có.
+    """
+    models = _present_models(records)
+    lead_times = sorted(set(r["lead_time"] for r in records))
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    for ax, metric in zip(axes, ["ade", "ate", "cte"]):
+        for model in models:
+            means, stds = [], []
+            for lt in lead_times:
+                by_seed = defaultdict(list)
+                for r in records:
+                    if r["model"] == model and r["lead_time"] == lt and r.get(metric) is not None:
+                        by_seed[r.get("seed", "unknown")].append(r[metric])
+                seed_means = [np.mean(v) for v in by_seed.values() if v]
+                means.append(np.mean(seed_means) if seed_means else np.nan)
+                stds.append(np.std(seed_means) if len(seed_means) > 1 else 0.0)
+            means = np.array(means); stds = np.array(stds)
+            hours = np.array([lt * 6 for lt in lead_times])
+            color = MODEL_COLORS.get(model, "#333")
+            ax.plot(hours, means, "o-", color=color, label=model, linewidth=1.8, markersize=4)
+            ax.fill_between(hours, means - stds, means + stds, color=color, alpha=0.15)
+        ax.set_xlabel("Forecast Lead Time (h)", fontsize=10)
+        ax.set_ylabel(f"{metric.upper()} (km)", fontsize=10)
+        ax.set_title(metric.upper(), fontsize=11, fontweight="bold")
+        ax.grid(True, alpha=0.3, linestyle="--")
+    axes[0].legend(fontsize=9, framealpha=0.9)
+    plt.suptitle("Track Forecast Errors Across Lead Time (±1 std qua seed)",
+                fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    out = os.path.join(output_dir, "error_vs_leadtime_band.png")
     plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close()
     print(f"  Saved → {out}")
@@ -589,9 +900,14 @@ def plot_seed_variance(records: List[Dict], output_dir: str, metric="ade"):
     for model in models:
         by_seed = defaultdict(list)
         for r in records:
-            if r["model"] == model:
+            if r["model"] == model and r.get(metric) is not None:
                 by_seed[r.get("seed", "unknown")].append(r[metric])
-        seed_means = [np.mean(v) for v in by_seed.values()]
+        # [FIX] r.get(metric) is not None lọc bỏ None (ate/cte tại
+        # lead_time=1/6h) trước khi tích lũy theo seed; v (mỗi list
+        # per-seed) giờ đảm bảo không rỗng do bộ lọc trên, nhưng vẫn
+        # check `if v` để an toàn với model/seed không có bất kỳ record
+        # hợp lệ nào (ví dụ seed đó chưa evaluate xong).
+        seed_means = [np.mean(v) for v in by_seed.values() if v]
         means.append(np.mean(seed_means) if seed_means else np.nan)
         stds.append(np.std(seed_means) if seed_means else np.nan)
 
@@ -651,6 +967,54 @@ def plot_ode_n_sweep(ode_sweep: Dict, output_dir: str):
     print(f"  Saved → {out}")
     return out
 
+
+def build_ode_n_table(ode_sweep: Dict) -> List[Dict]:
+    """
+    TABLE 4 (mới) — ADE/ATE/CTE/spread theo từng N (số bước tích phân
+    ODE), đọc CÙNG file JSON với plot_ode_n_sweep() (từ
+    ablation_runner.py --mode ode_steps --ode_steps_list ...).
+    Không phải mean±std theo seed (sweep này thường chỉ chạy trên 1
+    checkpoint, không phải multi-seed) — chỉ là bảng số trực tiếp từ
+    kết quả sweep, kèm delta so với N nhỏ nhất (mốc tham chiếu) để thấy
+    rõ trade-off ADE/ATE/CTE tăng nhẹ nhưng spread tăng mạnh khi N lớn.
+    """
+    ns = sorted(int(k) for k in ode_sweep.keys())
+    ref = ode_sweep.get(str(ns[0]), ode_sweep.get(ns[0], {})) if ns else {}
+    ref_ade = ref.get("ADE_mean", float("nan"))
+
+    rows = []
+    for n in ns:
+        entry = ode_sweep.get(str(n), ode_sweep.get(n, {}))
+        ade = entry.get("ADE_mean", float("nan"))
+        rows.append({
+            "n_steps":      n,
+            "ade_mean":     ade,
+            "ate_mean":     entry.get("ATE_mean", float("nan")),
+            "cte_mean":     entry.get("CTE_mean", float("nan")),
+            "spread_mean":  entry.get("spread_mean", float("nan")),
+            "delta_ade_vs_n1": ade - ref_ade if not np.isnan(ade) and not np.isnan(ref_ade) else float("nan"),
+            "time_s":       entry.get("time_s", float("nan")),
+            "n_storms":     entry.get("n_storms", 0),
+        })
+    return rows
+
+
+def print_ode_n_table(rows: List[Dict]):
+    print(f"\n  {'='*100}")
+    print(f"  TABLE 4 — ODE STEPS (N) SWEEP: ADE/ATE/CTE + Ensemble Spread")
+    print(f"  {'='*100}")
+    print(f"  {'N':>4} {'ADE(km)':>10} {'ATE(km)':>10} {'CTE(km)':>10} "
+          f"{'Spread(km)':>12} {'dADE vs N=1':>13} {'Time(s)':>9} {'n':>6}")
+    print(f"  {'-'*100}")
+    for r in rows:
+        print(f"  {r['n_steps']:>4} {r['ade_mean']:>10.2f} {r['ate_mean']:>10.2f} "
+              f"{r['cte_mean']:>10.2f} {r['spread_mean']:>12.2f} "
+              f"{r['delta_ade_vs_n1']:>+13.2f} {r['time_s']:>9.1f} {r['n_storms']:>6}")
+    print(f"  {'='*100}")
+    print(f"  Ghi chú: spread tăng mạnh khi N tăng thường đi kèm ADE/ATE/CTE nhích tệ nhẹ")
+    print(f"  (trade-off đã quan sát trong log dự án: N=1->10, spread 4km->55km, CRPS -9.5%,")
+    print(f"  ADE/ATE/CTE +1.7%/+1.9%/+7.2%). N=3-4 có thể KÉM HƠN cả N=1 và N=8-10 do lỗi")
+    print(f"  rời rạc hóa Euler ở N thấp — không đơn điệu, đọc kỹ bảng thay vì suy diễn tuyến tính.\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  FM-only: ablation bar chart (loss components / architecture pieces)
@@ -881,25 +1245,25 @@ def main():
                 print_significance_table_latex(rows, metric, args.baseline_model)
             sig_results[metric] = rows
 
-        strongest = pick_strongest_baseline(main_rows, exclude=args.baseline_model)
-        horizon_rows = []
-        if strongest:
-            print(f"  Strongest baseline by pooled mean ADE: {strongest}")
-            horizon_rows = build_per_horizon_table(
-                records, args.baseline_model, strongest,
-                zero_indexed=args.lead_time_zero_indexed)
-            print_per_horizon_table(horizon_rows, args.baseline_model, strongest)
-        else:
-            print("  ⚠ Could not determine strongest baseline — skipping Table 3")
+        horizon_rows = build_per_horizon_table(
+            records, models_for_main, zero_indexed=args.lead_time_zero_indexed)
+        for metric in args.metrics:
+            print_per_horizon_table(horizon_rows, models_for_main, metric=metric)
+
+        ode_n_rows = []
+        if args.ode_sweep:
+            ode_sweep_data = load_json(args.ode_sweep)
+            ode_n_rows = build_ode_n_table(ode_sweep_data)
+            print_ode_n_table(ode_n_rows)
 
         out = {
             "main_table":        main_rows,
             "significance_table": sig_results,
             "per_horizon_table": {
-                "baseline_model": args.baseline_model,
-                "strongest_other": strongest,
-                "rows": horizon_rows,
+                "models": models_for_main,
+                "rows":   horizon_rows,
             },
+            "ode_n_sweep_table": ode_n_rows,
         }
         out_path = os.path.join(args.output_dir, "paper_tables.json")
         with open(out_path, "w") as f:
@@ -914,10 +1278,21 @@ def main():
         saved = []
         saved += plot_error_vs_leadtime(records, args.output_dir)
         saved.append(plot_error_vs_leadtime_grid(records, args.output_dir))
+        saved.append(plot_error_vs_leadtime_with_band(records, args.output_dir))
         saved.append(plot_error_boxplots(records, args.output_dir))
+        saved.append(plot_error_violin(records, args.output_dir))
         saved.append(plot_boxplot_by_horizon(records, args.output_dir))
+        saved.append(plot_speed_vs_error(records, args.output_dir, metric="ade"))
         saved.append(plot_seed_variance(records, args.output_dir, metric="ade"))
+        saved.append(plot_seed_variance(records, args.output_dir, metric="ate"))
         saved.append(plot_seed_variance(records, args.output_dir, metric="cte"))
+
+        # Trực quan hoá thống kê (Table 2) — diff histogram cho từng metric
+        compare_against_plot = [m for m in args.compare_against if m in present_models]
+        for metric in args.metrics:
+            saved.append(plot_significance_diff_hist(
+                records, args.baseline_model, compare_against_plot,
+                metric, args.output_dir))
 
         if args.ode_sweep:
             ode_sweep = load_json(args.ode_sweep)

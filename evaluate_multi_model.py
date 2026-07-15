@@ -201,21 +201,21 @@ def evaluate_one_model(model, loader, device, model_name: str,
     One record per (storm, window, lead_time) triple — matches the
     paper's Table 10 pairing granularity (140 windows x 16 lead-times =
     2240 matched pairs, i.e. paired PER FORECAST STEP, not averaged over
-    the whole trajectory first). An earlier version of this function
-    emitted one record per (storm, window) with ADE/ATE/CTE already
-    averaged over all lead-times — that is a coarser, methodologically
-    weaker pairing than the paper's own design (fewer, less granular
-    pairs => less statistical power, and not directly comparable to the
-    paper's n=2240 convention).
+    the whole trajectory first).
 
-    ade/ate/cte alignment: ate_cte_full() returns [T-1, B] arrays where
-    index i holds the error at ORIGINAL step index i+1 (see its own
-    docstring / evaluate_full.py's established convention — no ATE/CTE
-    is defined at the very first predicted step, since there's no prior
-    heading reference). To keep all three metrics referring to the EXACT
-    SAME lead-time in every emitted record, ADE is also read at the
-    matching original step index (d[t+1], not d[t]) rather than emitting
-    all T ADE values independently of ATE/CTE's T-1 range.
+    lead_time convention (1-indexed, 1..T; T=pred_len, e.g. 1=6h...12=72h
+    when T=12): this is the SAME convention as generate_paper_report.py's
+    HORIZON_LEAD_TIMES = {"6h":1,...,"72h":12}. ADE (d) has a value for
+    EVERY lead_time 1..T. ATE/CTE do not: there is no heading reference
+    at the very first predicted step, so ate/cte are only defined for
+    lead_time 2..T (None at lead_time=1/6h). [FIX] An earlier version of
+    this loop bounded lead_time by ate/cte's shorter range (T-1 instead
+    of T), which silently dropped the LAST lead_time (T, i.e. 72h when
+    T=12) from ADE too, and additionally mislabeled lead_time=1 as if it
+    were the first step (6h) when it was actually the second step (12h,
+    0-indexed step 1) — both bugs are fixed by this version: ADE now
+    covers the full 1..T range, and lead_time=1 genuinely is the first
+    predicted step.
     """
     records = []
     is_fm = isinstance(model, TCFlowMatching) or hasattr(model, "sigma_inference")
@@ -241,9 +241,9 @@ def evaluate_one_model(model, loader, device, model_name: str,
         T = min(pred.shape[0], gt.shape[0])
         pd = _norm_to_deg(pred[:T])
         gd = _norm_to_deg(gt[:T, :, :2])
-        d  = _haversine_deg(pd, gd)                  # [T, B]
-        ate, cte = ate_cte_full(pd, gd)               # [T-1, B]
-        T_valid = ate.shape[0]                        # number of lead-times with ATE/CTE defined
+        d  = _haversine_deg(pd, gd)                  # [T, B] -- steps 0..T-1 (0=6h ... T-1=72h when T=12)
+        ate, cte = ate_cte_full(pd, gd)               # [T-1, B] -- ate[k] = error at step k+1 (0-indexed)
+        T_valid = ate.shape[0]                        # = T-1
 
         obs_deg = _norm_to_deg(obs[:, :, :2])
         if obs_deg.shape[0] >= 2:
@@ -260,17 +260,38 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 storm_key = f"{info['old'][1]}_{info['old'][0]}"
             else:
                 storm_key = f"UNKNOWN_batch{bi}"
-            for i in range(T_valid):
-                lead_time = i + 1  # original step index (see docstring)
+            # [FIX] Bug thật đã tìm ra: trước đây vòng lặp chạy
+            # `for i in range(T_valid)` (T_valid = T-1), với
+            # lead_time = i+1 (i=0..T_valid-1 => lead_time=1..T_valid=1..T-1).
+            # Với T=12, lead_time chỉ chạy 1..11 -- KHÔNG BAO GIỜ đạt 12.
+            # generate_paper_report.py's HORIZON_LEAD_TIMES tra "72h"->12,
+            # nên luôn ra n=0 ở 72h (khớp đúng hiện tượng đã quan sát).
+            # Đồng thời "lead_time=1" trước đây thực chất ứng 0-indexed
+            # step 1 (=12h theo evaluate_full.py's HORIZONS convention),
+            # KHÔNG PHẢI 6h -- tên horizon "6h" ở nơi đọc dữ liệu cũng bị
+            # lệch 1 bước so với dữ liệu thật.
+            #
+            # Sửa: lead_time giờ là 1-indexed THẬT trên toàn bộ T bước
+            # (lead_time = step_0indexed + 1, chạy 1..T, tức 1=6h...T=72h
+            # khi T=12) -- khớp đúng HORIZON_LEAD_TIMES = {"6h":1,...,
+            # "72h":12} sau khi sửa ở generate_paper_report.py.
+            # ADE (d) có đủ giá trị cho MỌI lead_time 1..T.
+            # ATE/CTE (ate/cte) chỉ có giá trị cho lead_time 2..T (không
+            # định nghĩa được ở lead_time=1/6h, vì cần bước trước đó để
+            # biết hướng đi) -- ghi None thay vì bỏ hẳn record.
+            for step0 in range(T):           # step0 = 0-indexed step, 0..T-1
+                lead_time = step0 + 1        # 1-indexed, 1..T (1=6h...T=72h)
+                has_atecte = step0 >= 1      # ate/cte defined for step0=1..T-1
+                ate_i = step0 - 1            # ate/cte array index when has_atecte
                 records.append({
                     "model":     model_name,
                     "seed":      seed,
                     "storm":     storm_key,
                     "window":    b,
                     "lead_time": lead_time,
-                    "ade":       float(d[lead_time, b]),
-                    "ate":       float(ate[i, b].abs()),
-                    "cte":       float(cte[i, b].abs()),
+                    "ade":       float(d[step0, b]),
+                    "ate":       float(ate[ate_i, b].abs()) if has_atecte else None,
+                    "cte":       float(cte[ate_i, b].abs()) if has_atecte else None,
                     "obs_speed": float(obs_speed[b]),
                 })
     return records
