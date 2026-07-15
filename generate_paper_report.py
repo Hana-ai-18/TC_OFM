@@ -1115,28 +1115,98 @@ def plot_sigma_sensitivity(eval_full_json: Dict, output_dir: str):
 
 
 def plot_ensemble_size_ablation(eval_full_json: Dict, output_dir: str):
-    """From evaluate_full.py's --ensemble_ablation block: ADE/ATE/CTE vs K."""
+    """
+    From evaluate_full.py's --ensemble_ablation block: ADE/ATE/CTE +
+    spread vs K, 4-panel layout GIỐNG HỆT plot_ode_n_sweep() để 2 hình
+    có thể đặt cạnh nhau trong paper, cho thấy trực quan sự khác biệt
+    cốt lõi: spread ở đây (theo K) gần như PHẲNG, trong khi spread ở
+    ode_n_sweep (theo N) tăng RÕ RỆT — bằng chứng trực tiếp cho việc N
+    mới là tham số giải quyết co cụm, không phải K (xem giải thích đầy
+    đủ trong ensemble_size_eval()'s docstring, evaluate_full.py).
+    """
     block = eval_full_json.get("ensemble_ablation")
     if not block:
         print("  ⚠ No 'ensemble_ablation' block in eval_full_json — skip")
         return None
 
     ks = sorted(int(k) for k in block.keys())
-    fig, ax = plt.subplots(figsize=(7, 5))
-    for metric, color in [("ADE", "#D62728"), ("ATE", "#1F5FBF"), ("CTE", "#2CA02C")]:
-        vals = [block[str(k)][metric] if str(k) in block else block[k][metric] for k in ks]
-        ax.plot(ks, vals, "o-", color=color, label=metric, linewidth=2)
-    ax.set_xlabel("Ensemble size K", fontsize=10)
-    ax.set_ylabel("Error (km)", fontsize=10)
-    ax.set_title("Sensitivity to Ensemble Size K", fontsize=12, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(True, alpha=0.3, linestyle="--")
+    def _get(k, key):
+        entry = block.get(str(k), block.get(k, {}))
+        return entry.get(key, float("nan"))
+
+    fig, axes = plt.subplots(1, 4, figsize=(22, 5))
+    titles = ["ADE (km)", "ATE (km)", "CTE (km)", "Ensemble Spread (km)"]
+    keys   = ["ADE", "ATE", "CTE", "spread"]
+    colors = ["#D62728", "#1F5FBF", "#2CA02C", "#9467BD"]
+
+    for ax, title, key, c in zip(axes, titles, keys, colors):
+        vals = [_get(k, key) for k in ks]
+        ax.plot(ks, vals, "o-", color=c, linewidth=2, markersize=6)
+        ax.set_xlabel("Ensemble size K", fontsize=9)
+        ax.set_ylabel(title, fontsize=9)
+        ax.set_title(title, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3, linestyle="--")
+        ax.set_xticks(ks)
+
+    plt.suptitle("FM: Accuracy vs Ensemble Diversity Trade-off Across Ensemble Size K "
+                "(so sánh với ODE N-sweep — spread ở đây nên PHẲNG hơn hẳn)",
+                fontsize=12, fontweight="bold")
     plt.tight_layout()
     out = os.path.join(output_dir, "ensemble_size_ablation.png")
     plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close()
     print(f"  Saved → {out}")
     return out
+
+
+def build_ensemble_k_table(eval_full_json: Dict) -> List[Dict]:
+    """
+    TABLE 5 (mới) — ADE/ATE/CTE/spread theo từng K (ensemble size),
+    CÙNG CẤU TRÚC với Table 4 (ODE N-sweep) để so sánh trực tiếp 2 bảng
+    cạnh nhau — đây là bằng chứng bằng số cho câu hỏi "K có xử lý được
+    co cụm không" (câu trả lời: không, xem cột spread gần như không đổi
+    theo K, khác hẳn Table 4 nơi spread tăng rõ theo N).
+    """
+    block = eval_full_json.get("ensemble_ablation")
+    if not block:
+        return []
+    ks = sorted(int(k) for k in block.keys())
+    ref = block.get(str(ks[0]), block.get(ks[0], {})) if ks else {}
+    ref_ade = ref.get("ADE", float("nan"))
+
+    rows = []
+    for k in ks:
+        entry = block.get(str(k), block.get(k, {}))
+        ade = entry.get("ADE", float("nan"))
+        rows.append({
+            "K":            k,
+            "ade_mean":     ade,
+            "ate_mean":     entry.get("ATE", float("nan")),
+            "cte_mean":     entry.get("CTE", float("nan")),
+            "spread_mean":  entry.get("spread", float("nan")),
+            "delta_ade_vs_k_min": ade - ref_ade if not np.isnan(ade) and not np.isnan(ref_ade) else float("nan"),
+            "time_s":       entry.get("time_s", float("nan")),
+            "n":            entry.get("n", 0),
+        })
+    return rows
+
+
+def print_ensemble_k_table(rows: List[Dict]):
+    print(f"\n  {'='*100}")
+    print(f"  TABLE 5 — ENSEMBLE SIZE (K) SWEEP: ADE/ATE/CTE + Ensemble Spread")
+    print(f"  {'='*100}")
+    print(f"  {'K':>4} {'ADE(km)':>10} {'ATE(km)':>10} {'CTE(km)':>10} "
+          f"{'Spread(km)':>12} {'dADE vs K_min':>14} {'Time(s)':>9} {'n':>6}")
+    print(f"  {'-'*100}")
+    for r in rows:
+        print(f"  {r['K']:>4} {r['ade_mean']:>10.2f} {r['ate_mean']:>10.2f} "
+              f"{r['cte_mean']:>10.2f} {r['spread_mean']:>12.2f} "
+              f"{r['delta_ade_vs_k_min']:>+14.2f} {r['time_s']:>9.1f} {r['n']:>6}")
+    print(f"  {'='*100}")
+    print(f"  Ghi chú: spread ở bảng này nên gần như KHÔNG ĐỔI theo K (khác Table 4 — ODE")
+    print(f"  N-sweep — nơi spread tăng rõ theo N). K chỉ giúp ước lượng phân phối mượt hơn")
+    print(f"  trong vùng đã bị N quyết định trước, KHÔNG mở rộng spread. Nếu bảng này cho")
+    print(f"  thấy spread tăng đáng kể theo K, cần xem lại giả thuyết trên bằng thực nghiệm.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1256,6 +1326,13 @@ def main():
             ode_n_rows = build_ode_n_table(ode_sweep_data)
             print_ode_n_table(ode_n_rows)
 
+        ensemble_k_rows = []
+        if args.eval_full_json:
+            eval_full_data = load_json(args.eval_full_json)
+            ensemble_k_rows = build_ensemble_k_table(eval_full_data)
+            if ensemble_k_rows:
+                print_ensemble_k_table(ensemble_k_rows)
+
         out = {
             "main_table":        main_rows,
             "significance_table": sig_results,
@@ -1263,7 +1340,8 @@ def main():
                 "models": models_for_main,
                 "rows":   horizon_rows,
             },
-            "ode_n_sweep_table": ode_n_rows,
+            "ode_n_sweep_table":  ode_n_rows,
+            "ensemble_k_sweep_table": ensemble_k_rows,
         }
         out_path = os.path.join(args.output_dir, "paper_tables.json")
         with open(out_path, "w") as f:

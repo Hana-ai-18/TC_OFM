@@ -401,9 +401,15 @@ def main():
                                    seed=seed, n_ensemble=args.n_ensemble)
         all_records.extend(recs)
 
-        ade = np.mean([r["ade"] for r in recs])
-        ate = np.mean([r["ate"] for r in recs])
-        cte = np.mean([r["cte"] for r in recs])
+        # [FIX] ate/cte là None ở lead_time=1 (6h) theo convention đã sửa
+        # (xem evaluate_one_model's docstring) — np.mean crash nếu None
+        # lẫn trong list. Lọc trước khi tính, giống mọi chỗ khác trong
+        # generate_paper_report.py đã áp dụng cùng bộ lọc này.
+        ade = np.mean([r["ade"] for r in recs if r["ade"] is not None])
+        ate_vals = [r["ate"] for r in recs if r["ate"] is not None]
+        cte_vals = [r["cte"] for r in recs if r["cte"] is not None]
+        ate = np.mean(ate_vals) if ate_vals else float("nan")
+        cte = np.mean(cte_vals) if cte_vals else float("nan")
         print(f"  {display_name} seed={seed}: n={len(recs)}  ADE={ade:.2f}  "
               f"ATE={ate:.2f}  CTE={cte:.2f}")
 

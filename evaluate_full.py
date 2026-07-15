@@ -823,17 +823,32 @@ def ensemble_size_eval(model, loader, device,
     Ablation: accuracy vs compute trade-off theo ensemble size K.
     → Justification cho K=20 default.
     → ESWA Table: shows diminishing returns beyond K=20.
+
+    [BỔ SUNG] Thêm spread_mean (độ phân tán trung bình giữa các ensemble
+    member cuối cùng) — dùng CHÍNH XÁC cùng công thức đã có sẵn ở
+    ablation_runner.py's ode_steps_sweep() (pairwise haversine giữa các
+    candidate cuối, subsample 10 cặp/batch để không quá chậm với K lớn),
+    không viết lại logic mới. Lý do cần thêm: K (n_ensemble) và N
+    (n_inference_steps) là 2 tham số khác nhau — N mới là cái thực sự
+    quyết định spread (velocity field được tích phân qua nhiều bước hơn
+    → sai khác giữa các candidate khuếch đại dần), còn K chỉ ước lượng
+    MỊN HƠN cùng 1 vùng phân phối đã bị N quyết định trước đó, KHÔNG mở
+    rộng được vùng đó. Bảng này tồn tại để CHỨNG MINH bằng số điều đó
+    (spread gần như phẳng theo K, khác hẳn xu hướng tăng rõ theo N ở
+    ode_steps_sweep) — nếu chỉ có bảng K mà thiếu cột spread, không có
+    cách nào phân biệt trực quan giữa "K giúp mượt hơn" và "K giúp mở
+    rộng spread" (2 tuyên bố rất khác nhau).
     """
     raw = _unwrap(model)
     results = {}
     for k in k_values:
-        all_ade, all_ate, all_cte = [], [], []
+        all_ade, all_ate, all_cte, all_spread = [], [], [], []
         t0 = time.time()
         for batch in loader:
             bl = move(list(batch), device)
             gt = bl[1]
             try:
-                pred, _, _ = model.sample(bl, num_ensemble=k)
+                pred, _, all_t = model.sample(bl, num_ensemble=k)
             except Exception:
                 continue
             T   = min(pred.shape[0], gt.shape[0])
@@ -845,15 +860,32 @@ def ensemble_size_eval(model, loader, device,
                 ate_v, cte_v = _ate_cte_full(pd, gd)
                 all_ate.extend(ate_v.abs().mean(0).tolist())
                 all_cte.extend(cte_v.abs().mean(0).tolist())
+
+            # [BỔ SUNG] spread — pairwise haversine giữa các candidate
+            # cuối cùng, cùng công thức với ode_steps_sweep(). K=1 luôn
+            # cho spread=NaN (không có cặp nào để so — đúng ý nghĩa,
+            # không phải bug).
+            if all_t is not None and torch.is_tensor(all_t) and all_t.shape[0] >= 2:
+                Kb = all_t.shape[0]
+                last = _norm_to_deg(all_t[:, -1, :, :2])   # [K, B, 2]
+                idx1 = torch.randperm(Kb)[:min(Kb, 10)]
+                idx2 = torch.randperm(Kb)[:min(Kb, 10)]
+                for a, b in zip(idx1.tolist(), idx2.tolist()):
+                    if a != b:
+                        dab = _haversine_deg(last[a:a+1], last[b:b+1]).squeeze(0)
+                        all_spread.append(float(dab.mean()))
+
         elapsed = time.time() - t0
         results[k] = {
             "K": k, "ADE": float(np.mean(all_ade)) if all_ade else float("nan"),
             "ATE": float(np.mean(all_ate)) if all_ate else float("nan"),
             "CTE": float(np.mean(all_cte)) if all_cte else float("nan"),
+            "spread": float(np.mean(all_spread)) if all_spread else float("nan"),
             "time_s": elapsed, "n": len(all_ade),
         }
         print(f"  K={k:3d}: ADE={results[k]['ADE']:.2f}  ATE={results[k]['ATE']:.2f}"
-              f"  CTE={results[k]['CTE']:.2f}  t={elapsed:.1f}s")
+              f"  CTE={results[k]['CTE']:.2f}  spread={results[k]['spread']:.2f}km  "
+              f"t={elapsed:.1f}s")
     return results
 
 
@@ -996,7 +1028,10 @@ def main():
     p.add_argument("--sigma_sensitivity", action="store_true", default=False,
                    help="Run sigma_inference sensitivity analysis (reviewer ablation)")
     p.add_argument("--ensemble_ablation",  action="store_true", default=False,
-                   help="Run ensemble size K ablation (K=1,3,5,10,20,40)")
+                   help="Run ensemble size K ablation")
+    p.add_argument("--k_values", type=int, nargs="+", default=[1, 3, 5, 10, 20, 40],
+                   help="Danh sách K để quét cho --ensemble_ablation. "
+                        "Default [1,3,5,10,20,40] bao quanh K=20 hiện dùng.")
     p.add_argument("--per_storm",         action="store_true", default=False,
                    help="[DEBUG] Break down ADE/ATE/CTE by real storm name "
                         "(from dataset tyID) instead of only speed/intensity "
@@ -1155,9 +1190,9 @@ def main():
 
     # ── Ensemble size ablation (nếu được yêu cầu) ─────────────────────────
     if args.ensemble_ablation:
-        print(f"\n  Running ensemble size ablation K=1,3,5,10,20,40...")
+        print(f"\n  Running ensemble size ablation K={args.k_values}...")
         ens_results = ensemble_size_eval(model, loader, device,
-                                          k_values=[1, 3, 5, 10, 20, 40])
+                                          k_values=args.k_values)
         result["ensemble_ablation"] = ens_results
 
     # ── Per-storm breakdown (nếu được yêu cầu) ─────────────────────────────
