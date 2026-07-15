@@ -657,11 +657,20 @@ def run_ode_steps_sweep_multi_seed(checkpoints: List[str], dataset_root: str,
                 all_lts |= set(per_seed_results[s][n_steps].get("by_lead_time", {}).keys())
         by_lead_time_merged = {}
         for lt in sorted(all_lts):
-            for metric in ("ADE", "ATE", "CTE"):
+            # [FIX] Trước đây chỉ gộp ADE/ATE/CTE — thiếu "spread" (mới
+            # thêm vào ode_steps_sweep()'s by_lead_time gần đây), khiến
+            # file JSON từ run_ode_steps_sweep_multi_seed() (multi-seed
+            # path) KHÔNG BAO GIỜ có spread per-lead-time dù
+            # ode_steps_sweep() (single-seed) đã tính đúng. Đây là
+            # nguyên nhân thật của "chưa có spread per-lead-time (file
+            # cũ)" quan sát được — không phải file cũ, mà là code gộp
+            # multi-seed bỏ sót field mới.
+            for metric in ("ADE", "ATE", "CTE", "spread"):
                 seed_vals = [per_seed_results[s][n_steps]["by_lead_time"][lt][metric]
                             for s in per_seed_results
                             if n_steps in per_seed_results[s]
                             and lt in per_seed_results[s][n_steps].get("by_lead_time", {})
+                            and metric in per_seed_results[s][n_steps]["by_lead_time"][lt]
                             and not np.isnan(per_seed_results[s][n_steps]["by_lead_time"][lt].get(metric, float("nan")))]
                 by_lead_time_merged.setdefault(lt, {})
                 by_lead_time_merged[lt][metric] = float(np.mean(seed_vals)) if seed_vals else float("nan")
