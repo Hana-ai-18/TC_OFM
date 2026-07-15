@@ -836,6 +836,24 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     print(f"  [deg] pred_deg (first) : {pred_deg[0]}")
     print(f"  expected: lon 100-180°E, lat 0-60°N\n")
 
+    # [FIX-11] pred_deg/gt_deg có thể lệch độ dài nếu model_cfg's
+    # pred_len (quyết định T của model.sample()) khác T thật của ground
+    # truth trong dataset (xem cảnh báo "XUNG ĐỘT pred_len" ở
+    # load_model_and_data nếu có) — trước đây haversine_km() crash
+    # cứng ValueError. Giờ cắt về min(T) chung, kèm cảnh báo rõ ràng.
+    if pred_deg.shape[0] != gt_deg.shape[0]:
+        T_min = min(pred_deg.shape[0], gt_deg.shape[0])
+        print(f"  ⚠ LỆCH ĐỘ DÀI: pred_deg có {pred_deg.shape[0]} bước, "
+              f"gt_deg có {gt_deg.shape[0]} bước — model_cfg's pred_len "
+              f"không khớp T thật của ground truth. Cắt cả 2 về {T_min} "
+              f"bước ({T_min * 6}h). Cần xác nhận lại đúng pred_len "
+              f"checkpoint thật được train với — kết quả sau đây chỉ "
+              f"phản ánh {T_min * 6}h đầu, KHÔNG phải toàn bộ horizon gốc.")
+        pred_deg = pred_deg[:T_min]
+        gt_deg   = gt_deg[:T_min]
+        if ens_deg is not None and ens_deg.shape[1] != T_min:
+            ens_deg = ens_deg[:, :T_min]
+
     errors_km = haversine_km(pred_deg, gt_deg)
 
     # CLIPER: constant-velocity extrapolation from last two observed points
@@ -899,6 +917,17 @@ def run_inference_generic(model, target, device, model_type: str,
     gt_deg   = to_deg(denorm_traj(gt_n))
     pred_deg = to_deg(denorm_traj(pred_n_abs))
     ens_deg  = to_deg(denorm_traj(ens_abs)) if ens_abs is not None else None
+
+    # [FIX-11] Cùng vấn đề với run_inference() — model_cfg's pred_len có
+    # thể lệch T thật của ground truth. Cắt an toàn thay vì crash.
+    if pred_deg.shape[0] != gt_deg.shape[0]:
+        T_min = min(pred_deg.shape[0], gt_deg.shape[0])
+        print(f"  ⚠ LỆCH ĐỘ DÀI ({model_type}): pred={pred_deg.shape[0]} "
+              f"vs gt={gt_deg.shape[0]} bước — cắt về {T_min} bước.")
+        pred_deg = pred_deg[:T_min]
+        gt_deg   = gt_deg[:T_min]
+        if ens_deg is not None and ens_deg.shape[1] != T_min:
+            ens_deg = ens_deg[:, :T_min]
 
     errors_km = haversine_km(pred_deg, gt_deg)
     return obs_deg, gt_deg, pred_deg, ens_deg, errors_km
@@ -1107,6 +1136,22 @@ def load_model_and_data(args, device, dset_type="test"):
               "train với kiến trúc mặc định.")
         model = TCFlowMatching(pred_len=args.pred_len, obs_len=args.obs_len).to(device)
     else:
+        # [FIX-10] model_cfg["pred_len"] có thể XUNG ĐỘT với
+        # detect_pred_len()'s kết quả (dựa vào pos_enc.shape[1]) — đây
+        # là nguyên nhân thật của lỗi "shape mismatch" giữa pred_deg và
+        # gt_deg quan sát được (model.sample() ra T theo model_cfg,
+        # nhưng ground truth trong dataset có T khác). model_cfg được
+        # ưu tiên (đại diện đúng architecture checkpoint thật), nhưng
+        # cảnh báo rõ để biết đây là vấn đề cần xác nhận lại, không
+        # phải lỗi code — run_inference() sẽ tự cắt về min(T) an toàn
+        # nếu vẫn lệch sau bước này.
+        cfg_pred_len = model_cfg.get("pred_len")
+        if cfg_pred_len is not None and cfg_pred_len != detected:
+            print(f"  ⚠ XUNG ĐỘT pred_len: model_cfg ghi {cfg_pred_len}, "
+                  f"detect_pred_len() phát hiện {detected}. Dùng "
+                  f"model_cfg's {cfg_pred_len} — có thể gây lệch shape "
+                  f"với ground truth, run_inference() sẽ tự cắt an toàn "
+                  f"nếu cần nhưng CẦN XÁC NHẬN LẠI đúng pred_len thật.")
         model = TCFlowMatching(**model_cfg).to(device)
 
     sd = ck.get("model", ck.get("model_state_dict", ck.get("model_state", ck)))
