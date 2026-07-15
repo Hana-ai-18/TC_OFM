@@ -61,6 +61,33 @@ from Model.flow_matching_model import (
     augment_batch,
 )
 
+
+def _ate_cte_full_local(pred_deg, gt_deg):
+    """
+    Local copy of evaluate_full.py's _ate_cte_full (identical formula —
+    ATE/CTE signed, [T-1, B] shape). Copied rather than imported to
+    remove the circular dependency that existed before (evaluate_full.py
+    imports ode_steps_sweep from THIS file at module load; this file
+    used to import _ate_cte_full back from evaluate_full.py inside a
+    function body). That lazy in-function import happened to not crash
+    because it only ran when the function was called, never at module
+    load time — but it was fragile (moving it to module level would
+    break both files), so it's removed in favor of this local copy.
+    If evaluate_full.py's _ate_cte_full formula ever changes, update
+    both copies.
+    """
+    from Model.flow_matching_model import _forward_azimuth
+    import torch as _torch
+    T = min(pred_deg.shape[0], gt_deg.shape[0])
+    if T < 2:
+        z = pred_deg.new_zeros(1, pred_deg.shape[1])
+        return z, z
+    bear_ref = _forward_azimuth(gt_deg[:T-1], gt_deg[1:T])
+    bear_err = _forward_azimuth(gt_deg[1:T],  pred_deg[1:T])
+    dist_err = _haversine_deg(pred_deg[1:T], gt_deg[1:T])
+    ang      = bear_err - bear_ref
+    return dist_err * _torch.cos(ang), dist_err * _torch.sin(ang)
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Ablation variant definitions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +174,110 @@ ABLATION_VARIANTS = {
     "ode_2step":  {"desc": "2-step ODE",          "n_inference_steps": 2},
     "ode_5step":  {"desc": "5-step ODE",          "n_inference_steps": 5},
     "ode_10step": {"desc": "10-step ODE",         "n_inference_steps": 10},
+
+    # NEWLY ADDED -- components that had a real, working constructor
+    # flag on TCFlowMatching but NO ablation entry, so they were never
+    # actually tested despite the flag existing. VERIFIED against
+    # train_flowmatching.py's actual argparse block (not assumed):
+    #   --no_ot              -> use_ot=False              [READY]
+    #   --disable_horizon_nll -> enable_horizon_nll=False  [READY]
+    #   --disable_hard_reg    -> lambda_hard_reg forced 0  [READY]
+    #   --no_ema              -> use_ema=False             [READY, inference-only via evaluate_full.py --no_ema, no retrain needed]
+    # These need RETRAINING (they change training-time behavior), run
+    # via `python train_flowmatching.py <the corresponding --flag>` --
+    # NOT via ablation_runner.py's --mode train_variant/AblationModel
+    # path, which does NOT forward these particular kwargs today.
+    "no_ot_matching": {
+        "desc": "w/o OT (Sinkhorn) coupling -- random x0/x1 pairing",
+        "train_flag": "--no_ot", "_status": "READY -- real train_flowmatching.py flag",
+    },
+    "no_horizon_nll": {
+        "desc": "w/o log_b_horizon Laplace-NLL horizon normalization",
+        "train_flag": "--disable_horizon_nll", "_status": "READY -- real train_flowmatching.py flag",
+    },
+    "no_hard_reg": {
+        "desc": "w/o lambda_hard_reg pull-to-uniform on hard_score weights",
+        "train_flag": "--disable_hard_reg", "_status": "READY -- real train_flowmatching.py flag",
+    },
+    "no_ema": {
+        "desc": "w/o EMA weights at inference (raw trained weights)",
+        "train_flag": "--no_ema",
+        "_status": "READY, but INFERENCE-ONLY -- use evaluate_full.py "
+                   "--no_ema on an EXISTING checkpoint (any checkpoint "
+                   "trained with EMA on works fine for this comparison; "
+                   "no retraining needed at all, unlike the other 3).",
+    },
+    # NOT YET IMPLEMENTED -- these describe real architectural
+    # components (see NEW_VARIANT_RATIONALE below for why each matters)
+    # but, unlike the 4 above, VERIFIED to have NO existing constructor
+    # kwarg or CLI flag in flow_matching_model.py / train_flowmatching.py.
+    # Listed here as a TODO, not a runnable variant -- do not attempt
+    # `--variant fixed_hard_score_weights` or `--variant no_kinematic_feat`,
+    # they will silently no-op (AblationModel has no code path for them).
+    "fixed_hard_score_weights": {
+        "desc": "[NOT IMPLEMENTED] hard_score with FIXED weights "
+                "(0.35/0.25/0.25/0.15) instead of learned weight_logits",
+        "_status": "NEEDS NEW CODE -- requires a new constructor kwarg "
+                   "(e.g. freeze_hard_score_weights: bool) that, in "
+                   "hard_score_from_obs()'s call site, passes a fixed "
+                   "tensor instead of self.hard_score_weight_logits, "
+                   "and disables that Parameter's gradient. Not present "
+                   "in flow_matching_model.py today.",
+    },
+    "no_kinematic_feat": {
+        "desc": "[NOT IMPLEMENTED] ContextEncoder w/o 6-dim kinematic "
+                "feature branch",
+        "_status": "NEEDS NEW CODE -- requires a new constructor kwarg "
+                   "threaded into ContextEncoder.__init__ / .forward to "
+                   "zero out or skip self.vel_obs_enc and adjust self.fuse's "
+                   "input dim accordingly (currently hardcoded to "
+                   "d_cond + d_cond//2 + d_cond//4). Not present today.",
+    },
+}
+
+# Rationale for each newly-added variant (kept out of the dict above to
+# keep it readable -- ABLATION_VARIANTS stays a flat config table):
+NEW_VARIANT_RATIONALE = {
+    "no_ot_matching": (
+        "OT matching (_ot_match/_sinkhorn_log) is claimed to give smoother "
+        "conditional flow paths than i.i.d. random pairing, but this is "
+        "asserted from general FM literature, not measured on this "
+        "dataset. --no_ot is a real, ready-to-run flag with zero ablation "
+        "evidence collected yet."
+    ),
+    "no_horizon_nll": (
+        "Newest of the 4 CTE/spread fixes (log train only reached ~ep81 "
+        "at time of writing) and the LEAST validated -- never isolated "
+        "from the other 3 fixes (sigma_min/max, sigma_decay_end, "
+        "n_inference_steps) in the current run. Needed to know how much "
+        "of the CTE gain is horizon-NLL specifically vs the sigma changes."
+    ),
+    "no_hard_reg": (
+        "hard_score's 4 component weights are LEARNED (LEARN-3) with "
+        "lambda_hard_reg=0.02 pulling toward uniform to prevent collapse. "
+        "No evidence yet that the regularizer at 0.02 does anything vs 0.0."
+    ),
+    "no_ema": (
+        "EMA (decay=0.995) is on by default for reported paper numbers, "
+        "but there is no side-by-side EMA-vs-raw table showing how much "
+        "of the final ADE/ATE/CTE improvement is attributable to EMA "
+        "specifically. Inference-only -- use evaluate_full.py --no_ema "
+        "on an EXISTING checkpoint, no retraining needed."
+    ),
+    "fixed_hard_score_weights": (
+        "Directly answers whether learning the hard_score weights helps "
+        "at all vs the original hand-picked 0.35/0.25/0.25/0.15. Currently "
+        "asserted, not tested -- AND not yet even codeable without adding "
+        "a new constructor kwarg first (see _status above)."
+    ),
+    "no_kinematic_feat": (
+        "ContextEncoder fuses 3 feature sources; only the whole encoder's "
+        "value is implicitly tested via baseline comparison. No ablation "
+        "isolates whether the kinematic branch specifically contributes "
+        "vs being redundant with what the 1D/spatial encoders already "
+        "see -- AND not yet even codeable without adding a new "
+        "constructor kwarg first (see _status above)."
+    ),
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -237,33 +368,42 @@ class AblationModel(TCFlowMatching):
 
 @torch.no_grad()
 def ode_steps_sweep(model, loader, device,
-                     steps_list: List[int] = [1, 2, 5, 10],
-                     n_ensemble: int = 20) -> Dict:
+                     steps_list: List[int] = [1, 4, 8, 10, 12, 16, 20],
+                     n_ensemble: int = 20,
+                     collect_spread: bool = True) -> Dict:
     """
-    Evaluate model with different numbers of ODE integration steps.
-    Standard inference uses n_steps=1 (Euler). More steps = more compute,
-    potentially better accuracy. This is the key FM advantage table.
+    Evaluate model with different numbers of ODE integration (N)
+    steps. Reports ADE/ATE/CTE (not just ADE, as the earlier version
+    did -- the project's own experiment log shows N is NOT monotonic
+    across all 3 metrics: N=1->10 improves spread/CRPS but slightly
+    WORSENS ADE/ATE/CTE, so a table that only shows ADE would hide
+    that trade-off) plus ensemble spread (mean pairwise distance
+    between ensemble members at the final step), the metric that
+    actually motivated raising N in the first place.
+
+    default steps_list = [1,4,8,10,12,16,20] matches the ablation the
+    project asked for. N=16 here is an ODE integration step count,
+    unrelated to pred_len=16 from the reference paper -- same
+    distinction flagged before, restated so this output isn't misread.
     """
     model.eval()
     results = {}
     raw = _unwrap(model)
+    from Model.flow_matching_model import _forward_azimuth
 
     for n_steps in steps_list:
         print(f"  ODE steps={n_steps}...")
-        all_ade = []
+        all_ade, all_ate, all_cte, all_spread = [], [], [], []
         t_start = time.time()
 
         for batch in loader:
             bl = [x.to(device) if torch.is_tensor(x) else x for x in batch]
             gt = bl[1]
-            B  = bl[0].shape[1]
 
-            # Multi-step ODE integration using Euler with n_steps steps
             try:
-                # Override n_inference_steps temporarily
                 orig_steps = getattr(raw, "n_inference_steps", 1)
                 raw.n_inference_steps = n_steps
-                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
+                pred, _, all_t = model.sample(bl, num_ensemble=n_ensemble)
                 raw.n_inference_steps = orig_steps
             except Exception as e:
                 print(f"    Error: {e}"); continue
@@ -274,32 +414,63 @@ def ode_steps_sweep(model, loader, device,
             d   = _haversine_deg(pd, gd)
             all_ade.extend(d.mean(0).tolist())
 
+            if T >= 2:
+                bear_ref = _forward_azimuth(gd[:T-1], gd[1:T])
+                bear_err = _forward_azimuth(gd[1:T], pd[1:T])
+                dist_err = _haversine_deg(pd[1:T], gd[1:T])
+                ang = bear_err - bear_ref
+                all_ate.extend((dist_err * torch.cos(ang)).abs().mean(0).tolist())
+                all_cte.extend((dist_err * torch.sin(ang)).abs().mean(0).tolist())
+
+            if collect_spread and all_t is not None and all_t.shape[0] >= 2:
+                K = all_t.shape[0]
+                last = _norm_to_deg(all_t[:, -1, :, :2])   # [K, B, 2]
+                idx1 = torch.randperm(K)[:min(K, 10)]
+                idx2 = torch.randperm(K)[:min(K, 10)]
+                for a, b in zip(idx1.tolist(), idx2.tolist()):
+                    if a != b:
+                        dab = _haversine_deg(last[a:a+1], last[b:b+1]).squeeze(0)
+                        all_spread.append(float(dab.mean()))
+
         elapsed = time.time() - t_start
         results[n_steps] = {
-            "n_steps": n_steps,
-            "ADE_mean": float(np.mean(all_ade)),
-            "ADE_std":  float(np.std(all_ade)),
-            "time_s":   elapsed,
-            "n_storms": len(all_ade),
+            "n_steps":     n_steps,
+            "ADE_mean":    float(np.mean(all_ade)) if all_ade else float("nan"),
+            "ADE_std":     float(np.std(all_ade))  if all_ade else float("nan"),
+            "ATE_mean":    float(np.mean(all_ate)) if all_ate else float("nan"),
+            "CTE_mean":    float(np.mean(all_cte)) if all_cte else float("nan"),
+            "spread_mean": float(np.mean(all_spread)) if all_spread else float("nan"),
+            "time_s":      elapsed,
+            "n_storms":    len(all_ade),
         }
-        print(f"    ADE={results[n_steps]['ADE_mean']:.2f}km  t={elapsed:.1f}s")
+        r = results[n_steps]
+        print(f"    ADE={r['ADE_mean']:.2f}  ATE={r['ATE_mean']:.2f}  "
+              f"CTE={r['CTE_mean']:.2f}  spread={r['spread_mean']:.2f}km  "
+              f"t={elapsed:.1f}s")
 
     return results
 
 
 def print_ode_sweep(results: Dict):
-    print(f"\n  {'='*60}")
-    print(f"  ODE STEPS SWEEP (FM core advantage)")
-    print(f"  {'─'*60}")
-    print(f"  {'Steps':>6} {'ADE(km)':>10} {'Δ vs 1-step':>12} {'Time(s)':>9}")
-    print(f"  {'─'*60}")
+    print(f"\n  {'='*88}")
+    print(f"  ODE STEPS (N) SWEEP -- ADE/ATE/CTE + ensemble spread vs compute")
+    print(f"  {'-'*88}")
+    print(f"  {'N':>4} {'ADE(km)':>9} {'ATE(km)':>9} {'CTE(km)':>9} "
+          f"{'Spread(km)':>11} {'dADE vs N=1':>12} {'Time(s)':>9}")
+    print(f"  {'-'*88}")
     ref_ade = results.get(1, {}).get("ADE_mean", float("nan"))
     for n, r in sorted(results.items()):
         delta = r["ADE_mean"] - ref_ade
-        print(f"  {n:>6} {r['ADE_mean']:>10.2f} {delta:>+12.2f} {r['time_s']:>9.1f}")
-    print(f"  {'='*60}")
-    print(f"  Key claim: FM achieves competitive accuracy with n_steps=1")
-    print(f"  → Confirm by showing diminishing returns beyond 1-2 steps\n")
+        print(f"  {n:>4} {r['ADE_mean']:>9.2f} {r['ATE_mean']:>9.2f} "
+              f"{r['CTE_mean']:>9.2f} {r['spread_mean']:>11.2f} "
+              f"{delta:>+12.2f} {r['time_s']:>9.1f}")
+    print(f"  {'='*88}")
+    print(f"  Known project result (empirical, N=1->10): spread 4km->55km, "
+          f"CRPS -9.5%, ADE/ATE/CTE +1.7%/+1.9%/+7.2%. N=3-4 was WORSE than")
+    print(f"  both N=1 and N=8-10 (non-monotonic -- Euler discretization "
+          f"error at low N). Use this sweep to confirm/update that curve on")
+    print(f"  the current 3-seed checkpoints, and check whether N=12/16/20")
+    print(f"  keep improving spread or plateau/regress past N=10.\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,8 +553,7 @@ def run_multi_seed(checkpoint_pattern: str,
                 pd  = _norm_to_deg(pred[:T])
                 gd  = _norm_to_deg(gt[:T, :, :2])
                 d   = _haversine_deg(pd, gd)
-                from evaluate_full import _ate_cte_full
-                ate, cte = _ate_cte_full(pd, gd)
+                ate, cte = _ate_cte_full_local(pd, gd)
                 all_ade.extend(d.mean(0).tolist())
                 all_ate.extend(ate.abs().mean(0).tolist())
                 all_cte.extend(cte.abs().mean(0).tolist())
@@ -478,6 +648,12 @@ def main():
     p.add_argument("--output_dir",        type=str, default="ablations")
     p.add_argument("--ablation_dir",      type=str, default="ablations")
     p.add_argument("--gpu",               type=int, default=0)
+    p.add_argument("--ode_steps_list",    type=int, nargs="+",
+                   default=[1, 4, 8, 10, 12, 16, 20],
+                   help="N values to sweep for --mode ode_steps. Default "
+                        "matches the requested ablation N=[1,4,8,10,12,16,20]. "
+                        "These are ODE integration steps, NOT related to "
+                        "pred_len.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -520,7 +696,7 @@ def main():
     if args.mode == "ode_steps":
         model = TCFlowMatching(**cfg).to(device)
         model.load_state_dict(ck.get("model", ck), strict=False)
-        steps_list = [1, 2, 5, 10]
+        steps_list = args.ode_steps_list
         results = ode_steps_sweep(model, loader, device,
                                    steps_list=steps_list,
                                    n_ensemble=args.n_ensemble)

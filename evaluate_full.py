@@ -51,6 +51,16 @@ from Model.flow_matching_model import (
     _step_speeds_kmh, _unwrap,
 )
 
+# ode_steps_sweep lives in ablation_runner.py (NOT duplicated here) — it
+# already implements the N sweep correctly (temporarily overrides
+# raw.n_inference_steps, calls model.sample(), restores it). Importing
+# rather than re-implementing avoids a second, possibly-diverging copy.
+try:
+    from ablation_runner import ode_steps_sweep, print_ode_sweep
+except ImportError:
+    ode_steps_sweep = None
+    print_ode_sweep = None
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 R_EARTH   = 6371.0
 DT_HOURS  = 6.0

@@ -54,6 +54,26 @@ from Model.paper_baseline_model import PaperBaseline, MODEL_TYPES
 from Model.st_trans_model import STTrans
 
 
+def _infer_seed(checkpoint_path: str, ck: dict) -> str:
+    """
+    Best-effort seed extraction: prefer an explicit 'seed' key saved in
+    the checkpoint (train_flowmatching.py / train_st_trans.py /
+    train_paper_baseline.py all save this per the project's multi-seed
+    convention). Falls back to parsing "_seed<N>" from the path/dirname
+    (the convention those same scripts use for output_dir), and finally
+    "unknown" if neither is found — records with seed="unknown" will
+    NOT be treated as genuinely pooled multi-seed data by
+    generate_paper_table.py (it warns explicitly in that case).
+    """
+    if isinstance(ck, dict) and "seed" in ck:
+        return str(ck["seed"])
+    import re
+    m = re.search(r"seed[_-]?(\d+)", checkpoint_path)
+    if m:
+        return m.group(1)
+    return "unknown"
+
+
 def move(batch, device):
     return [x.to(device) if torch.is_tensor(x) else x for x in batch]
 
@@ -88,7 +108,8 @@ def load_fm(checkpoint: str, device):
         print(f"  ⚠ FM load_state_dict: {len(missing)} missing, "
               f"{len(unexpected)} unexpected keys")
     model.eval()
-    return model
+    seed = _infer_seed(checkpoint, ck)
+    return model, seed
 
 
 def load_paper_baseline(checkpoint: str, model_type: str, device,
@@ -129,7 +150,8 @@ def load_paper_baseline(checkpoint: str, model_type: str, device,
         print(f"  ⚠ {model_type.upper()} load_state_dict: {len(missing)} "
               f"missing, {len(unexpected)} unexpected keys")
     model.eval()
-    return model
+    seed = _infer_seed(checkpoint, ck)
+    return model, seed
 
 
 def load_st_trans(checkpoint: str, device,
@@ -164,16 +186,18 @@ def load_st_trans(checkpoint: str, device,
         print(f"  ⚠ ST-Trans load_state_dict: {len(missing)} missing, "
               f"{len(unexpected)} unexpected keys")
     model.eval()
-    return model
+    seed = _infer_seed(checkpoint, ck)
+    return model, seed
 
 
 @torch.no_grad()
 def evaluate_one_model(model, loader, device, model_name: str,
+                        seed: str = "unknown",
                         n_ensemble: int = 20) -> List[Dict]:
     """
     Returns a list of PER-LEAD-TIME records:
-      {"model": name, "storm": storm_key, "window": idx, "lead_time": t,
-       "ade": .., "ate": .., "cte": .., "obs_speed": ..}
+      {"model": name, "seed": seed, "storm": storm_key, "window": idx,
+       "lead_time": t, "ade": .., "ate": .., "cte": .., "obs_speed": ..}
     One record per (storm, window, lead_time) triple — matches the
     paper's Table 10 pairing granularity (140 windows x 16 lead-times =
     2240 matched pairs, i.e. paired PER FORECAST STEP, not averaged over
@@ -240,6 +264,7 @@ def evaluate_one_model(model, loader, device, model_name: str,
                 lead_time = i + 1  # original step index (see docstring)
                 records.append({
                     "model":     model_name,
+                    "seed":      seed,
                     "storm":     storm_key,
                     "window":    b,
                     "lead_time": lead_time,
@@ -260,11 +285,22 @@ def main():
     p.add_argument("--n_ensemble", type=int, default=20)
     p.add_argument("--test_year", type=int, default=None)
 
-    p.add_argument("--fm_checkpoint",       default=None)
-    p.add_argument("--st_trans_checkpoint", default=None)
-    p.add_argument("--lstm_checkpoint",     default=None)
-    p.add_argument("--gru_checkpoint",      default=None)
-    p.add_argument("--rnn_checkpoint",      default=None)
+    p.add_argument("--fm_checkpoints",       nargs="+", default=None,
+                   help="One or more FM checkpoint paths, one per seed")
+    p.add_argument("--st_trans_checkpoints", nargs="+", default=None,
+                   help="One or more ST-Trans checkpoint paths, one per seed")
+    p.add_argument("--lstm_checkpoints",     nargs="+", default=None,
+                   help="One or more LSTM checkpoint paths, one per seed")
+    p.add_argument("--gru_checkpoints",      nargs="+", default=None,
+                   help="One or more GRU checkpoint paths, one per seed")
+    p.add_argument("--rnn_checkpoints",      nargs="+", default=None,
+                   help="One or more RNN checkpoint paths, one per seed")
+    # Backward-compat singular aliases (old single-checkpoint usage still works)
+    p.add_argument("--fm_checkpoint",       default=None, help="[legacy] single checkpoint, use --fm_checkpoints instead")
+    p.add_argument("--st_trans_checkpoint", default=None, help="[legacy] single checkpoint")
+    p.add_argument("--lstm_checkpoint",     default=None, help="[legacy] single checkpoint")
+    p.add_argument("--gru_checkpoint",      default=None, help="[legacy] single checkpoint")
+    p.add_argument("--rnn_checkpoint",      default=None, help="[legacy] single checkpoint")
 
     p.add_argument("--paper_hidden_dim", type=int, default=256)
     p.add_argument("--paper_n_layers",   type=int, default=3)
@@ -298,17 +334,23 @@ def main():
                              test=(args.split != "train"))
     print(f"  Data: {len(loader)} batches")
 
-    jobs = []
-    if args.fm_checkpoint:
-        jobs.append(("FM", "fm", args.fm_checkpoint))
-    if args.st_trans_checkpoint:
-        jobs.append(("ST-Trans", "st_trans", args.st_trans_checkpoint))
-    if args.lstm_checkpoint:
-        jobs.append(("LSTM", "lstm", args.lstm_checkpoint))
-    if args.gru_checkpoint:
-        jobs.append(("GRU", "gru", args.gru_checkpoint))
-    if args.rnn_checkpoint:
-        jobs.append(("RNN", "rnn", args.rnn_checkpoint))
+    def _collect(multi, single):
+        """Merge --xxx_checkpoints (list) and legacy --xxx_checkpoint (str) into one list."""
+        paths = list(multi) if multi else []
+        if single and single not in paths:
+            paths.append(single)
+        return paths
+
+    jobs = []  # (display_name, kind, checkpoint_path)
+    for display_name, kind, multi, single in [
+        ("FM",       "fm",       args.fm_checkpoints,       args.fm_checkpoint),
+        ("ST-Trans", "st_trans", args.st_trans_checkpoints, args.st_trans_checkpoint),
+        ("LSTM",     "lstm",     args.lstm_checkpoints,     args.lstm_checkpoint),
+        ("GRU",      "gru",      args.gru_checkpoints,      args.gru_checkpoint),
+        ("RNN",      "rnn",      args.rnn_checkpoints,      args.rnn_checkpoint),
+    ]:
+        for ckpt_path in _collect(multi, single):
+            jobs.append((display_name, kind, ckpt_path))
 
     if not jobs:
         print("  No checkpoints given — nothing to do.")
@@ -318,30 +360,30 @@ def main():
     for display_name, kind, ckpt_path in jobs:
         print(f"\n  {'='*70}\n  Loading {display_name}: {ckpt_path}\n  {'='*70}")
         if kind == "fm":
-            model = load_fm(ckpt_path, device)
+            model, seed = load_fm(ckpt_path, device)
         elif kind == "st_trans":
-            model = load_st_trans(ckpt_path, device,
+            model, seed = load_st_trans(ckpt_path, device,
                                    d_model=args.st_d_model, nhead=args.st_nhead,
                                    num_enc_layers=args.st_num_enc_layers,
                                    num_dec_layers=args.st_num_dec_layers,
                                    dim_ff=args.st_dim_ff, dropout=args.st_dropout)
         else:
-            model = load_paper_baseline(ckpt_path, kind, device,
+            model, seed = load_paper_baseline(ckpt_path, kind, device,
                                          hidden_dim=args.paper_hidden_dim,
                                          n_layers=args.paper_n_layers,
                                          dropout=args.paper_dropout)
 
         n_params = sum(pm.numel() for pm in model.parameters())
-        print(f"  {display_name}: {n_params:,} params")
+        print(f"  {display_name} (seed={seed}): {n_params:,} params")
 
         recs = evaluate_one_model(model, loader, device, display_name,
-                                   n_ensemble=args.n_ensemble)
+                                   seed=seed, n_ensemble=args.n_ensemble)
         all_records.extend(recs)
 
         ade = np.mean([r["ade"] for r in recs])
         ate = np.mean([r["ate"] for r in recs])
         cte = np.mean([r["cte"] for r in recs])
-        print(f"  {display_name}: n={len(recs)}  ADE={ade:.2f}  "
+        print(f"  {display_name} seed={seed}: n={len(recs)}  ADE={ade:.2f}  "
               f"ATE={ate:.2f}  CTE={cte:.2f}")
 
         del model

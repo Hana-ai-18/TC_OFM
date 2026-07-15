@@ -1,9 +1,21 @@
 """
-scripts/visual_evaluate_model_Me_v13.py
+visual_evaluate_model.py
 ========================================
-TC-FlowMatching — Forecast Visualisation v13
+TC-FlowMatching — Forecast Visualisation (paper/white style, merged)
 
-Fixes vs v12:
+GỘP từ visual_evaluate_mode_ME.py (v13, dark dashboard style) và
+plot_track_paper_style.py (paper style thử nghiệm). File này THAY THẾ
+cả hai — giữ nguyên TOÀN BỘ chức năng của bản v13 (single mode +
+case_study mode, cone xác suất 50/90%, wind-intensity markers, spread
+panel, CLIPER baseline, auto date-snap/forward-search) nhưng đổi style
+sang nền trắng kiểu paper (giống ảnh tham chiếu "Aila": nền trắng,
+coastline mảnh, 2 màu đường rõ ràng) thay vì nền tối/neon.
+
+Tất cả 7 fix của bản v13 (FIX-1..FIX-7, xem lịch sử bên dưới) được GIỮ
+NGUYÊN — chỉ đổi bảng màu (STYLE dict) và vài chỗ hardcode "white"/
+"#111111" cho khớp nền trắng, không đổi logic tính toán.
+
+Lịch sử fix kế thừa từ v13:
   - [FIX-1] find_target: bỏ dòng no-op `dt.replace(hour=dt.hour)`;
             chuyển `from datetime import timedelta` ra ngoài module-level
   - [FIX-2] _search_one_date: `best_pri = 99` → `float("inf")` để không
@@ -18,7 +30,10 @@ Fixes vs v12:
             khi 2 array có ndim khác nhau
   - [FIX-7] detect_pred_len: fallback duyệt key an toàn hơn với try/except
             để không crash khi checkpoint có cấu trúc lạ
-  - [CLEAN] Tất cả import được đưa lên top-level; xoá dead code
+  - [MERGE] Bảng màu đổi sang nền trắng; thêm 2 hàm mới
+            (plot_multi_model_comparison, run_inference_generic) để hỗ
+            trợ vẽ nhiều model (FM + baselines) trên cùng 1 bản đồ —
+            tính năng lấy từ plot_track_paper_style.py, không có ở v13 gốc.
 """
 from __future__ import annotations
 
@@ -52,45 +67,59 @@ except ImportError:
     print("  Warning: cartopy not found — using plain axes.")
 
 from Model.flow_matching_model import TCFlowMatching
+from Model.paper_baseline_model import PaperBaseline
+from Model.st_trans_model import STTrans
 from Model.data.loader import data_loader
 from Model.data.trajectoriesWithMe_unet_training import seq_collate
 
 
-# ── Styling ────────────────────────────────────────────────────────────────────
+# ── Styling (paper/white, thay cho dark neon của v13) ───────────────────────
 STYLE = dict(
-    obs_color     = "#00CFFF",
-    gt_color      = "#FF3B3B",
-    pred_color    = "#39FF14",
-    ens_color     = "#39FF14",
+    obs_color     = "#000000",   # đen — track quan sát
+    gt_color      = "#1F5FBF",   # xanh dương — Actual Track (khớp ảnh mẫu)
+    pred_color    = "#D62728",   # đỏ — Predicted (khớp ảnh mẫu)
+    ens_color     = "#D62728",
     ens_alpha     = 0.05,
-    marker_size   = 8,
-    lw_main       = 2.8,
-    lw_thin       = 1.6,
-    bg_color      = "#0D1B2A",
-    land_color    = "#2D4A3E",
-    ocean_color   = "#0D1B2A",
-    border_color  = "#4A6FA5",
-    grid_color    = "#FFFFFF",
-    grid_alpha    = 0.12,
-    error_color   = "#FFD700",
+    marker_size   = 6,
+    lw_main       = 2.0,
+    lw_thin       = 1.3,
+    bg_color      = "#FFFFFF",
+    land_color    = "#FFFFFF",
+    ocean_color   = "#EAF3FB",
+    border_color  = "#BBBBBB",
+    grid_color    = "#CCCCCC",
+    grid_alpha    = 0.5,
+    error_color   = "#B8860B",   # dark goldenrod — đọc được trên nền trắng
     title_pad     = 14,
-    cone_50_fill  = "#39FF14",
-    cone_90_fill  = "#00CFFF",
-    cone_50_alpha = 0.22,
+    cone_50_fill  = "#D62728",
+    cone_90_fill  = "#1F77B4",
+    cone_50_alpha = 0.18,
     cone_90_alpha = 0.10,
     cone_edge_lw  = 1.2,
+    text_color    = "#000000",
+    panel_edge    = "#888888",
 )
+
+# Màu riêng cho từng model khi vẽ nhiều model trên cùng bản đồ
+# (--mode multi_model, xem plot_multi_model_comparison bên dưới).
+MODEL_COLORS = {
+    "FM":       "#D62728",
+    "ST-Trans": "#FF7F0E",
+    "LSTM":     "#2CA02C",
+    "GRU":      "#9467BD",
+    "RNN":      "#8C564B",
+}
 
 _CHI2_50 = chi2.ppf(0.50, df=2)
 _CHI2_90 = chi2.ppf(0.90, df=2)
 
 INTENSITY = [
-    (0,   34,  "TD",       "#99CCFF"),
-    (34,  48,  "TS",       "#66FF66"),
-    (48,  64,  "TY",       "#FFFF00"),
-    (64,  84,  "Sev.TY",   "#FFA500"),
-    (84,  115, "Vis.TY",   "#FF4500"),
-    (115, 999, "Super TY", "#FF00FF"),
+    (0,   34,  "TD",       "#6699CC"),
+    (34,  48,  "TS",       "#33AA33"),
+    (48,  64,  "TY",       "#CCAA00"),
+    (64,  84,  "Sev.TY",   "#FF8C00"),
+    (84,  115, "Vis.TY",   "#E03C00"),
+    (115, 999, "Super TY", "#B000B0"),
 ]
 
 
@@ -407,6 +436,7 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
     [FIX-5] Error fill_between was incorrectly called on `ax` (spread axis)
             instead of `ax_twin` (error axis), causing it to be drawn against
             the wrong Y scale and potentially hidden under the spread fill.
+            (Fix preserved in this white-style version — unchanged logic.)
     """
     S, T, _ = ens_deg.shape
     lead_h   = np.arange(1, T + 1) * 6
@@ -420,43 +450,45 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
         spreads_km.append(np.sqrt(std_lon_km ** 2 + std_lat_km ** 2))
     spreads_km = np.array(spreads_km)
 
+    spread_color = "#1F77B4"  # xanh dương — spread (khác pred_color để không trùng)
+
     ax.set_facecolor(STYLE["bg_color"])
-    ax.fill_between(lead_h, 0, spreads_km, alpha=0.25,
-                    color=STYLE["cone_50_fill"], label="Ensemble spread (1σ)")
-    ax.plot(lead_h, spreads_km, "-", color=STYLE["cone_50_fill"], lw=2.2, zorder=5)
+    ax.fill_between(lead_h, 0, spreads_km, alpha=0.18,
+                    color=spread_color, label="Ensemble spread (1σ)")
+    ax.plot(lead_h, spreads_km, "-", color=spread_color, lw=2.2, zorder=5)
 
     ax_twin = ax.twinx()
     ax_twin.set_facecolor(STYLE["bg_color"])
     ax_twin.plot(lead_h, errors_km, "o-", color=STYLE["pred_color"],
-                 lw=2.5, ms=5, label="FM+PINN ADE", zorder=6)
+                 lw=2.5, ms=5, label="FM ADE", zorder=6)
     # [FIX-5] Use ax_twin (not ax) so the fill is scaled to the error Y-axis
-    ax_twin.fill_between(lead_h, 0, errors_km, alpha=0.12, color=STYLE["pred_color"])
+    ax_twin.fill_between(lead_h, 0, errors_km, alpha=0.10, color=STYLE["pred_color"])
 
     if cliper_err_km is not None:
         ax_twin.plot(lead_h, cliper_err_km[:T], "s--",
-                     color="#FF6666", lw=2, ms=4, label="CLIPER", zorder=4)
+                     color="#666666", lw=2, ms=4, label="CLIPER", zorder=4)
 
     for xm in [24, 48, 72]:
-        ax.axvline(xm, color=STYLE["error_color"], alpha=0.2, lw=0.7, ls=":")
+        ax.axvline(xm, color=STYLE["error_color"], alpha=0.3, lw=0.7, ls=":")
 
-    ax.set_xlabel("Lead time (h)", color="white", fontsize=8)
-    ax.set_ylabel("Spread 1σ (km)", color=STYLE["cone_50_fill"], fontsize=8)
+    ax.set_xlabel("Lead time (h)", color=STYLE["text_color"], fontsize=8)
+    ax.set_ylabel("Spread 1σ (km)", color=spread_color, fontsize=8)
     ax_twin.set_ylabel("Track error (km)", color=STYLE["pred_color"], fontsize=8)
-    ax.set_title(f"Spread vs Error — {t_name}", color="white",
+    ax.set_title(f"Spread vs Error — {t_name}", color=STYLE["text_color"],
                  fontsize=9, fontweight="bold")
 
     lines1, lbs1 = ax.get_legend_handles_labels()
     lines2, lbs2 = ax_twin.get_legend_handles_labels()
     ax.legend(lines1 + lines2, lbs1 + lbs2, fontsize=7.5,
-              facecolor="#111111", edgecolor="#00CFFF",
-              labelcolor="white", loc="upper left")
+              facecolor="white", edgecolor=STYLE["panel_edge"],
+              labelcolor=STYLE["text_color"], loc="upper left", framealpha=0.92)
 
     for spine in ax.spines.values():
-        spine.set_edgecolor("white")
-    ax.tick_params(colors="white", labelsize=7)
-    ax_twin.tick_params(colors="white", labelsize=7)
+        spine.set_edgecolor(STYLE["panel_edge"])
+    ax.tick_params(colors=STYLE["text_color"], labelsize=7)
+    ax_twin.tick_params(colors=STYLE["text_color"], labelsize=7)
     ax_twin.yaxis.label.set_color(STYLE["pred_color"])
-    ax.yaxis.label.set_color(STYLE["cone_50_fill"])
+    ax.yaxis.label.set_color(spread_color)
 
 
 # ── Map setup ──────────────────────────────────────────────────────────────────
@@ -476,7 +508,7 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
         ax.add_feature(cfeature.LAND.with_scale("50m"),
                        facecolor=STYLE["land_color"], zorder=1, alpha=0.9)
         ax.add_feature(cfeature.COASTLINE.with_scale("50m"),
-                       edgecolor="#8ABCD1", linewidth=0.7, zorder=2)
+                       edgecolor="#4D4D4D", linewidth=0.8, zorder=2)
         ax.add_feature(cfeature.BORDERS.with_scale("50m"),
                        edgecolor=STYLE["border_color"],
                        linewidth=0.4, linestyle=":", zorder=2)
@@ -487,22 +519,22 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
         )
         gl.top_labels   = False
         gl.right_labels = False
-        gl.xlabel_style = dict(color="white", fontsize=7)
-        gl.ylabel_style = dict(color="white", fontsize=7)
+        gl.xlabel_style = dict(color=STYLE["text_color"], fontsize=7)
+        gl.ylabel_style = dict(color=STYLE["text_color"], fontsize=7)
     else:
         ax = fig.add_subplot(subplot_spec)
         ax.set_facecolor(STYLE["bg_color"])
         ax.set_xlim(*lon_range)
         ax.set_ylim(*lat_range)
         for lon in np.arange(np.ceil(lon_range[0] / 5) * 5, lon_range[1], 5):
-            ax.axvline(lon, color="white", alpha=STYLE["grid_alpha"], lw=0.5)
+            ax.axvline(lon, color=STYLE["grid_color"], alpha=STYLE["grid_alpha"], lw=0.5)
         for lat in np.arange(np.ceil(lat_range[0] / 5) * 5, lat_range[1], 5):
-            ax.axhline(lat, color="white", alpha=STYLE["grid_alpha"], lw=0.5)
-        ax.set_xlabel("Longitude (°E)", color="white", fontsize=8)
-        ax.set_ylabel("Latitude (°N)",  color="white", fontsize=8)
-        ax.tick_params(colors="white", labelsize=7)
+            ax.axhline(lat, color=STYLE["grid_color"], alpha=STYLE["grid_alpha"], lw=0.5)
+        ax.set_xlabel("Longitude (°E)", color=STYLE["text_color"], fontsize=8)
+        ax.set_ylabel("Latitude (°N)",  color=STYLE["text_color"], fontsize=8)
+        ax.tick_params(colors=STYLE["text_color"], labelsize=7)
         for spine in ax.spines.values():
-            spine.set_edgecolor("white")
+            spine.set_edgecolor(STYLE["panel_edge"])
     return ax
 
 
@@ -510,10 +542,13 @@ def _plot_on_ax(
     ax, lon_range, lat_range,
     obs_deg, gt_deg, pred_deg, pred_Me_deg,
     all_trajs_deg=None, errors_km=None,
-    title="", dt_str="",
+    title="", dt_str="", pred_label="FM (mean)",
 ):
     transform = ccrs.PlateCarree() if HAS_CARTOPY else None
-    outline   = [pe.withStroke(linewidth=2.5, foreground="black")]
+    # Viền TRẮNG quanh chữ/marker (đảo ngược so với bản dark, vốn viền
+    # ĐEN quanh chữ sáng để nổi trên nền tối) — cho chữ đọc được trên nền
+    # trắng/xanh nhạt của bản đồ.
+    outline   = [pe.withStroke(linewidth=2.5, foreground="white")]
     cur_pos   = obs_deg[-1]
 
     def _plot(x, y, fmt=None, **kw):
@@ -560,7 +595,7 @@ def _plot_on_ax(
     _plot(pred_lon, pred_lat, fmt="o-",
           color=STYLE["pred_color"], linewidth=STYLE["lw_main"],
           markersize=STYLE["marker_size"],
-          markeredgecolor="#003300", markeredgewidth=1.0,
+          markeredgecolor="white", markeredgewidth=1.0,
           zorder=9, path_effects=outline)
 
     # 5. Wind intensity markers
@@ -570,7 +605,7 @@ def _plot_on_ax(
             _, wcolor = wind_intensity(wnd_kt)
             _scatter([pred_deg[i, 0]], [pred_deg[i, 1]],
                      s=70, color=wcolor,
-                     edgecolors="white", linewidths=0.7, zorder=11)
+                     edgecolors="black", linewidths=0.6, zorder=11)
 
     # 6. Error connectors at 24/48/72h
     if errors_km is not None:
@@ -581,11 +616,11 @@ def _plot_on_ax(
                 if HAS_CARTOPY:
                     ax.plot([gx, px], [gy, py], "--",
                             color=STYLE["error_color"], linewidth=1.2,
-                            alpha=0.7, transform=transform, zorder=7)
+                            alpha=0.8, transform=transform, zorder=7)
                 else:
                     ax.plot([gx, px], [gy, py], "--",
                             color=STYLE["error_color"], linewidth=1.2,
-                            alpha=0.7, zorder=7)
+                            alpha=0.8, zorder=7)
                 _text(
                     (gx + px) / 2, (gy + py) / 2,
                     f" {lbl}\n{errors_km[si]:.0f}km",
@@ -600,17 +635,17 @@ def _plot_on_ax(
         if h % 24 == 0:
             lbl = "NOW" if i == 0 else f"+{h}h"
             _text(pred_lon[i], pred_lat[i] + 0.5, lbl,
-                  color="#AAFFAA", fontweight="bold", fontsize=7.5,
+                  color=STYLE["pred_color"], fontweight="bold", fontsize=7.5,
                   path_effects=outline)
             if i < len(gt_lon):
                 _text(gt_lon[i], gt_lat[i] - 0.7, lbl,
-                      color="#FFAAAA", fontsize=6, alpha=0.8,
+                      color=STYLE["gt_color"], fontsize=6, alpha=0.9,
                       path_effects=outline)
 
     # 8. NOW star
     _scatter([cur_pos[0]], [cur_pos[1]],
              s=350, marker="*", color="#FFD700",
-             edgecolors="#FF4400", linewidths=2, zorder=20)
+             edgecolors="black", linewidths=1.5, zorder=20)
 
     # 9. Error summary box
     if errors_km is not None:
@@ -622,9 +657,9 @@ def _plot_on_ax(
         ax.text(
             0.02, 0.03, "\n".join(lines),
             transform=ax.transAxes, fontsize=8, va="bottom",
-            color="#88FF88", family="monospace",
-            bbox=dict(boxstyle="round,pad=0.4", fc=STYLE["bg_color"],
-                      alpha=0.85, ec="white", lw=0.8),
+            color=STYLE["text_color"], family="monospace",
+            bbox=dict(boxstyle="round,pad=0.4", fc="white",
+                      alpha=0.9, ec=STYLE["panel_edge"], lw=0.8),
             zorder=16,
         )
 
@@ -632,38 +667,39 @@ def _plot_on_ax(
     track_handles = [
         Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
         Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
-        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label="FM+PINN (mean)"),
-        mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.6,
+        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, label=f"Predicted ({pred_label})"),
+        mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
                        label="50% prob. cone"),
-        mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.45,
+        mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
                        label="90% prob. cone"),
     ]
     ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
-              facecolor="#111111", edgecolor="#00CFFF", labelcolor="white")
+              facecolor="white", edgecolor=STYLE["panel_edge"],
+              labelcolor=STYLE["text_color"], framealpha=0.92)
 
     wind_handles = [
         Line2D([0], [0], marker="o", color="none",
                markerfacecolor=c, markersize=7,
-               markeredgecolor="white", markeredgewidth=0.5,
+               markeredgecolor="black", markeredgewidth=0.5,
                label=f"{nm} ({lo}–{hi}kt)")
         for lo, hi, nm, c in INTENSITY
     ]
     leg2 = ax.legend(
         handles=wind_handles, loc="upper right", fontsize=6.5,
-        facecolor="#111111", edgecolor="#00FFFF",
-        labelcolor="white", title="Wind (kt)",
-        title_fontsize=7, ncol=2,
+        facecolor="white", edgecolor=STYLE["panel_edge"],
+        labelcolor=STYLE["text_color"], title="Wind (kt)",
+        title_fontsize=7, ncol=2, framealpha=0.92,
     )
     ax.add_artist(leg2)
 
     ax.set_title(
-        f"{title}\n{dt_str}", color="white", fontsize=10,
+        f"{title}\n{dt_str}", color=STYLE["text_color"], fontsize=10,
         fontweight="bold", pad=STYLE["title_pad"],
-        bbox=dict(fc=STYLE["bg_color"], alpha=0.88, ec="#00FFFF", lw=1.5),
+        bbox=dict(fc="white", alpha=0.9, ec=STYLE["panel_edge"], lw=1.2),
     )
     ax.set_facecolor(STYLE["bg_color"])
     for spine in ax.spines.values():
-        spine.set_edgecolor("#334466")
+        spine.set_edgecolor(STYLE["panel_edge"])
 
 
 # ── Run inference ──────────────────────────────────────────────────────────────
@@ -792,6 +828,233 @@ def run_inference(model, target, device, ode_steps, num_ensemble):
     return obs_deg, gt_deg, pred_deg, pred_Me_n, ens_deg, errors_km, cliper_err
 
 
+def run_inference_generic(model, target, device, model_type: str,
+                           ode_steps: int = 10, num_ensemble: int = 1):
+    """
+    [MERGE, từ plot_track_paper_style.py] Bản tổng quát của run_inference()
+    ở trên, dùng được cho CẢ FM lẫn RNN/GRU/LSTM/ST-Trans (không truyền
+    ddim_steps cho baseline vì các model đó không nhận tham số này).
+    Cùng logic auto-detect delta-vs-absolute và denorm — không đổi gì so
+    với run_inference() gốc, chỉ tổng quát hoá phần gọi model.sample().
+    Không in log chi tiết từng bước như run_inference() (dùng cho single
+    mode, cần debug kỹ) — bản này dùng cho multi_model mode, cần gọn.
+    """
+    batch = move_batch(seq_collate([target]), device)
+    is_fm = (model_type == "fm")
+
+    with torch.no_grad():
+        if is_fm:
+            pred_mean, pred_Me, all_trajs = model.sample(
+                batch, num_ensemble=max(num_ensemble, 1), ddim_steps=ode_steps)
+        else:
+            out = model.sample(batch, num_ensemble=1)
+            if isinstance(out, tuple) and len(out) == 3:
+                pred_mean, pred_Me, all_trajs = out
+            else:
+                pred_mean, pred_Me, all_trajs = out, None, None
+
+    obs_n  = _extract_seq(batch[0])
+    gt_n   = _extract_seq(batch[1])
+    pred_n = _extract_seq(pred_mean)
+    ens_n  = (_extract_ens(all_trajs)
+              if (all_trajs is not None and torch.is_tensor(all_trajs)
+                  and all_trajs.dim() == 4) else None)
+
+    obs_abs_mean  = np.abs(obs_n).mean()
+    pred_abs_mean = np.abs(pred_n).mean()
+    is_delta = pred_abs_mean < obs_abs_mean * 0.15
+
+    if is_delta:
+        pred_n_abs = obs_n[-1:] + np.cumsum(pred_n, axis=0)
+        ens_abs = (obs_n[-1:] + np.cumsum(ens_n, axis=1)) if ens_n is not None else None
+    else:
+        pred_n_abs = pred_n
+        ens_abs = ens_n
+
+    obs_deg  = to_deg(denorm_traj(obs_n))
+    gt_deg   = to_deg(denorm_traj(gt_n))
+    pred_deg = to_deg(denorm_traj(pred_n_abs))
+    ens_deg  = to_deg(denorm_traj(ens_abs)) if ens_abs is not None else None
+
+    errors_km = haversine_km(pred_deg, gt_deg)
+    return obs_deg, gt_deg, pred_deg, ens_deg, errors_km
+
+
+def load_model_generic(model_path: str, model_type: str, device,
+                        obs_len: int = 8, pred_len: int = 12):
+    """
+    [MERGE, từ plot_track_paper_style.py] Load 1 trong 5 kiến trúc
+    (fm/st_trans/lstm/gru/rnn) từ checkpoint, dùng model_cfg đã lưu nếu
+    có (khớp cách evaluate_multi_model.py load model), fallback về
+    default constructor nếu checkpoint cũ không có model_cfg.
+    """
+    ck = torch.load(model_path, map_location=device, weights_only=False)
+    model_cfg = ck.get("model_cfg") or {}
+
+    if model_type == "fm":
+        model = TCFlowMatching(**(model_cfg or dict(pred_len=pred_len, obs_len=obs_len))).to(device)
+        state = ck.get("model_state_dict", ck.get("model_state", ck.get("model", ck)))
+    elif model_type == "st_trans":
+        if model_cfg:
+            model = STTrans(**model_cfg).to(device)
+        else:
+            model = STTrans(obs_len=obs_len, pred_len=pred_len).to(device)
+        state = ck.get("model_state", ck.get("model"))
+    else:  # lstm/gru/rnn
+        if model_cfg:
+            model = PaperBaseline(**model_cfg).to(device)
+        else:
+            model = PaperBaseline(model_type=model_type, obs_len=obs_len,
+                                   pred_len=pred_len).to(device)
+        state = ck.get("model_state", ck.get("model"))
+
+    model.load_state_dict(state, strict=False)
+    model.eval()
+    return model
+
+
+def plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model,
+                                 t_name: str, output_path: str):
+    """
+    [MERGE, từ plot_track_paper_style.py] Vẽ nhiều model (FM + baselines)
+    trên CÙNG 1 bản đồ, so với 1 ground truth chung — mỗi model 1 màu
+    (MODEL_COLORS), legend ghi kèm ADE của từng model. Dùng make_map_ax
+    (đã đổi sang style trắng ở trên) để bản đồ nhất quán với single/
+    case_study mode.
+    """
+    transform = ccrs.PlateCarree() if HAS_CARTOPY else None
+    cur_pos = obs_deg[-1]
+
+    all_pts = [obs_deg, gt_deg] + list(preds_by_model.values())
+    all_deg = np.vstack(all_pts)
+    margin = 3.0
+    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
+    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
+
+    fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
+    ax = make_map_ax(fig, 111, lon_range, lat_range)
+
+    def _plot(x, y, **kw):
+        if HAS_CARTOPY:
+            ax.plot(x, y, transform=transform, **kw)
+        else:
+            ax.plot(x, y, **kw)
+
+    _plot(obs_deg[:, 0], obs_deg[:, 1], marker="o",
+          color=STYLE["obs_color"], linewidth=STYLE["lw_thin"],
+          markersize=STYLE["marker_size"], zorder=6, label="Observed")
+
+    gt_lon = np.concatenate([[cur_pos[0]], gt_deg[:, 0]])
+    gt_lat = np.concatenate([[cur_pos[1]], gt_deg[:, 1]])
+    _plot(gt_lon, gt_lat, marker="o",
+          color=STYLE["gt_color"], linewidth=2.2,
+          markersize=STYLE["marker_size"] + 1, zorder=10, label="Actual Track")
+
+    handles = [
+        Line2D([0], [0], color=STYLE["obs_color"], marker="o", lw=1.2, label="Observed"),
+        Line2D([0], [0], color=STYLE["gt_color"], marker="o", lw=2.2, label="Actual Track"),
+    ]
+
+    for model_name, pred_deg in preds_by_model.items():
+        color = MODEL_COLORS.get(model_name, "#333333")
+        pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
+        pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
+        _plot(pred_lon, pred_lat, marker="o",
+              color=color, linewidth=STYLE["lw_main"],
+              markersize=STYLE["marker_size"] - 1, zorder=9, alpha=0.9)
+        ade = errors_by_model[model_name].mean()
+        handles.append(Line2D([0], [0], color=color, marker="o", lw=1.6,
+                              label=f"{model_name} (ADE={ade:.0f}km)"))
+
+    ax.set_title(f"{t_name} — Model Comparison", fontsize=13,
+                fontweight="bold", color=STYLE["text_color"])
+    ax.legend(handles=handles, loc="lower right", fontsize=7.5, framealpha=0.92)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {output_path}")
+
+
+# Bảng màu riêng cho multi_seed (khác MODEL_COLORS — ở đây chỉ có 1
+# kiến trúc (FM), mỗi màu là 1 SEED, không phải 1 model).
+SEED_COLORS = {
+    "0": "#D62728", "1": "#1F77B4", "2": "#2CA02C",
+    "3": "#9467BD", "4": "#FF7F0E", "5": "#8C564B",
+}
+_SEED_COLOR_FALLBACK = ["#D62728", "#1F77B4", "#2CA02C", "#9467BD",
+                        "#FF7F0E", "#8C564B", "#17BECF", "#BCBD22"]
+
+
+def _seed_color(seed_label: str, idx: int) -> str:
+    return SEED_COLORS.get(str(seed_label),
+                           _SEED_COLOR_FALLBACK[idx % len(_SEED_COLOR_FALLBACK)])
+
+
+def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+                                t_name: str, output_path: str):
+    """
+    Vẽ nhiều SEED của CÙNG 1 kiến trúc (mặc định FM, nhưng tổng quát cho
+    bất kỳ model nào truyền vào) trên cùng 1 bản đồ, so với 1 ground
+    truth chung — mỗi seed 1 màu (SEED_COLORS), legend ghi kèm ADE từng
+    seed. Khác plot_multi_model_comparison() ở chỗ trục "nhiều đường" là
+    SEED thay vì MODEL — dùng để minh hoạ độ ổn định của 1 kiến trúc qua
+    random init, không phải so sánh kiến trúc với nhau.
+    """
+    transform = ccrs.PlateCarree() if HAS_CARTOPY else None
+    cur_pos = obs_deg[-1]
+
+    all_pts = [obs_deg, gt_deg] + list(preds_by_seed.values())
+    all_deg = np.vstack(all_pts)
+    margin = 3.0
+    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
+    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
+
+    fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
+    ax = make_map_ax(fig, 111, lon_range, lat_range)
+
+    def _plot(x, y, **kw):
+        if HAS_CARTOPY:
+            ax.plot(x, y, transform=transform, **kw)
+        else:
+            ax.plot(x, y, **kw)
+
+    _plot(obs_deg[:, 0], obs_deg[:, 1], marker="o",
+          color=STYLE["obs_color"], linewidth=STYLE["lw_thin"],
+          markersize=STYLE["marker_size"], zorder=6, label="Observed")
+
+    gt_lon = np.concatenate([[cur_pos[0]], gt_deg[:, 0]])
+    gt_lat = np.concatenate([[cur_pos[1]], gt_deg[:, 1]])
+    _plot(gt_lon, gt_lat, marker="o",
+          color=STYLE["gt_color"], linewidth=2.2,
+          markersize=STYLE["marker_size"] + 1, zorder=10, label="Actual Track")
+
+    handles = [
+        Line2D([0], [0], color=STYLE["obs_color"], marker="o", lw=1.2, label="Observed"),
+        Line2D([0], [0], color=STYLE["gt_color"], marker="o", lw=2.2, label="Actual Track"),
+    ]
+
+    for idx, (seed_label, pred_deg) in enumerate(preds_by_seed.items()):
+        color = _seed_color(seed_label, idx)
+        pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
+        pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
+        _plot(pred_lon, pred_lat, marker="o",
+              color=color, linewidth=STYLE["lw_main"],
+              markersize=STYLE["marker_size"] - 1, zorder=9, alpha=0.9)
+        ade = errors_by_seed[seed_label].mean()
+        handles.append(Line2D([0], [0], color=color, marker="o", lw=1.6,
+                              label=f"seed={seed_label} (ADE={ade:.0f}km)"))
+
+    ax.set_title(f"{t_name} — Seed Comparison", fontsize=13,
+                fontweight="bold", color=STYLE["text_color"])
+    ax.legend(handles=handles, loc="lower right", fontsize=7.5, framealpha=0.92)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {output_path}")
+
+
 # ── Load model & dataset ───────────────────────────────────────────────────────
 
 def load_model_and_data(args, device, dset_type="test"):
@@ -827,7 +1090,7 @@ def visualize_forecast(args):
     t_date, was_snapped = resolve_date(args.tc_date)
 
     print(f"{'=' * 65}")
-    print(f"  TC-FM v13  |  {t_name}  @  {t_date}")
+    print(f"  TC-FM Visualize (paper style)  |  {t_name}  @  {t_date}")
     print(f"{'=' * 65}\n")
 
     model, dset = load_model_and_data(args, device, args.dset_type)
@@ -885,7 +1148,7 @@ def visualize_forecast(args):
         all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
         errors_km=errors_km,
         title=(
-            f"🌀 {t_name}  —  {fh}h FC  |  FM+PINN v13"
+            f"{t_name}  —  {fh}h FC  |  FM"
             f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}){snap_note}"
         ),
         dt_str=dt_str,
@@ -988,15 +1251,175 @@ def visualize_case_study(args):
     print(f"\n  Saved → {out}")
 
 
+# ── Multi-model mode (MERGE, từ plot_track_paper_style.py) ─────────────────────
+
+def visualize_multi_model(args):
+    """
+    So sánh FM + tối đa 4 baseline (ST-Trans/LSTM/GRU/RNN) trên CÙNG 1
+    storm/window — mỗi checkpoint CLI arg là optional, chỉ vẽ model nào
+    được truyền checkpoint.
+    """
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    t_name              = args.tc_name.strip().upper()
+    t_date, was_snapped = resolve_date(args.tc_date)
+
+    print(f"{'=' * 65}")
+    print(f"  TC-FM Visualize — Multi-model comparison  |  {t_name}  @  {t_date}")
+    print(f"{'=' * 65}\n")
+
+    # Dataset load 1 lần, KHÔNG qua load_model_and_data (hàm đó gắn với
+    # riêng TCFlowMatching) — tự load dataset trực tiếp để dùng chung
+    # cho mọi model.
+    dset, _ = data_loader(
+        args, {"root": args.TC_data_path, "type": args.dset_type},
+        test=True, test_year=args.test_year,
+    )
+    print(f"  Dataset: {len(dset)} samples\n")
+
+    target, matched_obs_len, actual_date = find_target(dset, t_name, t_date, args.obs_len)
+    if target is None:
+        print(f"  '{t_name} @ {t_date}' not found.")
+        list_available(dset, t_name, args.obs_len)
+        return
+    if actual_date != t_date:
+        t_date = actual_date
+    print(f"  Found: {t_name} @ {t_date}\n")
+
+    jobs = [
+        ("FM",       "fm",       args.fm_checkpoint),
+        ("ST-Trans", "st_trans", args.st_trans_checkpoint),
+        ("LSTM",     "lstm",     args.lstm_checkpoint),
+        ("GRU",      "gru",      args.gru_checkpoint),
+        ("RNN",      "rnn",      args.rnn_checkpoint),
+    ]
+    jobs = [(n, k, p) for n, k, p in jobs if p]
+    if not jobs:
+        print("  ERROR: cần ít nhất 1 checkpoint (--fm_checkpoint / "
+              "--st_trans_checkpoint / --lstm_checkpoint / --gru_checkpoint / "
+              "--rnn_checkpoint)")
+        return
+
+    preds_by_model, errors_by_model = {}, {}
+    obs_deg = gt_deg = None
+    for name, kind, ckpt in jobs:
+        print(f"  Loading {name}: {ckpt}")
+        model = load_model_generic(ckpt, kind, device,
+                                   obs_len=args.obs_len, pred_len=args.pred_len)
+        od, gd, pd_, ens, err = run_inference_generic(
+            model, target, device, kind,
+            ode_steps=args.ode_steps,
+            num_ensemble=(args.num_ensemble if kind == "fm" else 1))
+        obs_deg, gt_deg = od, gd
+        preds_by_model[name] = pd_
+        errors_by_model[name] = err
+        print(f"    {name}: ADE={err.mean():.1f}km")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    out = os.path.join(args.output_dir, f"track_multi_{t_name}_{t_date}.png")
+    plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model,
+                                t_name, out)
+
+
+# ── Multi-seed mode (chỉ cho 1 kiến trúc, mặc định FM) ──────────────────────
+
+def visualize_multi_seed(args):
+    """
+    So sánh nhiều SEED của CÙNG 1 kiến trúc (mặc định --model_type fm)
+    trên CÙNG 1 storm/window — mỗi checkpoint trong --seed_checkpoints là
+    1 seed, tất cả cùng 1 kiến trúc (không trộn FM với baseline khác;
+    dùng --mode multi_model cho việc đó). Dùng để minh hoạ độ ổn định
+    của kiến trúc qua random init, KHÔNG dùng để thay thế bảng thống kê
+    mean±std theo seed (generate_paper_report.py) — bản đồ chỉ minh hoạ
+    1 lần dự báo cụ thể, không phải đại lượng thống kê.
+    """
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    t_name              = args.tc_name.strip().upper()
+    t_date, was_snapped = resolve_date(args.tc_date)
+
+    print(f"{'=' * 65}")
+    print(f"  TC-FM Visualize — Multi-seed comparison ({args.model_type.upper()})"
+          f"  |  {t_name}  @  {t_date}")
+    print(f"{'=' * 65}\n")
+
+    if not args.seed_checkpoints:
+        print("  ERROR: --seed_checkpoints cần ít nhất 1 checkpoint "
+              "(khuyến nghị >=2 để so sánh có ý nghĩa)")
+        return
+
+    dset, _ = data_loader(
+        args, {"root": args.TC_data_path, "type": args.dset_type},
+        test=True, test_year=args.test_year,
+    )
+    print(f"  Dataset: {len(dset)} samples\n")
+
+    target, matched_obs_len, actual_date = find_target(dset, t_name, t_date, args.obs_len)
+    if target is None:
+        print(f"  '{t_name} @ {t_date}' not found.")
+        list_available(dset, t_name, args.obs_len)
+        return
+    if actual_date != t_date:
+        t_date = actual_date
+    print(f"  Found: {t_name} @ {t_date}\n")
+
+    # Suy ra nhãn seed từ checkpoint: ưu tiên đọc field "seed" trong
+    # checkpoint (khớp cách evaluate_multi_model.py làm), fallback parse
+    # "seed<N>" từ đường dẫn, cuối cùng dùng số thứ tự nếu không tìm được.
+    import re
+    def _infer_seed_label(ckpt_path: str, idx: int) -> str:
+        try:
+            ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            if isinstance(ck, dict) and "seed" in ck:
+                return str(ck["seed"])
+        except Exception:
+            pass
+        m = re.search(r"seed[_-]?(\d+)", ckpt_path)
+        if m:
+            return m.group(1)
+        return str(idx)
+
+    preds_by_seed, errors_by_seed = {}, {}
+    obs_deg = gt_deg = None
+    for idx, ckpt in enumerate(args.seed_checkpoints):
+        seed_label = _infer_seed_label(ckpt, idx)
+        print(f"  Loading seed={seed_label}: {ckpt}")
+        model = load_model_generic(ckpt, args.model_type, device,
+                                   obs_len=args.obs_len, pred_len=args.pred_len)
+        od, gd, pd_, ens, err = run_inference_generic(
+            model, target, device, args.model_type,
+            ode_steps=args.ode_steps,
+            num_ensemble=(args.num_ensemble if args.model_type == "fm" else 1))
+        obs_deg, gt_deg = od, gd
+        preds_by_seed[seed_label] = pd_
+        errors_by_seed[seed_label] = err
+        print(f"    seed={seed_label}: ADE={err.mean():.1f}km")
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    out = os.path.join(args.output_dir,
+                       f"track_multiseed_{args.model_type}_{t_name}_{t_date}.png")
+    plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+                               f"{t_name} ({args.model_type.upper()})", out)
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--model_path",     required=True)
+    p.add_argument("--model_path",     default=None,
+                   help="Checkpoint FM (bắt buộc cho --mode single/case_study)")
     p.add_argument("--TC_data_path",   required=True)
     p.add_argument("--output_dir",     default="outputs")
     p.add_argument("--mode",           default="single",
-                   choices=["single", "case_study"])
+                   choices=["single", "case_study", "multi_model", "multi_seed"])
     p.add_argument("--tc_name",        default="WIPHA")
     p.add_argument("--tc_date",        default="2019073106")
     p.add_argument("--dset_type",      default="test")
@@ -1018,8 +1441,33 @@ if __name__ == "__main__":
     p.add_argument("--threshold",      type=float, default=0.002)
     p.add_argument("--other_modal",    default="gph")
 
+    # --mode multi_model: mỗi checkpoint optional, chỉ vẽ model được truyền
+    p.add_argument("--fm_checkpoint",       default=None)
+    p.add_argument("--st_trans_checkpoint", default=None)
+    p.add_argument("--lstm_checkpoint",     default=None)
+    p.add_argument("--gru_checkpoint",      default=None)
+    p.add_argument("--rnn_checkpoint",      default=None)
+
+    # --mode multi_seed: nhiều checkpoint CÙNG 1 kiến trúc (mặc định FM)
+    p.add_argument("--seed_checkpoints",    nargs="+", default=None,
+                   help="Danh sách checkpoint, mỗi cái 1 seed, CÙNG 1 "
+                        "kiến trúc (xem --model_type). Ví dụ: "
+                        "--seed_checkpoints runs/fm_seed0/best_model.pth "
+                        "runs/fm_seed1/best_model.pth runs/fm_seed3/best_model.pth")
+    p.add_argument("--model_type",          default="fm",
+                   choices=["fm", "st_trans", "lstm", "gru", "rnn"],
+                   help="Kiến trúc dùng cho --mode multi_seed (mặc định fm)")
+
     args = p.parse_args()
     if args.mode == "single":
+        if not args.model_path:
+            print("  ERROR: --model_path required for --mode single"); sys.exit(1)
         visualize_forecast(args)
-    else:
+    elif args.mode == "case_study":
+        if not args.model_path:
+            print("  ERROR: --model_path required for --mode case_study"); sys.exit(1)
         visualize_case_study(args)
+    elif args.mode == "multi_model":
+        visualize_multi_model(args)
+    else:
+        visualize_multi_seed(args)
