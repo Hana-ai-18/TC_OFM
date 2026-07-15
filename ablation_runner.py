@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import os, sys, argparse, json, time, copy
 from typing import Dict, List, Optional
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -400,6 +401,16 @@ def ode_steps_sweep(model, loader, device,
     project asked for. N=16 here is an ODE integration step count,
     unrelated to pred_len=16 from the reference paper -- same
     distinction flagged before, restated so this output isn't misread.
+
+    [BỔ SUNG, per-lead-time] Trước đây d.mean(0) gộp trung bình qua
+    TOÀN BỘ T lead-time (6h..72h) trước khi lưu -- mỗi storm chỉ đóng
+    góp 1 con số duy nhất, không có cách nào biết N ảnh hưởng CTE tại
+    72h khác gì tại 6h. Giờ vẫn giữ "*_mean"/"*_std" tổng thể (tương
+    thích ngược với print_ode_sweep/plot_ode_n_sweep, KHÔNG đổi hành vi
+    hiện có), nhưng THÊM "by_lead_time" -- dict {lead_time: {ADE/ATE/
+    CTE mean}} dùng CÙNG convention 1-indexed (1=6h...T=72h) đã thống
+    nhất với evaluate_multi_model.py, để build bảng/plot per-horizon
+    cho riêng ablation N nếu cần sau này.
     """
     model.eval()
     results = {}
@@ -409,6 +420,9 @@ def ode_steps_sweep(model, loader, device,
     for n_steps in steps_list:
         print(f"  ODE steps={n_steps}...")
         all_ade, all_ate, all_cte, all_spread = [], [], [], []
+        by_lt_ade = defaultdict(list)
+        by_lt_ate = defaultdict(list)
+        by_lt_cte = defaultdict(list)
         t_start = time.time()
 
         for batch in loader:
@@ -426,16 +440,26 @@ def ode_steps_sweep(model, loader, device,
             T   = min(pred.shape[0], gt.shape[0])
             pd  = _norm_to_deg(pred[:T])
             gd  = _norm_to_deg(gt[:T, :, :2])
-            d   = _haversine_deg(pd, gd)
-            all_ade.extend(d.mean(0).tolist())
+            d   = _haversine_deg(pd, gd)          # [T, B]
+            all_ade.extend(d.mean(0).tolist())     # tổng thể (giữ nguyên, tương thích ngược)
+            for step0 in range(T):                 # per-lead-time: 0-indexed step -> 1-indexed lead_time
+                by_lt_ade[step0 + 1].extend(d[step0].tolist())
 
             if T >= 2:
                 bear_ref = _forward_azimuth(gd[:T-1], gd[1:T])
                 bear_err = _forward_azimuth(gd[1:T], pd[1:T])
                 dist_err = _haversine_deg(pd[1:T], gd[1:T])
                 ang = bear_err - bear_ref
-                all_ate.extend((dist_err * torch.cos(ang)).abs().mean(0).tolist())
-                all_cte.extend((dist_err * torch.sin(ang)).abs().mean(0).tolist())
+                ate_full = (dist_err * torch.cos(ang)).abs()   # [T-1, B]
+                cte_full = (dist_err * torch.sin(ang)).abs()   # [T-1, B]
+                all_ate.extend(ate_full.mean(0).tolist())
+                all_cte.extend(cte_full.mean(0).tolist())
+                # ate_full[k] ứng original step k+1 (0-indexed) = lead_time k+2
+                # (không định nghĩa ở lead_time=1/6h -- xem
+                # evaluate_multi_model.py's docstring cho lý do toán học)
+                for k in range(T - 1):
+                    by_lt_ate[k + 2].extend(ate_full[k].tolist())
+                    by_lt_cte[k + 2].extend(cte_full[k].tolist())
 
             if collect_spread and all_t is not None and all_t.shape[0] >= 2:
                 K = all_t.shape[0]
@@ -448,6 +472,16 @@ def ode_steps_sweep(model, loader, device,
                         all_spread.append(float(dab.mean()))
 
         elapsed = time.time() - t_start
+        by_lead_time = {}
+        all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys()) | set(by_lt_cte.keys()))
+        for lt in all_lts:
+            by_lead_time[lt] = {
+                "ADE": float(np.mean(by_lt_ade[lt])) if by_lt_ade.get(lt) else float("nan"),
+                "ATE": float(np.mean(by_lt_ate[lt])) if by_lt_ate.get(lt) else float("nan"),
+                "CTE": float(np.mean(by_lt_cte[lt])) if by_lt_cte.get(lt) else float("nan"),
+                "n":   len(by_lt_ade.get(lt, [])),
+            }
+
         results[n_steps] = {
             "n_steps":     n_steps,
             "ADE_mean":    float(np.mean(all_ade)) if all_ade else float("nan"),
@@ -457,6 +491,7 @@ def ode_steps_sweep(model, loader, device,
             "spread_mean": float(np.mean(all_spread)) if all_spread else float("nan"),
             "time_s":      elapsed,
             "n_storms":    len(all_ade),
+            "by_lead_time": by_lead_time,
         }
         r = results[n_steps]
         print(f"    ADE={r['ADE_mean']:.2f}  ATE={r['ATE_mean']:.2f}  "
@@ -609,9 +644,21 @@ def move(batch, device):
 
 @torch.no_grad()
 def quick_eval(model, loader, device, n_ensemble=20) -> Dict:
-    """Quick evaluation: ADE/ATE/CTE only."""
+    """
+    Quick evaluation: ADE/ATE/CTE, tổng thể + per-lead-time.
+
+    [BỔ SUNG, per-lead-time] Giữ nguyên "ADE"/"ATE"/"CTE" tổng thể
+    (tương thích ngược với mọi nơi đang đọc quick_eval() cho 21 variant
+    trong ABLATION_VARIANTS), thêm "by_lead_time" cùng schema với
+    ode_steps_sweep()'s bổ sung -- convention 1-indexed (1=6h...T=72h),
+    khớp evaluate_multi_model.py.
+    """
     model.eval()
     all_ade, all_ate, all_cte = [], [], []
+    by_lt_ade = defaultdict(list)
+    by_lt_ate = defaultdict(list)
+    by_lt_cte = defaultdict(list)
+
     for batch in loader:
         bl = move(list(batch), device)
         gt = bl[1]
@@ -622,27 +669,42 @@ def quick_eval(model, loader, device, n_ensemble=20) -> Dict:
         T   = min(pred.shape[0], gt.shape[0])
         pd  = _norm_to_deg(pred[:T])
         gd  = _norm_to_deg(gt[:T, :, :2])
-        d   = _haversine_deg(pd, gd)
+        d   = _haversine_deg(pd, gd)          # [T, B]
 
         from Model.flow_matching_model import _forward_azimuth
         if T >= 2:
             bear_ref = _forward_azimuth(gd[:T-1], gd[1:T])
             bear_err = _forward_azimuth(gd[1:T], pd[1:T])
             dist_err = _haversine_deg(pd[1:T], gd[1:T])
-            import math
             ang  = bear_err - bear_ref
-            ate  = dist_err * torch.cos(ang)
-            cte  = dist_err * torch.sin(ang)
-            all_ate.extend(ate.abs().mean(0).tolist())
-            all_cte.extend(cte.abs().mean(0).tolist())
+            ate  = (dist_err * torch.cos(ang)).abs()   # [T-1, B]
+            cte  = (dist_err * torch.sin(ang)).abs()   # [T-1, B]
+            all_ate.extend(ate.mean(0).tolist())
+            all_cte.extend(cte.mean(0).tolist())
+            for k in range(T - 1):   # k+2 = lead_time (see ode_steps_sweep's comment)
+                by_lt_ate[k + 2].extend(ate[k].tolist())
+                by_lt_cte[k + 2].extend(cte[k].tolist())
 
         all_ade.extend(d.mean(0).tolist())
+        for step0 in range(T):
+            by_lt_ade[step0 + 1].extend(d[step0].tolist())
+
+    by_lead_time = {}
+    all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys()) | set(by_lt_cte.keys()))
+    for lt in all_lts:
+        by_lead_time[lt] = {
+            "ADE": float(np.mean(by_lt_ade[lt])) if by_lt_ade.get(lt) else float("nan"),
+            "ATE": float(np.mean(by_lt_ate[lt])) if by_lt_ate.get(lt) else float("nan"),
+            "CTE": float(np.mean(by_lt_cte[lt])) if by_lt_cte.get(lt) else float("nan"),
+            "n":   len(by_lt_ade.get(lt, [])),
+        }
 
     return {
         "ADE": float(np.mean(all_ade)) if all_ade else float("nan"),
         "ATE": float(np.mean(all_ate)) if all_ate else float("nan"),
         "CTE": float(np.mean(all_cte)) if all_cte else float("nan"),
         "n":   len(all_ade),
+        "by_lead_time": by_lead_time,
     }
 
 

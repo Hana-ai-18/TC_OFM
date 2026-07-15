@@ -838,11 +838,22 @@ def ensemble_size_eval(model, loader, device,
     ode_steps_sweep) — nếu chỉ có bảng K mà thiếu cột spread, không có
     cách nào phân biệt trực quan giữa "K giúp mượt hơn" và "K giúp mở
     rộng spread" (2 tuyên bố rất khác nhau).
+
+    [BỔ SUNG, per-lead-time] Trước đây d.mean(0) gộp trung bình qua
+    TOÀN BỘ T lead-time (6h..72h) trước khi lưu — mỗi storm chỉ đóng
+    góp 1 con số duy nhất. Giờ vẫn giữ "ADE"/"ATE"/"CTE" tổng thể
+    (tương thích ngược, không đổi hành vi hiện có), THÊM
+    "by_lead_time" — cùng schema/convention với ode_steps_sweep()'s
+    bổ sung (ablation_runner.py) và evaluate_multi_model.py (1-indexed,
+    1=6h...T=72h).
     """
     raw = _unwrap(model)
     results = {}
     for k in k_values:
         all_ade, all_ate, all_cte, all_spread = [], [], [], []
+        by_lt_ade = defaultdict(list)
+        by_lt_ate = defaultdict(list)
+        by_lt_cte = defaultdict(list)
         t0 = time.time()
         for batch in loader:
             bl = move(list(batch), device)
@@ -854,12 +865,18 @@ def ensemble_size_eval(model, loader, device,
             T   = min(pred.shape[0], gt.shape[0])
             pd  = _norm_to_deg(pred[:T])
             gd  = _norm_to_deg(gt[:T, :, :2])
-            d   = _haversine_deg(pd, gd)
+            d   = _haversine_deg(pd, gd)          # [T, B]
             all_ade.extend(d.mean(0).tolist())
+            for step0 in range(T):
+                by_lt_ade[step0 + 1].extend(d[step0].tolist())
+
             if T >= 2:
-                ate_v, cte_v = _ate_cte_full(pd, gd)
+                ate_v, cte_v = _ate_cte_full(pd, gd)   # [T-1, B] each
                 all_ate.extend(ate_v.abs().mean(0).tolist())
                 all_cte.extend(cte_v.abs().mean(0).tolist())
+                for kk in range(T - 1):   # kk+2 = lead_time
+                    by_lt_ate[kk + 2].extend(ate_v[kk].abs().tolist())
+                    by_lt_cte[kk + 2].extend(cte_v[kk].abs().tolist())
 
             # [BỔ SUNG] spread — pairwise haversine giữa các candidate
             # cuối cùng, cùng công thức với ode_steps_sweep(). K=1 luôn
@@ -876,17 +893,149 @@ def ensemble_size_eval(model, loader, device,
                         all_spread.append(float(dab.mean()))
 
         elapsed = time.time() - t0
+        by_lead_time = {}
+        all_lts = sorted(set(by_lt_ade.keys()) | set(by_lt_ate.keys()) | set(by_lt_cte.keys()))
+        for lt in all_lts:
+            by_lead_time[lt] = {
+                "ADE": float(np.mean(by_lt_ade[lt])) if by_lt_ade.get(lt) else float("nan"),
+                "ATE": float(np.mean(by_lt_ate[lt])) if by_lt_ate.get(lt) else float("nan"),
+                "CTE": float(np.mean(by_lt_cte[lt])) if by_lt_cte.get(lt) else float("nan"),
+                "n":   len(by_lt_ade.get(lt, [])),
+            }
+
         results[k] = {
             "K": k, "ADE": float(np.mean(all_ade)) if all_ade else float("nan"),
             "ATE": float(np.mean(all_ate)) if all_ate else float("nan"),
             "CTE": float(np.mean(all_cte)) if all_cte else float("nan"),
             "spread": float(np.mean(all_spread)) if all_spread else float("nan"),
             "time_s": elapsed, "n": len(all_ade),
+            "by_lead_time": by_lead_time,
         }
         print(f"  K={k:3d}: ADE={results[k]['ADE']:.2f}  ATE={results[k]['ATE']:.2f}"
               f"  CTE={results[k]['CTE']:.2f}  spread={results[k]['spread']:.2f}km  "
               f"t={elapsed:.1f}s")
     return results
+
+
+def _infer_seed_local(checkpoint_path: str, ck: dict) -> str:
+    """
+    Copy nguyên văn logic của evaluate_multi_model.py's _infer_seed()
+    (không import chéo — file này tự chứa, giữ đúng nguyên tắc đã áp
+    dụng cho các file khác trong dự án). Ưu tiên đọc field "seed" lưu
+    sẵn trong checkpoint, fallback parse "seed<N>" từ đường dẫn.
+    """
+    if isinstance(ck, dict) and "seed" in ck:
+        return str(ck["seed"])
+    import re
+    m = re.search(r"seed[_-]?(\d+)", checkpoint_path)
+    if m:
+        return m.group(1)
+    return "unknown"
+
+
+def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
+                                      split: str, k_values: List[int],
+                                      device, args) -> Dict:
+    """
+    [MỚI] Chạy ensemble_size_eval() (K-sweep) trên NHIỀU checkpoint
+    (nhiều seed của CÙNG 1 kiến trúc FM), rồi gộp thành mean±std theo
+    seed cho mỗi K — cùng triết lý "pooled/mean±std theo seed, không
+    chọn best/1 seed ngẫu nhiên" đã áp dụng cho generate_paper_report.py's
+    Table 1/3/4/5.
+
+    Trả về dict cùng SCHEMA với ensemble_size_eval() (key=K, value=dict
+    có ADE/ATE/CTE/spread) để build_ensemble_k_table() trong
+    generate_paper_report.py dùng lại được NGUYÊN VẸN, không cần sửa gì
+    ở phía đọc — chỉ khác là mỗi giá trị giờ là MEAN qua các seed, và
+    có thêm "_std" bên cạnh mỗi field để không mất thông tin biến thiên
+    giữa các seed.
+    """
+    from Model.data.loader_training import data_loader
+    per_seed_results = {}   # seed -> {K: {...}}
+    for ckpt_path in checkpoints:
+        print(f"\n  {'='*70}\n  Loading checkpoint: {ckpt_path}\n  {'='*70}")
+        ck = torch.load(ckpt_path, map_location="cpu")
+        model_cfg = ck.get("model_cfg") or {}
+        if not model_cfg:
+            print("  ⚠ Checkpoint has no model_cfg — dùng constructor defaults.")
+        model = TCFlowMatching(**model_cfg).to(device)
+        state = ck.get("model", ck)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"  ⚠ load_state_dict: {len(missing)} missing, "
+                  f"{len(unexpected)} unexpected keys")
+
+        if not args.no_ema and ck.get("ema"):
+            try:
+                ema = EMAModel(model)
+                for k, v in ck["ema"].items():
+                    if k in ema.shadow:
+                        ema.shadow[k].copy_(v.to(device))
+                print(f"  EMA loaded ({len(ema.shadow)} params)")
+            except Exception as e:
+                print(f"  ⚠ EMA failed: {e}")
+
+        seed = _infer_seed_local(ckpt_path, ck)
+        print(f"  seed={seed}  epoch={ck.get('epoch', '?')}")
+
+        class _NS: pass
+        ns = _NS()
+        for k, v in vars(args).items():
+            setattr(ns, k, v)
+        loader, _ = data_loader(ns, {"root": dataset_root, "type": split},
+                                test=True, test_year=args.test_year)
+
+        model.eval()
+        results = ensemble_size_eval(model, loader, device, k_values=k_values)
+        per_seed_results[seed] = results
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Gộp: mean±std qua các seed, cho từng K
+    n_seeds = len(per_seed_results)
+    print(f"\n  Gộp kết quả qua {n_seeds} seed: {list(per_seed_results.keys())}")
+    merged = {}
+    for k in k_values:
+        entry = {}
+        for field in ("ADE", "ATE", "CTE", "spread", "time_s", "n"):
+            vals = [per_seed_results[s][k][field] for s in per_seed_results
+                    if k in per_seed_results[s]
+                    and not np.isnan(per_seed_results[s][k].get(field, float("nan")))]
+            entry[field] = float(np.mean(vals)) if vals else float("nan")
+            if field in ("ADE", "ATE", "CTE", "spread"):
+                entry[f"{field}_std"] = float(np.std(vals)) if len(vals) > 1 else 0.0
+        entry["n_seeds"] = n_seeds
+
+        # [BỔ SUNG] Gộp by_lead_time qua các seed — cùng cách seed-mean-
+        # rồi-mean/std đã dùng cho generate_paper_report.py's Table 1/3
+        # (KHÔNG gộp raw records của mọi seed lại rồi mới mean, tránh
+        # lẫn variance storm-to-storm với variance seed-to-seed).
+        all_lts = set()
+        for s in per_seed_results:
+            if k in per_seed_results[s]:
+                all_lts |= set(per_seed_results[s][k].get("by_lead_time", {}).keys())
+        by_lead_time_merged = {}
+        for lt in sorted(all_lts):
+            for metric in ("ADE", "ATE", "CTE"):
+                seed_vals = [per_seed_results[s][k]["by_lead_time"][lt][metric]
+                            for s in per_seed_results
+                            if k in per_seed_results[s]
+                            and lt in per_seed_results[s][k].get("by_lead_time", {})
+                            and not np.isnan(per_seed_results[s][k]["by_lead_time"][lt].get(metric, float("nan")))]
+                by_lead_time_merged.setdefault(lt, {})
+                by_lead_time_merged[lt][metric] = float(np.mean(seed_vals)) if seed_vals else float("nan")
+                by_lead_time_merged[lt][f"{metric}_std"] = float(np.std(seed_vals)) if len(seed_vals) > 1 else 0.0
+        entry["by_lead_time"] = by_lead_time_merged
+
+        merged[k] = entry
+        print(f"  K={k:3d}: ADE={entry['ADE']:.2f}±{entry['ADE_std']:.2f}  "
+              f"ATE={entry['ATE']:.2f}±{entry['ATE_std']:.2f}  "
+              f"CTE={entry['CTE']:.2f}±{entry['CTE_std']:.2f}  "
+              f"spread={entry['spread']:.2f}±{entry['spread_std']:.2f}km")
+
+    return merged
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -993,7 +1142,19 @@ def compute_cone_of_uncertainty(ensemble: np.ndarray,
 
 def main():
     p = argparse.ArgumentParser(description="TC-FlowMatching ESWA Full Evaluation")
-    p.add_argument("--checkpoint",   required=True)
+    p.add_argument("--checkpoint",   required=False, default=None,
+                   help="1 checkpoint duy nhất — dùng cho pipeline đầy đủ "
+                        "(case_studies, sigma_sensitivity, per_storm, ...). "
+                        "Bắt buộc trừ khi dùng --checkpoints.")
+    p.add_argument("--checkpoints",  type=str, nargs="+", default=None,
+                   help="[MỚI] Nhiều checkpoint (nhiều seed CÙNG 1 kiến "
+                        "trúc) — CHỈ dùng được với --ensemble_ablation, "
+                        "chạy K-sweep trên từng checkpoint rồi gộp "
+                        "mean±std theo seed, lưu 1 file JSON riêng rồi "
+                        "thoát sớm (bỏ qua case_studies/sigma_sensitivity/"
+                        "per_storm — các phần đó gắn với đúng 1 checkpoint, "
+                        "không có ý nghĩa 'gộp qua seed'). Không thể dùng "
+                        "cùng lúc với --checkpoint.")
     p.add_argument("--dataset_root", required=True)
     p.add_argument("--split",        default="test", choices=["test","val","train"])
     p.add_argument("--n_ensemble",   type=int, default=20)
@@ -1043,6 +1204,39 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
+
+    # ── [MỚI] Multi-seed ensemble ablation — rẽ nhánh sớm, KHÔNG chạm
+    # vào phần còn lại của main() (case_studies/sigma_sensitivity/
+    # per_storm đều gắn với đúng 1 checkpoint, không có ý nghĩa "gộp
+    # qua seed") ────────────────────────────────────────────────────────
+    if args.checkpoints:
+        if args.checkpoint:
+            print("  ⚠ Truyền cả --checkpoint và --checkpoints — dùng "
+                  "--checkpoints (nhiều seed), bỏ qua --checkpoint.")
+        if not args.ensemble_ablation:
+            print("  ❌ --checkpoints chỉ hỗ trợ cùng --ensemble_ablation "
+                  "(các chế độ khác gắn với 1 checkpoint duy nhất, dùng "
+                  "--checkpoint thay vì --checkpoints cho chúng).")
+            return
+        print(f"\n  Multi-seed ensemble ablation | {len(args.checkpoints)} checkpoints")
+        print(f"  Split: {args.split} | Device: {device} | K values: {args.k_values}")
+        print("="*72)
+        merged = run_ensemble_ablation_multi_seed(
+            args.checkpoints, args.dataset_root, args.split,
+            args.k_values, device, args)
+        out_path = os.path.join(args.output_dir, f"ensemble_ablation_multiseed_{args.split}.json")
+        with open(out_path, "w") as f:
+            json.dump({"ensemble_ablation": merged}, f, indent=2)
+        print(f"\n  Saved multi-seed ensemble ablation → {out_path}")
+        print(f"  Dùng file này với generate_paper_report.py's --eval_full_json "
+              f"(schema khớp với 'ensemble_ablation' key mà build_ensemble_k_table() cần).")
+        return
+
+    if not args.checkpoint:
+        print("  ❌ Cần --checkpoint (1 checkpoint) hoặc --checkpoints "
+              "(nhiều checkpoint, chỉ dùng với --ensemble_ablation).")
+        return
+
     print(f"\n  Checkpoint: {args.checkpoint}")
     print(f"  Split: {args.split} | Device: {device}")
     print("="*72)
