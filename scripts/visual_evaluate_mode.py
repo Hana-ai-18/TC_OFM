@@ -190,22 +190,42 @@ def haversine_km(p1_deg, p2_deg):
 
 def detect_pred_len(ckpt_path):
     """
-    Infer pred_len from the pos_enc shape stored in the checkpoint.
+    Infer pred_len from the checkpoint — prefer model_cfg (authoritative,
+    matches the exact args used at train time), fallback to
+    velocity.pos_emb's shape if model_cfg is absent.
+
     [FIX-7] Wrapped in try/except so unusual checkpoint layouts don't crash.
     [FIX-8] Checkpoint thật lưu weights dưới key "model" (xác nhận qua
     evaluate_multi_model.py's load_fm() và train_flowmatching.py's
-    _save()), KHÔNG PHẢI "model_state_dict"/"model_state" — 2 key đó
-    không tồn tại trong checkpoint FM thật.
+    _save()), KHÔNG PHẢI "model_state_dict"/"model_state".
+    [FIX-12, quan trọng] Bug thật đã tìm và sửa: pattern tìm kiếm cũ
+    (`"pos_enc" in k`) khớp NHẦM layer "encoder.env_enc.pos_enc_env"
+    (positional encoding của ENVIRONMENT ENCODER — dữ liệu khí tượng,
+    hoàn toàn không liên quan đến số bước dự báo), có shape (1,8,64) vì
+    lý do riêng của feature map môi trường. Hàm cũ trả về 8 từ layer
+    SAI này, trong khi layer THẬT quyết định pred_len là
+    "velocity.pos_emb" (shape (1,12,256) — xác nhận qua kiểm tra trực
+    tiếp checkpoint thật) và "velocity.step_emb.weight" (shape
+    (12,256)) — cả 2 đều cho pred_len=12, KHỚP ĐÚNG với model_cfg's
+    pred_len=12. Sự kiện này gây crash "shape mismatch (12,2) vs (8,2)"
+    và khiến forecast bị cắt nhầm còn 48h thay vì đúng 72h.
+    Giờ ưu tiên model_cfg (nguồn đáng tin cậy nhất, ghi trực tiếp từ
+    args lúc train), chỉ dùng velocity.pos_emb làm fallback nếu
+    checkpoint không có model_cfg.
     """
     try:
         ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        model_cfg = ck.get("model_cfg")
+        if model_cfg and "pred_len" in model_cfg:
+            return model_cfg["pred_len"]
+
         sd = ck.get("model", ck.get("model_state_dict", ck.get("model_state", ck)))
-        for key in ["net.pos_enc", "denoiser.pos_enc", "pos_enc"]:
+        for key in ["velocity.pos_emb", "net.pos_emb", "pos_emb"]:
             if key in sd:
                 return sd[key].shape[1]
-        for k, v in sd.items():
-            if "pos_enc" in k and isinstance(v, torch.Tensor) and v.dim() == 3:
-                return v.shape[1]
+        for key in ["velocity.step_emb.weight", "step_emb.weight"]:
+            if key in sd:
+                return sd[key].shape[0]
     except Exception as e:
         print(f"  [WARN] detect_pred_len failed ({e}); defaulting to 12")
     return 12
@@ -497,7 +517,7 @@ def plot_spread_over_time(ax, ens_deg, errors_km, cliper_err_km, t_name):
 
 # ── Map setup ──────────────────────────────────────────────────────────────────
 
-def make_map_ax(fig, subplot_spec, lon_range, lat_range):
+def make_map_ax(fig, subplot_spec, lon_range, lat_range, use_satellite_bg=True):
     if HAS_CARTOPY:
         ax = fig.add_subplot(
             subplot_spec,
@@ -507,10 +527,20 @@ def make_map_ax(fig, subplot_spec, lon_range, lat_range):
             [lon_range[0], lon_range[1], lat_range[0], lat_range[1]],
             crs=ccrs.PlateCarree(),
         )
-        ax.add_feature(cfeature.OCEAN.with_scale("50m"),
-                       facecolor=STYLE["ocean_color"], zorder=0)
-        ax.add_feature(cfeature.LAND.with_scale("50m"),
-                       facecolor=STYLE["land_color"], zorder=1, alpha=0.9)
+        # [BỔ SUNG] Nền ảnh vệ tinh/địa hình thật (Natural Earth shaded
+        # relief, cùng nguồn dữ liệu cartopy dùng nội bộ — không cần tải
+        # thêm gì ngoài, hoạt động offline). Giống style ảnh minh họa
+        # (nền địa hình/vệ tinh thật) thay vì chỉ tô màu phẳng OCEAN/LAND.
+        if use_satellite_bg:
+            try:
+                ax.stock_img()
+            except Exception:
+                use_satellite_bg = False  # fallback nếu không tải được asset
+        if not use_satellite_bg:
+            ax.add_feature(cfeature.OCEAN.with_scale("50m"),
+                           facecolor=STYLE["ocean_color"], zorder=0)
+            ax.add_feature(cfeature.LAND.with_scale("50m"),
+                           facecolor=STYLE["land_color"], zorder=1, alpha=0.9)
         ax.add_feature(cfeature.COASTLINE.with_scale("50m"),
                        edgecolor="#4D4D4D", linewidth=0.8, zorder=2)
         ax.add_feature(cfeature.BORDERS.with_scale("50m"),
@@ -1238,13 +1268,25 @@ def visualize_forecast(args):
     lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
     margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
     margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+
+    # [BỔ SUNG] Theo yêu cầu "kéo bề ngang to ra": track RITA trải dài
+    # chủ yếu theo VĨ ĐỘ (Bắc-Nam), lon span tự nhiên hẹp hơn nhiều so
+    # với lat span -> nếu chỉ dùng margin tỷ lệ nhỏ, map ra hình rất
+    # cao-hẹp. Mở rộng thêm khoảng ngang (lon) để map có tỷ lệ gần
+    # vuông/ngang hơn, cho thấy nhiều bối cảnh địa lý xung quanh hơn —
+    # không đổi lat_range (giữ đúng độ dài track thật theo chiều dọc).
+    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
+    margin_lon += extra_lon_widen
+
     lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
     lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
 
     # [FIX] Theo yêu cầu mới nhất: bỏ panel Spread vs Error, map chiếm
     # full width. (Trước đó có 1 bản đổi ngược lại — bỏ map giữ Spread —
     # đã bị revert theo yêu cầu này.)
-    fig    = plt.figure(figsize=(11, 12), facecolor=STYLE["bg_color"])
+    # Figure to hơn (14x13, trước là 11x12) + tỷ lệ ngang rộng hơn nhờ
+    # lon_range đã mở, theo đúng yêu cầu "kéo bề ngang to ra".
+    fig    = plt.figure(figsize=(14, 13), facecolor=STYLE["bg_color"])
     ax_map = make_map_ax(fig, 111, lon_range, lat_range)
 
     dt_str    = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
