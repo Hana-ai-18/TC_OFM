@@ -978,12 +978,30 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
         seed = _infer_seed_local(ckpt_path, ck)
         print(f"  seed={seed}  epoch={ck.get('epoch', '?')}")
 
-        class _NS: pass
-        ns = _NS()
-        for k, v in vars(args).items():
-            setattr(ns, k, v)
-        loader, _ = data_loader(ns, {"root": dataset_root, "type": split},
-                                test=True, test_year=args.test_year)
+        # [FIX] 2 bug: (1) _NS copy vars(args) không đủ field data_loader()
+        # cần (obs_len/pred_len/batch_size/num_workers/skip/min_ped/
+        # threshold không có trong evaluate_full.py's CLI chính) —
+        # dùng đúng argparse.Namespace đầy đủ, CÙNG pattern đã chạy được
+        # ở luồng single-checkpoint (dòng ~1295) và evaluate_multi_model.py.
+        # (2) data_loader() trả về (train/val_loader, test_loader) —
+        # code cũ lấy NHẦM phần tử đầu (`loader, _ = ...`), trong khi
+        # mọi nơi khác trong codebase đều dùng `_, loader = ...` (phần
+        # tử thứ hai). Sửa cho khớp.
+        import argparse as _ap
+        _loader_args = _ap.Namespace(
+            dataset_root = dataset_root,
+            obs_len      = 8,
+            pred_len     = 12,
+            batch_size   = 64,
+            num_workers  = 2,
+            test_year    = getattr(args, "test_year", None),
+            skip         = getattr(args, "skip", 1),
+            min_ped      = getattr(args, "min_ped", 1),
+            threshold    = getattr(args, "threshold", 0.002),
+        )
+        _, loader = data_loader(_loader_args, {"root": dataset_root, "type": split},
+                                test=(split != "train"))
+        print(f"  Data: {len(loader)} batches")
 
         model.eval()
         results = ensemble_size_eval(model, loader, device, k_values=k_values)
