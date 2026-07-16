@@ -31,6 +31,14 @@ Usage:
     --split test \\
     --output_dir results/ \\
     --n_ensemble 20
+
+  [MỚI] Đánh giá baseline (không chỉ FM) — thêm --model_type:
+  python evaluate_full.py \\
+    --checkpoint runs/best_model_lstm_seed0.pth \\
+    --model_type lstm \\
+    --dataset_root /path/to/tc-ofm \\
+    --split test --per_storm --no_crps \\
+    --output_dir results/lstm_seed0/
 """
 from __future__ import annotations
 
@@ -50,6 +58,15 @@ from Model.flow_matching_model import (
     _norm_to_deg, _haversine_deg, _forward_azimuth,
     _step_speeds_kmh, _unwrap,
 )
+# [MỚI, --model_type] Baseline architectures — chỉ cần cho việc XÂY
+# model đúng loại (constructor) và LOAD checkpoint; toàn bộ phần đánh
+# giá phía dưới (run_full_evaluation/per_storm_breakdown/...) đã viết
+# tổng quát trên "model" (gọi model.sample(bl, num_ensemble=..., **kw)
+# và đọc pred/all_t) nên không cần đổi gì thêm — cả 2 lớp baseline này
+# đã có sẵn sample() cùng chữ ký/return-shape với TCFlowMatching (xem
+# ghi chú trong _build_model() bên dưới để biết đã verify thế nào).
+from Model.st_trans_model import STTrans
+from Model.paper_baseline_model import PaperBaseline
 
 # ode_steps_sweep lives in ablation_runner.py (NOT duplicated here) — it
 # already implements the N sweep correctly (temporarily overrides
@@ -81,6 +98,11 @@ SPEED_FAST   = 15.0
 # Physical bounds
 MAX_TC_SPEED_KMH  = 100.0   # TC track speed >100km/h per 6h is unphysical
 MAX_ACCEL_KMH2    = 30.0    # Speed change >30km/h per step is unphysical
+
+# [MỚI, --model_type] Kiến trúc hợp lệ — "fm" giữ nguyên hành vi mặc
+# định cũ (không truyền --model_type vẫn ra đúng TCFlowMatching, không
+# đổi hành vi cho mọi lệnh gọi evaluate_full.py đã có từ trước).
+MODEL_TYPES = ["fm", "st_trans", "lstm", "gru", "rnn"]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +247,74 @@ def _obs_speed(obs_deg: torch.Tensor) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  [MỚI, --model_type] Model construction / loading — 1 kiến trúc bất kỳ
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_model(model_type: str, model_cfg: dict, device):
+    """
+    Xây model theo đúng kiến trúc --model_type, dùng model_cfg đã lưu
+    trong checkpoint nếu có (giữ đúng cách flow_matching's nhánh vẫn
+    làm từ trước — chỉ tổng quát hoá sang 4 kiến trúc còn lại).
+
+    Đã verify TRƯỚC khi viết hàm này (không đoán):
+      - STTrans.sample(batch_list, num_ensemble=1, **kwargs) ->
+        (pred[T,B,2], me_mean[T,B,2] zeros, pred.unsqueeze(0)) — cùng
+        3-tuple return convention với TCFlowMatching.sample(), và nhận
+        **kwargs nên các keyword evaluate_full.py truyền thêm (vd
+        use_curvature_score=) không làm crash dù bị bỏ qua.
+      - PaperBaseline(model_type="lstm"/"gru"/"rnn", ...).sample(...)
+        cùng chữ ký, cùng return convention y hệt STTrans — 1 lớp dùng
+        chung cho cả 3 kiến trúc RNN-họ, chọn qua model_cfg["model_type"]
+        hoặc đối số model_type truyền vào constructor.
+    Do đó toàn bộ phần đánh giá phía dưới (run_full_evaluation,
+    per_storm_breakdown, collect_case_studies, sigma_sensitivity,
+    ensemble_size_eval) không cần sửa gì — chúng chỉ gọi
+    model.sample(bl, num_ensemble=..., **kw) và đọc (pred, _, all_t),
+    đúng interface chung của cả 5 kiến trúc.
+    """
+    if model_type == "fm":
+        return TCFlowMatching(**model_cfg).to(device)
+    elif model_type == "st_trans":
+        return STTrans(**model_cfg).to(device)
+    elif model_type in ("lstm", "gru", "rnn"):
+        # model_cfg có thể đã có "model_type" (lưu từ lúc train) — nếu
+        # có, ưu tiên nó khớp đúng checkpoint thật; nếu không, dùng
+        # --model_type CLI đang chạy. Tránh truyền "model_type" 2 lần
+        # (1 lần trong model_cfg, 1 lần override) gây lỗi "multiple
+        # values for keyword argument".
+        cfg = dict(model_cfg)
+        cfg.setdefault("model_type", model_type)
+        return PaperBaseline(**cfg).to(device)
+    else:
+        raise ValueError(f"Unknown --model_type: {model_type!r} "
+                          f"(phải là 1 trong {MODEL_TYPES})")
+
+
+def _infer_model_type_from_checkpoint(ck: dict, cli_model_type: str) -> str:
+    """
+    [MỚI] Nếu checkpoint tự ghi lại kiến trúc thật (model_cfg chứa
+    "model_type" — đúng cách PaperBaseline lưu, vì 3 kiến trúc lstm/
+    gru/rnn dùng CHUNG 1 class PaperBaseline, chỉ khác field này), ưu
+    tiên nó thay vì --model_type CLI người dùng gõ tay — tránh trường
+    hợp gõ nhầm --model_type lstm nhưng checkpoint thật là gru (2 kiến
+    trúc có cùng shape tensor phần lớn layer, load_state_dict(strict=
+    False) có thể "load được" một phần rồi âm thầm cho kết quả sai
+    thay vì báo lỗi rõ ràng). Cảnh báo rõ nếu 2 nguồn xung đột; vẫn ưu
+    tiên checkpoint vì đó là nguồn đáng tin hơn (ghi tại thời điểm
+    train, không phụ thuộc người dùng gõ đúng CLI mỗi lần eval).
+    """
+    model_cfg = ck.get("model_cfg") or {}
+    ckpt_type = model_cfg.get("model_type")
+    if ckpt_type and ckpt_type != cli_model_type:
+        print(f"  ⚠ --model_type={cli_model_type!r} nhưng checkpoint's "
+              f"model_cfg ghi model_type={ckpt_type!r} — DÙNG giá trị "
+              f"trong checkpoint (đáng tin hơn CLI gõ tay). Nếu đây "
+              f"không phải ý bạn, kiểm tra lại đường dẫn --checkpoint.")
+        return ckpt_type
+    return cli_model_type
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Main evaluation loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -245,7 +335,8 @@ def run_full_evaluation(model, loader, device,
       existing physics-score components. Pure inference-time change on an
       already-trained checkpoint — no retraining needed. See
       flow_matching_model.py's _physics_score docstring for the full
-      rationale.
+      rationale. Baseline models (STTrans/PaperBaseline) accept and
+      ignore this kwarg via **kwargs — harmless no-op for them.
     ddim_steps: [MULTI-STEP, opt-in] number of Euler integration steps for
       sampling, overriding the checkpoint's trained n_inference_steps
       (default 1 — single-shot x0+v). This mechanism already existed in
@@ -258,6 +349,8 @@ def run_full_evaluation(model, loader, device,
       of the low Spread/Skill ratio), multi-step will improve per-sample
       trajectory accuracy without necessarily improving diversity. Must be
       measured empirically, not assumed. None = use checkpoint default (1).
+      Baseline models ignore this kwarg via **kwargs (no ODE integration
+      concept for them — deterministic single-shot regression heads).
     """
     bk = None
     if ema is not None:
@@ -532,6 +625,12 @@ def per_storm_breakdown(model, loader, device,
     it's a list of dicts, not a tensor. This was previously computed but
     never surfaced in evaluate_full.py's output; nothing else changes.
 
+    [MỚI, --model_type] Hàm này nhận "model" tổng quát (không hardcode
+    TCFlowMatching) — hoạt động y hệt với STTrans/PaperBaseline vì cả 3
+    đều implement cùng model.sample(bl, num_ensemble=..., **kwargs) ->
+    (pred, _, all_t) interface (xem _build_model()'s docstring). Không
+    cần sửa gì trong thân hàm.
+
     Returns: {storm_name: {"n": int, "ade": [...], "ate": [...],
                             "cte": [...], "obs_speed": [...], "year": [...]}}
     One list entry per WINDOW belonging to that storm (a storm usually
@@ -737,22 +836,6 @@ def print_full_results(r: Dict, st_trans: Dict = ST_TRANS):
         dist_ps   = r.get("dist_per_step_mean", [])
         ss = crps.get("spread_skill_ratio", [])
         if spread_ps:
-            # [DEBUG] Raw spread (km) and skill (km, = actual mean error at
-            # that step) per horizon, not just the ratio. Distinguishes two
-            # hypotheses for why Spread/Skill ratio decreases over horizon:
-            #  (a) spread itself barely grows with horizon (flat) while
-            #      skill grows fast -> points to loss imbalance / reg_step_
-            #      logits underweighting far horizons (L_reg, which
-            #      dominates L_cfm ~15-20x, gets only ~7-13% of its already-
-            #      small attention on horizons 8-12/30h-72h — see
-            #      flow_matching_model.py's reg_step_logits docstring).
-            #  (b) spread DOES grow with horizon but proportionally slower
-            #      than skill -> more consistent with sigma_inference being
-            #      too small to seed enough divergence in the first place.
-            # Both could be partially true; this print is the evidence
-            # needed to judge which dominates before deciding whether to
-            # spend a full retrain on Hướng 1 (sigma) vs Hướng 3 (loss
-            # rebalance, e.g. --log_sigma_reg_min_clamp).
             hz_spread = {h: spread_ps[s] if s < len(spread_ps) else float("nan")
                          for h, s in HORIZONS.items()}
             hz_skill  = {h: dist_ps[s] if s < len(dist_ps) else float("nan")
@@ -782,8 +865,18 @@ def sigma_sensitivity(model, loader, device,
     Ablation: sensitivity của kết quả theo sigma_inference.
     Chạy inference với nhiều sigma khác nhau trên cùng checkpoint.
     → Justification cho sigma_inference=0.04 cố định (reviewer question).
+
+    [MỚI, --model_type] CHỈ có ý nghĩa cho FM (sigma_inference là tham
+    số CFM riêng của TCFlowMatching — STTrans/PaperBaseline không có
+    attribute này). Guard rõ ràng ngay đầu hàm thay vì để crash mơ hồ
+    (AttributeError không rõ nguyên nhân) khi lỡ gọi với baseline.
     """
     raw = _unwrap(model)
+    if not hasattr(raw, "sigma_inference"):
+        print("  ⚠ sigma_sensitivity: model không có sigma_inference "
+              "(không phải FM — bỏ qua, trả về rỗng). Ablation này chỉ "
+              "áp dụng cho --model_type fm.")
+        return {}
     orig_sigma = float(raw.sigma_inference)
     results = {}
     for sigma in sigma_values:
@@ -824,30 +917,24 @@ def ensemble_size_eval(model, loader, device,
     → Justification cho K=20 default.
     → ESWA Table: shows diminishing returns beyond K=20.
 
-    [BỔ SUNG] Thêm spread_mean (độ phân tán trung bình giữa các ensemble
-    member cuối cùng) — dùng CHÍNH XÁC cùng công thức đã có sẵn ở
-    ablation_runner.py's ode_steps_sweep() (pairwise haversine giữa các
-    candidate cuối, subsample 10 cặp/batch để không quá chậm với K lớn),
-    không viết lại logic mới. Lý do cần thêm: K (n_ensemble) và N
-    (n_inference_steps) là 2 tham số khác nhau — N mới là cái thực sự
-    quyết định spread (velocity field được tích phân qua nhiều bước hơn
-    → sai khác giữa các candidate khuếch đại dần), còn K chỉ ước lượng
-    MỊN HƠN cùng 1 vùng phân phối đã bị N quyết định trước đó, KHÔNG mở
-    rộng được vùng đó. Bảng này tồn tại để CHỨNG MINH bằng số điều đó
-    (spread gần như phẳng theo K, khác hẳn xu hướng tăng rõ theo N ở
-    ode_steps_sweep) — nếu chỉ có bảng K mà thiếu cột spread, không có
-    cách nào phân biệt trực quan giữa "K giúp mượt hơn" và "K giúp mở
-    rộng spread" (2 tuyên bố rất khác nhau).
-
-    [BỔ SUNG, per-lead-time] Trước đây d.mean(0) gộp trung bình qua
-    TOÀN BỘ T lead-time (6h..72h) trước khi lưu — mỗi storm chỉ đóng
-    góp 1 con số duy nhất. Giờ vẫn giữ "ADE"/"ATE"/"CTE" tổng thể
-    (tương thích ngược, không đổi hành vi hiện có), THÊM
-    "by_lead_time" — cùng schema/convention với ode_steps_sweep()'s
-    bổ sung (ablation_runner.py) và evaluate_multi_model.py (1-indexed,
-    1=6h...T=72h).
+    [MỚI, --model_type] Baseline (STTrans/PaperBaseline) đều
+    deterministic (sample() luôn trả cùng 1 pred bất kể num_ensemble,
+    all_t chỉ có K=1 candidate) — K-sweep vẫn CHẠY ĐƯỢC (không crash,
+    model.sample() nhận num_ensemble qua **kwargs rồi bỏ qua), nhưng
+    ADE/ATE/CTE sẽ giống hệt nhau ở mọi K và spread luôn NaN (không đủ
+    2 candidate để tính pairwise distance) — đây là kết quả ĐÚNG về mặt
+    ý nghĩa (baseline không có khái niệm ensemble), không phải bug,
+    nhưng dễ gây hiểu nhầm nếu không biết trước. Không chặn cứng vì có
+    thể vẫn hữu ích để xác nhận baseline stable qua K (dù luôn giống
+    nhau) — chỉ in cảnh báo 1 lần.
     """
     raw = _unwrap(model)
+    if not hasattr(raw, "n_inference_steps") and not hasattr(raw, "sigma_inference"):
+        print("  ⚠ ensemble_size_eval: model có vẻ là baseline "
+              "deterministic (không phải FM) — ADE/ATE/CTE sẽ GIỐNG "
+              "HỆT nhau ở mọi K, spread sẽ luôn NaN. Đây là kết quả "
+              "đúng (baseline không có khái niệm ensemble), không phải "
+              "lỗi.")
     results = {}
     for k in k_values:
         all_ade, all_ate, all_cte, all_spread = [], [], [], []
@@ -881,7 +968,9 @@ def ensemble_size_eval(model, loader, device,
             # [BỔ SUNG] spread — pairwise haversine giữa các candidate
             # cuối cùng, cùng công thức với ode_steps_sweep(). K=1 luôn
             # cho spread=NaN (không có cặp nào để so — đúng ý nghĩa,
-            # không phải bug).
+            # không phải bug). Baseline: all_t.shape[0] luôn = 1
+            # (deterministic) nên nhánh này tự động không chạy — spread
+            # luôn NaN cho baseline, đúng như cảnh báo ở đầu hàm.
             if all_t is not None and torch.is_tensor(all_t) and all_t.shape[0] >= 2:
                 Kb = all_t.shape[0]
                 last = _norm_to_deg(all_t[:, -1, :, :2])   # [K, B, 2]
@@ -943,6 +1032,12 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
     chọn best/1 seed ngẫu nhiên" đã áp dụng cho generate_paper_report.py's
     Table 1/3/4/5.
 
+    [MỚI, --model_type] Nhánh multi-seed vẫn CHỈ dùng cho FM (K-sweep
+    có ý nghĩa nhất với FM — baseline deterministic nên spread luôn
+    NaN, xem cảnh báo trong ensemble_size_eval()). Nếu args.model_type
+    khác "fm", vẫn chạy được (dùng _build_model tổng quát) nhưng kết
+    quả sẽ đơn điệu theo K — không cấm, chỉ không phải use-case chính.
+
     Trả về dict cùng SCHEMA với ensemble_size_eval() (key=K, value=dict
     có ADE/ATE/CTE/spread) để build_ensemble_k_table() trong
     generate_paper_report.py dùng lại được NGUYÊN VẸN, không cần sửa gì
@@ -951,6 +1046,7 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
     giữa các seed.
     """
     from Model.data.loader_training import data_loader
+    model_type = getattr(args, "model_type", "fm")
     per_seed_results = {}   # seed -> {K: {...}}
     for ckpt_path in checkpoints:
         print(f"\n  {'='*70}\n  Loading checkpoint: {ckpt_path}\n  {'='*70}")
@@ -958,14 +1054,16 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
         model_cfg = ck.get("model_cfg") or {}
         if not model_cfg:
             print("  ⚠ Checkpoint has no model_cfg — dùng constructor defaults.")
-        model = TCFlowMatching(**model_cfg).to(device)
+        resolved_type = _infer_model_type_from_checkpoint(ck, model_type)
+        model = _build_model(resolved_type, model_cfg, device)
         state = ck.get("model", ck)
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
             print(f"  ⚠ load_state_dict: {len(missing)} missing, "
                   f"{len(unexpected)} unexpected keys")
 
-        if not args.no_ema and ck.get("ema"):
+        ema = None
+        if resolved_type == "fm" and not args.no_ema and ck.get("ema"):
             try:
                 ema = EMAModel(model)
                 for k, v in ck["ema"].items():
@@ -976,7 +1074,7 @@ def run_ensemble_ablation_multi_seed(checkpoints: List[str], dataset_root: str,
                 print(f"  ⚠ EMA failed: {e}")
 
         seed = _infer_seed_local(ckpt_path, ck)
-        print(f"  seed={seed}  epoch={ck.get('epoch', '?')}")
+        print(f"  seed={seed}  epoch={ck.get('epoch', '?')}  model_type={resolved_type}")
 
         # [FIX] 2 bug: (1) _NS copy vars(args) không đủ field data_loader()
         # cần (obs_len/pred_len/batch_size/num_workers/skip/min_ped/
@@ -1173,6 +1271,18 @@ def main():
                         "per_storm — các phần đó gắn với đúng 1 checkpoint, "
                         "không có ý nghĩa 'gộp qua seed'). Không thể dùng "
                         "cùng lúc với --checkpoint.")
+    p.add_argument("--model_type",   default="fm", choices=MODEL_TYPES,
+                   help="[MỚI] Kiến trúc của checkpoint đang eval: fm "
+                        "(TCFlowMatching, mặc định — giữ nguyên hành vi "
+                        "cũ khi không truyền cờ này), st_trans (STTrans), "
+                        "lstm/gru/rnn (PaperBaseline với model_type "
+                        "tương ứng). Nếu checkpoint tự ghi model_type "
+                        "trong model_cfg (đúng cách PaperBaseline lưu), "
+                        "giá trị đó được ưu tiên hơn cờ CLI này — xem "
+                        "_infer_model_type_from_checkpoint(). Các tính "
+                        "năng chỉ có ý nghĩa cho FM (--sigma_sensitivity, "
+                        "EMA) tự bỏ qua/cảnh báo khi model_type khác fm, "
+                        "không crash.")
     p.add_argument("--dataset_root", required=True)
     p.add_argument("--split",        default="test", choices=["test","val","train"])
     p.add_argument("--n_ensemble",   type=int, default=20)
@@ -1187,7 +1297,8 @@ def main():
                         "existing physics-score components). Pure "
                         "inference-time change on an already-trained "
                         "checkpoint — no retraining needed. Default False "
-                        "preserves prior behavior exactly.")
+                        "preserves prior behavior exactly. No-op for "
+                        "baseline models (accepted via **kwargs, ignored).")
     p.add_argument("--ddim_steps", type=int, default=None,
                    help="[MULTI-STEP, opt-in] Number of Euler integration "
                         "steps for sampling (overrides checkpoint's "
@@ -1197,7 +1308,9 @@ def main():
                         "Spread/Skill ratio) on an EXISTING checkpoint — "
                         "no retraining needed. Effect is NOT guaranteed; "
                         "measure and compare against the default before "
-                        "relying on it. None = use checkpoint default (1).")
+                        "relying on it. None = use checkpoint default (1). "
+                        "No-op for baseline models (accepted via **kwargs, "
+                        "ignored — no ODE integration concept for them).")
     p.add_argument("--case_studies", action="store_true", default=True,
                    help="Collect case study data")
     p.add_argument("--n_cases",      type=int, default=6)
@@ -1205,7 +1318,9 @@ def main():
     p.add_argument("--test_year",    type=int, default=None,
                    help="Filter test set by year (same as evaluate_test_storms.py)")
     p.add_argument("--sigma_sensitivity", action="store_true", default=False,
-                   help="Run sigma_inference sensitivity analysis (reviewer ablation)")
+                   help="Run sigma_inference sensitivity analysis (reviewer "
+                        "ablation). FM-only — auto-skipped with a warning "
+                        "if --model_type is not fm.")
     p.add_argument("--ensemble_ablation",  action="store_true", default=False,
                    help="Run ensemble size K ablation")
     p.add_argument("--k_values", type=int, nargs="+", default=[1, 3, 5, 10, 20, 40],
@@ -1217,7 +1332,8 @@ def main():
                         "buckets. Prints storms sorted by CTE, worst first. "
                         "Also saves per_storm_<split>_ep<N>.json for "
                         "cross-checkpoint comparison (see compare_seeds.py "
-                        "usage in this file's docstring / README).")
+                        "usage in this file's docstring / README). Works "
+                        "for any --model_type.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -1237,12 +1353,14 @@ def main():
                   "--checkpoint thay vì --checkpoints cho chúng).")
             return
         print(f"\n  Multi-seed ensemble ablation | {len(args.checkpoints)} checkpoints")
-        print(f"  Split: {args.split} | Device: {device} | K values: {args.k_values}")
+        print(f"  Model type: {args.model_type} | Split: {args.split} | "
+              f"Device: {device} | K values: {args.k_values}")
         print("="*72)
         merged = run_ensemble_ablation_multi_seed(
             args.checkpoints, args.dataset_root, args.split,
             args.k_values, device, args)
-        out_path = os.path.join(args.output_dir, f"ensemble_ablation_multiseed_{args.split}.json")
+        out_path = os.path.join(args.output_dir,
+                                 f"ensemble_ablation_multiseed_{args.model_type}_{args.split}.json")
         with open(out_path, "w") as f:
             json.dump({"ensemble_ablation": merged}, f, indent=2)
         print(f"\n  Saved multi-seed ensemble ablation → {out_path}")
@@ -1256,7 +1374,7 @@ def main():
         return
 
     print(f"\n  Checkpoint: {args.checkpoint}")
-    print(f"  Split: {args.split} | Device: {device}")
+    print(f"  Model type: {args.model_type} | Split: {args.split} | Device: {device}")
     print("="*72)
 
     # ── Load model ─────────────────────────────────────────────────────────
@@ -1268,19 +1386,20 @@ def main():
     if not model_cfg:
         print("  ⚠ Checkpoint has no model_cfg — reconstructing with "
               "constructor DEFAULTS. This is only correct if the checkpoint "
-              "was trained with default architecture args (d_model=256, "
-              "nhead=8, num_dec_layers=4, ...). If you trained with "
-              "non-default architecture flags, this will silently load the "
-              "WRONG architecture.")
-    model = TCFlowMatching(**model_cfg).to(device)
+              "was trained with default architecture args. If you trained "
+              "with non-default architecture flags, this will silently "
+              "load the WRONG architecture.")
+    resolved_type = _infer_model_type_from_checkpoint(ck, args.model_type)
+    model = _build_model(resolved_type, model_cfg, device)
     state = ck.get("model", ck)
     missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:    print(f"  ⚠ Missing keys ({len(missing)}): {missing[:3]}...")
     if unexpected: print(f"  ⚠ Unexpected ({len(unexpected)}): {unexpected[:3]}...")
     ep = ck.get("epoch", "?")
-    print(f"  Loaded ep{ep}")
+    print(f"  Loaded ep{ep}  (model_type={resolved_type})")
 
-    # Print learned params
+    # Print learned params (FM-only attributes — guarded with hasattr,
+    # baseline models simply skip these lines silently)
     raw = _unwrap(model)
     if hasattr(raw, "speed_correction_logits"):
         corr = (torch.sigmoid(raw.speed_correction_logits) * 2.0).tolist()
@@ -1297,8 +1416,14 @@ def main():
     print(f"  Model: {total_params:,} params | {mem_mb:.1f}MB")
 
     # ── EMA ────────────────────────────────────────────────────────────────
+    # [MỚI, --model_type] EMA (EMAModel) là cơ chế train-time riêng của
+    # TCFlowMatching (self._ema trong constructor) — STTrans/PaperBaseline
+    # không có. Guard theo resolved_type để không thử load EMA state vào
+    # 1 model không hỗ trợ nó (checkpoint baseline sẽ không có key "ema"
+    # nên nhánh này vốn đã tự nhiên bỏ qua, nhưng guard rõ ràng ở đây để
+    # ý định không phụ thuộc vào việc checkpoint "tình cờ" thiếu key).
     ema = None
-    if not args.no_ema and ck.get("ema"):
+    if resolved_type == "fm" and not args.no_ema and ck.get("ema"):
         try:
             ema = EMAModel(model)
             for k, v in ck["ema"].items():
@@ -1335,7 +1460,7 @@ def main():
     # ── Full evaluation ─────────────────────────────────────────────────────
     result = run_full_evaluation(
         model, loader, device,
-        tag=f"{args.split.upper()} ep{ep}",
+        tag=f"{args.split.upper()} ep{ep} [{resolved_type}]",
         n_ensemble=args.n_ensemble,
         ema=ema,
         collect_samples=not args.no_crps,
@@ -1362,6 +1487,7 @@ def main():
     result["inference_ms_per_batch"] = ms_per_step
     result["total_params"] = total_params
     result["model_mb"] = mem_mb
+    result["model_type"] = resolved_type
 
     # ── Case studies ─────────────────────────────────────────────────────────
     case_results = []
@@ -1417,21 +1543,24 @@ def main():
         # Saved SEPARATELY (not nested in the main eval JSON) so
         # compare_per_storm_across_checkpoints() can load several of these
         # by path and diff them across seeds/checkpoints directly.
+        # [MỚI] Filename giờ bao gồm model_type để 5 kiến trúc x 3 seed
+        # (15 lần chạy) không ghi đè lẫn nhau trong CÙNG 1 --output_dir.
         ps_summary = {name: {"n": rec["n"],
                               "ade": float(np.mean(rec["ade"])),
                               "ate": float(np.mean(rec["ate"])),
                               "cte": float(np.mean(rec["cte"])),
                               "obs_speed": float(np.mean(rec["obs_speed"]))}
                       for name, rec in ps.items() if rec["n"] > 0}
-        ps_path = os.path.join(args.output_dir,
-                                f"per_storm_{args.split}_ep{ep}.json")
+        ps_path = os.path.join(
+            args.output_dir,
+            f"per_storm_{resolved_type}_{args.split}_ep{ep}.json")
         with open(ps_path, "w") as f:
             json.dump(ps_summary, f, indent=2)
         print(f"  Saved per-storm breakdown → {ps_path}")
 
     # ── Save ────────────────────────────────────────────────────────────────
     out_path = os.path.join(args.output_dir,
-                             f"eval_{args.split}_ep{ep}.json")
+                             f"eval_{resolved_type}_{args.split}_ep{ep}.json")
     save_result = {k: v for k, v in result.items()
                    if k != "boxplot_ade"}   # exclude large arrays from main JSON
     save_result["boxplot_ade"] = result.get("boxplot_ade", [])  # keep for boxplot
@@ -1444,7 +1573,7 @@ def main():
 
     # Summary line for paper table
     print(f"\n  ── PAPER TABLE ROW ──")
-    print(f"  FM(ours) | "
+    print(f"  {resolved_type.upper()} | "
           f"ADE={result['ADE']:.1f}±{result.get('ADE_std',0):.1f} | "
           f"ATE={result['ATE']:.1f}±{result.get('ATE_std',0):.1f} | "
           f"CTE={result['CTE']:.1f}±{result.get('CTE_std',0):.1f} | "
