@@ -572,6 +572,140 @@ def write_csv_agg(agg_rows: List[Dict], path: str):
     print(f"  Saved per-timestep mean±std CSV → {path}  ({len(rows)} rows)")
 
 
+def write_csv_trajectory(records: List[Dict], path: str):
+    """
+    [NEW] One row per (storm, model) — ADE/ATE/CTE averaged over the
+    WHOLE trajectory (all lead times, not broken out per horizon like
+    write_csv()/write_markdown_summary()), plus FINAL ADE (the ADE at
+    the LAST lead time only, e.g. 72h for pred_len=12 — the endpoint
+    error, a standard metric distinct from the trajectory-average ADE:
+    see the paper's own "Final-Step DPE" convention). This is the
+    per-storm summary table layout requested (storm as a row group,
+    model as sub-rows, one mean±std-style value per metric) — separate
+    from, and complementary to, the per-lead-time CSV (write_csv()),
+    which stays available for the full per-6h detail.
+
+    A storm can have multiple windows (multiple forecast issue times)
+    in the test set — this function averages across windows too, so
+    each (storm, model) pair collapses to exactly one row. If you need
+    per-window trajectory averages instead, filter records by "window"
+    before calling this function.
+    """
+    storms = sorted(set(r["storm"] for r in records))
+    models_seen = sorted(set(r["model"] for r in records))
+    max_lead_h = max(r["lead_time_h"] for r in records)
+
+    fieldnames = ["storm", "model", "n_lead_times", "n_windows",
+                  "ade_km", "ate_km", "cte_km", "final_ade_km"]
+    rows = []
+    for storm in storms:
+        storm_recs = [r for r in records if r["storm"] == storm]
+        n_windows = len(set(r["window"] for r in storm_recs))
+        for model in models_seen:
+            m_recs = [r for r in storm_recs if r["model"] == model]
+            if not m_recs:
+                continue
+            ade_vals = [r["ade"] for r in m_recs if r["ade"] is not None]
+            ate_vals = [r["ate"] for r in m_recs if r["ate"] is not None]
+            cte_vals = [r["cte"] for r in m_recs if r["cte"] is not None]
+            final_vals = [r["ade"] for r in m_recs
+                          if r["lead_time_h"] == max_lead_h and r["ade"] is not None]
+            rows.append({
+                "storm": storm, "model": model,
+                "n_lead_times": len(set(r["lead_time_h"] for r in m_recs)),
+                "n_windows": n_windows,
+                "ade_km": f"{np.mean(ade_vals):.2f}" if ade_vals else "",
+                "ate_km": f"{np.mean(ate_vals):.2f}" if ate_vals else "",
+                "cte_km": f"{np.mean(cte_vals):.2f}" if cte_vals else "",
+                "final_ade_km": f"{np.mean(final_vals):.2f}" if final_vals else "",
+            })
+
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  Saved per-storm trajectory-summary CSV → {path}  ({len(rows)} rows)")
+
+
+def write_csv_trajectory_agg(agg_rows: List[Dict], path: str):
+    """
+    [MULTI-SEED] Same as write_csv_trajectory() but takes
+    aggregate_across_seeds()'s output (already mean±std PER lead_time,
+    across seeds) and further collapses ACROSS lead_times into one row
+    per (storm, model) — i.e. this mixes two different sources of
+    variance (seed-to-seed AND lead-time-to-lead-time) into a single
+    reported std. That is exactly what the requested table layout
+    (image: one mean±std value per metric per storm x model, no
+    separate per-horizon breakdown) calls for, but it means this std is
+    NOT the same quantity as aggregate_across_seeds()'s own per-lead-
+    time std — it is coarser, "how much does ADE vary across BOTH seeds
+    and forecast horizon for this storm" rather than "how much does ADE
+    at exactly 24h vary across seeds". If you need the seed-only std at
+    a fixed horizon, use write_csv_agg() (per-lead-time) instead; this
+    function is for the compact whole-trajectory summary specifically.
+
+    FINAL ADE mean±std is computed from the LAST lead_time's per-seed
+    values directly (via the underlying per-seed ade_mean/ade_std at
+    that horizon) — same endpoint-error convention as
+    write_csv_trajectory()'s FINAL ADE column.
+    """
+    storms = sorted(set(r["storm"] for r in agg_rows))
+    models_seen = sorted(set(r["model"] for r in agg_rows))
+    max_lead_h = max(r["lead_time_h"] for r in agg_rows)
+
+    fieldnames = ["storm", "model", "n_lead_times", "n_windows", "n_seeds",
+                  "ade_mean_km", "ade_std_km", "ate_mean_km", "ate_std_km",
+                  "cte_mean_km", "cte_std_km", "final_ade_mean_km", "final_ade_std_km"]
+    rows = []
+    for storm in storms:
+        storm_recs = [r for r in agg_rows if r["storm"] == storm]
+        n_windows = len(set(r["window"] for r in storm_recs))
+        for model in models_seen:
+            m_recs = [r for r in storm_recs if r["model"] == model]
+            if not m_recs:
+                continue
+            n_seeds_here = m_recs[0]["n_seeds"] if m_recs else 0
+
+            # [NOTE, see docstring] Pooling per-lead-time means/stds into
+            # one trajectory-level mean/std here: mean of means is exact,
+            # but "mean of per-horizon stds" is a simplification (not the
+            # true combined std of the underlying pooled distribution) —
+            # accurate enough for a compact summary table, not a
+            # substitute for the per-lead-time CSV if exact variance
+            # decomposition matters for your analysis.
+            ade_m = [r["ade_mean"] for r in m_recs if r["ade_mean"] is not None]
+            ade_s = [r["ade_std"]  for r in m_recs if r["ade_std"]  is not None]
+            ate_m = [r["ate_mean"] for r in m_recs if r["ate_mean"] is not None]
+            ate_s = [r["ate_std"]  for r in m_recs if r["ate_std"]  is not None]
+            cte_m = [r["cte_mean"] for r in m_recs if r["cte_mean"] is not None]
+            cte_s = [r["cte_std"]  for r in m_recs if r["cte_std"]  is not None]
+            final_m = [r["ade_mean"] for r in m_recs
+                       if r["lead_time_h"] == max_lead_h and r["ade_mean"] is not None]
+            final_s = [r["ade_std"]  for r in m_recs
+                       if r["lead_time_h"] == max_lead_h and r["ade_std"]  is not None]
+
+            rows.append({
+                "storm": storm, "model": model,
+                "n_lead_times": len(set(r["lead_time_h"] for r in m_recs)),
+                "n_windows": n_windows, "n_seeds": n_seeds_here,
+                "ade_mean_km": f"{np.mean(ade_m):.2f}" if ade_m else "",
+                "ade_std_km":  f"{np.mean(ade_s):.2f}" if ade_s else "",
+                "ate_mean_km": f"{np.mean(ate_m):.2f}" if ate_m else "",
+                "ate_std_km":  f"{np.mean(ate_s):.2f}" if ate_s else "",
+                "cte_mean_km": f"{np.mean(cte_m):.2f}" if cte_m else "",
+                "cte_std_km":  f"{np.mean(cte_s):.2f}" if cte_s else "",
+                "final_ade_mean_km": f"{np.mean(final_m):.2f}" if final_m else "",
+                "final_ade_std_km":  f"{np.mean(final_s):.2f}" if final_s else "",
+            })
+
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"  Saved per-storm trajectory-summary mean±std CSV → {path}  ({len(rows)} rows)")
+
+
+
 def write_markdown_summary_agg(agg_rows: List[Dict], path: str,
                                 horizons_h: List[int] = None):
     """
@@ -824,6 +958,11 @@ def main():
         # unchanged output filenames/format.
         print_storm_tables(all_records)
         write_csv(all_records, os.path.join(args.output_dir, f"per_storm_timeline_{args.split}.csv"))
+        # [NEW] Per-storm trajectory-summary CSV — one row per (storm,
+        # model), ADE/ATE/CTE averaged over the WHOLE trajectory plus
+        # FINAL ADE (endpoint error), instead of broken out per horizon
+        # like the CSV above. Separate file, does not replace it.
+        write_csv_trajectory(all_records, os.path.join(args.output_dir, f"per_storm_trajectory_{args.split}.csv"))
         # [COMPACT] Markdown table uses STANDARD horizons (12/24/48/72h),
         # not every 6h step — the full per-6h detail is in the CSV above.
         # Only fall back to whatever horizons the data actually has if
@@ -848,6 +987,11 @@ def main():
         print(f"\n  Saved mean±std records → {agg_json_path}")
 
         write_csv_agg(agg_rows, os.path.join(args.output_dir, f"per_storm_timeline_{args.split}_meanstd.csv"))
+        # [NEW] Per-storm trajectory-summary CSV, multi-seed mean±std
+        # version — one row per (storm, model), matching the requested
+        # layout (image: storm as a row group, model as sub-rows,
+        # mean±std per metric, no per-horizon breakdown).
+        write_csv_trajectory_agg(agg_rows, os.path.join(args.output_dir, f"per_storm_trajectory_{args.split}_meanstd.csv"))
         md_horizons = [h for h in STANDARD_HORIZONS_H if h in horizons_h] or horizons_h
         write_markdown_summary_agg(agg_rows, os.path.join(args.output_dir, f"per_storm_summary_{args.split}_meanstd.md"),
                                     md_horizons)
