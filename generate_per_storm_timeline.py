@@ -432,39 +432,120 @@ def write_csv(records: List[Dict], path: str):
     print(f"  Saved per-timestep CSV → {path}  ({len(rows)} rows)")
 
 
-def write_markdown_summary(records: List[Dict], path: str, horizons_h: List[int]):
+STANDARD_HORIZONS_H = [12, 24, 48, 72]  # matches paper's own reporting convention
+                                          # (Table 7/8 style) — not every 6h step
+
+
+def write_markdown_summary(records: List[Dict], path: str,
+                            horizons_h: List[int] = None):
     """
-    Compact paper-ready markdown: one row per (storm, model), ADE broken
-    out into separate columns every `horizons_h` hours (default every
-    6h, i.e. every available lead time) — this is the "in ra ade mỗi 6h"
-    table the user asked for, condensed enough to actually fit in a
-    paper appendix (unlike the full per-timestep CSV, which is meant
-    for supplementary material / raw data, not in-line reading).
+    [REDESIGNED, compact] ONE flat table per metric (ADE/ATE/CTE), NOT one
+    table per storm — a reader scans rows top-to-bottom to compare storms
+    and models directly, instead of scrolling through dozens of small
+    per-storm tables. Columns are the STANDARD reporting horizons
+    (12h/24h/48h/72h, matching the paper's own Table 7/8 convention),
+    not every single 6h step — the full per-6h detail is still in the
+    CSV (write_csv) for anyone who needs it, but a paper table showing
+    12 columns per metric is not readable; 4 is.
+
+    horizons_h defaults to STANDARD_HORIZONS_H (12/24/48/72h). Pass a
+    different list only if your data genuinely only has other lead
+    times available (e.g. a shorter forecast horizon).
     """
+    if horizons_h is None:
+        horizons_h = STANDARD_HORIZONS_H
+
     storms = sorted(set(r["storm"] for r in records))
     models_seen = sorted(set(r["model"] for r in records))
 
-    lines = ["# Per-storm, per-horizon ADE (km) — all 5 architectures\n"]
-    for storm in storms:
-        storm_recs = [r for r in records if r["storm"] == storm]
-        windows = sorted(set(r["window"] for r in storm_recs))
-        for w in windows:
-            w_recs = [r for r in storm_recs if r["window"] == w]
-            title = f"## {storm}" + (f" (window {w})" if len(windows) > 1 else "")
-            lines.append(title)
-            header = "| Model | " + " | ".join(f"{h}h" for h in horizons_h) + " |"
-            sep    = "|---|" + "---|" * len(horizons_h)
-            lines.append(header)
-            lines.append(sep)
+    lines = ["# Per-storm error summary — all architectures\n",
+             f"Standard horizons: {', '.join(f'{h}h' for h in horizons_h)}. "
+             f"Full per-6h detail available in the companion CSV.\n"]
+
+    for metric, label in [("ade", "ADE"), ("ate", "ATE"), ("cte", "CTE")]:
+        lines.append(f"\n## {label} (km)\n")
+        header = "| Storm | Model | " + " | ".join(f"{h}h" for h in horizons_h) + " |"
+        sep    = "|---|---|" + "---|" * len(horizons_h)
+        lines.append(header)
+        lines.append(sep)
+        for storm in storms:
+            storm_recs = [r for r in records if r["storm"] == storm]
+            # A storm can have multiple windows (multiple forecast issue
+            # times) in the test set — average ADE/ATE/CTE across windows
+            # at each horizon so ONE row represents the whole storm,
+            # keeping the table storm-per-row rather than
+            # storm*window-per-row (which would defeat the "compact"
+            # goal for storms with many windows).
             for model in models_seen:
-                m_recs = {r["lead_time_h"]: r["ade"] for r in w_recs if r["model"] == model}
-                cells = [f"{m_recs[h]:.1f}" if h in m_recs else "—" for h in horizons_h]
-                lines.append(f"| {model} | " + " | ".join(cells) + " |")
-            lines.append("")
+                m_recs = [r for r in storm_recs if r["model"] == model]
+                if not m_recs:
+                    continue
+                cells = []
+                for h in horizons_h:
+                    vals = [r[metric] for r in m_recs
+                            if r["lead_time_h"] == h and r[metric] is not None]
+                    cells.append(f"{np.mean(vals):.1f}" if vals else "—")
+                lines.append(f"| {storm} | {model} | " + " | ".join(cells) + " |")
 
     with open(path, "w") as f:
         f.write("\n".join(lines))
-    print(f"  Saved markdown summary → {path}")
+    print(f"  Saved compact markdown summary → {path}")
+
+
+def write_markdown_summary_merged(records: List[Dict], path: str,
+                                   horizons_h: List[int] = None):
+    """
+    [MERGED] Single table combining ADE/ATE/CTE, instead of 3 separate
+    tables (write_markdown_summary()'s layout) — one row per
+    (storm, model), one column PER HORIZON, each cell showing all three
+    metrics as "ADE/ATE/CTE" (km). This is the table requested to sit
+    alongside the full per-timestep output: same row granularity
+    (storm x model) as write_markdown_summary(), but all three metrics
+    readable in one pass instead of scrolling between three tables.
+
+    ATE/CTE are undefined at the very first predicted step in general
+    (see ate_cte_full's docstring) — this cannot occur for the standard
+    horizons here (12h/24h/48h/72h are never the first step for
+    obs_len=8/pred_len=12), so "—/—" for ATE/CTE at these columns would
+    indicate missing DATA (e.g. a sample_error during inference), not
+    the expected first-step gap — worth investigating if seen.
+    """
+    if horizons_h is None:
+        horizons_h = STANDARD_HORIZONS_H
+
+    storms = sorted(set(r["storm"] for r in records))
+    models_seen = sorted(set(r["model"] for r in records))
+
+    lines = ["# Per-storm error summary (ADE/ATE/CTE, km) — all architectures\n",
+             f"Each cell: ADE/ATE/CTE (km) at that horizon. "
+             f"Standard horizons: {', '.join(f'{h}h' for h in horizons_h)}. "
+             f"Full per-6h detail available in the companion CSV.\n"]
+    header = "| Storm | Model | " + " | ".join(f"{h}h (ADE/ATE/CTE)" for h in horizons_h) + " |"
+    sep    = "|---|---|" + "---|" * len(horizons_h)
+    lines.append(header)
+    lines.append(sep)
+
+    for storm in storms:
+        storm_recs = [r for r in records if r["storm"] == storm]
+        for model in models_seen:
+            m_recs = [r for r in storm_recs if r["model"] == model]
+            if not m_recs:
+                continue
+            cells = []
+            for h in horizons_h:
+                h_recs = [r for r in m_recs if r["lead_time_h"] == h]
+                ade_vals = [r["ade"] for r in h_recs if r["ade"] is not None]
+                ate_vals = [r["ate"] for r in h_recs if r["ate"] is not None]
+                cte_vals = [r["cte"] for r in h_recs if r["cte"] is not None]
+                ade_s = f"{np.mean(ade_vals):.1f}" if ade_vals else "—"
+                ate_s = f"{np.mean(ate_vals):.1f}" if ate_vals else "—"
+                cte_s = f"{np.mean(cte_vals):.1f}" if cte_vals else "—"
+                cells.append(f"{ade_s}/{ate_s}/{cte_s}")
+            lines.append(f"| {storm} | {model} | " + " | ".join(cells) + " |")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"  Saved merged (ADE/ATE/CTE) markdown summary → {path}")
 
 
 def write_csv_agg(agg_rows: List[Dict], path: str):
@@ -491,40 +572,118 @@ def write_csv_agg(agg_rows: List[Dict], path: str):
     print(f"  Saved per-timestep mean±std CSV → {path}  ({len(rows)} rows)")
 
 
-def write_markdown_summary_agg(agg_rows: List[Dict], path: str, horizons_h: List[int]):
-    """[MULTI-SEED] Same as write_markdown_summary() but cells show
-    "mean±std" (ADE) instead of a single value — the compact, paper-
-    appendix-ready table for the multi-seed case."""
+def write_markdown_summary_agg(agg_rows: List[Dict], path: str,
+                                horizons_h: List[int] = None):
+    """
+    [MULTI-SEED, REDESIGNED, compact] Same restructuring as
+    write_markdown_summary(): ONE flat table per metric (ADE/ATE/CTE),
+    storm+model as rows, standard horizons (12/24/48/72h) as columns —
+    not one small table per storm. Cells show "mean±std" across seeds.
+    This is the table to paste into a paper appendix; the full per-6h,
+    per-seed detail stays in the companion CSV/JSON.
+    """
+    if horizons_h is None:
+        horizons_h = STANDARD_HORIZONS_H
+
     storms = sorted(set(r["storm"] for r in agg_rows))
     models_seen = sorted(set(r["model"] for r in agg_rows))
 
-    lines = ["# Per-storm, per-horizon ADE mean±std (km) across seeds — all architectures\n"]
-    for storm in storms:
-        storm_recs = [r for r in agg_rows if r["storm"] == storm]
-        windows = sorted(set(r["window"] for r in storm_recs))
-        for w in windows:
-            w_recs = [r for r in storm_recs if r["window"] == w]
-            title = f"## {storm}" + (f" (window {w})" if len(windows) > 1 else "")
-            lines.append(title)
-            header = "| Model | " + " | ".join(f"{h}h" for h in horizons_h) + " |"
-            sep    = "|---|" + "---|" * len(horizons_h)
-            lines.append(header)
-            lines.append(sep)
+    lines = ["# Per-storm error summary (mean±std across seeds) — all architectures\n",
+             f"Standard horizons: {', '.join(f'{h}h' for h in horizons_h)}. "
+             f"Full per-6h, per-seed detail available in the companion CSV/JSON.\n"]
+
+    for metric, mean_key, std_key, label in [
+        ("ade", "ade_mean", "ade_std", "ADE"),
+        ("ate", "ate_mean", "ate_std", "ATE"),
+        ("cte", "cte_mean", "cte_std", "CTE"),
+    ]:
+        lines.append(f"\n## {label} (km)\n")
+        header = "| Storm | Model | " + " | ".join(f"{h}h" for h in horizons_h) + " |"
+        sep    = "|---|---|" + "---|" * len(horizons_h)
+        lines.append(header)
+        lines.append(sep)
+        for storm in storms:
+            storm_recs = [r for r in agg_rows if r["storm"] == storm]
             for model in models_seen:
-                m_recs = {r["lead_time_h"]: r for r in w_recs if r["model"] == model}
+                m_recs = [r for r in storm_recs if r["model"] == model]
+                if not m_recs:
+                    continue
                 cells = []
                 for h in horizons_h:
-                    if h in m_recs:
-                        r = m_recs[h]
-                        cells.append(f"{r['ade_mean']:.1f}±{r['ade_std']:.1f}")
+                    matches = [r for r in m_recs if r["lead_time_h"] == h
+                               and r[mean_key] is not None]
+                    if matches:
+                        # Multiple windows for this storm at this horizon
+                        # — average the per-window means (std is dropped
+                        # at this aggregation level since it would mix
+                        # cross-seed and cross-window variance; the
+                        # per-window, per-seed std is in the CSV/JSON for
+                        # anyone who needs that finer breakdown).
+                        cells.append(f"{np.mean([r[mean_key] for r in matches]):.1f}"
+                                     f"±{np.mean([r[std_key] for r in matches]):.1f}")
                     else:
                         cells.append("—")
-                lines.append(f"| {model} | " + " | ".join(cells) + " |")
-            lines.append("")
+                lines.append(f"| {storm} | {model} | " + " | ".join(cells) + " |")
 
     with open(path, "w") as f:
         f.write("\n".join(lines))
-    print(f"  Saved mean±std markdown summary → {path}")
+    print(f"  Saved compact mean±std markdown summary → {path}")
+
+
+def write_markdown_summary_agg_merged(agg_rows: List[Dict], path: str,
+                                       horizons_h: List[int] = None):
+    """
+    [MULTI-SEED, MERGED] Single table combining ADE/ATE/CTE mean±std,
+    instead of 3 separate tables — one row per (storm, model), one
+    column per horizon, each cell showing all three metrics as
+    "ADE±std/ATE±std/CTE±std" (km). Same idea as
+    write_markdown_summary_merged() but for the multi-seed case.
+
+    Cells get visually dense with 3 mean±std values each — if that
+    reads as too cramped once you see it, write_markdown_summary_agg()
+    (3 separate per-metric tables) remains available and is still
+    written alongside this one; use whichever fits your paper's layout
+    better. This function does not replace that one, only supplements it.
+    """
+    if horizons_h is None:
+        horizons_h = STANDARD_HORIZONS_H
+
+    storms = sorted(set(r["storm"] for r in agg_rows))
+    models_seen = sorted(set(r["model"] for r in agg_rows))
+
+    lines = ["# Per-storm error summary (ADE/ATE/CTE, mean±std across seeds, km) — all architectures\n",
+             f"Each cell: ADE±std/ATE±std/CTE±std (km) at that horizon. "
+             f"Standard horizons: {', '.join(f'{h}h' for h in horizons_h)}. "
+             f"Full per-6h, per-seed detail available in the companion CSV/JSON.\n"]
+    header = "| Storm | Model | " + " | ".join(f"{h}h (ADE/ATE/CTE)" for h in horizons_h) + " |"
+    sep    = "|---|---|" + "---|" * len(horizons_h)
+    lines.append(header)
+    lines.append(sep)
+
+    for storm in storms:
+        storm_recs = [r for r in agg_rows if r["storm"] == storm]
+        for model in models_seen:
+            m_recs = [r for r in storm_recs if r["model"] == model]
+            if not m_recs:
+                continue
+            cells = []
+            for h in horizons_h:
+                h_recs = [r for r in m_recs if r["lead_time_h"] == h]
+                ade_m = [r["ade_mean"] for r in h_recs if r["ade_mean"] is not None]
+                ade_s = [r["ade_std"]  for r in h_recs if r["ade_std"]  is not None]
+                ate_m = [r["ate_mean"] for r in h_recs if r["ate_mean"] is not None]
+                ate_s = [r["ate_std"]  for r in h_recs if r["ate_std"]  is not None]
+                cte_m = [r["cte_mean"] for r in h_recs if r["cte_mean"] is not None]
+                cte_s = [r["cte_std"]  for r in h_recs if r["cte_std"]  is not None]
+                ade_c = f"{np.mean(ade_m):.1f}±{np.mean(ade_s):.1f}" if ade_m else "—"
+                ate_c = f"{np.mean(ate_m):.1f}±{np.mean(ate_s):.1f}" if ate_m else "—"
+                cte_c = f"{np.mean(cte_m):.1f}±{np.mean(cte_s):.1f}" if cte_m else "—"
+                cells.append(f"{ade_c}/{ate_c}/{cte_c}")
+            lines.append(f"| {storm} | {model} | " + " | ".join(cells) + " |")
+
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"  Saved merged mean±std (ADE/ATE/CTE) markdown summary → {path}")
 
 
 def _parse_seed_from_path(path: str, fallback_idx: int) -> int:
@@ -665,8 +824,17 @@ def main():
         # unchanged output filenames/format.
         print_storm_tables(all_records)
         write_csv(all_records, os.path.join(args.output_dir, f"per_storm_timeline_{args.split}.csv"))
+        # [COMPACT] Markdown table uses STANDARD horizons (12/24/48/72h),
+        # not every 6h step — the full per-6h detail is in the CSV above.
+        # Only fall back to whatever horizons the data actually has if
+        # none of the standard ones are present (e.g. a shorter forecast).
+        md_horizons = [h for h in STANDARD_HORIZONS_H if h in horizons_h] or horizons_h
         write_markdown_summary(all_records, os.path.join(args.output_dir, f"per_storm_summary_{args.split}.md"),
-                                horizons_h)
+                                md_horizons)
+        # [MERGED] Same data, ADE/ATE/CTE combined into ONE table instead
+        # of three — supplements (does not replace) the per-metric file above.
+        write_markdown_summary_merged(all_records, os.path.join(args.output_dir, f"per_storm_summary_{args.split}_merged.md"),
+                                       md_horizons)
     else:
         print(f"\n  Multi-seed input detected ({n_seeds_by_arch}) — "
               f"aggregating to mean±std per (storm, window, model, lead_time)...")
@@ -680,8 +848,12 @@ def main():
         print(f"\n  Saved mean±std records → {agg_json_path}")
 
         write_csv_agg(agg_rows, os.path.join(args.output_dir, f"per_storm_timeline_{args.split}_meanstd.csv"))
+        md_horizons = [h for h in STANDARD_HORIZONS_H if h in horizons_h] or horizons_h
         write_markdown_summary_agg(agg_rows, os.path.join(args.output_dir, f"per_storm_summary_{args.split}_meanstd.md"),
-                                    horizons_h)
+                                    md_horizons)
+        # [MERGED] Same data, ADE/ATE/CTE combined into ONE table.
+        write_markdown_summary_agg_merged(agg_rows, os.path.join(args.output_dir, f"per_storm_summary_{args.split}_meanstd_merged.md"),
+                                           md_horizons)
 
 
 if __name__ == "__main__":
