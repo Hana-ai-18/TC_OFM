@@ -330,6 +330,42 @@ def aggregate_across_seeds(records: List[Dict]) -> List[Dict]:
                           f"ADE={r['ade']:7.1f}km  ATE={ate_s:>9}  CTE={cte_s:>9}")
 
 
+def print_storm_tables(records: List[Dict]):
+    """
+    [RESTORED] Human-readable console output for the SINGLE-seed case:
+    one block per storm, one sub-block per model, one line per timestep
+    — exactly the layout requested. This function was accidentally
+    dropped when print_storm_tables_agg() (the multi-seed mean±std
+    variant) was added in a later edit — main() still calls this name
+    for the is_multi_seed=False branch, so its absence was a real bug
+    (NameError at runtime), not just a Pylance false positive.
+    """
+    storms = sorted(set(r["storm"] for r in records))
+    models_seen = sorted(set(r["model"] for r in records))
+
+    for storm in storms:
+        print(f"\n{'='*78}")
+        print(f"Storm: {storm}")
+        print(f"{'='*78}")
+        storm_recs = [r for r in records if r["storm"] == storm]
+        windows = sorted(set(r["window"] for r in storm_recs))
+        for w in windows:
+            w_recs = [r for r in storm_recs if r["window"] == w]
+            if len(windows) > 1:
+                print(f"\n  -- window {w} --")
+            for model in models_seen:
+                m_recs = sorted([r for r in w_recs if r["model"] == model],
+                                 key=lambda r: r["lead_time_idx"])
+                if not m_recs:
+                    continue
+                print(f"\n  Model: {model}")
+                for r in m_recs:
+                    ate_s = f"{r['ate']:.1f}km" if r["ate"] is not None else "  n/a "
+                    cte_s = f"{r['cte']:.1f}km" if r["cte"] is not None else "  n/a "
+                    print(f"    {r['timestamp']:<20} (+{r['lead_time_h']:>3}h)  "
+                          f"ADE={r['ade']:7.1f}km  ATE={ate_s:>9}  CTE={cte_s:>9}")
+
+
 def print_storm_tables_agg(agg_rows: List[Dict]):
     """
     [MULTI-SEED] Same layout as print_storm_tables(), but for
