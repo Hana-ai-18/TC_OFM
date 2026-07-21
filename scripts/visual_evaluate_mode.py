@@ -1096,23 +1096,11 @@ def plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model
 
     all_pts = [obs_deg, gt_deg] + list(preds_by_model.values())
     all_deg = np.vstack(all_pts)
+    margin = 3.0
+    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
+    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
 
-    # [FIX] Cùng bug với plot_multi_seed_comparison — margin cố định
-    # 3.0° gây map bị co lệch khi track dài (aspect ratio PlateCarree
-    # giữ 1:1 độ kinh/vĩ). Dùng margin động theo độ trải dài thật.
-    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
-    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
-    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
-    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
-    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
-    margin_lon += extra_lon_widen
-    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
-    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
-
-    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
-    fig_h = 10.0
-    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 13.0))
-    fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
+    fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
     ax = make_map_ax(fig, 111, lon_range, lat_range)
 
     def _plot(x, y, **kw):
@@ -1196,44 +1184,19 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
 
     all_pts = [obs_deg, gt_deg] + list(preds_by_seed.values())
     all_deg = np.vstack(all_pts)
-
-    # [FIX, quan trọng] Trước đây margin=3.0 CỐ ĐỊNH — cùng lỗi đã tìm
-    # và sửa ở visualize_forecast(): với track dài (lệch hướng nhiều,
-    # trải rộng theo vĩ độ), khung map thật sự sẽ CAO-HẸP vì PlateCarree
-    # giữ đúng tỷ lệ 1:1 độ kinh/vĩ, nhưng figsize CỐ ĐỊNH (14,9) hay
-    # (8,9) không khớp tỷ lệ đó — matplotlib tự co map lại theo chiều
-    # ngang để giữ đúng aspect ratio, để lại khoảng trắng lớn 2 bên
-    # (đúng hiện tượng quan sát ở ảnh CONSON: map dồn lệch, viền trắng
-    # rất to). Sửa: margin tỷ lệ theo độ trải dài track thật (10% mỗi
-    # chiều, sàn 1.0°, trần 4.5°) — CÙNG công thức với visualize_forecast.
-    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
-    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
-    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
-    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
-    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
-    margin_lon += extra_lon_widen
-    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
-    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
-
-    # [FIX] figsize giờ tính ĐỘNG theo đúng tỷ lệ lon_range/lat_range
-    # thật của map — không còn hardcode (14,9)/(8,9). Panel wind (nếu
-    # có) giữ độ rộng cố định hợp lý bên cạnh, không phụ thuộc aspect
-    # ratio địa lý (nó là biểu đồ thường, không phải bản đồ).
-    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
-    fig_h = 10.0
-    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 13.0))
+    margin = 3.0
+    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
+    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
 
     has_wind = bool(winds_pred_by_seed) and wind_gt is not None
     if has_wind:
-        fig_w_wind = 6.0
-        fig = plt.figure(figsize=(fig_w_map + fig_w_wind + 1.0, fig_h),
-                         facecolor=STYLE["bg_color"])
-        gs  = fig.add_gridspec(1, 2, width_ratios=[fig_w_map, fig_w_wind], wspace=0.15)
+        fig = plt.figure(figsize=(14, 9), facecolor=STYLE["bg_color"])
+        gs  = fig.add_gridspec(1, 2, width_ratios=[3, 2], wspace=0.15)
         ax  = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
         ax_wind = fig.add_subplot(gs[0, 1])
         ax_wind.set_facecolor(STYLE["bg_color"])
     else:
-        fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
+        fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
         ax  = make_map_ax(fig, 111, lon_range, lat_range)
 
     def _plot(x, y, **kw):
