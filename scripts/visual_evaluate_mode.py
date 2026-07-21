@@ -1943,7 +1943,20 @@ if __name__ == "__main__":
     p.add_argument("--straight2_name", default="MANGKHUT")
     p.add_argument("--straight2_date", default="2018091312")
     p.add_argument("--recurv_date",    default="2019073106")
-    p.add_argument("--test_year",      type=int,   default=2019)
+    p.add_argument("--test_year",      type=int,   default=None,
+                   help="[FIX] Trước đây default=2019 -- data_loader() "
+                        "chỉ load file .txt có '2019' trong TÊN FILE "
+                        "(xác nhận qua trajectoriesWithMe_unet_training.py: "
+                        "'test_year is None or str(test_year) in f'), khiến "
+                        "MỌI storm khác năm 2019 bị loại bỏ hoàn toàn (đây "
+                        "là nguyên nhân RITA 1975 báo 'not found' trước đây). "
+                        "Dataset test ở đây có 1 file/storm trải dài "
+                        "1975-2024 (RITA/WAYNE/YANCY/FLO/TERESA/LINFA/"
+                        "DANAS/MOLAVE/CONSON/SURIGAE/HINNAMNOR/EWINIAR) -- "
+                        "default=None (không lọc gì, load HẾT mọi storm) "
+                        "là đúng cho cấu trúc dataset này. Chỉ truyền "
+                        "--test_year <năm> nếu bạn CHỦ ĐỘNG muốn giới hạn "
+                        "1 năm cụ thể.")
     p.add_argument("--obs_len",        type=int,   default=8)
     p.add_argument("--pred_len",       type=int,   default=12)
     p.add_argument("--ode_steps",      type=int,   default=10)
