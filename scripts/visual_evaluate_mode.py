@@ -40,8 +40,10 @@ from __future__ import annotations
 import os
 import sys
 import json
+import re
 import random
 import argparse
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -962,6 +964,15 @@ def run_inference_generic(model, target, device, model_type: str,
     với run_inference() gốc, chỉ tổng quát hoá phần gọi model.sample().
     Không in log chi tiết từng bước như run_inference() (dùng cho single
     mode, cần debug kỹ) — bản này dùng cho multi_model mode, cần gọn.
+
+    [BỔ SUNG] Giờ trả thêm wind_pred_kt (từ pred_Me, model output — cột
+    index 1 = WND, xác nhận qua trajectoriesWithMe_unet_training.py's
+    dòng "wind_norm = float(obs_Me[1, t])") và wind_gt_kt (ground-truth
+    wind thật, đọc từ batch[8] = pred_Me_out theo đúng thứ tự trả về
+    của seq_collate() — KHÔNG PHẢI đoán, đã xác nhận trực tiếp từ
+    source seq_collate: return (obs_traj, pred_traj, obs_rel, pred_rel,
+    nlp, mask, seq_start_end, obs_Me, pred_Me, pred_Me_rel, ...) — index
+    8 = pred_Me, đúng là Me (PRES,WND) của khoảng GT/prediction target).
     """
     batch = move_batch(seq_collate([target]), device)
     is_fm = (model_type == "fm")
@@ -983,6 +994,21 @@ def run_inference_generic(model, target, device, model_type: str,
     ens_n  = (_extract_ens(all_trajs)
               if (all_trajs is not None and torch.is_tensor(all_trajs)
                   and all_trajs.dim() == 4) else None)
+
+    # [BỔ SUNG] wind: pred_Me[:, 1] denorm bằng denorm_wind(); gt wind
+    # thật đọc từ batch[8] (pred_Me_out, đã xác nhận đúng index qua
+    # seq_collate() source thật, không phải đoán).
+    wind_pred_kt = None
+    if pred_Me is not None and torch.is_tensor(pred_Me):
+        pred_Me_n = _extract_seq(pred_Me)   # [T_pred, F_me], cột 1 = WND
+        if pred_Me_n.shape[-1] >= 2:
+            wind_pred_kt = denorm_wind(pred_Me_n[:, 1])
+
+    wind_gt_kt = None
+    if len(batch) > 8 and torch.is_tensor(batch[8]):
+        gt_Me_n = _extract_seq(batch[8])    # [T_pred, F_me], cột 1 = WND
+        if gt_Me_n.shape[-1] >= 2:
+            wind_gt_kt = denorm_wind(gt_Me_n[:, 1])
 
     obs_abs_mean  = np.abs(obs_n).mean()
     pred_abs_mean = np.abs(pred_n).mean()
@@ -1010,9 +1036,13 @@ def run_inference_generic(model, target, device, model_type: str,
         gt_deg   = gt_deg[:T_min]
         if ens_deg is not None and ens_deg.shape[1] != T_min:
             ens_deg = ens_deg[:, :T_min]
+        if wind_pred_kt is not None and wind_pred_kt.shape[0] != T_min:
+            wind_pred_kt = wind_pred_kt[:T_min]
+        if wind_gt_kt is not None and wind_gt_kt.shape[0] != T_min:
+            wind_gt_kt = wind_gt_kt[:T_min]
 
     errors_km = haversine_km(pred_deg, gt_deg)
-    return obs_deg, gt_deg, pred_deg, ens_deg, errors_km
+    return obs_deg, gt_deg, pred_deg, ens_deg, errors_km, wind_pred_kt, wind_gt_kt
 
 
 def load_model_generic(model_path: str, model_type: str, device,
@@ -1131,7 +1161,9 @@ def _seed_color(seed_label: str, idx: int) -> str:
 
 
 def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
-                                t_name: str, output_path: str):
+                                t_name: str, output_path: str,
+                                winds_pred_by_seed: dict = None,
+                                wind_gt=None):
     """
     Vẽ nhiều SEED của CÙNG 1 kiến trúc (mặc định FM, nhưng tổng quát cho
     bất kỳ model nào truyền vào) trên cùng 1 bản đồ, so với 1 ground
@@ -1139,6 +1171,13 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
     seed. Khác plot_multi_model_comparison() ở chỗ trục "nhiều đường" là
     SEED thay vì MODEL — dùng để minh hoạ độ ổn định của 1 kiến trúc qua
     random init, không phải so sánh kiến trúc với nhau.
+
+    [BỔ SUNG] winds_pred_by_seed (dict seed_label -> wind_kt array) và
+    wind_gt (ground-truth wind, chung cho mọi seed) — nếu được truyền,
+    thêm panel wind theo lead-time bên phải map (giống layout Spread vs
+    Error trước đây) + box thống kê MAE wind. Optional, default None
+    giữ nguyên hành vi cũ (chỉ map, không panel wind) cho tương thích
+    ngược với mọi lời gọi cũ chưa có wind data.
     """
     transform = ccrs.PlateCarree() if HAS_CARTOPY else None
     cur_pos = obs_deg[-1]
@@ -1149,8 +1188,16 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
     lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
     lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
 
-    fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
-    ax = make_map_ax(fig, 111, lon_range, lat_range)
+    has_wind = bool(winds_pred_by_seed) and wind_gt is not None
+    if has_wind:
+        fig = plt.figure(figsize=(14, 9), facecolor=STYLE["bg_color"])
+        gs  = fig.add_gridspec(1, 2, width_ratios=[3, 2], wspace=0.15)
+        ax  = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
+        ax_wind = fig.add_subplot(gs[0, 1])
+        ax_wind.set_facecolor(STYLE["bg_color"])
+    else:
+        fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
+        ax  = make_map_ax(fig, 111, lon_range, lat_range)
 
     def _plot(x, y, **kw):
         if HAS_CARTOPY:
@@ -1173,6 +1220,7 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
         Line2D([0], [0], color=STYLE["gt_color"], marker="o", lw=2.2, label="Actual Track"),
     ]
 
+    wind_lines = ["Wind MAE (kt):"] if has_wind else []
     for idx, (seed_label, pred_deg) in enumerate(preds_by_seed.items()):
         color = _seed_color(seed_label, idx)
         pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
@@ -1183,6 +1231,38 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
         ade = errors_by_seed[seed_label].mean()
         handles.append(Line2D([0], [0], color=color, marker="o", lw=1.6,
                               label=f"seed={seed_label} (ADE={ade:.0f}km)"))
+
+        # [BỔ SUNG] Panel wind theo lead-time, 1 đường/seed + 1 đường GT
+        if has_wind:
+            wpred = winds_pred_by_seed.get(seed_label)
+            if wpred is not None:
+                T = min(len(wpred), len(wind_gt))
+                hours = np.arange(1, T + 1) * 6
+                ax_wind.plot(hours, wpred[:T], "o-", color=color,
+                            linewidth=1.6, markersize=3.5,
+                            label=f"seed={seed_label}")
+                mae = float(np.abs(wpred[:T] - wind_gt[:T]).mean())
+                wind_lines.append(f" seed={seed_label}: {mae:.1f} kt")
+
+    if has_wind:
+        T_gt = len(wind_gt)
+        hours_gt = np.arange(1, T_gt + 1) * 6
+        ax_wind.plot(hours_gt, wind_gt, "o-", color=STYLE["gt_color"],
+                    linewidth=2.2, markersize=4, label="Actual", zorder=10)
+        ax_wind.set_xlabel("Forecast Lead Time (h)", fontsize=9)
+        ax_wind.set_ylabel("Wind Speed (kt)", fontsize=9)
+        ax_wind.set_title("Wind Speed Comparison", fontsize=11, fontweight="bold")
+        ax_wind.legend(fontsize=7.5, framealpha=0.9)
+        ax_wind.grid(True, alpha=0.3, linestyle="--")
+
+        ax.text(
+            0.02, 0.03, "\n".join(wind_lines),
+            transform=ax.transAxes, fontsize=8, va="bottom",
+            color=STYLE["text_color"], family="monospace",
+            bbox=dict(boxstyle="round,pad=0.4", fc="white",
+                      alpha=0.9, ec=STYLE["panel_edge"], lw=0.8),
+            zorder=16,
+        )
 
     ax.set_title(f"{t_name} — Seed Comparison", fontsize=13,
                 fontweight="bold", color=STYLE["text_color"])
@@ -1569,18 +1649,22 @@ def visualize_multi_model(args):
         return
 
     preds_by_model, errors_by_model = {}, {}
+    winds_pred_by_model, wind_gt = {}, None
     obs_deg = gt_deg = None
     for name, kind, ckpt in jobs:
         print(f"  Loading {name}: {ckpt}")
         model = load_model_generic(ckpt, kind, device,
                                    obs_len=args.obs_len, pred_len=args.pred_len)
-        od, gd, pd_, ens, err = run_inference_generic(
+        od, gd, pd_, ens, err, wpred, wgt = run_inference_generic(
             model, target, device, kind,
             ode_steps=args.ode_steps,
             num_ensemble=(args.num_ensemble if kind == "fm" else 1))
         obs_deg, gt_deg = od, gd
         preds_by_model[name] = pd_
         errors_by_model[name] = err
+        winds_pred_by_model[name] = wpred
+        if wind_gt is None:
+            wind_gt = wgt  # giống nhau cho mọi model (cùng ground truth)
         print(f"    {name}: ADE={err.mean():.1f}km")
         del model
         if torch.cuda.is_available():
@@ -1590,6 +1674,164 @@ def visualize_multi_model(args):
     out = os.path.join(args.output_dir, f"track_multi_{t_name}_{t_date}.png")
     plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model,
                                 t_name, out)
+
+
+# ── Batch mode: mọi storm x mọi timestep x 5 model x 3 seed ─────────────────
+
+def iterate_all_storms(dset, obs_len: int):
+    """
+    [MỚI] Liệt kê TOÀN BỘ storm trong dataset + mọi index (mỗi index =
+    1 sample = 1 mốc dự báo cụ thể, dataset đã tự chia sẵn sliding
+    window lúc build — xác nhận qua trajectoriesWithMe_unet_training.py:
+    self.tyID.append({"old": [year, name, start_idx], "tydate": [...]})
+    với mỗi (start_idx, start_idx+seq_len) là 1 cửa sổ cố định, KHÔNG
+    cần tự trượt cửa sổ thủ công ở đây).
+
+    Trả về dict {storm_name: [(dataset_idx, forecast_date_str), ...]},
+    sắp theo đúng thứ tự thời gian trong dataset (đã là thứ tự sliding
+    window tăng dần vì cách self.tyID được append tuần tự lúc build).
+    """
+    storms = defaultdict(list)
+    seen_per_storm = defaultdict(set)  # tránh trùng lặp (storm, date) nếu dataset có augment
+    for i in range(len(dset)):
+        info = dset[i][-1]
+        name = str(info["old"][1]).strip().upper()
+        if obs_len >= len(info["tydate"]):
+            continue
+        fdate = str(info["tydate"][obs_len]).strip()
+        key = (name, fdate)
+        if key in seen_per_storm[name]:
+            continue
+        seen_per_storm[name].add(key)
+        storms[name].append((i, fdate))
+    return storms
+
+
+def visualize_batch_all_storms(args):
+    """
+    [MỚI] Chạy visualize cho MỌI storm x MỌI timestep có sẵn trong
+    dataset x 5 model (FM/ST-Trans/LSTM/GRU/RNN), mỗi model in cả 3
+    seed lên CÙNG 1 hình (dùng lại plot_multi_seed_comparison + logic
+    của visualize_multi_seed, không viết lại). Mỗi model dự báo đủ
+    args.pred_len bước (mặc định 12 = 72h).
+
+    Output: <output_dir>/<Storm>/<Model>/forecast_<date>.png
+
+    Checkpoint cho mỗi model: dùng --fm_checkpoints/--st_trans_checkpoints/
+    --lstm_checkpoints/--gru_checkpoints/--rnn_checkpoints (mỗi flag
+    nhận nhiều path, 1/seed) — model nào KHÔNG được truyền checkpoint sẽ
+    tự động BỎ QUA (không lỗi), để bạn có thể chạy batch chỉ với vài
+    model nếu chưa có đủ 5x3=15 checkpoint.
+
+    CẢNH BÁO SỐ LƯỢNG: với dataset nhiều storm dài, số hình sinh ra có
+    thể RẤT LỚN (mỗi storm N mốc x 5 model = 5N hình). Dùng --storm_filter
+    để giới hạn 1 vài storm cụ thể nếu chỉ muốn test trước khi chạy full.
+    """
+    set_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(f"{'=' * 65}")
+    print(f"  TC-FM Visualize — BATCH mode (mọi storm x mọi timestep)")
+    print(f"{'=' * 65}\n")
+
+    model_groups = [
+        ("FM",       "fm",       args.fm_checkpoints),
+        ("ST-Trans", "st_trans", args.st_trans_checkpoints),
+        ("LSTM",     "lstm",     args.lstm_checkpoints),
+        ("GRU",      "gru",      args.gru_checkpoints),
+        ("RNN",      "rnn",      args.rnn_checkpoints),
+    ]
+    model_groups = [(name, kind, ckpts) for name, kind, ckpts in model_groups if ckpts]
+    if not model_groups:
+        print("  ERROR: cần ít nhất 1 trong --fm_checkpoints / "
+              "--st_trans_checkpoints / --lstm_checkpoints / "
+              "--gru_checkpoints / --rnn_checkpoints (mỗi flag nhận "
+              "nhiều path, 1/seed)")
+        return
+    print(f"  Models sẽ chạy: {[name for name, _, _ in model_groups]}\n")
+
+    # Dataset load 1 lần dùng chung cho mọi model/seed (giống
+    # visualize_multi_model — tự load trực tiếp, không qua
+    # load_model_and_data() vốn gắn với 1 checkpoint FM cụ thể).
+    dset, _ = data_loader(
+        args, {"root": args.TC_data_path, "type": args.dset_type},
+        test=True, test_year=args.test_year,
+    )
+    print(f"  Dataset: {len(dset)} samples\n")
+
+    storms = iterate_all_storms(dset, args.obs_len)
+    if args.storm_filter:
+        wanted = {s.strip().upper() for s in args.storm_filter}
+        storms = {k: v for k, v in storms.items() if k in wanted}
+        print(f"  --storm_filter áp dụng: {sorted(storms.keys())}")
+
+    total_windows = sum(len(v) for v in storms.values())
+    print(f"  Tổng: {len(storms)} storm, {total_windows} mốc dự báo, "
+          f"{len(model_groups)} model → tối đa {total_windows * len(model_groups)} hình\n")
+
+    n_done, n_skipped = 0, 0
+    for storm_name, windows in storms.items():
+        for dataset_idx, fdate in windows:
+            target = dset[dataset_idx]
+
+            for model_name, model_kind, checkpoints in model_groups:
+                out_dir = os.path.join(args.output_dir, storm_name, model_name)
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"forecast_{fdate}.png")
+
+                if args.skip_existing and os.path.exists(out_path):
+                    n_skipped += 1
+                    continue
+
+                preds_by_seed, errors_by_seed = {}, {}
+                winds_pred_by_seed, wind_gt = {}, None
+                obs_deg = gt_deg = None
+                ok = True
+                for seed_idx, ckpt in enumerate(checkpoints):
+                    try:
+                        model = load_model_generic(
+                            ckpt, model_kind, device,
+                            obs_len=args.obs_len, pred_len=args.pred_len)
+                        od, gd, pd_, ens, err, wpred, wgt = run_inference_generic(
+                            model, target, device, model_kind,
+                            ode_steps=args.ode_steps,
+                            num_ensemble=(args.num_ensemble if model_kind == "fm" else 1))
+                        del model
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception as e:
+                        print(f"  ⚠ Lỗi {storm_name}/{model_name}/seed{seed_idx} "
+                              f"@ {fdate}: {e}")
+                        ok = False
+                        continue
+                    obs_deg, gt_deg = od, gd
+                    seed_label = str(seed_idx)
+                    m = re.search(r"seed[_-]?(\d+)", ckpt)
+                    if m:
+                        seed_label = m.group(1)
+                    preds_by_seed[seed_label] = pd_
+                    errors_by_seed[seed_label] = err
+                    winds_pred_by_seed[seed_label] = wpred
+                    if wind_gt is None:
+                        wind_gt = wgt
+
+                if not ok or not preds_by_seed:
+                    n_skipped += 1
+                    continue
+
+                try:
+                    plot_multi_seed_comparison(
+                        obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+                        f"{storm_name} @ {fdate}", out_path,
+                        winds_pred_by_seed=winds_pred_by_seed,
+                        wind_gt=wind_gt)
+                    n_done += 1
+                except Exception as e:
+                    print(f"  ⚠ Lỗi vẽ {storm_name}/{model_name} @ {fdate}: {e}")
+                    n_skipped += 1
+
+    print(f"\n  Hoàn tất: {n_done} hình đã lưu, {n_skipped} bị bỏ qua "
+          f"(lỗi hoặc đã tồn tại nếu --skip_existing).")
 
 
 # ── Multi-seed mode (chỉ cho 1 kiến trúc, mặc định FM) ──────────────────────
@@ -1652,19 +1894,23 @@ def visualize_multi_seed(args):
         return str(idx)
 
     preds_by_seed, errors_by_seed = {}, {}
+    winds_pred_by_seed, wind_gt = {}, None
     obs_deg = gt_deg = None
     for idx, ckpt in enumerate(args.seed_checkpoints):
         seed_label = _infer_seed_label(ckpt, idx)
         print(f"  Loading seed={seed_label}: {ckpt}")
         model = load_model_generic(ckpt, args.model_type, device,
                                    obs_len=args.obs_len, pred_len=args.pred_len)
-        od, gd, pd_, ens, err = run_inference_generic(
+        od, gd, pd_, ens, err, wpred, wgt = run_inference_generic(
             model, target, device, args.model_type,
             ode_steps=args.ode_steps,
             num_ensemble=(args.num_ensemble if args.model_type == "fm" else 1))
         obs_deg, gt_deg = od, gd
         preds_by_seed[seed_label] = pd_
         errors_by_seed[seed_label] = err
+        winds_pred_by_seed[seed_label] = wpred
+        if wind_gt is None:
+            wind_gt = wgt  # giống nhau cho mọi seed (cùng ground truth)
         print(f"    seed={seed_label}: ADE={err.mean():.1f}km")
         del model
         if torch.cuda.is_available():
@@ -1674,7 +1920,9 @@ def visualize_multi_seed(args):
     out = os.path.join(args.output_dir,
                        f"track_multiseed_{args.model_type}_{t_name}_{t_date}.png")
     plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
-                               f"{t_name} ({args.model_type.upper()})", out)
+                               f"{t_name} ({args.model_type.upper()})", out,
+                               winds_pred_by_seed=winds_pred_by_seed,
+                               wind_gt=wind_gt)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -1686,7 +1934,7 @@ if __name__ == "__main__":
     p.add_argument("--TC_data_path",   required=True)
     p.add_argument("--output_dir",     default="outputs")
     p.add_argument("--mode",           default="single",
-                   choices=["single", "case_study", "multi_model", "multi_seed"])
+                   choices=["single", "case_study", "multi_model", "multi_seed", "batch_all"])
     p.add_argument("--tc_name",        default="WIPHA")
     p.add_argument("--tc_date",        default="2019073106")
     p.add_argument("--dset_type",      default="test")
@@ -1733,6 +1981,28 @@ if __name__ == "__main__":
                    choices=["fm", "st_trans", "lstm", "gru", "rnn"],
                    help="Kiến trúc dùng cho --mode multi_seed (mặc định fm)")
 
+    # --mode batch_all: MỖI model nhận NHIỀU checkpoint (nhiều seed) —
+    # khác --fm_checkpoint (số ít, multi_model) và --seed_checkpoints
+    # (chỉ 1 model, multi_seed). Model nào không truyền checkpoints sẽ
+    # tự động bỏ qua khi chạy batch.
+    p.add_argument("--fm_checkpoints",       nargs="+", default=None,
+                   help="[batch_all] Nhiều checkpoint FM, 1/seed")
+    p.add_argument("--st_trans_checkpoints", nargs="+", default=None,
+                   help="[batch_all] Nhiều checkpoint ST-Trans, 1/seed")
+    p.add_argument("--lstm_checkpoints",     nargs="+", default=None,
+                   help="[batch_all] Nhiều checkpoint LSTM, 1/seed")
+    p.add_argument("--gru_checkpoints",      nargs="+", default=None,
+                   help="[batch_all] Nhiều checkpoint GRU, 1/seed")
+    p.add_argument("--rnn_checkpoints",      nargs="+", default=None,
+                   help="[batch_all] Nhiều checkpoint RNN, 1/seed")
+    p.add_argument("--storm_filter",         nargs="+", default=None,
+                   help="[batch_all, optional] Chỉ chạy các storm này "
+                        "(tên viết hoa, ví dụ RITA WIPHA) — không truyền "
+                        "thì chạy TOÀN BỘ storm trong dataset.")
+    p.add_argument("--skip_existing",        action="store_true", default=False,
+                   help="[batch_all] Bỏ qua nếu file output đã tồn tại "
+                        "(hữu ích khi chạy lại sau khi bị gián đoạn).")
+
     args = p.parse_args()
     if args.mode == "single":
         if not args.model_path:
@@ -1744,5 +2014,7 @@ if __name__ == "__main__":
         visualize_case_study(args)
     elif args.mode == "multi_model":
         visualize_multi_model(args)
-    else:
+    elif args.mode == "multi_seed":
         visualize_multi_seed(args)
+    elif args.mode == "batch_all":
+        visualize_batch_all_storms(args)
