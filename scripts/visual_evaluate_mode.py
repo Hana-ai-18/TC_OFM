@@ -1471,11 +1471,29 @@ def visualize_forecast(args):
     # báo (pred + ensemble, margin nhỏ cố định ~1.5x max spread thay vì
     # margin theo track dài), để ensemble luôn nhìn rõ được bất kể map
     # chính phải zoom xa cỡ nào.
-    fig = plt.figure(figsize=(18, 13), facecolor=STYLE["bg_color"])
-    gs  = fig.add_gridspec(1, 3, width_ratios=[2, 2, 1], wspace=0.12)
-    ax_map   = make_map_ax(fig, gs[0, :2], lon_range, lat_range)
-    ax_inset = make_map_ax(fig, gs[0, 2],
-                           *_inset_range(pred_deg, ens_deg))
+    # [FIX, quan trọng] Layout trước đây dùng figsize CỐ ĐỊNH (18,13)
+    # không tính tỷ lệ khung hình thật của map — với PlateCarree,
+    # cartopy giữ ĐÚNG tỷ lệ 1:1 độ kinh/vĩ khi vẽ. Track RITA trải dài
+    # chủ yếu theo VĨ ĐỘ (cao-hẹp), nhưng figsize (18,13) là khung
+    # RỘNG-THẤP (tỷ lệ ~1.38:1) — matplotlib tự co map lại theo chiều
+    # ngang để giữ đúng aspect ratio địa lý, để lại khoảng trắng lớn 2
+    # bên (đúng hiện tượng quan sát được trong ảnh). Giờ tính figsize
+    # ĐỘNG theo đúng tỷ lệ lon_range/lat_range thật của map chính, với
+    # 1 cột phụ hẹp cho inset (không dùng width_ratios cố định nữa vì
+    # nó không biết trước tỷ lệ khung hình thật).
+    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
+    fig_h = 11.0
+    fig_w_map = fig_h * map_aspect
+    fig_w_map = float(np.clip(fig_w_map, 5.0, 14.0))   # tránh quá hẹp/quá rộng
+    inset_lon_r, inset_lat_r = _inset_range(pred_deg, ens_deg)
+    inset_aspect = (inset_lon_r[1] - inset_lon_r[0]) / max(inset_lat_r[1] - inset_lat_r[0], 0.01)
+    fig_w_inset = float(np.clip(fig_h * inset_aspect, 3.0, 7.0))
+
+    fig = plt.figure(figsize=(fig_w_map + fig_w_inset + 1.5, fig_h),
+                     facecolor=STYLE["bg_color"])
+    gs  = fig.add_gridspec(1, 2, width_ratios=[fig_w_map, fig_w_inset], wspace=0.15)
+    ax_map   = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
+    ax_inset = make_map_ax(fig, gs[0, 1], inset_lon_r, inset_lat_r)
 
     dt_str    = datetime.strptime(t_date, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
     fh        = args.pred_len * 6
@@ -1494,7 +1512,7 @@ def visualize_forecast(args):
         ref_spread_km=ref_spread_km,
     )
     _plot_on_ax(
-        ax_inset, *_inset_range(pred_deg, ens_deg),
+        ax_inset, inset_lon_r, inset_lat_r,
         obs_deg, gt_deg, pred_deg, pred_Me_n,
         all_trajs_deg=ens_deg if args.num_ensemble >= 3 else None,
         errors_km=None,   # không lặp lại error summary box trong inset — chỉ cần cone
