@@ -810,6 +810,214 @@ def _plot_on_ax(
         spine.set_edgecolor(STYLE["panel_edge"])
 
 
+def _plot_multi_seed_on_ax(
+    ax, lon_range, lat_range,
+    obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+    all_trajs_by_seed=None,
+    title="", dt_str="",
+    ref_spread_km=None,
+):
+    """
+    [MỚI] Bản multi-seed của _plot_on_ax() — GIỮ NGUYÊN toàn bộ chi tiết
+    (cone xác suất 50/90%, error connector 24/48/72h, error+spread
+    summary box, lead-time label, NOW star, legend track) nhưng:
+      - KHÔNG có wind-intensity markers/legend (theo yêu cầu bỏ wind)
+      - Predicted track giờ là NHIỀU đường (1/seed), màu theo XẾP HẠNG
+        chất lượng: seed có ADE thấp nhất (tốt nhất) tô ĐẬM/dày, các
+        seed còn lại tô NHẠT/mảnh hơn — thay vì mỗi seed 1 màu riêng
+        như plot_multi_seed_comparison() cũ.
+      - Cone xác suất được vẽ từ ENSEMBLE GỘP CẢ 3 SEED (concat theo
+        trục S) — thể hiện đúng "spread kỹ" gồm cả model uncertainty
+        (ensemble trong 1 seed) LẪN variance giữa các seed, không chỉ
+        1 trong 2 nguồn bất định.
+
+    all_trajs_by_seed: dict seed_label -> ens_deg [K,T,2] (optional).
+    """
+    transform = ccrs.PlateCarree() if HAS_CARTOPY else None
+    outline   = [pe.withStroke(linewidth=2.5, foreground="white")]
+    cur_pos   = obs_deg[-1]
+
+    def _plot(x, y, fmt=None, **kw):
+        args_ = [x, y] + ([fmt] if fmt is not None else [])
+        if HAS_CARTOPY:
+            ax.plot(*args_, transform=transform, **kw)
+        else:
+            ax.plot(*args_, **kw)
+
+    def _scatter(x, y, **kw):
+        if HAS_CARTOPY:
+            ax.scatter(x, y, transform=transform, **kw)
+        else:
+            ax.scatter(x, y, **kw)
+
+    def _text(x, y, s, **kw):
+        if HAS_CARTOPY:
+            ax.text(x, y, s, transform=transform, **kw)
+        else:
+            ax.text(x, y, s, **kw)
+
+    # 1. Probability cone — GỘP ensemble của TẤT CẢ seed thành 1 cone
+    # duy nhất (không phải 1 cone/seed) để thể hiện đúng "spread kỹ"
+    # bao gồm cả model uncertainty lẫn seed-to-seed variance.
+    all_trajs_deg = None
+    if all_trajs_by_seed:
+        valid_ens = [v for v in all_trajs_by_seed.values() if v is not None]
+        if valid_ens:
+            T_min = min(v.shape[1] for v in valid_ens)
+            all_trajs_deg = np.concatenate([v[:, :T_min, :] for v in valid_ens], axis=0)
+    if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
+        draw_smooth_cone(ax, all_trajs_deg, cur_pos, transform)
+
+    # 2. Observed track
+    _plot(obs_deg[:, 0], obs_deg[:, 1], fmt="o-",
+          color=STYLE["obs_color"], linewidth=STYLE["lw_thin"], markersize=5,
+          markeredgecolor="white", markeredgewidth=0.8,
+          zorder=7, path_effects=outline)
+
+    # 3. Ground truth
+    gt_lon = np.concatenate([[cur_pos[0]], gt_deg[:, 0]])
+    gt_lat = np.concatenate([[cur_pos[1]], gt_deg[:, 1]])
+    _plot(gt_lon, gt_lat, fmt="o-",
+          color=STYLE["gt_color"], linewidth=STYLE["lw_main"],
+          markersize=STYLE["marker_size"],
+          markeredgecolor="white", markeredgewidth=1.2,
+          zorder=8, path_effects=outline)
+
+    # 4. Predicted track — NHIỀU seed, màu/độ đậm theo xếp hạng ADE.
+    # Seed tốt nhất (ADE thấp nhất): pred_color đậm, nét dày, zorder cao
+    # nhất (vẽ đè lên trên). Seed còn lại: cùng màu nhưng alpha thấp
+    # hơn, nét mảnh hơn, zorder thấp hơn (vẽ dưới) — tạo cảm giác "mờ
+    # dần" cho seed kém hơn, đúng yêu cầu "tốt nhất đậm, tệ nhạt".
+    ranked = sorted(errors_by_seed.items(), key=lambda kv: kv[1].mean())
+    n_seeds = len(ranked)
+    all_pred_lon_last, all_pred_lat_last = None, None
+    for rank, (seed_label, err) in enumerate(ranked):
+        pred_deg = preds_by_seed[seed_label]
+        pred_lon = np.concatenate([[cur_pos[0]], pred_deg[:, 0]])
+        pred_lat = np.concatenate([[cur_pos[1]], pred_deg[:, 1]])
+        is_best  = (rank == 0)
+        alpha    = 1.0 if is_best else max(0.35, 0.75 - 0.25 * rank)
+        lw       = STYLE["lw_main"] * (1.15 if is_best else 0.75)
+        ms       = STYLE["marker_size"] * (1.0 if is_best else 0.75)
+        zo       = 9 + (n_seeds - rank)   # best seed vẽ sau cùng => đè lên trên
+        _plot(pred_lon, pred_lat, fmt="o-",
+              color=STYLE["pred_color"], linewidth=lw, alpha=alpha,
+              markersize=ms, markeredgecolor="white",
+              markeredgewidth=1.0 if is_best else 0.6,
+              zorder=zo, path_effects=(outline if is_best else None))
+        if is_best:
+            all_pred_lon_last, all_pred_lat_last = pred_lon, pred_lat
+
+    # Dùng track của seed TỐT NHẤT làm mốc cho label/error-connector bên
+    # dưới (đại diện, tránh chồng chéo label nếu vẽ cho cả 3 seed).
+    best_seed_label, best_err = ranked[0]
+    pred_deg_best = preds_by_seed[best_seed_label]
+    pred_lon, pred_lat = all_pred_lon_last, all_pred_lat_last
+    errors_km = best_err
+
+    # 5. (Wind markers — ĐÃ BỎ theo yêu cầu)
+
+    # 6. Error connectors at 24/48/72h — dùng seed tốt nhất
+    for si, lbl in {3: "24h", 7: "48h", 11: "72h"}.items():
+        if si < len(gt_deg) and si < len(pred_deg_best):
+            gx, gy = gt_deg[si, 0], gt_deg[si, 1]
+            px, py = pred_deg_best[si, 0], pred_deg_best[si, 1]
+            if HAS_CARTOPY:
+                ax.plot([gx, px], [gy, py], "--",
+                        color=STYLE["error_color"], linewidth=1.2,
+                        alpha=0.8, transform=transform, zorder=7)
+            else:
+                ax.plot([gx, px], [gy, py], "--",
+                        color=STYLE["error_color"], linewidth=1.2,
+                        alpha=0.8, zorder=7)
+            _text(
+                (gx + px) / 2, (gy + py) / 2,
+                f" {lbl}\n{errors_km[si]:.0f}km",
+                fontsize=7, color=STYLE["error_color"],
+                ha="center", va="bottom", zorder=14,
+                path_effects=outline,
+            )
+
+    # 7. Lead-time labels every 24h
+    for i in range(len(pred_lon)):
+        h = i * 6
+        if h % 24 == 0:
+            lbl = "NOW" if i == 0 else f"+{h}h"
+            _text(pred_lon[i], pred_lat[i] + 0.5, lbl,
+                  color=STYLE["pred_color"], fontweight="bold", fontsize=7.5,
+                  path_effects=outline)
+            if i < len(gt_lon):
+                _text(gt_lon[i], gt_lat[i] - 0.7, lbl,
+                      color=STYLE["gt_color"], fontsize=6, alpha=0.9,
+                      path_effects=outline)
+
+    # 8. NOW star
+    _scatter([cur_pos[0]], [cur_pos[1]],
+             s=350, marker="*", color="#FFD700",
+             edgecolors="black", linewidths=1.5, zorder=20)
+
+    # 9. Error + Spread summary box — ADE mỗi seed + spread gộp
+    n = len(errors_km)
+    lines = ["ADE by seed (km):"]
+    for seed_label, err in ranked:
+        tag = " ★best" if seed_label == best_seed_label else ""
+        lines.append(f" seed={seed_label}: {err.mean():.0f}{tag}")
+    lines.append("")
+    lines.append(f"Best seed @ 24/48/72h:")
+    for si, lh in [(3, 24), (7, 48), (11, 72)]:
+        if si < n:
+            lines.append(f" {lh}h: {errors_km[si]:.0f} km")
+
+    if all_trajs_deg is not None and all_trajs_deg.shape[0] >= 3:
+        lines.append("")
+        lines.append("Spread (1σ, gộp seed):")
+        for si, lh in [(3, 24), (7, 48), (11, 72)]:
+            if si < all_trajs_deg.shape[1]:
+                members_at_t = all_trajs_deg[:, si, :]
+                mean_at_t    = members_at_t.mean(axis=0, keepdims=True)
+                d_to_mean    = haversine_km(members_at_t, np.repeat(mean_at_t, members_at_t.shape[0], axis=0))
+                this_spread  = d_to_mean.std()
+                ref_str = ""
+                if ref_spread_km and lh in ref_spread_km:
+                    ref_str = f" (ref: {ref_spread_km[lh]:.0f})"
+                lines.append(f" {lh}h: {this_spread:.0f} km{ref_str}")
+
+    ax.text(
+        0.02, 0.03, "\n".join(lines),
+        transform=ax.transAxes, fontsize=8, va="bottom",
+        color=STYLE["text_color"], family="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", fc="white",
+                  alpha=0.9, ec=STYLE["panel_edge"], lw=0.8),
+        zorder=16,
+    )
+
+    # 10. Legend (không có wind legend)
+    track_handles = [
+        Line2D([0], [0], color=STYLE["obs_color"],  lw=2,   label="Observed"),
+        Line2D([0], [0], color=STYLE["gt_color"],   lw=2,   label="Ground truth"),
+        Line2D([0], [0], color=STYLE["pred_color"], lw=2.5, alpha=1.0,
+               label=f"Predicted (seed={best_seed_label}, best)"),
+        Line2D([0], [0], color=STYLE["pred_color"], lw=1.5, alpha=0.5,
+               label="Predicted (other seeds)"),
+        mpatches.Patch(facecolor=STYLE["cone_50_fill"], alpha=0.5,
+                       label="50% prob. cone"),
+        mpatches.Patch(facecolor=STYLE["cone_90_fill"], alpha=0.35,
+                       label="90% prob. cone"),
+    ]
+    ax.legend(handles=track_handles, loc="lower right", fontsize=7.5,
+              facecolor="white", edgecolor=STYLE["panel_edge"],
+              labelcolor=STYLE["text_color"], framealpha=0.92)
+
+    ax.set_title(
+        f"{title}\n{dt_str}", color=STYLE["text_color"], fontsize=10,
+        fontweight="bold", pad=STYLE["title_pad"],
+        bbox=dict(fc="white", alpha=0.9, ec=STYLE["panel_edge"], lw=1.2),
+    )
+    ax.set_facecolor(STYLE["bg_color"])
+    for spine in ax.spines.values():
+        spine.set_edgecolor(STYLE["panel_edge"])
+
+
 # ── Run inference ──────────────────────────────────────────────────────────────
 
 def _extract_seq(tensor, batch_idx=0):
@@ -1096,11 +1304,23 @@ def plot_multi_model_comparison(obs_deg, gt_deg, preds_by_model, errors_by_model
 
     all_pts = [obs_deg, gt_deg] + list(preds_by_model.values())
     all_deg = np.vstack(all_pts)
-    margin = 3.0
-    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
-    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
 
-    fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
+    # [FIX] Cùng bug với plot_multi_seed_comparison — margin cố định
+    # 3.0° gây map bị co lệch khi track dài (aspect ratio PlateCarree
+    # giữ 1:1 độ kinh/vĩ). Dùng margin động theo độ trải dài thật.
+    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
+    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
+    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
+    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
+    margin_lon += extra_lon_widen
+    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
+    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
+
+    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
+    fig_h = 10.0
+    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 13.0))
+    fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
     ax = make_map_ax(fig, 111, lon_range, lat_range)
 
     def _plot(x, y, **kw):
@@ -1184,19 +1404,44 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
 
     all_pts = [obs_deg, gt_deg] + list(preds_by_seed.values())
     all_deg = np.vstack(all_pts)
-    margin = 3.0
-    lon_range = (all_deg[:, 0].min() - margin, all_deg[:, 0].max() + margin)
-    lat_range = (all_deg[:, 1].min() - margin, all_deg[:, 1].max() + margin)
+
+    # [FIX, quan trọng] Trước đây margin=3.0 CỐ ĐỊNH — cùng lỗi đã tìm
+    # và sửa ở visualize_forecast(): với track dài (lệch hướng nhiều,
+    # trải rộng theo vĩ độ), khung map thật sự sẽ CAO-HẸP vì PlateCarree
+    # giữ đúng tỷ lệ 1:1 độ kinh/vĩ, nhưng figsize CỐ ĐỊNH (14,9) hay
+    # (8,9) không khớp tỷ lệ đó — matplotlib tự co map lại theo chiều
+    # ngang để giữ đúng aspect ratio, để lại khoảng trắng lớn 2 bên
+    # (đúng hiện tượng quan sát ở ảnh CONSON: map dồn lệch, viền trắng
+    # rất to). Sửa: margin tỷ lệ theo độ trải dài track thật (10% mỗi
+    # chiều, sàn 1.0°, trần 4.5°) — CÙNG công thức với visualize_forecast.
+    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
+    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
+    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
+    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
+    margin_lon += extra_lon_widen
+    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
+    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
+
+    # [FIX] figsize giờ tính ĐỘNG theo đúng tỷ lệ lon_range/lat_range
+    # thật của map — không còn hardcode (14,9)/(8,9). Panel wind (nếu
+    # có) giữ độ rộng cố định hợp lý bên cạnh, không phụ thuộc aspect
+    # ratio địa lý (nó là biểu đồ thường, không phải bản đồ).
+    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
+    fig_h = 10.0
+    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 13.0))
 
     has_wind = bool(winds_pred_by_seed) and wind_gt is not None
     if has_wind:
-        fig = plt.figure(figsize=(14, 9), facecolor=STYLE["bg_color"])
-        gs  = fig.add_gridspec(1, 2, width_ratios=[3, 2], wspace=0.15)
+        fig_w_wind = 6.0
+        fig = plt.figure(figsize=(fig_w_map + fig_w_wind + 1.0, fig_h),
+                         facecolor=STYLE["bg_color"])
+        gs  = fig.add_gridspec(1, 2, width_ratios=[fig_w_map, fig_w_wind], wspace=0.15)
         ax  = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
         ax_wind = fig.add_subplot(gs[0, 1])
         ax_wind.set_facecolor(STYLE["bg_color"])
     else:
-        fig = plt.figure(figsize=(8, 9), facecolor=STYLE["bg_color"])
+        fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
         ax  = make_map_ax(fig, 111, lon_range, lat_range)
 
     def _plot(x, y, **kw):
@@ -1270,6 +1515,90 @@ def plot_multi_seed_comparison(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
 
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"  Saved → {output_path}")
+
+
+def plot_multi_seed_forecast(obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+                              t_name: str, dt_str: str, output_path: str,
+                              all_trajs_by_seed: dict = None,
+                              ref_spread_km=None):
+    """
+    [MỚI] Layout ĐẦY ĐỦ CHI TIẾT giống hệt visualize_forecast() (map
+    chính + inset zoom cận cảnh, cone xác suất 50/90%, error connector,
+    error+spread summary box) nhưng cho NHIỀU SEED của 1 kiến trúc thay
+    vì 1 model đơn — dùng _plot_multi_seed_on_ax() (không có wind, màu
+    theo xếp hạng: seed tốt nhất đậm, seed còn lại nhạt).
+
+    Đây là hàm THAY THẾ plot_multi_seed_comparison() cho mục đích cần
+    độ chi tiết cao (batch_all mode) — plot_multi_seed_comparison() cũ
+    vẫn giữ nguyên, dùng cho trường hợp cần cả wind panel.
+    """
+    all_pts = [obs_deg, gt_deg] + list(preds_by_seed.values())
+    if all_trajs_by_seed:
+        for v in all_trajs_by_seed.values():
+            if v is not None:
+                all_pts.append(v.reshape(-1, 2))
+    all_deg = np.vstack(all_pts)
+
+    # Margin động theo track thật — cùng công thức đã dùng ở
+    # visualize_forecast()/plot_multi_seed_comparison() đã sửa.
+    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
+    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
+    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
+    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
+    margin_lon += extra_lon_widen
+    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
+    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
+
+    # Best-seed track + ensemble dùng để tính inset zoom (giống
+    # visualize_forecast() zoom quanh pred+ensemble của model chính).
+    ranked = sorted(errors_by_seed.items(), key=lambda kv: kv[1].mean())
+    best_seed_label = ranked[0][0]
+    pred_deg_best = preds_by_seed[best_seed_label]
+    ens_best = all_trajs_by_seed.get(best_seed_label) if all_trajs_by_seed else None
+    # Ensemble gộp CẢ 3 seed cho inset — thấy được spread thật đầy đủ,
+    # không chỉ riêng seed tốt nhất.
+    ens_all = None
+    if all_trajs_by_seed:
+        valid_ens = [v for v in all_trajs_by_seed.values() if v is not None]
+        if valid_ens:
+            T_min = min(v.shape[1] for v in valid_ens)
+            ens_all = np.concatenate([v[:, :T_min, :] for v in valid_ens], axis=0)
+
+    inset_lon_r, inset_lat_r = _inset_range(pred_deg_best, ens_all)
+
+    # Figsize động theo đúng tỷ lệ khung hình thật (cùng công thức đã
+    # dùng ở visualize_forecast()).
+    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
+    fig_h = 11.0
+    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 14.0))
+    inset_aspect = (inset_lon_r[1] - inset_lon_r[0]) / max(inset_lat_r[1] - inset_lat_r[0], 0.01)
+    fig_w_inset = float(np.clip(fig_h * inset_aspect, 3.0, 7.0))
+
+    fig = plt.figure(figsize=(fig_w_map + fig_w_inset + 1.5, fig_h),
+                     facecolor=STYLE["bg_color"])
+    gs  = fig.add_gridspec(1, 2, width_ratios=[fig_w_map, fig_w_inset], wspace=0.15)
+    ax_map   = make_map_ax(fig, gs[0, 0], lon_range, lat_range)
+    ax_inset = make_map_ax(fig, gs[0, 1], inset_lon_r, inset_lat_r)
+
+    _plot_multi_seed_on_ax(
+        ax_map, lon_range, lat_range,
+        obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+        all_trajs_by_seed=all_trajs_by_seed,
+        title=t_name, dt_str=dt_str,
+        ref_spread_km=ref_spread_km,
+    )
+    _plot_multi_seed_on_ax(
+        ax_inset, inset_lon_r, inset_lat_r,
+        obs_deg, gt_deg, preds_by_seed, errors_by_seed,
+        all_trajs_by_seed=all_trajs_by_seed,
+        title="Zoom: Predicted + Spread", dt_str="",
+    )
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    plt.savefig(output_path, dpi=200, bbox_inches="tight", facecolor=STYLE["bg_color"])
     plt.close()
     print(f"  Saved → {output_path}")
 
@@ -1729,8 +2058,11 @@ def visualize_batch_all_storms(args):
     """
     [MỚI] Chạy visualize cho MỌI storm x MỌI timestep có sẵn trong
     dataset x 5 model (FM/ST-Trans/LSTM/GRU/RNN), mỗi model in cả 3
-    seed lên CÙNG 1 hình (dùng lại plot_multi_seed_comparison + logic
-    của visualize_multi_seed, không viết lại). Mỗi model dự báo đủ
+    seed lên CÙNG 1 hình. Dùng plot_multi_seed_forecast() — layout ĐẦY
+    ĐỦ CHI TIẾT (map chính + inset zoom cận cảnh, cone xác suất 50/90%,
+    error connector 24/48/72h, error+spread summary box), KHÔNG có wind
+    panel/marker (đã bỏ theo yêu cầu). Seed tốt nhất (ADE thấp nhất) tô
+    đậm/dày, seed còn lại tô nhạt/mảnh hơn. Mỗi model dự báo đủ
     args.pred_len bước (mặc định 12 = 72h).
 
     Output: <output_dir>/<Storm>/<Model>/forecast_<date>.png
@@ -1801,8 +2133,7 @@ def visualize_batch_all_storms(args):
                     n_skipped += 1
                     continue
 
-                preds_by_seed, errors_by_seed = {}, {}
-                winds_pred_by_seed, wind_gt = {}, None
+                preds_by_seed, errors_by_seed, ens_by_seed = {}, {}, {}
                 obs_deg = gt_deg = None
                 ok = True
                 for seed_idx, ckpt in enumerate(checkpoints):
@@ -1829,20 +2160,21 @@ def visualize_batch_all_storms(args):
                         seed_label = m.group(1)
                     preds_by_seed[seed_label] = pd_
                     errors_by_seed[seed_label] = err
-                    winds_pred_by_seed[seed_label] = wpred
-                    if wind_gt is None:
-                        wind_gt = wgt
+                    ens_by_seed[seed_label] = ens   # [K,T,2] ensemble của seed này (None nếu model không phải FM/không có ensemble)
 
                 if not ok or not preds_by_seed:
                     n_skipped += 1
                     continue
 
                 try:
-                    plot_multi_seed_comparison(
+                    dt_str = datetime.strptime(fdate, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
+                    fh = args.pred_len * 6
+                    plot_multi_seed_forecast(
                         obs_deg, gt_deg, preds_by_seed, errors_by_seed,
-                        f"{storm_name} @ {fdate}", out_path,
-                        winds_pred_by_seed=winds_pred_by_seed,
-                        wind_gt=wind_gt)
+                        f"{storm_name}  —  {fh}h FC  |  {model_name}"
+                        f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps})",
+                        dt_str, out_path,
+                        all_trajs_by_seed=ens_by_seed)
                     n_done += 1
                 except Exception as e:
                     print(f"  ⚠ Lỗi vẽ {storm_name}/{model_name} @ {fdate}: {e}")
