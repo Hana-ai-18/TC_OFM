@@ -2068,13 +2068,13 @@ def iterate_all_storms(dset, obs_len: int):
 def visualize_batch_all_storms(args):
     """
     [MỚI] Chạy visualize cho MỌI storm x MỌI timestep có sẵn trong
-    dataset x 5 model (FM/ST-Trans/LSTM/GRU/RNN), mỗi model in cả 3
-    seed lên CÙNG 1 hình. Dùng plot_multi_seed_forecast() — layout ĐẦY
-    ĐỦ CHI TIẾT (map chính + inset zoom cận cảnh, cone xác suất 50/90%,
-    error connector 24/48/72h, error+spread summary box), KHÔNG có wind
-    panel/marker (đã bỏ theo yêu cầu). Seed tốt nhất (ADE thấp nhất) tô
-    đậm/dày, seed còn lại tô nhạt/mảnh hơn. Mỗi model dự báo đủ
-    args.pred_len bước (mặc định 12 = 72h).
+    dataset x 5 model (FM/ST-Trans/LSTM/GRU/RNN). Với mỗi model, chạy
+    đủ 3 seed để XÁC ĐỊNH seed nào có ADE thấp nhất (tốt nhất), nhưng
+    CHỈ VẼ seed tốt nhất đó — dùng thẳng _plot_on_ax() (giống hệt
+    visualize_forecast(), full map không inset, đúng style/nền đã xác
+    nhận đúng), KHÔNG còn hiển thị multi-seed đậm/nhạt như bản trước.
+    Không có wind panel/marker. Mỗi model dự báo đủ args.pred_len bước
+    (mặc định 12 = 72h).
 
     Output: <output_dir>/<Storm>/<Model>/forecast_<date>.png
 
@@ -2177,15 +2177,61 @@ def visualize_batch_all_storms(args):
                     n_skipped += 1
                     continue
 
+                # [FIX-17] Theo yêu cầu: KHÔNG còn hiển thị multi-seed
+                # (đậm/nhạt) nữa — chỉ chọn seed có ADE thấp nhất (tốt
+                # nhất) rồi vẽ y hệt visualize_forecast() (dùng thẳng
+                # _plot_on_ax(), full map không inset, đúng style/nền
+                # đã xác nhận đúng ở visualize_forecast()).
                 try:
+                    best_seed_label = min(errors_by_seed, key=lambda k: errors_by_seed[k].mean())
+                    pred_deg  = preds_by_seed[best_seed_label]
+                    ens_deg   = ens_by_seed.get(best_seed_label)
+                    errors_km = errors_by_seed[best_seed_label]
+
+                    all_pts = [obs_deg, gt_deg, pred_deg]
+                    if ens_deg is not None:
+                        all_pts.append(ens_deg.reshape(-1, 2))
+                    all_deg = np.vstack(all_pts)
+
+                    # Margin động theo track thật — CÙNG công thức đã
+                    # dùng ở visualize_forecast() (đây chính là style
+                    # bạn xác nhận đúng ở ảnh mẫu).
+                    lon_span = all_deg[:, 0].max() - all_deg[:, 0].min()
+                    lat_span = all_deg[:, 1].max() - all_deg[:, 1].min()
+                    margin_lon = float(np.clip(lon_span * 0.10, 1.0, 4.5))
+                    margin_lat = float(np.clip(lat_span * 0.10, 1.0, 4.5))
+                    extra_lon_widen = max(0.0, (lat_span - lon_span) * 0.35)
+                    margin_lon += extra_lon_widen
+                    lon_range = (all_deg[:, 0].min() - margin_lon, all_deg[:, 0].max() + margin_lon)
+                    lat_range = (all_deg[:, 1].min() - margin_lat, all_deg[:, 1].max() + margin_lat)
+
+                    map_aspect = (lon_range[1] - lon_range[0]) / max(lat_range[1] - lat_range[0], 0.01)
+                    fig_h = 11.0
+                    fig_w_map = float(np.clip(fig_h * map_aspect, 5.0, 14.0))
+
+                    fig = plt.figure(figsize=(fig_w_map, fig_h), facecolor=STYLE["bg_color"])
+                    ax_map = make_map_ax(fig, 111, lon_range, lat_range)
+
                     dt_str = datetime.strptime(fdate, "%Y%m%d%H").strftime("%d %b %Y  %H:%M UTC")
                     fh = args.pred_len * 6
-                    plot_multi_seed_forecast(
-                        obs_deg, gt_deg, preds_by_seed, errors_by_seed,
-                        f"{storm_name}  —  {fh}h FC  |  {model_name}"
-                        f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps})",
-                        dt_str, out_path,
-                        all_trajs_by_seed=ens_by_seed)
+                    _plot_on_ax(
+                        ax_map, lon_range, lat_range,
+                        obs_deg, gt_deg, pred_deg, None,   # pred_Me_deg=None -> không có wind marker
+                        all_trajs_deg=ens_deg if (ens_deg is not None and ens_deg.shape[0] >= 3) else None,
+                        errors_km=errors_km,
+                        title=(
+                            f"{storm_name}  —  {fh}h FC  |  {model_name}"
+                            f"  (ens={args.num_ensemble}, ode_steps={args.ode_steps}, "
+                            f"seed={best_seed_label})"
+                        ),
+                        dt_str=dt_str,
+                        pred_label=f"{model_name} seed={best_seed_label}",
+                    )
+
+                    os.makedirs(out_dir, exist_ok=True)
+                    plt.savefig(out_path, dpi=200, bbox_inches="tight", facecolor=STYLE["bg_color"])
+                    plt.close()
+                    print(f"  Saved → {out_path}")
                     n_done += 1
                 except Exception as e:
                     print(f"  ⚠ Lỗi vẽ {storm_name}/{model_name} @ {fdate}: {e}")
