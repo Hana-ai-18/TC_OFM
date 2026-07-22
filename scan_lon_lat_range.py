@@ -76,14 +76,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True,
                     help="Thư mục chứa Data1d/ (vd: /kaggle/input/datasets/kaggle1234uitvn/tc-ofm)")
-    ap.add_argument("--outlier_lon_threshold", type=float, default=95.0,
-                    help="[MỚI] Storm có bất kỳ điểm nào với kinh độ < ngưỡng này "
-                         "sẽ bị coi là OUTLIER (khác khu vực, ví dụ Vịnh Bengal/Ấn Độ "
-                         "Dương) và loại khỏi việc tính phạm vi -- thay vì liệt kê tay "
-                         "từng tên storm (đã chứng minh không đáng tin, có thể bỏ sót). "
-                         "Mặc định 95 độ E: đủ thấp để giữ mọi storm Tây Bắc TBD/Biển "
-                         "Đông/Việt Nam thật, đủ cao để loại storm Vịnh Bengal/Ấn Độ "
-                         "Dương (quan sát ở 74-79 độ E, cách biệt rõ so với nhóm còn lại).")
+    ap.add_argument("--scs_lon_min", type=float, default=99.0,
+                    help="[MỚI] Biên Tây của hộp 'Biển Đông' dùng để lọc storm -- "
+                         "mặc định 99°E (khoảng Vịnh Thái Lan/phía Nam Biển Đông).")
+    ap.add_argument("--scs_lon_max", type=float, default=121.0,
+                    help="[MỚI] Biên Đông của hộp 'Biển Đông' -- mặc định 121°E "
+                         "(khoảng Luzon Strait, ranh giới với Tây TBD).")
+    ap.add_argument("--scs_lat_min", type=float, default=0.0,
+                    help="[MỚI] Biên Nam của hộp 'Biển Đông' -- mặc định 0°N.")
+    ap.add_argument("--scs_lat_max", type=float, default=23.0,
+                    help="[MỚI] Biên Bắc của hộp 'Biển Đông' -- mặc định 23°N "
+                         "(khoảng biên giới Việt Nam - Trung Quốc / đảo Hải Nam).")
     args = ap.parse_args()
 
     data1d = os.path.join(args.root, "Data1d")
@@ -94,7 +97,13 @@ def main():
     splits = ["train", "val", "test"]
     global_lon_min, global_lon_max = float("inf"), float("-inf")
     global_lat_min, global_lat_max = float("inf"), float("-inf")
-    outliers = []
+    kept, dropped = [], []
+
+    print(f"  Hộp 'Biển Đông' dùng để lọc: LON [{args.scs_lon_min}, {args.scs_lon_max}]°E, "
+          f"LAT [{args.scs_lat_min}, {args.scs_lat_max}]°N")
+    print(f"  Tiêu chí: GIỮ storm nếu có ÍT NHẤT 1 ĐIỂM (không phải toàn bộ track) "
+          f"rơi vào hộp trên -- storm hình thành xa rồi đi vào Biển Đông (hoặc")
+    print(f"  ngược lại) vẫn được giữ NGUYÊN VẸN cả track (obs_len cần cả đoạn xa).\n")
 
     print(f"{'Split':<8} {'File':<28} {'#pts':>6} {'lon_min':>9} {'lon_max':>9} {'lat_min':>9} {'lat_max':>9}  {'Note':<10}")
     print("-" * 100)
@@ -119,35 +128,50 @@ def main():
             lo_min, lo_max = min(lons), max(lons)
             la_min, la_max = min(lats), max(lats)
 
-            # [MỚI] Tự động phát hiện outlier bằng ngưỡng, không liệt kê
-            # tay — tránh lặp lại lỗi bỏ sót (1979_HOPE bị bỏ sót khi
-            # liệt kê tay ở lần trước).
-            is_outlier = lo_min < args.outlier_lon_threshold
-            note = "OUTLIER" if is_outlier else ""
+            # [MỚI, quan trọng] Kiểm tra TỪNG ĐIỂM (không chỉ min/max
+            # tổng thể) -- storm được GIỮ nếu có ít nhất 1 điểm (lon,
+            # lat) nằm trong hộp Biển Đông. Đây khác hẳn cách cũ (chỉ
+            # so lon_min với 1 ngưỡng) -- cách cũ có thể giữ nhầm storm
+            # không hề đi qua Biển Đông (nếu lon_min tình cờ thấp vì lý
+            # do khác) hoặc loại nhầm storm CÓ đi qua Biển Đông nhưng
+            # phần lớn track ở xa (lon_min cao vì track dài).
+            crosses_scs = any(
+                args.scs_lon_min <= lon <= args.scs_lon_max and
+                args.scs_lat_min <= lat <= args.scs_lat_max
+                for lon, lat in pts
+            )
+            note = "" if crosses_scs else "KHONG_QUA_SCS"
 
-            if is_outlier:
-                outliers.append((split, fname, lo_min, lo_max, la_min, la_max))
-            else:
+            if crosses_scs:
+                kept.append((split, fname, lo_min, lo_max, la_min, la_max))
                 global_lon_min = min(global_lon_min, lo_min)
                 global_lon_max = max(global_lon_max, lo_max)
                 global_lat_min = min(global_lat_min, la_min)
                 global_lat_max = max(global_lat_max, la_max)
+            else:
+                dropped.append((split, fname, lo_min, lo_max, la_min, la_max))
 
             print(f"{split:<8} {fname:<28} {len(pts):>6} "
                   f"{lo_min:>9.2f} {lo_max:>9.2f} {la_min:>9.2f} {la_max:>9.2f}  {note:<10}")
 
     print("-" * 100)
 
-    if outliers:
-        print(f"\n  ⚠ {len(outliers)} STORM BỊ COI LÀ OUTLIER "
-              f"(lon_min < {args.outlier_lon_threshold}°E), ĐÃ LOẠI khỏi phạm vi tính:")
-        for split, fname, lo_min, lo_max, la_min, la_max in outliers:
-            print(f"    {split}/{fname}: lon=[{lo_min:.1f},{lo_max:.1f}] lat=[{la_min:.1f},{la_max:.1f}]")
-        print(f"\n  ⚠ KIỂM TRA LẠI danh sách trên — nếu có storm nào THỰC SỰ thuộc")
-        print(f"  vùng bạn quan tâm (Biển Đông/Việt Nam) bị loại nhầm, giảm")
-        print(f"  --outlier_lon_threshold xuống rồi chạy lại (vd: --outlier_lon_threshold 90).")
+    print(f"\n  Tổng: {len(kept)} storm GIỮ (có đi qua Biển Đông), "
+          f"{len(dropped)} storm LOẠI (không hề đi qua Biển Đông).")
 
-    print(f"\n  PHẠM VI THẬT (đã loại {len(outliers)} outlier tự động phát hiện):")
+    if dropped:
+        print(f"\n  ⚠ {len(dropped)} STORM BỊ LOẠI (không có điểm nào trong hộp Biển Đông):")
+        for split, fname, lo_min, lo_max, la_min, la_max in dropped:
+            print(f"    {split}/{fname}: lon=[{lo_min:.1f},{lo_max:.1f}] lat=[{la_min:.1f},{la_max:.1f}]")
+        print(f"\n  ⚠ KIỂM TRA LẠI danh sách trên — nếu có storm nào bạn biết CHẮC CHẮN")
+        print(f"  có đi qua Biển Đông/gần Việt Nam mà vẫn bị loại, nới rộng hộp bằng")
+        print(f"  --scs_lon_min/--scs_lon_max/--scs_lat_min/--scs_lat_max rồi chạy lại.")
+
+    if global_lon_min == float("inf"):
+        print("\n  ❌ Không có storm nào khớp tiêu chí — kiểm tra lại hộp Biển Đông.")
+        return
+
+    print(f"\n  PHẠM VI THẬT (chỉ tính {len(kept)} storm có đi qua Biển Đông):")
     print(f"    LON: [{global_lon_min:.2f}, {global_lon_max:.2f}]°E")
     print(f"    LAT: [{global_lat_min:.2f}, {global_lat_max:.2f}]°N")
 
