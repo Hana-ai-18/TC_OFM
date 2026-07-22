@@ -76,6 +76,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True,
                     help="Thư mục chứa Data1d/ (vd: /kaggle/input/datasets/kaggle1234uitvn/tc-ofm)")
+    ap.add_argument("--outlier_lon_threshold", type=float, default=95.0,
+                    help="[MỚI] Storm có bất kỳ điểm nào với kinh độ < ngưỡng này "
+                         "sẽ bị coi là OUTLIER (khác khu vực, ví dụ Vịnh Bengal/Ấn Độ "
+                         "Dương) và loại khỏi việc tính phạm vi -- thay vì liệt kê tay "
+                         "từng tên storm (đã chứng minh không đáng tin, có thể bỏ sót). "
+                         "Mặc định 95 độ E: đủ thấp để giữ mọi storm Tây Bắc TBD/Biển "
+                         "Đông/Việt Nam thật, đủ cao để loại storm Vịnh Bengal/Ấn Độ "
+                         "Dương (quan sát ở 74-79 độ E, cách biệt rõ so với nhóm còn lại).")
     args = ap.parse_args()
 
     data1d = os.path.join(args.root, "Data1d")
@@ -86,9 +94,10 @@ def main():
     splits = ["train", "val", "test"]
     global_lon_min, global_lon_max = float("inf"), float("-inf")
     global_lat_min, global_lat_max = float("inf"), float("-inf")
+    outliers = []
 
-    print(f"{'Split':<8} {'File':<28} {'#pts':>6} {'lon_min':>9} {'lon_max':>9} {'lat_min':>9} {'lat_max':>9}")
-    print("-" * 90)
+    print(f"{'Split':<8} {'File':<28} {'#pts':>6} {'lon_min':>9} {'lon_max':>9} {'lat_min':>9} {'lat_max':>9}  {'Note':<10}")
+    print("-" * 100)
 
     for split in splits:
         split_dir = os.path.join(data1d, split)
@@ -110,16 +119,35 @@ def main():
             lo_min, lo_max = min(lons), max(lons)
             la_min, la_max = min(lats), max(lats)
 
-            global_lon_min = min(global_lon_min, lo_min)
-            global_lon_max = max(global_lon_max, lo_max)
-            global_lat_min = min(global_lat_min, la_min)
-            global_lat_max = max(global_lat_max, la_max)
+            # [MỚI] Tự động phát hiện outlier bằng ngưỡng, không liệt kê
+            # tay — tránh lặp lại lỗi bỏ sót (1979_HOPE bị bỏ sót khi
+            # liệt kê tay ở lần trước).
+            is_outlier = lo_min < args.outlier_lon_threshold
+            note = "OUTLIER" if is_outlier else ""
+
+            if is_outlier:
+                outliers.append((split, fname, lo_min, lo_max, la_min, la_max))
+            else:
+                global_lon_min = min(global_lon_min, lo_min)
+                global_lon_max = max(global_lon_max, lo_max)
+                global_lat_min = min(global_lat_min, la_min)
+                global_lat_max = max(global_lat_max, la_max)
 
             print(f"{split:<8} {fname:<28} {len(pts):>6} "
-                  f"{lo_min:>9.2f} {lo_max:>9.2f} {la_min:>9.2f} {la_max:>9.2f}")
+                  f"{lo_min:>9.2f} {lo_max:>9.2f} {la_min:>9.2f} {la_max:>9.2f}  {note:<10}")
 
-    print("-" * 90)
-    print(f"\n  PHẠM VI THẬT TOÀN BỘ DATASET (train+val+test):")
+    print("-" * 100)
+
+    if outliers:
+        print(f"\n  ⚠ {len(outliers)} STORM BỊ COI LÀ OUTLIER "
+              f"(lon_min < {args.outlier_lon_threshold}°E), ĐÃ LOẠI khỏi phạm vi tính:")
+        for split, fname, lo_min, lo_max, la_min, la_max in outliers:
+            print(f"    {split}/{fname}: lon=[{lo_min:.1f},{lo_max:.1f}] lat=[{la_min:.1f},{la_max:.1f}]")
+        print(f"\n  ⚠ KIỂM TRA LẠI danh sách trên — nếu có storm nào THỰC SỰ thuộc")
+        print(f"  vùng bạn quan tâm (Biển Đông/Việt Nam) bị loại nhầm, giảm")
+        print(f"  --outlier_lon_threshold xuống rồi chạy lại (vd: --outlier_lon_threshold 90).")
+
+    print(f"\n  PHẠM VI THẬT (đã loại {len(outliers)} outlier tự động phát hiện):")
     print(f"    LON: [{global_lon_min:.2f}, {global_lon_max:.2f}]°E")
     print(f"    LAT: [{global_lat_min:.2f}, {global_lat_max:.2f}]°N")
 
