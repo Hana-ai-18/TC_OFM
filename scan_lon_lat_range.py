@@ -87,6 +87,16 @@ def main():
     ap.add_argument("--scs_lat_max", type=float, default=23.0,
                     help="[MỚI] Biên Bắc của hộp 'Biển Đông' -- mặc định 23°N "
                          "(khoảng biên giới Việt Nam - Trung Quốc / đảo Hải Nam).")
+    ap.add_argument("--min_pct_in_scs", type=float, default=15.0,
+                    help="[MỚI, FIX] Trước đây chỉ cần >=1 điểm trong hộp là GIỮ "
+                         "toàn bộ storm -- điều này giữ NHẦM các storm như "
+                         "1989_GAY (chủ yếu ở Vịnh Bengal, 74-92°E, chỉ chạm "
+                         "rìa Tây Biển Đông ở vài điểm CUỐI track, 99-105°E) vì "
+                         "về mặt TOÁN HỌC nó có >=1 điểm trong hộp. Giờ yêu cầu "
+                         "ÍT NHẤT bao nhiêu %% số điểm của track phải nằm trong "
+                         "hộp mới được GIỮ -- mặc định 15%% (đủ thấp để giữ storm "
+                         "hình thành xa rồi mới vào Biển Đông ở nửa sau track như "
+                         "MOLAVE, đủ cao để loại storm chỉ chạm rìa thoáng qua).")
     args = ap.parse_args()
 
     data1d = os.path.join(args.root, "Data1d")
@@ -101,12 +111,12 @@ def main():
 
     print(f"  Hộp 'Biển Đông' dùng để lọc: LON [{args.scs_lon_min}, {args.scs_lon_max}]°E, "
           f"LAT [{args.scs_lat_min}, {args.scs_lat_max}]°N")
-    print(f"  Tiêu chí: GIỮ storm nếu có ÍT NHẤT 1 ĐIỂM (không phải toàn bộ track) "
-          f"rơi vào hộp trên -- storm hình thành xa rồi đi vào Biển Đông (hoặc")
-    print(f"  ngược lại) vẫn được giữ NGUYÊN VẸN cả track (obs_len cần cả đoạn xa).\n")
+    print(f"  Tiêu chí: GIỮ storm nếu ÍT NHẤT {args.min_pct_in_scs}% số điểm "
+          f"trong track rơi vào hộp trên (không phải chỉ >=1 điểm — tránh giữ")
+    print(f"  nhầm storm chỉ chạm rìa thoáng qua như 1989_GAY, chủ yếu ở Vịnh Bengal).\n")
 
-    print(f"{'Split':<8} {'File':<28} {'#pts':>6} {'lon_min':>9} {'lon_max':>9} {'lat_min':>9} {'lat_max':>9}  {'Note':<10}")
-    print("-" * 100)
+    print(f"{'Split':<8} {'File':<28} {'#pts':>6} {'lon_min':>9} {'lon_max':>9} {'lat_min':>9} {'lat_max':>9} {'%inSCS':>7}  {'Note':<10}")
+    print("-" * 108)
 
     for split in splits:
         split_dir = os.path.join(data1d, split)
@@ -128,18 +138,20 @@ def main():
             lo_min, lo_max = min(lons), max(lons)
             la_min, la_max = min(lats), max(lats)
 
-            # [MỚI, quan trọng] Kiểm tra TỪNG ĐIỂM (không chỉ min/max
-            # tổng thể) -- storm được GIỮ nếu có ít nhất 1 điểm (lon,
-            # lat) nằm trong hộp Biển Đông. Đây khác hẳn cách cũ (chỉ
-            # so lon_min với 1 ngưỡng) -- cách cũ có thể giữ nhầm storm
-            # không hề đi qua Biển Đông (nếu lon_min tình cờ thấp vì lý
-            # do khác) hoặc loại nhầm storm CÓ đi qua Biển Đông nhưng
-            # phần lớn track ở xa (lon_min cao vì track dài).
-            crosses_scs = any(
-                args.scs_lon_min <= lon <= args.scs_lon_max and
-                args.scs_lat_min <= lat <= args.scs_lat_max
-                for lon, lat in pts
+            # [MỚI, FIX] Đếm % điểm trong hộp, không chỉ check >=1 điểm.
+            # Bug đã tìm ra ở lần chạy trước: any() cho phép storm như
+            # 1989_GAY (74-105°E, chủ yếu ở Vịnh Bengal, chỉ vài điểm
+            # CUỐI chạm rìa Tây Biển Đông 99-105°E) vẫn được GIỮ vì về
+            # mặt toán học nó có >=1 điểm trong hộp -- kéo _LON_NORM_MIN
+            # xuống tận 73°E một cách sai lệch. Giờ yêu cầu tỷ lệ % tối
+            # thiểu số điểm phải nằm trong hộp.
+            n_in_scs = sum(
+                1 for lon, lat in pts
+                if args.scs_lon_min <= lon <= args.scs_lon_max and
+                   args.scs_lat_min <= lat <= args.scs_lat_max
             )
+            pct_in_scs = 100.0 * n_in_scs / len(pts)
+            crosses_scs = pct_in_scs >= args.min_pct_in_scs
             note = "" if crosses_scs else "KHONG_QUA_SCS"
 
             if crosses_scs:
@@ -149,23 +161,23 @@ def main():
                 global_lat_min = min(global_lat_min, la_min)
                 global_lat_max = max(global_lat_max, la_max)
             else:
-                dropped.append((split, fname, lo_min, lo_max, la_min, la_max))
+                dropped.append((split, fname, lo_min, lo_max, la_min, la_max, pct_in_scs))
 
             print(f"{split:<8} {fname:<28} {len(pts):>6} "
-                  f"{lo_min:>9.2f} {lo_max:>9.2f} {la_min:>9.2f} {la_max:>9.2f}  {note:<10}")
+                  f"{lo_min:>9.2f} {lo_max:>9.2f} {la_min:>9.2f} {la_max:>9.2f} {pct_in_scs:>6.1f}%  {note:<10}")
 
-    print("-" * 100)
+    print("-" * 108)
 
     print(f"\n  Tổng: {len(kept)} storm GIỮ (có đi qua Biển Đông), "
           f"{len(dropped)} storm LOẠI (không hề đi qua Biển Đông).")
 
     if dropped:
-        print(f"\n  ⚠ {len(dropped)} STORM BỊ LOẠI (không có điểm nào trong hộp Biển Đông):")
-        for split, fname, lo_min, lo_max, la_min, la_max in dropped:
-            print(f"    {split}/{fname}: lon=[{lo_min:.1f},{lo_max:.1f}] lat=[{la_min:.1f},{la_max:.1f}]")
+        print(f"\n  ⚠ {len(dropped)} STORM BỊ LOẠI (dưới {args.min_pct_in_scs}% điểm trong hộp Biển Đông):")
+        for split, fname, lo_min, lo_max, la_min, la_max, pct in dropped:
+            print(f"    {split}/{fname}: lon=[{lo_min:.1f},{lo_max:.1f}] lat=[{la_min:.1f},{la_max:.1f}]  ({pct:.1f}% trong hộp)")
         print(f"\n  ⚠ KIỂM TRA LẠI danh sách trên — nếu có storm nào bạn biết CHẮC CHẮN")
-        print(f"  có đi qua Biển Đông/gần Việt Nam mà vẫn bị loại, nới rộng hộp bằng")
-        print(f"  --scs_lon_min/--scs_lon_max/--scs_lat_min/--scs_lat_max rồi chạy lại.")
+        print(f"  có đi qua Biển Đông/gần Việt Nam mà vẫn bị loại, giảm --min_pct_in_scs")
+        print(f"  hoặc nới rộng hộp bằng --scs_lon_min/--scs_lon_max/--scs_lat_min/--scs_lat_max.")
 
     if global_lon_min == float("inf"):
         print("\n  ❌ Không có storm nào khớp tiêu chí — kiểm tra lại hộp Biển Đông.")
