@@ -39,7 +39,7 @@ that generate_comparison_table.py consumes directly for the Table-10-style
 statistical significance tables.
 """
 from __future__ import annotations
-import sys, os, argparse, json
+import sys, os, argparse, json, random
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -166,10 +166,36 @@ def load_st_trans(checkpoint: str, device,
     naturally works for either. This loader only instantiates STTrans
     (non-AR) — STTransAR support would need its own loader if you also
     want to evaluate that variant.
+
+    [FIX-STTRANS-MODEL-CFG] Checkpoints saved by an OLDER version of
+    train_st_trans.py (before the "STTrans vs STTransAR have different
+    ctor signatures" fix was added there) can have a model_cfg dict that
+    includes extra keys STTrans.__init__() does not accept -- observed in
+    practice: 'model_type' (TypeError: STTrans.__init__() got an
+    unexpected keyword argument 'model_type'). Current train_st_trans.py
+    saves model_type as a SEPARATE top-level checkpoint key (ck['model_type']),
+    not inside model_cfg, so a clean checkpoint should not hit this -- but
+    since we cannot control what checkpoint file the user points this at
+    (e.g. one trained before that convention existed), filter model_cfg
+    down to exactly STTrans's known-valid non_ar constructor keys before
+    calling STTrans(**model_cfg), rather than trusting the checkpoint's
+    model_cfg blindly. Any dropped key is reported so a real config
+    mismatch (not just a harmless stale extra key) is still visible.
     """
     ck = torch.load(checkpoint, map_location="cpu")
     model_cfg = ck.get("model_cfg")
     if model_cfg:
+        _VALID_STTRANS_KEYS = {
+            "obs_len", "pred_len", "unet_in_ch", "d_model", "nhead",
+            "num_enc_layers", "num_dec_layers", "dim_ff", "dropout",
+        }
+        _dropped = {k: v for k, v in model_cfg.items() if k not in _VALID_STTRANS_KEYS}
+        if _dropped:
+            print(f"  ⚠ ST-Trans checkpoint's model_cfg has keys STTrans.__init__() "
+                  f"doesn't accept — dropping before construction: {list(_dropped.keys())}. "
+                  f"(Likely saved by an older train_st_trans.py; verify this is really "
+                  f"an STTrans non_ar checkpoint, not e.g. STTransAR, if unsure.)")
+        model_cfg = {k: v for k, v in model_cfg.items() if k in _VALID_STTRANS_KEYS}
         model = STTrans(**model_cfg).to(device)
     else:
         print(f"  ⚠ ST-Trans checkpoint has no model_cfg — using "
@@ -193,7 +219,8 @@ def load_st_trans(checkpoint: str, device,
 @torch.no_grad()
 def evaluate_one_model(model, loader, device, model_name: str,
                         seed: str = "unknown",
-                        n_ensemble: int = 20) -> List[Dict]:
+                        n_ensemble: int = 20,
+                        ddim_steps: Optional[int] = None) -> List[Dict]:
     """
     Returns a list of PER-LEAD-TIME records:
       {"model": name, "seed": seed, "storm": storm_key, "window": idx,
@@ -231,7 +258,12 @@ def evaluate_one_model(model, loader, device, model_name: str,
 
         try:
             if is_fm:
-                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble)
+                # [FIX-ODE-STEPS-MISMATCH] Previously ignored any ddim_steps
+                # override entirely and always used the checkpoint's own
+                # self.n_inference_steps. Now CLI-configurable via --ddim_steps
+                # to match evaluate_full.py's convention (None = defer to
+                # checkpoint's trained value, same as before if not passed).
+                pred, _, _ = model.sample(bl, num_ensemble=n_ensemble, ddim_steps=ddim_steps)
             else:
                 pred, _, _ = model.sample(bl, num_ensemble=1)
         except Exception as e:
@@ -297,13 +329,37 @@ def evaluate_one_model(model, loader, device, model_name: str,
     return records
 
 
+# [FIX-DETERMINISM] Mirrors evaluate_full.py / visual_evaluate_mode.py's
+# set_seed(): this script never seeded RNGs before model.sample()'s
+# K-candidate torch.randn(...) draw, so repeated runs (and comparisons
+# against visualize's fixed-seed output) were not reproducible for FM.
+def set_seed(s: int = 42):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark     = False
+
+
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--seed", type=int, default=42,
+                   help="[FIX-DETERMINISM] RNG seed applied before any model.sample() call; "
+                        "matches visual_evaluate_mode.py's fixed seed(42) convention.")
     p.add_argument("--dataset_root", required=True)
     p.add_argument("--split", default="test", choices=["test", "val", "train"])
     p.add_argument("--output_dir", default="eval_multi")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--n_ensemble", type=int, default=20)
+    p.add_argument("--ddim_steps", type=int, default=None,
+                   help="[FIX-ODE-STEPS-MISMATCH] Number of ODE integration steps for "
+                        "FM's model.sample(). Was previously not exposed here at all "
+                        "(evaluate_one_model always used the checkpoint's own trained "
+                        "n_inference_steps, silently ignoring any intended override). "
+                        "Default None matches evaluate_full.py's --ddim_steps convention: "
+                        "defer to the checkpoint's own value unless explicitly set.")
     p.add_argument("--test_year", type=int, default=None)
 
     p.add_argument("--fm_checkpoints",       nargs="+", default=None,
@@ -334,6 +390,7 @@ def main():
     p.add_argument("--st_dropout",        type=float, default=0.1)
 
     args = p.parse_args()
+    set_seed(args.seed)   # [FIX-DETERMINISM] must run before any model.sample() call below
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
 
@@ -398,7 +455,8 @@ def main():
         print(f"  {display_name} (seed={seed}): {n_params:,} params")
 
         recs = evaluate_one_model(model, loader, device, display_name,
-                                   seed=seed, n_ensemble=args.n_ensemble)
+                                   seed=seed, n_ensemble=args.n_ensemble,
+                                   ddim_steps=args.ddim_steps)
         all_records.extend(recs)
 
         # [FIX] ate/cte là None ở lead_time=1 (6h) theo convention đã sửa
