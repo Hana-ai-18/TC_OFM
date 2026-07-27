@@ -4821,7 +4821,7 @@ if __name__ == "__main__":
     p.add_argument("--obs_len",        type=int,   default=8)
     p.add_argument("--pred_len",       type=int,   default=12)
     p.add_argument("--ode_steps",      type=int,   default=10)
-    p.add_argument("--num_ensemble",   type=int,   default=50)
+    p.add_argument("--num_ensemble",   type=int,   default=20)
     p.add_argument("--batch_size",     type=int,   default=1)
     p.add_argument("--num_workers",    type=int,   default=0)
     p.add_argument("--delim",          default=" ")
