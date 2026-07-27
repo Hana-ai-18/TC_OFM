@@ -191,10 +191,36 @@ def load_st_trans(checkpoint: str, device,
         }
         _dropped = {k: v for k, v in model_cfg.items() if k not in _VALID_STTRANS_KEYS}
         if _dropped:
-            print(f"  ⚠ ST-Trans checkpoint's model_cfg has keys STTrans.__init__() "
-                  f"doesn't accept — dropping before construction: {list(_dropped.keys())}. "
-                  f"(Likely saved by an older train_st_trans.py; verify this is really "
-                  f"an STTrans non_ar checkpoint, not e.g. STTransAR, if unsure.)")
+            # [FIX-STTRANS-WRONG-CKPT] 'hidden_dim'/'n_layers' are
+            # PaperBaseline-specific (RNN/GRU/LSTM), never valid STTrans
+            # ctor args under ANY version of train_st_trans.py -- their
+            # presence means this file is almost certainly a PaperBaseline
+            # checkpoint pointed at by the wrong --st_trans_checkpoints
+            # path/filename, NOT a genuinely-older-but-valid STTrans
+            # checkpoint. Silently dropping and proceeding in that case
+            # would build a randomly-initialized STTrans and load a
+            # state_dict for a totally different architecture (near-total
+            # missing/unexpected key mismatch), producing a model that
+            # LOOKS like it loaded (no crash) but is untrained garbage --
+            # exactly the ADE~6000km symptom this warning exists to catch
+            # before it's mistaken for a legitimate eval result.
+            _paper_baseline_keys = _dropped.keys() & {"model_type", "hidden_dim", "n_layers"}
+            if _paper_baseline_keys:
+                print(f"  🛑 ST-Trans checkpoint's model_cfg contains "
+                      f"{sorted(_paper_baseline_keys)} — these are PaperBaseline "
+                      f"(RNN/GRU/LSTM) architecture keys, NEVER valid for STTrans. "
+                      f"This file is very likely NOT an ST-Trans checkpoint at all "
+                      f"(wrong path in --st_trans_checkpoints?). Proceeding anyway "
+                      f"per current call, but expect load_state_dict to report a "
+                      f"large missing/unexpected key count below if so — if that "
+                      f"happens, the resulting ADE number is meaningless (near-random "
+                      f"weights), not a real evaluation of ST-Trans. Verify the "
+                      f"checkpoint path before trusting any metric from this run.")
+            else:
+                print(f"  ⚠ ST-Trans checkpoint's model_cfg has keys STTrans.__init__() "
+                      f"doesn't accept — dropping before construction: {list(_dropped.keys())}. "
+                      f"(Likely saved by an older train_st_trans.py; verify this is really "
+                      f"an STTrans non_ar checkpoint, not e.g. STTransAR, if unsure.)")
         model_cfg = {k: v for k, v in model_cfg.items() if k in _VALID_STTRANS_KEYS}
         model = STTrans(**model_cfg).to(device)
     else:
@@ -211,6 +237,24 @@ def load_st_trans(checkpoint: str, device,
     if missing or unexpected:
         print(f"  ⚠ ST-Trans load_state_dict: {len(missing)} missing, "
               f"{len(unexpected)} unexpected keys")
+        # [FIX-STTRANS-WRONG-CKPT] A handful of missing/unexpected keys can
+        # legitimately happen (e.g. a minor architecture tweak between
+        # checkpoint versions). A LARGE fraction mismatching means the
+        # state_dict almost certainly belongs to a different architecture
+        # entirely -- most of the model is left at its random init, so any
+        # ADE/ATE/CTE computed from it is meaningless, not a real result.
+        try:
+            total_model_params = len(list(model.state_dict().keys()))
+            mismatch_frac = (len(missing) + len(unexpected)) / max(total_model_params, 1)
+        except Exception:
+            mismatch_frac = 0.0
+        if mismatch_frac > 0.25:
+            print(f"  🛑 {mismatch_frac*100:.0f}% of STTrans's parameter keys did not "
+                  f"match this checkpoint's state_dict -- this is FAR too many for a "
+                  f"minor version difference. The loaded weights are almost entirely "
+                  f"random-initialized, not the trained checkpoint. Any metric reported "
+                  f"below (ADE/ATE/CTE) is NOT a valid evaluation of ST-Trans -- stop and "
+                  f"verify the checkpoint path/architecture before using these numbers.")
     model.eval()
     seed = _infer_seed(checkpoint, ck)
     return model, seed
