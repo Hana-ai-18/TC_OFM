@@ -1612,7 +1612,18 @@ class TrajectoryDataset(Dataset):
             base   = os.path.splitext(os.path.basename(path))[0]
             parts  = base.split("_")
             f_year = parts[0] if parts else "unknown"
-            f_name = parts[1] if len(parts) > 1 else base
+            # FIX-DATA-31 [P0-CRITICAL]: lay TOAN BO phan con lai sau year
+            # (noi lai bang "_"), KHONG chi lay parts[1]. Ten file co the
+            # co dang "<year>_<name>_<so_thu_tu>.txt" (vd "2000_0019_2.txt"
+            # cho con bao thu 2 trung ma so/ten "0019" trong nam 2000).
+            # BUG CU: f_name = parts[1] cat mat phan "_2", khien nhieu con
+            # bao khac nhau trong cung 1 nam (vd 2000_0019.txt den
+            # 2000_0019_7.txt, 7 con bao rieng biet) DEU bi gan chung
+            # f_name="0019" -> khi img_read()/_load_env_npy() tim thu muc
+            # Data3d/Env theo (year, f_name), ca 7 con bao se doc NHAM
+            # anh ve tinh/du lieu moi truong cua con bao goc "0019" thay
+            # vi du lieu rieng cua chinh no trong "0019_2".."0019_7".
+            f_name = "_".join(parts[1:]) if len(parts) > 1 else base
 
             d    = self._read_file(path, delim)
             data = d["main"]
